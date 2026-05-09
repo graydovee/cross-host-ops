@@ -1,0 +1,47 @@
+[package]
+name = "remote-hop"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "rhop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rhop"
+path = "src/bin/rhop.rs"
+
+[[bin]]
+name = "rhopd"
+path = "src/bin/rhopd.rs"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+data-encoding = "2.9"
+home = "0.5"
+hmac = "0.12"
+hyper-util = { version = "0.1", features = ["tokio"] }
+parking_lot = "0.12"
+prost = "0.14"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+russh = { version = "0.60", default-features = false, features = ["ring", "flate2", "rsa"] }
+russh-sftp = "2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha1 = "0.10"
+thiserror = "1.0"
+tokio = { version = "1.48", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+toml = "0.8"
+tonic = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+tower = { version = "0.5", features = ["util"] }
+uuid = { version = "1.19", features = ["serde", "v4"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"

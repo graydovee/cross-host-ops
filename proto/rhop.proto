@@ -1,0 +1,101 @@
+syntax = "proto3";
+
+package rhop.rpc;
+
+service RhopRpc {
+  rpc Execute(stream ExecuteRequest) returns (stream ExecuteResponse);
+  rpc Copy(CopyRequest) returns (InfoResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+  rpc ReloadConfig(ReloadConfigRequest) returns (InfoResponse);
+}
+
+message ExecuteRequest {
+  oneof request {
+    StartRequest start = 1;
+    ConfirmRequest confirm = 2;
+  }
+}
+
+message StartRequest {
+  string target = 1;
+  repeated string argv = 2;
+}
+
+message ConfirmRequest {
+  string execution_id = 1;
+  bool allow = 2;
+}
+
+enum CopyDirection {
+  COPY_DIRECTION_UNSPECIFIED = 0;
+  COPY_DIRECTION_UPLOAD = 1;
+  COPY_DIRECTION_DOWNLOAD = 2;
+}
+
+message CopyRequest {
+  string target = 1;
+  string local_path = 2;
+  string remote_path = 3;
+  bool recursive = 4;
+  CopyDirection direction = 5;
+}
+
+message ExecuteResponse {
+  oneof event {
+    ReviewResult review_result = 1;
+    ConfirmRequired confirm_required = 2;
+    OutputChunk stdout = 3;
+    OutputChunk stderr = 4;
+    ExitStatus exit_status = 5;
+    InfoResponse info = 6;
+    ErrorResponse error = 7;
+  }
+}
+
+message ReviewResult {
+  string execution_id = 1;
+  string risk_level = 2;
+  string action = 3;
+  string reason = 4;
+  string matched_whitelist_reason = 5;
+}
+
+message ConfirmRequired {
+  string execution_id = 1;
+  string reason = 2;
+}
+
+message OutputChunk {
+  bytes data = 1;
+}
+
+message ExitStatus {
+  int32 code = 1;
+}
+
+message ErrorResponse {
+  string message = 1;
+}
+
+message InfoResponse {
+  string message = 1;
+}
+
+message StatusRequest {}
+
+message ReloadConfigRequest {}
+
+message StatusResponse {
+  bool daemon_running = 1;
+  string socket_path = 2;
+  uint64 active_executions = 3;
+  repeated PoolStatus pools = 4;
+}
+
+message PoolStatus {
+  string key = 1;
+  uint64 total = 2;
+  uint64 busy = 3;
+  uint64 idle = 4;
+  uint64 queued = 5;
+}

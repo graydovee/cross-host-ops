@@ -1,0 +1,96 @@
+# rhop example config
+#
+# The program can run without any config file.
+# Default behavior with no config:
+# - socket path: ~/.local/run/rhop/rhopd.sock
+# - target resolution: derive IP from the first CLI argument
+# - direct SSH only: the derived IP must match a Host entry in ~/.ssh/config
+# - jumpserver: disabled by default
+# - command review: disabled by default
+#
+# Copy only the sections you need into ~/.config/rhop/config.toml.
+# Every setting below is commented out on purpose.
+
+# [server]
+# socket_path = "~/.local/run/rhop/rhopd.sock"
+# log_path = "/var/log/rhopd.log"
+# log_level = "info"
+# reaper_interval = "30s"
+
+# [ssh]
+# ssh_config_path = "~/.ssh/config"
+# connect_timeout = "10s"
+# keepalive_interval = "30s"
+# max_idle_time = "10m"
+# max_connections_per_ip = 10
+
+# Enable this only when a target is not reachable through ~/.ssh/config direct SSH.
+# [jumpserver]
+# enabled = true
+# host = "bastion.example.com"
+# port = 20221
+# user = "user@example.com"
+# identity_file = "~/.ssh/id_rsa"
+# menu_prompt_contains = "Opt"
+# mfa_prompt_contains = "MFA"
+# shell_prompt_suffixes = ["$ ", "# "]
+
+# [jumpserver.mfa]
+# totp_secret_base32 = "REPLACE_ME"
+# digits = 6
+# period = 30
+# digest = "sha1"
+
+# Enable this only when you want LLM command review before execution.
+# If api_key is omitted, rhop will try RHOP_REVIEW_API_KEY first, then OPENAI_API_KEY.
+# endpoint, model, prompts, policy, and semantic_whitelist all have code defaults.
+# [review]
+# enable = true
+# endpoint = "https://api.openai.com/v1/chat/completions"
+# model = "gpt-4.1-mini"
+# api_key = "REPLACE_ME"
+# timeout = "10s"
+# failure_action = "deny"
+# # Optional: CLI suppresses normal allow/safe review output; rhopd keeps it in logs.
+
+# Optional: fast-pass simple commands locally before calling the LLM.
+# If a rule contains '*', it uses wildcard matching against the full shell command.
+# If a rule does not contain '*', it must match exactly.
+# [review.fast_allowlist]
+# enable = true
+# commands = ["ls", "ls *", "cat *", "grep *", "kubectl get *"]
+
+# Optional extra HTTP headers for an OpenAI-compatible endpoint.
+# [review.headers]
+# Authorization = "Bearer REPLACE_ME"
+# X-Custom-Header = "value"
+
+# Optional: override the built-in review prompts.
+# [review.prompts]
+# system = "You are a command safety reviewer. Return JSON only."
+# template = """
+# Classify the command into exactly one risk level: safe, risky, or dangerous.
+# Return compact JSON with keys: risk_level, reason, matched_whitelist_reason.
+# """
+
+# Optional: override the built-in action policy.
+# [review.policy]
+# safe = "allow"
+# risky = "confirm"
+# dangerous = "deny"
+
+# Optional: override or extend the built-in semantic whitelist hints.
+# [[review.semantic_whitelist]]
+# name = "read-only inspection"
+# description = "Read-only inspection of files, logs, process state, sockets, environment, or system metadata."
+# examples = ["cat /etc/hosts", "journalctl -u nginx", "ps aux | grep kubelet"]
+
+# [[review.semantic_whitelist]]
+# name = "source and git inspection"
+# description = "Read-only inspection of source code or git history/status without checkout, reset, clean, apply, or commit."
+# examples = ["grep -R TODO src", "git status --short", "git log --oneline -20"]
+
+# [[review.semantic_whitelist]]
+# name = "kubernetes read-only inspection"
+# description = "Cluster inspection commands that only get, describe, or view logs and do not patch, edit, apply, delete, scale, or exec."
+# examples = ["kubectl get pods -A", "kubectl describe pod my-pod -n prod", "kubectl logs deploy/api -n prod --since=10m"]
