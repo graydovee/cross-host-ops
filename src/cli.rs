@@ -89,8 +89,6 @@ pub enum DaemonCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ConfigCommand {
-    #[command(about = "Reload daemon configuration")]
-    Reload,
     #[command(about = "Show the daemon's effective config paths")]
     List,
 }
@@ -283,16 +281,6 @@ async fn run_copy(recursive: bool, source: String, dest: String) -> Result<i32> 
     Ok(0)
 }
 
-async fn reload_config() -> Result<i32> {
-    let socket_path = socket_path()?;
-    let mut client = connect_client(&socket_path)
-        .await
-        .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
-    let response = client.reload_config(rpc::ReloadConfigRequest {}).await?;
-    println!("{}", response.into_inner().message);
-    Ok(0)
-}
-
 async fn run_daemon_command(command: DaemonCommand) -> Result<i32> {
     match command {
         DaemonCommand::Start { config, log_level } => daemon_start(CliDaemonStartOptions {
@@ -306,7 +294,6 @@ async fn run_daemon_command(command: DaemonCommand) -> Result<i32> {
 
 async fn run_config_command(command: ConfigCommand) -> Result<i32> {
     match command {
-        ConfigCommand::Reload => reload_config().await,
         ConfigCommand::List => list_config().await,
     }
 }

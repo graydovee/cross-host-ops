@@ -21,6 +21,7 @@
 # ssh_config_path = "~/.ssh/config"
 # server_config_path = "~/.rhup/server.toml"
 # fallback = ["ssh_config", "jumpserver"]
+# pty = true
 # connect_timeout = "10s"
 # keepalive_interval = "30s"
 # max_idle_time = "10m"

@@ -6,7 +6,6 @@ service RhopRpc {
   rpc Execute(stream ExecuteRequest) returns (stream ExecuteResponse);
   rpc Copy(stream CopyRequest) returns (stream CopyResponse);
   rpc Status(StatusRequest) returns (StatusResponse);
-  rpc ReloadConfig(ReloadConfigRequest) returns (InfoResponse);
   rpc ListConfig(ConfigListRequest) returns (ConfigListResponse);
   rpc ListServers(ServerListRequest) returns (ServerListResponse);
   rpc Shutdown(ShutdownRequest) returns (InfoResponse);
@@ -120,8 +119,6 @@ message InfoResponse {
 }
 
 message StatusRequest {}
-
-message ReloadConfigRequest {}
 
 message ConfigListRequest {}
 

@@ -111,6 +111,7 @@ pub struct SshConfig {
     pub ssh_config_path: String,
     pub server_config_path: String,
     pub fallback: Vec<FallbackTransport>,
+    pub pty: bool,
     #[serde(deserialize_with = "deserialize_duration")]
     pub connect_timeout: Duration,
     #[serde(deserialize_with = "deserialize_duration")]
@@ -129,6 +130,7 @@ impl Default for SshConfig {
                 FallbackTransport::SshConfig,
                 FallbackTransport::Jumpserver,
             ],
+            pty: true,
             connect_timeout: Duration::from_secs(10),
             keepalive_interval: Duration::from_secs(30),
             max_idle_time: Duration::from_secs(600),

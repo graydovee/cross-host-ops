@@ -89,11 +89,26 @@ impl ConnectionPool {
                 *guard = Some(self.open_any_connection(&targets, auth_prompter.clone()).await?);
             }
             let config = self.config.read().await.clone();
-            guard
+            let first_result = guard
                 .as_mut()
                 .expect("connection initialized")
                 .copy(&spec, &config)
-                .await
+                .await;
+            match first_result {
+                Ok(()) => Ok(()),
+                Err(error) if should_reconnect(&error.to_string()) => {
+                    info!(target = %target.key, error = %error, "reopening stale pooled SSH connection");
+                    *guard = None;
+                    *guard = Some(self.open_any_connection(&targets, auth_prompter.clone()).await?);
+                    let config = self.config.read().await.clone();
+                    guard
+                        .as_mut()
+                        .expect("connection reinitialized")
+                        .copy(&spec, &config)
+                        .await
+                }
+                Err(error) => Err(error),
+            }
         }
         .await;
         pool.release(slot.id);
@@ -286,8 +301,32 @@ struct Lease {
 fn should_reconnect(error: &str) -> bool {
     let lowered = error.to_ascii_lowercase();
     lowered.contains("channel closed")
+        || lowered.contains("channel send error")
         || lowered.contains("closed unexpectedly")
         || lowered.contains("broken pipe")
         || lowered.contains("connection reset")
         || lowered.contains("connection aborted")
+        || lowered.contains("send error")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_reconnect;
+
+    #[test]
+    fn reconnects_on_channel_send_error() {
+        assert!(should_reconnect("Channel send error"));
+    }
+
+    #[test]
+    fn reconnects_on_closed_transport_errors() {
+        assert!(should_reconnect("shell closed unexpectedly"));
+        assert!(should_reconnect("broken pipe"));
+        assert!(should_reconnect("connection reset by peer"));
+    }
+
+    #[test]
+    fn ignores_non_transport_errors() {
+        assert!(!should_reconnect("permission denied"));
+    }
 }

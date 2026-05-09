@@ -5,6 +5,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::fs;
 use tokio::net::UnixListener;
 use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::sleep;
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::transport::Server;
@@ -15,7 +16,7 @@ use uuid::Uuid;
 use crate::config::{AppConfig, ReviewAction, default_config_path, list_server_entries};
 use crate::connection::CopySpec;
 use crate::connection::{AuthPrompter, AuthPromptRequest, build_remote_command, resolve_target};
-use crate::logging::init_logging;
+use crate::logging::{init_logging, reopen_log_output};
 use crate::pool::ConnectionPool;
 use crate::protocol::{self, AuthPromptMessage, ExecRequest, ServerEvent, rpc};
 use crate::review::CommandReviewer;
@@ -121,6 +122,18 @@ pub async fn run_with_overrides(
         }
     });
 
+    tokio::spawn(async move {
+        let Ok(mut sighup) = signal(SignalKind::hangup()) else {
+            return;
+        };
+        while sighup.recv().await.is_some() {
+            match reopen_log_output() {
+                Ok(()) => info!("reopened log output after SIGHUP"),
+                Err(error) => warn!(error = %format!("{error:#}"), "failed to reopen log output after SIGHUP"),
+            }
+        }
+    });
+
     let incoming = UnixListenerStream::new(listener);
     Server::builder()
         .add_service(rpc::rhop_rpc_server::RhopRpcServer::new(RhopRpcService {
@@ -142,17 +155,6 @@ async fn ensure_socket_parent(state: &DaemonState) -> Result<()> {
         .parent()
         .ok_or_else(|| anyhow!("invalid socket path {}", socket_path))?;
     fs::create_dir_all(parent).await?;
-    Ok(())
-}
-
-async fn reload_config(state: &DaemonState) -> Result<()> {
-    let old_log_path = state.config.read().await.server.log_path.clone();
-    let config = AppConfig::load(Some(&state.config_path))?;
-    if config.server.log_path != old_log_path {
-        warn!("log_path changes require daemon restart to take effect");
-    }
-    *state.config.write().await = config;
-    info!(config_path = %state.config_path.display(), "reloaded config");
     Ok(())
 }
 
@@ -579,19 +581,6 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 .unwrap_or_default(),
         };
         Ok(Response::new(response))
-    }
-
-    async fn reload_config(
-        &self,
-        _request: Request<rpc::ReloadConfigRequest>,
-    ) -> Result<Response<rpc::InfoResponse>, Status> {
-        info!("reload-config request");
-        reload_config(&self.state)
-            .await
-            .map_err(|error| Status::internal(error.to_string()))?;
-        Ok(Response::new(rpc::InfoResponse {
-            message: "config reloaded".to_string(),
-        }))
     }
 
     async fn list_config(

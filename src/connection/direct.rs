@@ -12,8 +12,8 @@ use crate::protocol::ServerEvent;
 
 use super::Connection;
 use super::shared::{
-    ClientHandler, authenticate_with_key, authenticate_with_password, build_remote_command,
-    connect_handle,
+    ClientHandler, PtyShell, authenticate_with_key, authenticate_with_password,
+    build_interactive_shell_command, build_remote_command, connect_handle, request_default_pty,
 };
 use super::AuthPrompter;
 use super::types::{CopyDirection, CopySpec, DirectTarget};
@@ -57,11 +57,35 @@ impl Connection for DirectSshConnection {
         &mut self,
         argv: &[String],
         sender: &UnboundedSender<ServerEvent>,
-        _config: &AppConfig,
+        config: &AppConfig,
     ) -> Result<i32> {
-        let command = build_remote_command(argv);
+        let command = if config.ssh.pty {
+            build_interactive_shell_command(argv)
+        } else {
+            build_remote_command(argv)
+        };
+        if config.ssh.pty {
+            return self.execute_with_pty(&command, sender, config).await;
+        }
+        self.execute_without_pty(&command, sender).await
+    }
+
+    async fn copy(&mut self, spec: &CopySpec, _config: &AppConfig) -> Result<()> {
+        match spec.direction {
+            CopyDirection::Upload => self.copy_upload(spec).await,
+            CopyDirection::Download => self.copy_download(spec).await,
+        }
+    }
+}
+
+impl DirectSshConnection {
+    async fn execute_without_pty(
+        &mut self,
+        command: &str,
+        sender: &UnboundedSender<ServerEvent>,
+    ) -> Result<i32> {
         let mut channel = self.handle.channel_open_session().await?;
-        channel.exec(true, command.as_str()).await?;
+        channel.exec(true, command).await?;
         let mut exit_code = None;
         loop {
             let Some(message) = channel.wait().await else {
@@ -90,11 +114,32 @@ impl Connection for DirectSshConnection {
         Ok(exit_code.unwrap_or(255))
     }
 
-    async fn copy(&mut self, spec: &CopySpec, _config: &AppConfig) -> Result<()> {
-        match spec.direction {
-            CopyDirection::Upload => self.copy_upload(spec).await,
-            CopyDirection::Download => self.copy_download(spec).await,
-        }
+    async fn execute_with_pty(
+        &mut self,
+        command: &str,
+        sender: &UnboundedSender<ServerEvent>,
+        config: &AppConfig,
+    ) -> Result<i32> {
+        let channel = self.handle.channel_open_session().await?;
+        request_default_pty(&channel).await?;
+        let mut shell = PtyShell::new(
+            channel,
+            vec!["$ ".to_string(), "# ".to_string()],
+            config.ssh.connect_timeout,
+        );
+        shell.request_shell().await?;
+        shell.wait_for_prompt().await?;
+        shell.clear_prompt_remainder();
+        shell.write_line("stty -echo").await?;
+        shell.wait_for_prompt().await?;
+        shell.clear_pending();
+        shell.clear_prompt_remainder();
+        let marker = shell.make_marker("__RHOP_EXEC__");
+        let wrapped = shell.wrap_shell_command(command, marker.as_ref());
+        shell.write_line(&wrapped).await?;
+        let (status, _) = shell.read_until_sentinel(marker.as_ref(), Some(sender)).await?;
+        shell.finish_roundtrip().await?;
+        Ok(status)
     }
 }
 

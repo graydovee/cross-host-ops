@@ -1,16 +1,14 @@
-use std::io::{Cursor, Read, Write};
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use russh::{Channel, ChannelMsg, client};
+use russh::client;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task;
-use tokio::time::{Duration, timeout};
 use tracing::{debug, info};
-use uuid::Uuid;
 
 use crate::config::{
     AppConfig, JumpserverConfig, MfaConfig, SshHostEntry, parse_ssh_config, resolve_ssh_host,
@@ -19,8 +17,8 @@ use crate::protocol::ServerEvent;
 
 use super::{AuthPromptRequest, AuthPrompter, Connection};
 use super::shared::{
-    ClientHandler, authenticate_with_key, build_remote_command, connect_handle, extract_sentinel,
-    looks_like_prompt,
+    ClientHandler, PtyShell, authenticate_with_key, build_interactive_shell_command,
+    connect_handle, request_default_pty,
 };
 use super::types::{CopyDirection, CopySpec, ResolvedTarget};
 
@@ -35,10 +33,7 @@ struct ShellCommandOutcome {
 
 pub struct JumpSshConnection {
     _handle: client::Handle<ClientHandler>,
-    channel: Channel<russh::client::Msg>,
-    pending: Vec<u8>,
-    prompt_suffixes: Vec<String>,
-    shell_timeout: Duration,
+    shell: PtyShell,
 }
 
 impl JumpSshConnection {
@@ -62,18 +57,14 @@ impl JumpSshConnection {
         )
         .await?;
         let channel = handle.channel_open_session().await?;
-        channel
-            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
-            .await?;
-        channel.request_shell(true).await?;
-
-        let mut connection = Self {
-            _handle: handle,
+        request_default_pty(&channel).await?;
+        let shell = PtyShell::new(
             channel,
-            pending: Vec::new(),
-            prompt_suffixes: jump.shell_prompt_suffixes.clone(),
-            shell_timeout: config.ssh.connect_timeout,
-        };
+            jump.shell_prompt_suffixes.clone(),
+            config.ssh.connect_timeout,
+        );
+        let mut connection = Self { _handle: handle, shell };
+        connection.shell.request_shell().await?;
         connection
             .establish_jump_shell(target, &jump, &config.jumpserver.mfa, auth_prompter)
             .await?;
@@ -91,9 +82,9 @@ impl JumpSshConnection {
         let mut selected = false;
         let mut mfa_sent = false;
         loop {
-            let chunk = self.read_shell_chunk().await?;
-            self.pending.extend_from_slice(&chunk);
-            let text = String::from_utf8_lossy(&self.pending);
+            let chunk = self.shell.read_chunk().await?;
+            self.shell.extend_pending(&chunk);
+            let text = self.shell.pending_text();
             if !mfa_sent
                 && text.contains(&jump.mfa_prompt_contains)
             {
@@ -112,120 +103,29 @@ impl JumpSshConnection {
                     })
                     .await?
                 };
-                self.write_shell_line(&code).await?;
-                self.pending.clear();
+                self.shell.write_line(&code).await?;
+                self.shell.clear_pending();
                 mfa_sent = true;
                 info!(target_ip = %target.ip, "jumpserver MFA completed");
                 continue;
             }
             if !selected && text.contains(&jump.menu_prompt_contains) {
                 debug!(target_ip = %target.ip, "jumpserver menu detected, selecting target");
-                self.write_shell_line(&target.ip).await?;
-                self.pending.clear();
+                self.shell.write_line(&target.ip).await?;
+                self.shell.clear_pending();
                 selected = true;
                 continue;
             }
-            if selected && looks_like_prompt(&self.pending, &self.prompt_suffixes) {
+            if selected && self.shell.pending_has_prompt() {
                 debug!(target_ip = %target.ip, "remote shell prompt detected");
                 break;
             }
         }
-        self.pending.clear();
-        self.write_shell_line("stty -echo").await?;
-        self.wait_for_prompt().await?;
-        self.pending.clear();
+        self.shell.clear_pending();
+        self.shell.write_line("stty -echo").await?;
+        self.shell.wait_for_prompt().await?;
+        self.shell.clear_pending();
         Ok(())
-    }
-
-    async fn wait_for_prompt(&mut self) -> Result<()> {
-        while !looks_like_prompt(&self.pending, &self.prompt_suffixes) {
-            let chunk = self.read_shell_chunk().await?;
-            self.pending.extend_from_slice(&chunk);
-        }
-        Ok(())
-    }
-
-    async fn write_shell_line(&mut self, line: &str) -> Result<()> {
-        let payload = format!("{line}\r").into_bytes();
-        self.channel.data(Cursor::new(payload)).await?;
-        Ok(())
-    }
-
-    async fn read_shell_chunk(&mut self) -> Result<Vec<u8>> {
-        let message = timeout(self.shell_timeout, self.channel.wait())
-            .await
-            .context("timed out waiting for jumpserver shell output")?;
-        let Some(message) = message else {
-            bail!("jumpserver shell closed unexpectedly");
-        };
-        match message {
-            ChannelMsg::Data { data } => Ok(data.to_vec()),
-            ChannelMsg::ExtendedData { data, .. } => Ok(data.to_vec()),
-            ChannelMsg::Close | ChannelMsg::Eof => bail!("jumpserver shell closed unexpectedly"),
-            _ => Ok(Vec::new()),
-        }
-    }
-
-    fn clear_prompt_remainder(&mut self) {
-        if looks_like_prompt(&self.pending, &self.prompt_suffixes) {
-            self.pending.clear();
-        }
-    }
-
-    async fn finish_shell_roundtrip(&mut self) -> Result<()> {
-        self.wait_for_prompt().await?;
-        self.pending.clear();
-        Ok(())
-    }
-
-    fn make_marker(&self, prefix: &str) -> String {
-        format!("{}{}__", prefix, Uuid::new_v4().simple())
-    }
-
-    fn wrap_shell_command(&self, command: &str, marker: &str) -> String {
-        format!("{{ {command}; }}; status=$?; printf '\\n{marker}:%s\\n' \"$status\"")
-    }
-
-    async fn read_until_sentinel(
-        &mut self,
-        marker: &str,
-        sender: Option<&UnboundedSender<ServerEvent>>,
-    ) -> Result<ShellCommandOutcome> {
-        let prefix = marker.as_bytes();
-        let mut payload = Vec::new();
-
-        loop {
-            let chunk = self.read_shell_chunk().await?;
-            self.pending.extend_from_slice(&chunk);
-            if let Some((code, before, after)) = extract_sentinel(&self.pending, prefix) {
-                if !before.is_empty() {
-                    if let Some(sender) = sender {
-                        let _ = sender.send(ServerEvent::Stdout {
-                            data: before.to_vec(),
-                        });
-                    } else {
-                        payload.extend_from_slice(before);
-                    }
-                }
-                self.pending = after.to_vec();
-                return Ok(ShellCommandOutcome {
-                    exit_code: code,
-                    payload,
-                });
-            }
-
-            let keep = prefix.len() + 32;
-            if self.pending.len() > keep {
-                let safe_len = self.pending.len() - keep;
-                let chunk = self.pending[..safe_len].to_vec();
-                self.pending.drain(..safe_len);
-                if let Some(sender) = sender {
-                    let _ = sender.send(ServerEvent::Stdout { data: chunk });
-                } else {
-                    payload.extend_from_slice(&chunk);
-                }
-            }
-        }
     }
 
     async fn run_shell_command_stream(
@@ -234,13 +134,13 @@ impl JumpSshConnection {
         sender: &UnboundedSender<ServerEvent>,
         marker_prefix: &str,
     ) -> Result<i32> {
-        self.clear_prompt_remainder();
-        let marker = self.make_marker(marker_prefix);
-        let wrapped = self.wrap_shell_command(command, &marker);
-        self.write_shell_line(&wrapped).await?;
-        let outcome = self.read_until_sentinel(&marker, Some(sender)).await?;
-        self.finish_shell_roundtrip().await?;
-        Ok(outcome.exit_code)
+        self.shell.clear_prompt_remainder();
+        let marker = self.shell.make_marker(marker_prefix);
+        let wrapped = self.shell.wrap_shell_command(command, &marker);
+        self.shell.write_line(&wrapped).await?;
+        let (status, _) = self.shell.read_until_sentinel(&marker, Some(sender)).await?;
+        self.shell.finish_roundtrip().await?;
+        Ok(status)
     }
 
     async fn run_shell_command_capture(
@@ -248,13 +148,13 @@ impl JumpSshConnection {
         command: &str,
         marker_prefix: &str,
     ) -> Result<ShellCommandOutcome> {
-        self.clear_prompt_remainder();
-        let marker = self.make_marker(marker_prefix);
-        let wrapped = self.wrap_shell_command(command, &marker);
-        self.write_shell_line(&wrapped).await?;
-        let outcome = self.read_until_sentinel(&marker, None).await?;
-        self.finish_shell_roundtrip().await?;
-        Ok(outcome)
+        self.shell.clear_prompt_remainder();
+        let marker = self.shell.make_marker(marker_prefix);
+        let wrapped = self.shell.wrap_shell_command(command, &marker);
+        self.shell.write_line(&wrapped).await?;
+        let (exit_code, payload) = self.shell.read_until_sentinel(&marker, None).await?;
+        self.shell.finish_roundtrip().await?;
+        Ok(ShellCommandOutcome { exit_code, payload })
     }
 
     async fn run_shell_heredoc_upload(
@@ -263,18 +163,13 @@ impl JumpSshConnection {
         payload: &[u8],
         marker_prefix: &str,
     ) -> Result<()> {
-        self.clear_prompt_remainder();
-        let marker = self.make_marker(marker_prefix);
+        self.shell.clear_prompt_remainder();
+        let marker = self.shell.make_marker(marker_prefix);
         let command = format!("{}\r", command.replace("{}", &marker));
-        self.write_shell_raw(command.as_bytes()).await?;
+        self.shell.write_raw(command.as_bytes()).await?;
         self.stream_shell_payload(payload).await?;
-        self.write_shell_line(&marker).await?;
-        self.finish_shell_roundtrip().await
-    }
-
-    async fn write_shell_raw(&mut self, payload: &[u8]) -> Result<()> {
-        self.channel.data(Cursor::new(payload.to_vec())).await?;
-        Ok(())
+        self.shell.write_line(&marker).await?;
+        self.shell.finish_roundtrip().await
     }
 }
 
@@ -447,7 +342,7 @@ impl Connection for JumpSshConnection {
         sender: &UnboundedSender<ServerEvent>,
         _config: &AppConfig,
     ) -> Result<i32> {
-        let command = build_remote_command(argv);
+        let command = build_interactive_shell_command(argv);
         self.run_shell_command_stream(&command, sender, EXEC_SENTINEL_PREFIX)
             .await
     }
@@ -485,7 +380,7 @@ impl JumpSshConnection {
 
     async fn stream_shell_payload(&mut self, payload: &[u8]) -> Result<()> {
         for chunk in payload.chunks(32 * 1024) {
-            self.channel.data(Cursor::new(chunk.to_vec())).await?;
+            self.shell.write_raw(chunk).await?;
         }
         Ok(())
     }

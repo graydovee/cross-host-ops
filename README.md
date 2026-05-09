@@ -85,7 +85,6 @@ daemon 管理保护：
 - `Execute`：双向流 RPC
 - `Copy`：双向流 RPC
 - `Status`：普通 unary RPC
-- `ReloadConfig`：普通 unary RPC
 
 `Execute` 流里：
 
@@ -186,6 +185,7 @@ cp config.example.toml ~/.rhup/config.toml
 最常见的是：
 
 - 配置 `server.toml` 机器清单
+- 调整 `ssh.pty`
 - 开启 jumpserver
 - 开启 review
 - 修改 socket 路径
@@ -226,10 +226,28 @@ password = "REPLACE_ME"
 - 未命中表键时，会再用原始 target 和推导 IP 精确匹配 `host`
 - 单机认证优先级是 `password > identity_file > defaults.identity_file`
 
-### 第 4 步：重载 daemon 配置
+### 第 3.6 步：可选，调整 `ssh.pty`
+
+在 `~/.rhup/config.toml` 中：
+
+```toml
+[ssh]
+pty = true
+```
+
+语义：
+
+- `pty = true`
+  - 直连命令更像手工 SSH，`ls` 等命令会正常输出颜色
+  - jumpserver 保持现有 PTY 交互与颜色表现
+- `pty = false`
+  - 直连命令按非 PTY 风格执行，颜色不输出
+  - jumpserver 不受该开关影响，仍然始终使用 PTY
+
+### 第 4 步：重启 daemon 使配置生效
 
 ```bash
-./target/debug/rhop config reload
+./target/debug/rhop daemon restart
 ```
 
 如果 daemon 还没有运行，那么第一次执行命令时会自动读取新配置。
@@ -260,10 +278,10 @@ period = 30
 digest = "sha1"
 ```
 
-### 第 2 步：重载配置
+### 第 2 步：重启 daemon 使配置生效
 
 ```bash
-./target/debug/rhop config reload
+./target/debug/rhop daemon restart
 ```
 
 ### 第 3 步：执行一个未在 `~/.ssh/config` 中定义直连的目标
@@ -316,10 +334,10 @@ enable = true
 - 风险等级策略
 - 语义白名单
 
-### 第 3 步：重载配置
+### 第 3 步：重启 daemon 使配置生效
 
 ```bash
-./target/debug/rhop config reload
+./target/debug/rhop daemon restart
 ```
 
 ### 第 4 步：执行命令
@@ -442,10 +460,10 @@ review 现在分两层：
 ./target/debug/rhopd -c ~/.rhup/config.toml --log-level debug
 ```
 
-重载配置：
+修改配置后重启 daemon：
 
 ```bash
-./target/debug/rhop config reload
+./target/debug/rhop daemon restart
 ```
 
 ## 目标解析规则

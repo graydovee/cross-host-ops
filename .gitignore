@@ -1,5 +1,7 @@
 target
+logs
 
 arun
+
 config.toml
 server.toml

@@ -1,3 +1,4 @@
+use std::io::Cursor;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -5,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use data_encoding::BASE32_NOPAD;
 use hmac::{Hmac, Mac};
 use russh::MethodKind;
+use russh::ChannelMsg;
 use russh::client::KeyboardInteractiveAuthResponse;
 use russh::client::{self, AuthResult, Handle};
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, load_secret_key};
@@ -104,6 +106,28 @@ pub fn build_remote_command(argv: &[String]) -> String {
     result
 }
 
+pub fn build_interactive_shell_command(argv: &[String]) -> String {
+    let mut result = String::new();
+    for (index, arg) in argv.iter().enumerate() {
+        if index > 0 {
+            result.push(' ');
+        }
+        if index == 0 && is_safe_shell_command_word(arg) {
+            result.push_str(arg);
+        } else {
+            result.push_str(&shell_quote(arg));
+        }
+    }
+    result
+}
+
+fn is_safe_shell_command_word(arg: &str) -> bool {
+    !arg.is_empty()
+        && arg
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '+'))
+}
+
 pub fn shell_quote(arg: &str) -> String {
     if arg.is_empty() {
         return "''".to_string();
@@ -143,6 +167,223 @@ pub(super) fn extract_sentinel<'a>(
         &status_start[line_end..]
     };
     Some((status, before, remainder))
+}
+
+pub(super) const DEFAULT_PTY_TERM: &str = "xterm";
+pub(super) const DEFAULT_PTY_COLS: u32 = 80;
+pub(super) const DEFAULT_PTY_ROWS: u32 = 24;
+
+pub(super) async fn request_default_pty(
+    channel: &russh::Channel<russh::client::Msg>,
+) -> Result<()> {
+    channel
+        .request_pty(
+            true,
+            DEFAULT_PTY_TERM,
+            DEFAULT_PTY_COLS,
+            DEFAULT_PTY_ROWS,
+            0,
+            0,
+            &[],
+        )
+        .await?;
+    Ok(())
+}
+
+pub(super) struct PtyShell {
+    channel: russh::Channel<russh::client::Msg>,
+    pending: Vec<u8>,
+    prompt_suffixes: Vec<String>,
+    shell_timeout: std::time::Duration,
+}
+
+impl PtyShell {
+    pub(super) fn new(
+        channel: russh::Channel<russh::client::Msg>,
+        prompt_suffixes: Vec<String>,
+        shell_timeout: std::time::Duration,
+    ) -> Self {
+        Self {
+            channel,
+            pending: Vec::new(),
+            prompt_suffixes,
+            shell_timeout,
+        }
+    }
+
+    pub(super) async fn request_shell(&self) -> Result<()> {
+        self.channel.request_shell(true).await?;
+        Ok(())
+    }
+
+    pub(super) async fn wait_for_prompt(&mut self) -> Result<()> {
+        while !looks_like_prompt(&self.pending, &self.prompt_suffixes) {
+            let chunk = self.read_chunk().await?;
+            self.pending.extend_from_slice(&chunk);
+        }
+        Ok(())
+    }
+
+    pub(super) fn pending_text(&self) -> String {
+        String::from_utf8_lossy(&self.pending).to_string()
+    }
+
+    pub(super) fn pending_has_prompt(&self) -> bool {
+        looks_like_prompt(&self.pending, &self.prompt_suffixes)
+    }
+
+    pub(super) fn clear_pending(&mut self) {
+        self.pending.clear();
+    }
+
+    pub(super) fn extend_pending(&mut self, chunk: &[u8]) {
+        self.pending.extend_from_slice(chunk);
+    }
+
+    pub(super) fn clear_prompt_remainder(&mut self) {
+        if looks_like_prompt(&self.pending, &self.prompt_suffixes) {
+            self.pending.clear();
+        }
+    }
+
+    pub(super) async fn finish_roundtrip(&mut self) -> Result<()> {
+        self.wait_for_prompt().await?;
+        self.pending.clear();
+        Ok(())
+    }
+
+    pub(super) async fn write_line(&mut self, line: &str) -> Result<()> {
+        let payload = format!("{line}\r").into_bytes();
+        self.channel.data(Cursor::new(payload)).await?;
+        Ok(())
+    }
+
+    pub(super) async fn write_raw(&mut self, payload: &[u8]) -> Result<()> {
+        self.channel.data(Cursor::new(payload.to_vec())).await?;
+        Ok(())
+    }
+
+    pub(super) async fn read_chunk(&mut self) -> Result<Vec<u8>> {
+        let message = timeout(self.shell_timeout, self.channel.wait())
+            .await
+            .context("timed out waiting for shell output")?;
+        let Some(message) = message else {
+            bail!("shell closed unexpectedly");
+        };
+        match message {
+            ChannelMsg::Data { data } => Ok(data.to_vec()),
+            ChannelMsg::ExtendedData { data, .. } => Ok(data.to_vec()),
+            ChannelMsg::Close | ChannelMsg::Eof => bail!("shell closed unexpectedly"),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    pub(super) fn make_marker(&self, prefix: &str) -> String {
+        format!("{}{}__", prefix, uuid::Uuid::new_v4().simple())
+    }
+
+    pub(super) fn wrap_shell_command(&self, command: &str, marker: &str) -> String {
+        format!("{{ {command}; }}; status=$?; printf '{marker}:%s\\n' \"$status\"")
+    }
+
+    pub(super) async fn read_until_sentinel(
+        &mut self,
+        marker: &str,
+        sender: Option<&tokio::sync::mpsc::UnboundedSender<crate::protocol::ServerEvent>>,
+    ) -> Result<(i32, Vec<u8>)> {
+        let prefix = marker.as_bytes();
+        let mut payload = Vec::new();
+        let mut first_output = true;
+
+        loop {
+            let chunk = self.read_chunk().await?;
+            self.pending.extend_from_slice(&chunk);
+            if let Some((code, before, after)) = extract_sentinel(&self.pending, prefix) {
+                let before = if first_output {
+                    strip_leading_shell_noise(before)
+                } else {
+                    before
+                };
+                if !before.is_empty() {
+                    if let Some(sender) = sender {
+                        let _ = sender.send(crate::protocol::ServerEvent::Stdout {
+                            data: before.to_vec(),
+                        });
+                    } else {
+                        payload.extend_from_slice(before);
+                    }
+                }
+                self.pending = after.to_vec();
+                return Ok((code, payload));
+            }
+
+            let keep = prefix.len() + 32;
+            if self.pending.len() > keep {
+                let safe_len = self.pending.len() - keep;
+                let chunk = if first_output {
+                    first_output = false;
+                    strip_leading_shell_noise(&self.pending[..safe_len]).to_vec()
+                } else {
+                    self.pending[..safe_len].to_vec()
+                };
+                self.pending.drain(..safe_len);
+                if !chunk.is_empty() {
+                    if let Some(sender) = sender {
+                        let _ = sender.send(crate::protocol::ServerEvent::Stdout { data: chunk });
+                    } else {
+                        payload.extend_from_slice(&chunk);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn strip_leading_shell_noise(bytes: &[u8]) -> &[u8] {
+    let mut index = 0;
+    loop {
+        while index < bytes.len() && matches!(bytes[index], b'\r' | b'\n') {
+            index += 1;
+        }
+        if let Some(next) = skip_leading_ansi_escape(bytes, index) {
+            index = next;
+            continue;
+        }
+        break;
+    }
+    &bytes[index..]
+}
+
+fn skip_leading_ansi_escape(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&0x1b) {
+        return None;
+    }
+    match bytes.get(start + 1) {
+        Some(b'[') => {
+            let mut index = start + 2;
+            while let Some(byte) = bytes.get(index) {
+                if (0x40..=0x7e).contains(byte) {
+                    return Some(index + 1);
+                }
+                index += 1;
+            }
+            None
+        }
+        Some(b']') => {
+            let mut index = start + 2;
+            while let Some(byte) = bytes.get(index) {
+                if *byte == 0x07 {
+                    return Some(index + 1);
+                }
+                if *byte == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
+                    return Some(index + 2);
+                }
+                index += 1;
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 fn strip_trailing_cr(bytes: &[u8]) -> &[u8] {
