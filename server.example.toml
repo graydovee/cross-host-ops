@@ -1,0 +1,17 @@
+[defaults]
+identity_file = "~/.ssh/id_rsa"
+
+[servers.devbox]
+host = "192.0.2.163"
+port = 22
+user = "root"
+
+[servers.ops]
+host = "foo-192-0-2-163"
+user = "ops"
+identity_file = "~/.ssh/id_ed25519"
+
+[servers.db]
+host = "192.0.2.200"
+user = "dba"
+password = "REPLACE_ME"

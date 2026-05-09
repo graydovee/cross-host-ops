@@ -17,7 +17,7 @@ use crate::config::{
 };
 use crate::protocol::ServerEvent;
 
-use super::Connection;
+use super::{AuthPromptRequest, AuthPrompter, Connection};
 use super::shared::{
     ClientHandler, authenticate_with_key, build_remote_command, connect_handle, extract_sentinel,
     looks_like_prompt,
@@ -42,7 +42,11 @@ pub struct JumpSshConnection {
 }
 
 impl JumpSshConnection {
-    pub async fn connect(target: &ResolvedTarget, config: &AppConfig) -> Result<Self> {
+    pub async fn connect(
+        target: &ResolvedTarget,
+        config: &AppConfig,
+        auth_prompter: &AuthPrompter,
+    ) -> Result<Self> {
         let jump = merge_jumpserver_target(config)?;
         let mut handle = connect_handle(&jump.host, jump.port, config).await?;
         authenticate_with_key(
@@ -51,8 +55,10 @@ impl JumpSshConnection {
             jump.identity_file
                 .as_deref()
                 .ok_or_else(|| anyhow!("jumpserver identity_file is required"))?,
+            &target.target_label,
             Some(&jump.mfa),
             jump.pubkey_accepted_algorithms.as_deref(),
+            Some(auth_prompter),
         )
         .await?;
         let channel = handle.channel_open_session().await?;
@@ -69,7 +75,7 @@ impl JumpSshConnection {
             shell_timeout: config.ssh.connect_timeout,
         };
         connection
-            .establish_jump_shell(target, &jump, &config.jumpserver.mfa)
+            .establish_jump_shell(target, &jump, &config.jumpserver.mfa, auth_prompter)
             .await?;
         Ok(connection)
     }
@@ -79,6 +85,7 @@ impl JumpSshConnection {
         target: &ResolvedTarget,
         jump: &JumpserverConfig,
         mfa: &MfaConfig,
+        auth_prompter: &AuthPrompter,
     ) -> Result<()> {
         debug!(target_ip = %target.ip, "waiting for jumpserver shell output");
         let mut selected = false;
@@ -88,11 +95,23 @@ impl JumpSshConnection {
             self.pending.extend_from_slice(&chunk);
             let text = String::from_utf8_lossy(&self.pending);
             if !mfa_sent
-                && !mfa.totp_secret_base32.is_empty()
                 && text.contains(&jump.mfa_prompt_contains)
             {
                 debug!(target_ip = %target.ip, "jumpserver requested MFA");
-                let code = generate_totp(mfa)?;
+                let code = if !mfa.totp_secret_base32.is_empty() {
+                    generate_totp(mfa)?
+                } else {
+                    auth_prompter(AuthPromptRequest {
+                        target_label: target.target_label.clone(),
+                        kind: "jump_mfa".to_string(),
+                        message: format!(
+                            "jumpserver requested MFA for {}",
+                            target.target_label
+                        ),
+                        secret: true,
+                    })
+                    .await?
+                };
                 self.write_shell_line(&code).await?;
                 self.pending.clear();
                 mfa_sent = true;

@@ -12,6 +12,10 @@ name = "rhop"
 path = "src/bin/rhop.rs"
 
 [[bin]]
+name = "rhup"
+path = "src/bin/rhup.rs"
+
+[[bin]]
 name = "rhopd"
 path = "src/bin/rhopd.rs"
 
@@ -23,6 +27,7 @@ data-encoding = "2.9"
 home = "0.5"
 hmac = "0.12"
 hyper-util = { version = "0.1", features = ["tokio"] }
+libc = "0.2"
 parking_lot = "0.12"
 prost = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -44,4 +49,5 @@ tower = { version = "0.5", features = ["util"] }
 uuid = { version = "1.19", features = ["serde", "v4"] }
 
 [build-dependencies]
+protoc-bin-vendored = "3"
 tonic-prost-build = "0.14"

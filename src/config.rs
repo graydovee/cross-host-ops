@@ -53,6 +53,7 @@ impl AppConfig {
             self.server.log_path = Some(expand_tilde(log_path)?);
         }
         self.ssh.ssh_config_path = expand_tilde(&self.ssh.ssh_config_path)?;
+        self.ssh.server_config_path = expand_tilde(&self.ssh.server_config_path)?;
         if let Some(identity) = &self.jumpserver.identity_file {
             self.jumpserver.identity_file = Some(expand_tilde(identity)?);
         }
@@ -63,7 +64,7 @@ impl AppConfig {
 pub fn default_config_path() -> PathBuf {
     home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config/rhop/config.toml")
+        .join(".rhup/config.toml")
 }
 
 pub fn expand_tilde(value: &str) -> Result<String> {
@@ -96,7 +97,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            socket_path: "~/.local/run/rhop/rhopd.sock".to_string(),
+            socket_path: "~/.rhup/rhopd.sock".to_string(),
             log_path: None,
             log_level: "info".to_string(),
             reaper_interval: Duration::from_secs(30),
@@ -108,6 +109,8 @@ impl Default for ServerConfig {
 #[serde(default)]
 pub struct SshConfig {
     pub ssh_config_path: String,
+    pub server_config_path: String,
+    pub fallback: Vec<FallbackTransport>,
     #[serde(deserialize_with = "deserialize_duration")]
     pub connect_timeout: Duration,
     #[serde(deserialize_with = "deserialize_duration")]
@@ -121,6 +124,11 @@ impl Default for SshConfig {
     fn default() -> Self {
         Self {
             ssh_config_path: "~/.ssh/config".to_string(),
+            server_config_path: "~/.rhup/server.toml".to_string(),
+            fallback: vec![
+                FallbackTransport::SshConfig,
+                FallbackTransport::Jumpserver,
+            ],
             connect_timeout: Duration::from_secs(10),
             keepalive_interval: Duration::from_secs(30),
             max_idle_time: Duration::from_secs(600),
@@ -177,6 +185,69 @@ impl Default for MfaConfig {
             digits: 6,
             period: 30,
             digest: "sha1".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FallbackTransport {
+    SshConfig,
+    Jumpserver,
+}
+
+impl fmt::Display for FallbackTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FallbackTransport::SshConfig => write!(f, "ssh_config"),
+            FallbackTransport::Jumpserver => write!(f, "jumpserver"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ServerConfigFile {
+    pub defaults: ServerDefaults,
+    pub servers: HashMap<String, ServerHostConfig>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ServerDefaults {
+    pub identity_file: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ServerHostConfig {
+    pub host: String,
+    pub port: Option<u16>,
+    pub user: String,
+    pub identity_file: Option<String>,
+    pub password: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DirectAuth {
+    Key { identity_file: String },
+    Password { password: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerEntry {
+    pub alias: String,
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub auth: DirectAuth,
+}
+
+impl ServerEntry {
+    pub fn auth_kind(&self) -> &'static str {
+        match self.auth {
+            DirectAuth::Key { .. } => "key",
+            DirectAuth::Password { .. } => "password",
         }
     }
 }
@@ -525,6 +596,88 @@ pub fn parse_ssh_config(path: &Path) -> Result<Vec<SshHostEntry>> {
     if !current.patterns.is_empty() {
         entries.push(current);
     }
+    Ok(entries)
+}
+
+pub fn load_server_config(path: &Path) -> Result<ServerConfigFile> {
+    if !path.exists() {
+        return Ok(ServerConfigFile::default());
+    }
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let mut config: ServerConfigFile =
+        toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
+    expand_server_config_paths(&mut config)?;
+    validate_server_config(&config)?;
+    Ok(config)
+}
+
+fn expand_server_config_paths(config: &mut ServerConfigFile) -> Result<()> {
+    if let Some(identity_file) = &config.defaults.identity_file {
+        config.defaults.identity_file = Some(expand_tilde(identity_file)?);
+    }
+    for server in config.servers.values_mut() {
+        if let Some(identity_file) = &server.identity_file {
+            server.identity_file = Some(expand_tilde(identity_file)?);
+        }
+    }
+    Ok(())
+}
+
+fn validate_server_config(config: &ServerConfigFile) -> Result<()> {
+    for (alias, server) in &config.servers {
+        if server.host.trim().is_empty() {
+            bail!("server entry {} is missing host", alias);
+        }
+        if server.user.trim().is_empty() {
+            bail!("server entry {} is missing user", alias);
+        }
+        if server.password.is_some() && server.identity_file.is_some() {
+            bail!(
+                "server entry {} cannot set both password and identity_file",
+                alias
+            );
+        }
+        resolve_server_entry(alias, server, &config.defaults)?;
+    }
+    Ok(())
+}
+
+pub fn resolve_server_entry(
+    alias: &str,
+    server: &ServerHostConfig,
+    defaults: &ServerDefaults,
+) -> Result<ServerEntry> {
+    let auth = if let Some(password) = server.password.clone() {
+        DirectAuth::Password { password }
+    } else if let Some(identity_file) = server.identity_file.clone() {
+        DirectAuth::Key { identity_file }
+    } else if let Some(identity_file) = defaults.identity_file.clone() {
+        DirectAuth::Key { identity_file }
+    } else {
+        bail!(
+            "server entry {} is missing authentication; set password, identity_file, or defaults.identity_file",
+            alias
+        );
+    };
+
+    Ok(ServerEntry {
+        alias: alias.to_string(),
+        host: server.host.clone(),
+        port: server.port.unwrap_or(22),
+        user: server.user.clone(),
+        auth,
+    })
+}
+
+pub fn list_server_entries(path: &Path) -> Result<Vec<ServerEntry>> {
+    let config = load_server_config(path)?;
+    let mut entries = config
+        .servers
+        .iter()
+        .map(|(alias, server)| resolve_server_entry(alias, server, &config.defaults))
+        .collect::<Result<Vec<_>>>()?;
+    entries.sort_by(|a, b| a.alias.cmp(&b.alias));
     Ok(entries)
 }
 

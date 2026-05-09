@@ -2,13 +2,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use parking_lot::Mutex;
 use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, mpsc::UnboundedSender};
 use tracing::info;
 
 use crate::config::AppConfig;
-use crate::connection::{Connection, CopySpec, ResolvedTarget, connect};
+use crate::connection::{AuthPrompter, Connection, CopySpec, ResolvedTarget, connect};
 use crate::protocol::PoolStatus;
 use crate::protocol::ServerEvent;
 
@@ -28,18 +28,21 @@ impl ConnectionPool {
 
     pub async fn execute(
         &self,
-        target: ResolvedTarget,
+        targets: Vec<ResolvedTarget>,
         argv: Vec<String>,
         sender: UnboundedSender<ServerEvent>,
+        auth_prompter: Arc<AuthPrompter>,
     ) -> Result<i32> {
+        let target = targets
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("no resolved targets available"))?;
         let pool = self.get_or_create_pool(target.clone());
         let slot = pool.acquire(self.config.clone()).await?;
         let result = async {
             let mut guard = slot.connection.connection.lock().await;
             if guard.is_none() {
-                let config = self.config.read().await.clone();
-                info!(target = %target.key, "opening new pooled SSH connection");
-                *guard = Some(connect(&target, &config).await?);
+                *guard = Some(self.open_any_connection(&targets, auth_prompter.clone()).await?);
             }
             let config = self.config.read().await.clone();
             let first_result = guard
@@ -52,8 +55,8 @@ impl ConnectionPool {
                 Err(error) if should_reconnect(&error.to_string()) => {
                     info!(target = %target.key, error = %error, "reopening stale pooled SSH connection");
                     *guard = None;
+                    *guard = Some(self.open_any_connection(&targets, auth_prompter.clone()).await?);
                     let config = self.config.read().await.clone();
-                    *guard = Some(connect(&target, &config).await?);
                     guard
                         .as_mut()
                         .expect("connection reinitialized")
@@ -68,15 +71,22 @@ impl ConnectionPool {
         result
     }
 
-    pub async fn copy(&self, target: ResolvedTarget, spec: CopySpec) -> Result<()> {
+    pub async fn copy(
+        &self,
+        targets: Vec<ResolvedTarget>,
+        spec: CopySpec,
+        auth_prompter: Arc<AuthPrompter>,
+    ) -> Result<()> {
+        let target = targets
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("no resolved targets available"))?;
         let pool = self.get_or_create_pool(target.clone());
         let slot = pool.acquire(self.config.clone()).await?;
         let result = async {
             let mut guard = slot.connection.connection.lock().await;
             if guard.is_none() {
-                let config = self.config.read().await.clone();
-                info!(target = %target.key, "opening new pooled SSH connection");
-                *guard = Some(connect(&target, &config).await?);
+                *guard = Some(self.open_any_connection(&targets, auth_prompter.clone()).await?);
             }
             let config = self.config.read().await.clone();
             guard
@@ -88,6 +98,25 @@ impl ConnectionPool {
         .await;
         pool.release(slot.id);
         result
+    }
+
+    async fn open_any_connection(
+        &self,
+        targets: &[ResolvedTarget],
+        auth_prompter: Arc<AuthPrompter>,
+    ) -> Result<Box<dyn Connection>> {
+        let config = self.config.read().await.clone();
+        let mut last_error = None;
+        for target in targets {
+            info!(target = %target.key, transport = %target.transport, "opening candidate SSH connection");
+            match connect(target, &config, auth_prompter.as_ref()).await {
+                Ok(connection) => return Ok(connection),
+                Err(error) => {
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("failed to open any candidate connection")))
     }
 
     pub async fn prune_idle(&self) {

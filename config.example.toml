@@ -2,23 +2,25 @@
 #
 # The program can run without any config file.
 # Default behavior with no config:
-# - socket path: ~/.local/run/rhop/rhopd.sock
+# - socket path: ~/.rhup/rhopd.sock
 # - target resolution: derive IP from the first CLI argument
 # - direct SSH only: the derived IP must match a Host entry in ~/.ssh/config
 # - jumpserver: disabled by default
 # - command review: disabled by default
 #
-# Copy only the sections you need into ~/.config/rhop/config.toml.
+# Copy only the sections you need into ~/.rhup/config.toml.
 # Every setting below is commented out on purpose.
 
 # [server]
-# socket_path = "~/.local/run/rhop/rhopd.sock"
+# socket_path = "~/.rhup/rhopd.sock"
 # log_path = "/var/log/rhopd.log"
 # log_level = "info"
 # reaper_interval = "30s"
 
 # [ssh]
 # ssh_config_path = "~/.ssh/config"
+# server_config_path = "~/.rhup/server.toml"
+# fallback = ["ssh_config", "jumpserver"]
 # connect_timeout = "10s"
 # keepalive_interval = "30s"
 # max_idle_time = "10m"

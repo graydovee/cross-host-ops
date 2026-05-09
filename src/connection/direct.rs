@@ -7,11 +7,15 @@ use russh_sftp::client::SftpSession;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, DirectAuth};
 use crate::protocol::ServerEvent;
 
 use super::Connection;
-use super::shared::{ClientHandler, authenticate_with_key, build_remote_command, connect_handle};
+use super::shared::{
+    ClientHandler, authenticate_with_key, authenticate_with_password, build_remote_command,
+    connect_handle,
+};
+use super::AuthPrompter;
 use super::types::{CopyDirection, CopySpec, DirectTarget};
 
 pub struct DirectSshConnection {
@@ -19,16 +23,30 @@ pub struct DirectSshConnection {
 }
 
 impl DirectSshConnection {
-    pub async fn connect(target: &DirectTarget, config: &AppConfig) -> Result<Self> {
+    pub async fn connect(
+        target: &DirectTarget,
+        config: &AppConfig,
+        _auth_prompter: &AuthPrompter,
+    ) -> Result<Self> {
         let mut handle = connect_handle(&target.host_name, target.port, config).await?;
-        authenticate_with_key(
-            &mut handle,
-            &target.user,
-            &target.identity_file,
-            None,
-            target.pubkey_accepted_algorithms.as_deref(),
-        )
-        .await?;
+        match &target.auth {
+            DirectAuth::Key { identity_file } => {
+                authenticate_with_key(
+                    &mut handle,
+                    &target.user,
+                    identity_file,
+                    &target.host,
+                    None,
+                    target.pubkey_accepted_algorithms.as_deref(),
+                    None,
+                )
+                .await?;
+            }
+            DirectAuth::Password { password } => {
+                authenticate_with_password(&mut handle, &target.user, password).await?;
+            }
+        }
+        probe_session(&mut handle).await?;
         Ok(Self { handle })
     }
 }
@@ -78,6 +96,12 @@ impl Connection for DirectSshConnection {
             CopyDirection::Download => self.copy_download(spec).await,
         }
     }
+}
+
+async fn probe_session(handle: &mut Handle<ClientHandler>) -> Result<()> {
+    let channel = handle.channel_open_session().await?;
+    drop(channel);
+    Ok(())
 }
 
 impl DirectSshConnection {

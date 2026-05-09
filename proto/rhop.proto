@@ -4,15 +4,19 @@ package rhop.rpc;
 
 service RhopRpc {
   rpc Execute(stream ExecuteRequest) returns (stream ExecuteResponse);
-  rpc Copy(CopyRequest) returns (InfoResponse);
+  rpc Copy(stream CopyRequest) returns (stream CopyResponse);
   rpc Status(StatusRequest) returns (StatusResponse);
   rpc ReloadConfig(ReloadConfigRequest) returns (InfoResponse);
+  rpc ListConfig(ConfigListRequest) returns (ConfigListResponse);
+  rpc ListServers(ServerListRequest) returns (ServerListResponse);
+  rpc Shutdown(ShutdownRequest) returns (InfoResponse);
 }
 
 message ExecuteRequest {
   oneof request {
     StartRequest start = 1;
     ConfirmRequest confirm = 2;
+    AuthInputRequest auth_input = 3;
   }
 }
 
@@ -26,6 +30,11 @@ message ConfirmRequest {
   bool allow = 2;
 }
 
+message AuthInputRequest {
+  string prompt_id = 1;
+  string value = 2;
+}
+
 enum CopyDirection {
   COPY_DIRECTION_UNSPECIFIED = 0;
   COPY_DIRECTION_UPLOAD = 1;
@@ -33,6 +42,13 @@ enum CopyDirection {
 }
 
 message CopyRequest {
+  oneof request {
+    CopyStartRequest start = 1;
+    AuthInputRequest auth_input = 2;
+  }
+}
+
+message CopyStartRequest {
   string target = 1;
   string local_path = 2;
   string remote_path = 3;
@@ -49,6 +65,16 @@ message ExecuteResponse {
     ExitStatus exit_status = 5;
     InfoResponse info = 6;
     ErrorResponse error = 7;
+    AuthPrompt auth_prompt = 8;
+  }
+}
+
+message CopyResponse {
+  oneof event {
+    InfoResponse info = 1;
+    ErrorResponse error = 2;
+    AuthPrompt auth_prompt = 3;
+    CopyComplete complete = 4;
   }
 }
 
@@ -65,12 +91,24 @@ message ConfirmRequired {
   string reason = 2;
 }
 
+message AuthPrompt {
+  string prompt_id = 1;
+  string target_label = 2;
+  string kind = 3;
+  bool secret = 4;
+  string message = 5;
+}
+
 message OutputChunk {
   bytes data = 1;
 }
 
 message ExitStatus {
   int32 code = 1;
+}
+
+message CopyComplete {
+  string message = 1;
 }
 
 message ErrorResponse {
@@ -85,11 +123,44 @@ message StatusRequest {}
 
 message ReloadConfigRequest {}
 
+message ConfigListRequest {}
+
+message ServerListRequest {}
+
+message ShutdownRequest {}
+
 message StatusResponse {
   bool daemon_running = 1;
   string socket_path = 2;
   uint64 active_executions = 3;
   repeated PoolStatus pools = 4;
+  string daemon_origin = 5;
+  bool cli_controllable = 6;
+  string cli_start_config_path = 7;
+  string cli_start_log_level = 8;
+}
+
+message ConfigListResponse {
+  string config_path = 1;
+  string server_config_path = 2;
+  string ssh_config_path = 3;
+  string socket_path = 4;
+  repeated string fallback = 5;
+  bool jumpserver_enabled = 6;
+  string jumpserver_host = 7;
+}
+
+message ServerListResponse {
+  string server_config_path = 1;
+  repeated ServerEntry servers = 2;
+}
+
+message ServerEntry {
+  string alias = 1;
+  string host = 2;
+  uint32 port = 3;
+  string user = 4;
+  string auth_kind = 5;
 }
 
 message PoolStatus {

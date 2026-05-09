@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::config::DirectAuth;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CopyDirection {
     Upload,
@@ -36,6 +38,7 @@ pub struct ResolvedTarget {
     pub key: String,
     pub transport: TargetTransport,
     pub direct: Option<DirectTarget>,
+    pub target_label: String,
 }
 
 #[derive(Clone, Debug)]
@@ -44,7 +47,7 @@ pub struct DirectTarget {
     pub host_name: String,
     pub port: u16,
     pub user: String,
-    pub identity_file: String,
+    pub auth: DirectAuth,
     pub proxy_command: Option<String>,
     pub pubkey_accepted_algorithms: Option<String>,
 }

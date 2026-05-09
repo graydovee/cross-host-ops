@@ -14,20 +14,31 @@ pub struct ExecRequest {
     pub argv: Vec<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct AuthPromptMessage {
+    pub prompt_id: String,
+    pub target_label: String,
+    pub kind: String,
+    pub secret: bool,
+    pub message: String,
+}
+
 pub fn copy_spec_to_rpc(target: String, spec: CopySpec) -> rpc::CopyRequest {
     rpc::CopyRequest {
-        target,
-        local_path: spec.local_path,
-        remote_path: spec.remote_path,
-        recursive: spec.recursive,
-        direction: match spec.direction {
-            CopyDirection::Upload => rpc::CopyDirection::Upload as i32,
-            CopyDirection::Download => rpc::CopyDirection::Download as i32,
-        },
+        request: Some(rpc::copy_request::Request::Start(rpc::CopyStartRequest {
+            target,
+            local_path: spec.local_path,
+            remote_path: spec.remote_path,
+            recursive: spec.recursive,
+            direction: match spec.direction {
+                CopyDirection::Upload => rpc::CopyDirection::Upload as i32,
+                CopyDirection::Download => rpc::CopyDirection::Download as i32,
+            },
+        })),
     }
 }
 
-pub fn copy_spec_from_rpc(request: rpc::CopyRequest) -> Result<(String, CopySpec)> {
+pub fn copy_spec_from_rpc(request: rpc::CopyStartRequest) -> Result<(String, CopySpec)> {
     let direction = match rpc::CopyDirection::try_from(request.direction)
         .unwrap_or(rpc::CopyDirection::Unspecified)
     {
@@ -60,6 +71,13 @@ pub enum ServerEvent {
     ConfirmRequired {
         execution_id: Uuid,
         reason: String,
+    },
+    AuthPrompt {
+        prompt_id: String,
+        target_label: String,
+        kind: String,
+        secret: bool,
+        message: String,
     },
     Stdout {
         data: Vec<u8>,
@@ -111,6 +129,19 @@ pub fn server_event_to_rpc(event: ServerEvent) -> rpc::ExecuteResponse {
             execution_id: execution_id.to_string(),
             reason,
         }),
+        ServerEvent::AuthPrompt {
+            prompt_id,
+            target_label,
+            kind,
+            secret,
+            message,
+        } => Event::AuthPrompt(rpc::AuthPrompt {
+            prompt_id,
+            target_label,
+            kind,
+            secret,
+            message,
+        }),
         ServerEvent::Stdout { data } => Event::Stdout(rpc::OutputChunk { data }),
         ServerEvent::Stderr { data } => Event::Stderr(rpc::OutputChunk { data }),
         ServerEvent::ExitStatus { code } => Event::ExitStatus(rpc::ExitStatus { code }),
@@ -134,5 +165,55 @@ pub fn pool_status_to_rpc(status: PoolStatus) -> rpc::PoolStatus {
         busy: status.busy as u64,
         idle: status.idle as u64,
         queued: status.queued as u64,
+    }
+}
+
+pub fn execute_auth_input_request(prompt_id: String, value: String) -> rpc::ExecuteRequest {
+    rpc::ExecuteRequest {
+        request: Some(rpc::execute_request::Request::AuthInput(
+            rpc::AuthInputRequest { prompt_id, value },
+        )),
+    }
+}
+
+pub fn copy_auth_input_request(prompt_id: String, value: String) -> rpc::CopyRequest {
+    rpc::CopyRequest {
+        request: Some(rpc::copy_request::Request::AuthInput(
+            rpc::AuthInputRequest { prompt_id, value },
+        )),
+    }
+}
+
+pub fn auth_prompt_message_to_rpc(message: AuthPromptMessage) -> rpc::AuthPrompt {
+    rpc::AuthPrompt {
+        prompt_id: message.prompt_id,
+        target_label: message.target_label,
+        kind: message.kind,
+        secret: message.secret,
+        message: message.message,
+    }
+}
+
+pub fn copy_auth_prompt_response(message: AuthPromptMessage) -> rpc::CopyResponse {
+    rpc::CopyResponse {
+        event: Some(rpc::copy_response::Event::AuthPrompt(
+            auth_prompt_message_to_rpc(message),
+        )),
+    }
+}
+
+pub fn copy_complete_response(message: impl Into<String>) -> rpc::CopyResponse {
+    rpc::CopyResponse {
+        event: Some(rpc::copy_response::Event::Complete(rpc::CopyComplete {
+            message: message.into(),
+        })),
+    }
+}
+
+pub fn copy_error_response(message: impl Into<String>) -> rpc::CopyResponse {
+    rpc::CopyResponse {
+        event: Some(rpc::copy_response::Event::Error(rpc::ErrorResponse {
+            message: message.into(),
+        })),
     }
 }

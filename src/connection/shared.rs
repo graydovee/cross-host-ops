@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use data_encoding::BASE32_NOPAD;
 use hmac::{Hmac, Mac};
 use russh::MethodKind;
@@ -13,6 +13,8 @@ use tokio::time::timeout;
 use tracing::info;
 
 use crate::config::{AppConfig, MfaConfig};
+
+use super::{AuthPromptRequest, AuthPrompter};
 
 type HmacSha1 = Hmac<Sha1>;
 
@@ -51,8 +53,10 @@ pub(super) async fn authenticate_with_key(
     handle: &mut Handle<ClientHandler>,
     user: &str,
     identity_file: &str,
+    target_label: &str,
     mfa: Option<&MfaConfig>,
     pubkey_accepted_algorithms: Option<&str>,
+    auth_prompter: Option<&AuthPrompter>,
 ) -> Result<()> {
     let key = load_secret_key(identity_file, None)
         .with_context(|| format!("failed to load key {}", identity_file))?;
@@ -68,18 +72,25 @@ pub(super) async fn authenticate_with_key(
             remaining_methods,
             partial_success,
         } if partial_success && remaining_methods.contains(&MethodKind::KeyboardInteractive) => {
-            let mfa = mfa.ok_or_else(|| {
-                anyhow!(
-                    "SSH authentication for {} requires keyboard-interactive MFA, but MFA config is missing",
-                    user
-                )
-            })?;
-            authenticate_keyboard_interactive(handle, user, mfa).await?;
+            authenticate_keyboard_interactive(handle, user, target_label, mfa, auth_prompter)
+                .await?;
             info!(user = %user, "SSH keyboard-interactive MFA succeeded");
             Ok(())
         }
         _ => bail!("SSH publickey authentication failed for {}", user),
     }
+}
+
+pub(super) async fn authenticate_with_password(
+    handle: &mut Handle<ClientHandler>,
+    user: &str,
+    password: &str,
+) -> Result<()> {
+    let auth = handle.authenticate_password(user, password).await?;
+    if auth.success() {
+        return Ok(());
+    }
+    bail!("SSH password authentication failed for {}", user)
 }
 
 pub fn build_remote_command(argv: &[String]) -> String {
@@ -170,7 +181,9 @@ fn wants_legacy_ssh_rsa(pubkey_accepted_algorithms: Option<&str>) -> bool {
 async fn authenticate_keyboard_interactive(
     handle: &mut Handle<ClientHandler>,
     user: &str,
-    mfa: &MfaConfig,
+    target_label: &str,
+    mfa: Option<&MfaConfig>,
+    auth_prompter: Option<&AuthPrompter>,
 ) -> Result<()> {
     let mut reply = handle
         .authenticate_keyboard_interactive_start(user, Option::<String>::None)
@@ -185,8 +198,35 @@ async fn authenticate_keyboard_interactive(
                 )
             }
             KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
-                let code = generate_totp(mfa)?;
-                let responses = prompts.into_iter().map(|_| code.clone()).collect();
+                let mut responses = Vec::with_capacity(prompts.len());
+                for prompt in prompts {
+                    let response = if let Some(mfa) = mfa {
+                        if !mfa.totp_secret_base32.is_empty() {
+                            generate_totp(mfa)?
+                        } else if let Some(auth_prompter) = auth_prompter {
+                            auth_prompter(AuthPromptRequest {
+                                target_label: target_label.to_string(),
+                                kind: "jump_mfa".to_string(),
+                                message: prompt.prompt.to_string(),
+                                secret: !prompt.echo,
+                            })
+                            .await?
+                        } else {
+                            bail!("keyboard-interactive MFA requires an auth prompt handler")
+                        }
+                    } else if let Some(auth_prompter) = auth_prompter {
+                        auth_prompter(AuthPromptRequest {
+                            target_label: target_label.to_string(),
+                            kind: "jump_mfa".to_string(),
+                            message: prompt.prompt.to_string(),
+                            secret: !prompt.echo,
+                        })
+                        .await?
+                    } else {
+                        bail!("keyboard-interactive MFA requires an auth prompt handler")
+                    };
+                    responses.push(response);
+                }
                 reply = handle
                     .authenticate_keyboard_interactive_respond(responses)
                     .await?;
