@@ -2,24 +2,35 @@
 #
 # The program can run without any config file.
 # Default behavior with no config:
-# - socket path: ~/.rhup/rhopd.sock
+# - local daemon socket enabled: ~/.rhop/rhopd.sock
+# - remote daemon listener disabled
 # - target resolution: derive IP from the first CLI argument
 # - direct SSH only: the derived IP must match a Host entry in ~/.ssh/config
 # - jumpserver: disabled by default
 # - command review: disabled by default
 #
-# Copy only the sections you need into ~/.rhup/config.toml.
+# Copy only the sections you need into ~/.rhop/config.toml.
 # Every setting below is commented out on purpose.
 
 # [server]
-# socket_path = "~/.rhup/rhopd.sock"
 # log_path = "/var/log/rhopd.log"
 # log_level = "info"
 # reaper_interval = "30s"
 
+# [server.local]
+# enable = true
+# socket_path = "~/.rhop/rhopd.sock"
+
+# [server.remote]
+# enable = true
+# listen_addr = "0.0.0.0:2222"
+# user = "rhop"
+# host_key_path = "~/.rhop/host_key"
+# authorized_keys_path = "~/.rhop/authorized_keys"
+
 # [ssh]
 # ssh_config_path = "~/.ssh/config"
-# server_config_path = "~/.rhup/server.toml"
+# server_config_path = "~/.rhop/server.toml"
 # fallback = ["ssh_config", "jumpserver"]
 # pty = true
 # connect_timeout = "10s"
@@ -54,21 +65,14 @@
 # api_key = "REPLACE_ME"
 # timeout = "10s"
 # failure_action = "deny"
-# # Optional: CLI suppresses normal allow/safe review output; rhopd keeps it in logs.
 
-# Optional: fast-pass simple commands locally before calling the LLM.
-# If a rule contains '*', it uses wildcard matching against the full shell command.
-# If a rule does not contain '*', it must match exactly.
 # [review.fast_allowlist]
 # enable = true
 # commands = ["ls", "ls *", "cat *", "grep *", "kubectl get *"]
 
-# Optional extra HTTP headers for an OpenAI-compatible endpoint.
 # [review.headers]
 # Authorization = "Bearer REPLACE_ME"
-# X-Custom-Header = "value"
 
-# Optional: override the built-in review prompts.
 # [review.prompts]
 # system = "You are a command safety reviewer. Return JSON only."
 # template = """
@@ -76,24 +80,7 @@
 # Return compact JSON with keys: risk_level, reason, matched_whitelist_reason.
 # """
 
-# Optional: override the built-in action policy.
 # [review.policy]
 # safe = "allow"
 # risky = "confirm"
 # dangerous = "deny"
-
-# Optional: override or extend the built-in semantic whitelist hints.
-# [[review.semantic_whitelist]]
-# name = "read-only inspection"
-# description = "Read-only inspection of files, logs, process state, sockets, environment, or system metadata."
-# examples = ["cat /etc/hosts", "journalctl -u nginx", "ps aux | grep kubelet"]
-
-# [[review.semantic_whitelist]]
-# name = "source and git inspection"
-# description = "Read-only inspection of source code or git history/status without checkout, reset, clean, apply, or commit."
-# examples = ["grep -R TODO src", "git status --short", "git log --oneline -20"]
-
-# [[review.semantic_whitelist]]
-# name = "kubernetes read-only inspection"
-# description = "Cluster inspection commands that only get, describe, or view logs and do not patch, edit, apply, delete, scale, or exec."
-# examples = ["kubectl get pods -A", "kubectl describe pod my-pod -n prod", "kubectl logs deploy/api -n prod --since=10m"]

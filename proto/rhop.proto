@@ -128,23 +128,33 @@ message ShutdownRequest {}
 
 message StatusResponse {
   bool daemon_running = 1;
-  string socket_path = 2;
+  string local_socket_path = 2;
   uint64 active_executions = 3;
   repeated PoolStatus pools = 4;
   string daemon_origin = 5;
   bool cli_controllable = 6;
   string cli_start_config_path = 7;
   string cli_start_log_level = 8;
+  bool local_enabled = 9;
+  bool remote_enabled = 10;
+  string remote_listen_addr = 11;
+  string remote_user = 12;
 }
 
 message ConfigListResponse {
   string config_path = 1;
   string server_config_path = 2;
   string ssh_config_path = 3;
-  string socket_path = 4;
+  string local_socket_path = 4;
   repeated string fallback = 5;
   bool jumpserver_enabled = 6;
   string jumpserver_host = 7;
+  bool local_enabled = 8;
+  bool remote_enabled = 9;
+  string remote_listen_addr = 10;
+  string remote_user = 11;
+  string authorized_keys_path = 12;
+  string host_key_path = 13;
 }
 
 message ServerListResponse {

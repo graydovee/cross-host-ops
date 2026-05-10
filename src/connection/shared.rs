@@ -1,8 +1,9 @@
 use std::io::Cursor;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use data_encoding::BASE32_NOPAD;
 use hmac::{Hmac, Mac};
 use russh::MethodKind;
@@ -188,6 +189,62 @@ pub(super) async fn request_default_pty(
         )
         .await?;
     Ok(())
+}
+
+pub(super) fn remote_path_needs_expansion(path: &str) -> bool {
+    path == "~" || path.starts_with("~/") || is_tilde_user_path(path)
+}
+
+pub(super) fn is_tilde_user_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix('~') else {
+        return false;
+    };
+    !rest.is_empty() && !rest.starts_with('/') && rest.contains('/')
+}
+
+pub(super) fn split_tilde_path(path: &str) -> Option<(Option<&str>, &str)> {
+    let rest = path.strip_prefix('~')?;
+    if rest.is_empty() {
+        return Some((None, ""));
+    }
+    if let Some(stripped) = rest.strip_prefix('/') {
+        return Some((None, stripped));
+    }
+    let (user, suffix) = rest.split_once('/')?;
+    Some((Some(user), suffix))
+}
+
+pub(super) fn join_remote_path(home: &str, suffix: &str) -> String {
+    if suffix.is_empty() {
+        home.to_string()
+    } else {
+        format!("{}/{}", home.trim_end_matches('/'), suffix)
+    }
+}
+
+pub(super) fn upload_destination_for_directory(local_path: &Path, remote_dir: &str) -> Result<String> {
+    let basename = local_path
+        .file_name()
+        .ok_or_else(|| anyhow!("failed to derive local basename from {}", local_path.display()))?
+        .to_string_lossy()
+        .to_string();
+    Ok(format!("{}/{}", remote_dir.trim_end_matches('/'), basename))
+}
+
+pub(super) fn download_destination_for_directory(remote_path: &str, local_dir: &Path) -> Result<String> {
+    let basename = Path::new(remote_path)
+        .file_name()
+        .ok_or_else(|| anyhow!("failed to derive remote basename from {}", remote_path))?
+        .to_string_lossy()
+        .to_string();
+    Ok(local_dir.join(basename).display().to_string())
+}
+
+pub(super) fn maybe_local_download_target(local_path: &Path, remote_path: &str) -> Result<String> {
+    if local_path.exists() && local_path.is_dir() {
+        return download_destination_for_directory(remote_path, local_path);
+    }
+    Ok(local_path.display().to_string())
 }
 
 pub(super) struct PtyShell {
@@ -507,7 +564,13 @@ fn generate_totp(config: &MfaConfig) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_remote_command, extract_sentinel, shell_quote};
+    use std::path::Path;
+
+    use super::{
+        build_remote_command, download_destination_for_directory, extract_sentinel,
+        is_tilde_user_path, join_remote_path, maybe_local_download_target, remote_path_needs_expansion,
+        shell_quote, split_tilde_path, upload_destination_for_directory,
+    };
 
     #[test]
     fn shell_quotes_arguments() {
@@ -529,5 +592,40 @@ mod tests {
         assert_eq!(status, 17);
         assert_eq!(before, b"hello\n");
         assert_eq!(after, b"prompt$ ");
+    }
+
+    #[test]
+    fn detects_remote_tilde_paths() {
+        assert!(remote_path_needs_expansion("~"));
+        assert!(remote_path_needs_expansion("~/rhop"));
+        assert!(remote_path_needs_expansion("~root/.ssh"));
+        assert!(!remote_path_needs_expansion("/tmp/file"));
+        assert!(!remote_path_needs_expansion("foo~/bar"));
+        assert!(is_tilde_user_path("~root/.ssh"));
+        assert_eq!(split_tilde_path("~"), Some((None, "")));
+        assert_eq!(split_tilde_path("~/rhop"), Some((None, "rhop")));
+        assert_eq!(split_tilde_path("~root/.ssh"), Some((Some("root"), ".ssh")));
+        assert_eq!(join_remote_path("/root", ""), "/root");
+        assert_eq!(join_remote_path("/root", "bin/app"), "/root/bin/app");
+    }
+
+    #[test]
+    fn computes_upload_and_download_basenames() {
+        assert_eq!(
+            upload_destination_for_directory(Path::new("./target/release/rhop"), "/root").unwrap(),
+            "/root/rhop"
+        );
+        assert_eq!(
+            download_destination_for_directory("/root/frp.sh", Path::new("./logs")).unwrap(),
+            "./logs/frp.sh"
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "rhop-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let local = maybe_local_download_target(&dir, "/root/frp.sh").unwrap();
+        assert_eq!(local, dir.join("frp.sh").display().to_string());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

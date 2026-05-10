@@ -8,12 +8,12 @@
 - `rhup`：CLI 前端别名
 - `rhopd`：本地 daemon 后端
 
-CLI 通过 `gRPC over Unix socket` 与 daemon 通信。daemon 负责 SSH 连接管理、连接池、可选 `server.toml` 目标解析、可选 jumpserver、可选 LLM 命令审查，以及远端输出流式转发。
+CLI 通过本地 `gRPC over Unix socket` 或远程 `gRPC over SSH subsystem` 与 daemon 通信。daemon 负责 SSH 连接管理、连接池、可选 `server.toml` 目标解析、可选 jumpserver、可选 LLM 命令审查，以及远端输出流式转发。
 
 ## 功能
 
 - CLI 用法：`rhop exec <target> <cmd> [arg...]`
-- 前后端分离，使用 `gRPC over Unix socket` 通信
+- 前后端分离，支持本地 `gRPC over Unix socket` 与远程 `gRPC over SSH subsystem`
 - 按目标 IP 复用 SSH 连接
 - 没有空闲连接时自动新建连接
 - 单 IP 连接数上限可配置，默认 `10`
@@ -66,7 +66,7 @@ daemon 管理保护：
 ## 工作方式
 
 1. `rhop exec` 接收目标和命令。
-2. `rhop` 通过 `gRPC over Unix socket` 连接 `rhopd`。
+2. `rhop` 默认通过本地 `gRPC over Unix socket` 连接 `rhopd`。
 3. 如果 `rhopd` 尚未运行，`rhop` 会自动以 `--daemon` 模式拉起它。
 4. daemon 根据第一个参数推导目标 IP。
 5. daemon 先检查 `server.toml`，支持按别名或 `host` 字段命中目标。
@@ -80,7 +80,10 @@ daemon 管理保护：
 
 ## 通信方式
 
-前后端当前使用 `gRPC over Unix socket`。
+前后端使用统一的 gRPC RPC：
+
+- local：`gRPC over Unix socket`
+- remote：`gRPC over SSH subsystem (rhop-rpc)`
 
 - `Execute`：双向流 RPC
 - `Copy`：双向流 RPC
@@ -161,7 +164,7 @@ cargo build
 默认配置路径：
 
 ```text
-~/.rhup/config.toml
+~/.rhop/config.toml
 ```
 
 仓库中提供了一个完整但全部注释掉的示例：
@@ -171,13 +174,13 @@ cargo build
 ### 第 1 步：创建配置目录
 
 ```bash
-mkdir -p ~/.rhup
+mkdir -p ~/.rhop
 ```
 
 ### 第 2 步：复制示例配置
 
 ```bash
-cp config.example.toml ~/.rhup/config.toml
+cp config.example.toml ~/.rhop/config.toml
 ```
 
 ### 第 3 步：只打开你需要的配置项
@@ -196,7 +199,7 @@ cp config.example.toml ~/.rhup/config.toml
 默认路径：
 
 ```text
-~/.rhup/server.toml
+~/.rhop/server.toml
 ```
 
 示例：
@@ -228,7 +231,7 @@ password = "REPLACE_ME"
 
 ### 第 3.6 步：可选，调整 `ssh.pty`
 
-在 `~/.rhup/config.toml` 中：
+在 `~/.rhop/config.toml` 中：
 
 ```toml
 [ssh]
@@ -252,13 +255,45 @@ pty = true
 
 如果 daemon 还没有运行，那么第一次执行命令时会自动读取新配置。
 
+## One By One：连接远程 daemon
+
+远程模式的默认体验接近 `ssh`：
+
+1. 在远端机器上开启 `server.remote.enable = true`
+2. 首次连接：
+
+```bash
+./target/debug/rhop remote connect rhop@example.com:2222
+```
+
+如果主机还不在 `~/.rhop/known_hosts` 中，CLI 会展示 SSH host key 的 SHA256 指纹并等待确认。确认后会把主机记录写入 `~/.rhop/known_hosts`，并把远程目标保存到 `~/.rhop/client.toml`。
+
+3. 切换默认执行目标到远程 daemon：
+
+```bash
+./target/debug/rhop remote enable
+```
+
+4. 之后普通命令默认走远程 daemon：
+
+```bash
+./target/debug/rhop status
+./target/debug/rhop exec foo-192-0-2-163 hostname
+```
+
+5. 切回本地 daemon：
+
+```bash
+./target/debug/rhop remote disable
+```
+
 ## One By One：开启 jumpserver
 
 只有当目标既不能通过 `server.toml` 成功直连，也不能通过 `~/.ssh/config` 成功直连时，才需要启用 jumpserver。
 
 ### 第 1 步：打开 jumpserver 配置段
 
-在 `~/.rhup/config.toml` 中取消注释并填写：
+在 `~/.rhop/config.toml` 中取消注释并填写：
 
 ```toml
 [jumpserver]
@@ -404,12 +439,6 @@ review 现在分两层：
 
 如果 `daemon_origin=external`，则 `daemon stop` 和 `daemon restart` 会被拒绝。
 
-查看 daemon 当前生效配置：
-
-```bash
-./target/debug/rhop config list
-```
-
 查看 daemon 当前使用的 `server.toml` 中有哪些服务器：
 
 ```bash
@@ -425,7 +454,7 @@ review 现在分两层：
 带显式参数启动 daemon：
 
 ```bash
-./target/debug/rhop daemon start --config ~/.rhup/config.toml --log-level debug
+./target/debug/rhop daemon start --config ~/.rhop/config.toml --log-level debug
 ```
 
 停止 daemon：
@@ -457,7 +486,7 @@ review 现在分两层：
 指定配置文件和日志级别：
 
 ```bash
-./target/debug/rhopd -c ~/.rhup/config.toml --log-level debug
+./target/debug/rhopd -c ~/.rhop/config.toml --log-level debug
 ```
 
 修改配置后重启 daemon：

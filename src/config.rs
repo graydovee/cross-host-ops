@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
@@ -37,6 +38,7 @@ impl AppConfig {
         if !path.exists() {
             let mut config = Self::default();
             config.expand_paths()?;
+            config.validate()?;
             return Ok(config);
         }
         let raw = fs::read_to_string(&path)
@@ -44,14 +46,18 @@ impl AppConfig {
         let mut config: AppConfig =
             toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
         config.expand_paths()?;
+        config.validate()?;
         Ok(config)
     }
 
     pub fn expand_paths(&mut self) -> Result<()> {
-        self.server.socket_path = expand_tilde(&self.server.socket_path)?;
         if let Some(log_path) = &self.server.log_path {
             self.server.log_path = Some(expand_tilde(log_path)?);
         }
+        self.server.local.socket_path = expand_tilde(&self.server.local.socket_path)?;
+        self.server.remote.host_key_path = expand_tilde(&self.server.remote.host_key_path)?;
+        self.server.remote.authorized_keys_path =
+            expand_tilde(&self.server.remote.authorized_keys_path)?;
         self.ssh.ssh_config_path = expand_tilde(&self.ssh.ssh_config_path)?;
         self.ssh.server_config_path = expand_tilde(&self.ssh.server_config_path)?;
         if let Some(identity) = &self.jumpserver.identity_file {
@@ -59,12 +65,30 @@ impl AppConfig {
         }
         Ok(())
     }
+
+    pub fn validate(&self) -> Result<()> {
+        self.server.validate()
+    }
 }
 
 pub fn default_config_path() -> PathBuf {
     home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".rhup/config.toml")
+        .join(".rhop/config.toml")
+}
+
+pub fn default_client_config_path() -> PathBuf {
+    default_root_dir().join("client.toml")
+}
+
+pub fn default_root_dir() -> PathBuf {
+    home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".rhop")
+}
+
+pub fn default_known_hosts_path() -> PathBuf {
+    default_root_dir().join("known_hosts")
 }
 
 pub fn expand_tilde(value: &str) -> Result<String> {
@@ -87,20 +111,89 @@ pub fn expand_tilde(value: &str) -> Result<String> {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ServerConfig {
-    pub socket_path: String,
     pub log_path: Option<String>,
     pub log_level: String,
     #[serde(deserialize_with = "deserialize_duration")]
     pub reaper_interval: Duration,
+    pub local: LocalServerConfig,
+    pub remote: RemoteServerConfig,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            socket_path: "~/.rhup/rhopd.sock".to_string(),
             log_path: None,
             log_level: "info".to_string(),
             reaper_interval: Duration::from_secs(30),
+            local: LocalServerConfig::default(),
+            remote: RemoteServerConfig::default(),
+        }
+    }
+}
+
+impl ServerConfig {
+    pub fn validate(&self) -> Result<()> {
+        if !self.local.enable && !self.remote.enable {
+            bail!("at least one of server.local.enable or server.remote.enable must be true");
+        }
+        if self.local.enable && self.local.socket_path.trim().is_empty() {
+            bail!("server.local.socket_path must not be empty");
+        }
+        if self.remote.enable {
+            if self.remote.user.trim().is_empty() {
+                bail!("server.remote.user must not be empty");
+            }
+            if self.remote.listen_addr.parse::<SocketAddr>().is_err() {
+                bail!(
+                    "server.remote.listen_addr is invalid: {}",
+                    self.remote.listen_addr
+                );
+            }
+            if self.remote.host_key_path.trim().is_empty() {
+                bail!("server.remote.host_key_path must not be empty");
+            }
+            if self.remote.authorized_keys_path.trim().is_empty() {
+                bail!("server.remote.authorized_keys_path must not be empty");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LocalServerConfig {
+    pub enable: bool,
+    pub socket_path: String,
+}
+
+impl Default for LocalServerConfig {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            socket_path: "~/.rhop/rhopd.sock".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct RemoteServerConfig {
+    pub enable: bool,
+    pub listen_addr: String,
+    pub user: String,
+    pub host_key_path: String,
+    pub authorized_keys_path: String,
+}
+
+impl Default for RemoteServerConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            listen_addr: "0.0.0.0:2222".to_string(),
+            user: "rhop".to_string(),
+            host_key_path: "~/.rhop/host_key".to_string(),
+            authorized_keys_path: "~/.rhop/authorized_keys".to_string(),
         }
     }
 }
@@ -125,7 +218,7 @@ impl Default for SshConfig {
     fn default() -> Self {
         Self {
             ssh_config_path: "~/.ssh/config".to_string(),
-            server_config_path: "~/.rhup/server.toml".to_string(),
+            server_config_path: "~/.rhop/server.toml".to_string(),
             fallback: vec![
                 FallbackTransport::SshConfig,
                 FallbackTransport::Jumpserver,
@@ -425,6 +518,113 @@ pub struct SemanticWhitelistEntry {
     pub name: String,
     pub description: String,
     pub examples: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientMode {
+    #[default]
+    Local,
+    Remote,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ClientConfig {
+    pub mode: ClientMode,
+    pub local: LocalClientConfig,
+    pub remote: RemoteClientConfig,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            mode: ClientMode::Local,
+            local: LocalClientConfig::default(),
+            remote: RemoteClientConfig::default(),
+        }
+    }
+}
+
+impl ClientConfig {
+    pub fn load() -> Result<Self> {
+        let path = default_client_config_path();
+        Self::load_from_path(&path)
+    }
+
+    pub fn load_from_path(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            let mut config = Self::default();
+            config.expand_paths()?;
+            return Ok(config);
+        }
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to read config {}", path.display()))?;
+        let mut config: ClientConfig =
+            toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
+        config.expand_paths()?;
+        Ok(config)
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let path = default_client_config_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let raw = toml::to_string_pretty(self).context("failed to serialize client config")?;
+        fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn expand_paths(&mut self) -> Result<()> {
+        self.local.socket_path = expand_tilde(&self.local.socket_path)?;
+        self.remote.identity_file = expand_tilde(&self.remote.identity_file)?;
+        self.remote.known_hosts_path = expand_tilde(&self.remote.known_hosts_path)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LocalClientConfig {
+    pub socket_path: String,
+    pub auto_start: bool,
+}
+
+impl Default for LocalClientConfig {
+    fn default() -> Self {
+        Self {
+            socket_path: "~/.rhop/rhopd.sock".to_string(),
+            auto_start: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct RemoteClientConfig {
+    pub address: String,
+    pub user: String,
+    pub identity_file: String,
+    pub known_hosts_path: String,
+}
+
+impl RemoteClientConfig {
+    pub fn is_configured(&self) -> bool {
+        !self.address.trim().is_empty()
+    }
+}
+
+impl Default for RemoteClientConfig {
+    fn default() -> Self {
+        Self {
+            address: String::new(),
+            user: "rhop".to_string(),
+            identity_file: "~/.ssh/id_ed25519".to_string(),
+            known_hosts_path: "~/.rhop/known_hosts".to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -742,7 +942,10 @@ fn glob_match_inner(pattern: &[char], text: &[char], pi: usize, ti: usize) -> bo
 
 #[cfg(test)]
 mod tests {
-    use super::{SshHostEntry, glob_match, parse_duration, resolve_ssh_host};
+    use super::{
+        AppConfig, ClientConfig, SshHostEntry, default_client_config_path, default_config_path,
+        default_known_hosts_path, glob_match, parse_duration, resolve_ssh_host,
+    };
 
     #[test]
     fn parses_duration() {
@@ -777,5 +980,31 @@ mod tests {
         assert_eq!(resolved.user.as_deref(), Some("root"));
         assert_eq!(resolved.port, Some(2222));
         assert_eq!(resolved.identity_file.as_deref(), Some("/tmp/key"));
+    }
+
+    #[test]
+    fn defaults_use_rhop_paths() {
+        assert!(default_config_path().ends_with(".rhop/config.toml"));
+        assert!(default_client_config_path().ends_with(".rhop/client.toml"));
+        assert!(default_known_hosts_path().ends_with(".rhop/known_hosts"));
+        let config = AppConfig::default();
+        assert_eq!(config.server.local.socket_path, "~/.rhop/rhopd.sock");
+        assert_eq!(config.server.remote.host_key_path, "~/.rhop/host_key");
+        assert_eq!(
+            config.server.remote.authorized_keys_path,
+            "~/.rhop/authorized_keys"
+        );
+        let client = ClientConfig::default();
+        assert_eq!(client.local.socket_path, "~/.rhop/rhopd.sock");
+        assert_eq!(client.remote.identity_file, "~/.ssh/id_ed25519");
+        assert_eq!(client.remote.known_hosts_path, "~/.rhop/known_hosts");
+    }
+
+    #[test]
+    fn validates_at_least_one_server_listener() {
+        let mut config = AppConfig::default();
+        config.server.local.enable = false;
+        config.server.remote.enable = false;
+        assert!(config.validate().is_err());
     }
 }

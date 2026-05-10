@@ -18,7 +18,9 @@ use crate::protocol::ServerEvent;
 use super::{AuthPromptRequest, AuthPrompter, Connection};
 use super::shared::{
     ClientHandler, PtyShell, authenticate_with_key, build_interactive_shell_command,
-    connect_handle, request_default_pty,
+    connect_handle, join_remote_path, maybe_local_download_target,
+    remote_path_needs_expansion, request_default_pty, split_tilde_path,
+    upload_destination_for_directory,
 };
 use super::types::{CopyDirection, CopySpec, ResolvedTarget};
 
@@ -358,14 +360,25 @@ impl Connection for JumpSshConnection {
 
 impl JumpSshConnection {
     async fn copy_upload(&mut self, spec: &CopySpec) -> Result<()> {
-        let payload = build_upload_payload(spec).await?;
-        let command = upload_here_doc_command(spec, "{}");
+        let local = Path::new(&spec.local_path);
+        let remote_path = self
+            .normalize_remote_upload_path(spec, local)
+            .await?;
+        let mut spec = spec.clone();
+        spec.remote_path = remote_path;
+        let payload = build_upload_payload(&spec).await?;
+        let command = upload_here_doc_command(&spec, "{}");
         self.run_shell_heredoc_upload(&command, &payload, COPY_HEREDOC_PREFIX)
             .await
     }
 
     async fn copy_download(&mut self, spec: &CopySpec) -> Result<()> {
-        let command = download_command(spec)?;
+        let remote_path = self.expand_remote_copy_path(&spec.remote_path).await?;
+        let local_path = maybe_local_download_target(Path::new(&spec.local_path), &remote_path)?;
+        let mut spec = spec.clone();
+        spec.remote_path = remote_path;
+        spec.local_path = local_path;
+        let command = download_command(&spec)?;
         let outcome = self
             .run_shell_command_capture(&command, COPY_SENTINEL_PREFIX)
             .await?;
@@ -375,7 +388,7 @@ impl JumpSshConnection {
                 outcome.exit_code
             );
         }
-        consume_download_payload(spec, strip_trailing_newlines(outcome.payload)).await
+        consume_download_payload(&spec, strip_trailing_newlines(outcome.payload)).await
     }
 
     async fn stream_shell_payload(&mut self, payload: &[u8]) -> Result<()> {
@@ -383,6 +396,75 @@ impl JumpSshConnection {
             self.shell.write_raw(chunk).await?;
         }
         Ok(())
+    }
+
+    async fn expand_remote_copy_path(&mut self, remote_path: &str) -> Result<String> {
+        if !remote_path_needs_expansion(remote_path) {
+            return Ok(remote_path.to_string());
+        }
+        let (user, suffix) = split_tilde_path(remote_path)
+            .ok_or_else(|| anyhow!("invalid remote path {}", remote_path))?;
+        let home = match user {
+            Some(user) => self.remote_home_for_user(user).await?,
+            None => self.remote_home_for_current_user().await?,
+        };
+        Ok(join_remote_path(&home, suffix))
+    }
+
+    async fn normalize_remote_upload_path(
+        &mut self,
+        spec: &CopySpec,
+        local_path: &Path,
+    ) -> Result<String> {
+        let remote_path = self.expand_remote_copy_path(&spec.remote_path).await?;
+        if spec.recursive {
+            return Ok(remote_path);
+        }
+        if self.remote_path_is_dir(&remote_path).await? {
+            return upload_destination_for_directory(local_path, &remote_path);
+        }
+        Ok(remote_path)
+    }
+
+    async fn remote_path_is_dir(&mut self, remote_path: &str) -> Result<bool> {
+        let command = format!(
+            "test -d {}",
+            shell_single_quote(remote_path)
+        );
+        let outcome = self
+            .run_shell_command_capture(&command, COPY_SENTINEL_PREFIX)
+            .await?;
+        Ok(outcome.exit_code == 0)
+    }
+
+    async fn remote_home_for_current_user(&mut self) -> Result<String> {
+        let home = self.capture_simple_stdout("printf %s \"$HOME\"").await?;
+        if !home.is_empty() && home.starts_with('/') {
+            return Ok(home);
+        }
+        self.capture_simple_stdout("getent passwd \"$(id -un)\" | cut -d: -f6")
+            .await
+    }
+
+    async fn remote_home_for_user(&mut self, user: &str) -> Result<String> {
+        self.capture_simple_stdout(&format!(
+            "getent passwd {} | cut -d: -f6",
+            shell_single_quote(user)
+        ))
+        .await
+    }
+
+    async fn capture_simple_stdout(&mut self, command: &str) -> Result<String> {
+        let outcome = self
+            .run_shell_command_capture(command, COPY_SENTINEL_PREFIX)
+            .await?;
+        let output = String::from_utf8_lossy(&strip_trailing_newlines(outcome.payload))
+            .trim()
+            .to_string();
+        if outcome.exit_code != 0 || output.is_empty() || !output.starts_with('/') {
+            bail!("failed to resolve remote path via `{}`", command);
+        }
+        Ok(output)
     }
 }
 

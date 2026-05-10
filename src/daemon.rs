@@ -1,14 +1,24 @@
+use std::collections::HashMap;
+use std::io;
+use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use russh::keys::ssh_key::{self, HashAlg, LineEnding};
+use russh::server::{self, Auth, Msg, Server as _};
+use russh::{Channel, ChannelId};
 use tokio::fs;
-use tokio::net::UnixListener;
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::time::sleep;
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::transport::Server;
+use tonic::transport::server::Connected;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -19,6 +29,7 @@ use crate::connection::{AuthPrompter, AuthPromptRequest, build_remote_command, r
 use crate::logging::{init_logging, reopen_log_output};
 use crate::pool::ConnectionPool;
 use crate::protocol::{self, AuthPromptMessage, ExecRequest, ServerEvent, rpc};
+use crate::remote::remote_subsystem_name;
 use crate::review::CommandReviewer;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +78,215 @@ struct PendingAuthPrompt {
     response_tx: oneshot::Sender<Result<String>>,
 }
 
+enum IncomingConn {
+    Local(UnixStream),
+    Remote(RemoteChannelStream),
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct RemoteConnectInfo {
+    peer_addr: Option<SocketAddr>,
+    ssh_user: String,
+    public_key_fingerprint: String,
+}
+
+struct RemoteChannelStream {
+    stream: russh::ChannelStream<russh::server::Msg>,
+    info: RemoteConnectInfo,
+}
+
+#[derive(Clone)]
+struct RemoteSshServer {
+    state: DaemonState,
+    accepted_tx: mpsc::Sender<IncomingConn>,
+}
+
+struct RemoteSshHandler {
+    state: DaemonState,
+    accepted_tx: mpsc::Sender<IncomingConn>,
+    peer_addr: Option<SocketAddr>,
+    accepted_user: Option<String>,
+    accepted_fingerprint: Option<String>,
+    channels: HashMap<ChannelId, Channel<Msg>>,
+}
+
+impl Connected for IncomingConn {
+    type ConnectInfo = Option<RemoteConnectInfo>;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        match self {
+            Self::Local(_) => None,
+            Self::Remote(stream) => Some(stream.info.clone()),
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for IncomingConn {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match &mut *self {
+            IncomingConn::Local(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+            IncomingConn::Remote(stream) => std::pin::Pin::new(&mut stream.stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for IncomingConn {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        match &mut *self {
+            IncomingConn::Local(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+            IncomingConn::Remote(stream) => std::pin::Pin::new(&mut stream.stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match &mut *self {
+            IncomingConn::Local(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+            IncomingConn::Remote(stream) => std::pin::Pin::new(&mut stream.stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match &mut *self {
+            IncomingConn::Local(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+            IncomingConn::Remote(stream) => std::pin::Pin::new(&mut stream.stream).poll_shutdown(cx),
+        }
+    }
+}
+
+impl server::Server for RemoteSshServer {
+    type Handler = RemoteSshHandler;
+
+    fn new_client(&mut self, peer_addr: Option<SocketAddr>) -> Self::Handler {
+        RemoteSshHandler {
+            state: self.state.clone(),
+            accepted_tx: self.accepted_tx.clone(),
+            peer_addr,
+            accepted_user: None,
+            accepted_fingerprint: None,
+            channels: HashMap::new(),
+        }
+    }
+}
+
+impl server::Handler for RemoteSshHandler {
+    type Error = anyhow::Error;
+
+    async fn auth_publickey(
+        &mut self,
+        user: &str,
+        key: &ssh_key::PublicKey,
+    ) -> Result<Auth, Self::Error> {
+        let config = self.state.config.read().await.clone();
+        if user != config.server.remote.user {
+            return Ok(Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            });
+        }
+        if !is_authorized_key(Path::new(&config.server.remote.authorized_keys_path), key)? {
+            return Ok(Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            });
+        }
+        self.accepted_user = Some(user.to_string());
+        self.accepted_fingerprint = Some(key.fingerprint(HashAlg::Sha256).to_string());
+        Ok(Auth::Accept)
+    }
+
+    async fn channel_open_session(
+        &mut self,
+        channel: Channel<Msg>,
+        _session: &mut server::Session,
+    ) -> Result<bool, Self::Error> {
+        self.channels.insert(channel.id(), channel);
+        Ok(true)
+    }
+
+    async fn shell_request(
+        &mut self,
+        channel: ChannelId,
+        session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        session.channel_failure(channel)?;
+        Ok(())
+    }
+
+    async fn exec_request(
+        &mut self,
+        channel: ChannelId,
+        _data: &[u8],
+        session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        session.channel_failure(channel)?;
+        Ok(())
+    }
+
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        name: &str,
+        session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        if name != remote_subsystem_name() {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
+
+        let Some(channel_stream) = self.channels.remove(&channel) else {
+            session.channel_failure(channel)?;
+            return Ok(());
+        };
+
+        let info = RemoteConnectInfo {
+            peer_addr: self.peer_addr,
+            ssh_user: self.accepted_user.clone().unwrap_or_default(),
+            public_key_fingerprint: self.accepted_fingerprint.clone().unwrap_or_default(),
+        };
+        session.channel_success(channel)?;
+        self.accepted_tx
+            .send(IncomingConn::Remote(RemoteChannelStream {
+                stream: channel_stream.into_stream(),
+                info,
+            }))
+            .await
+            .map_err(|_| anyhow!("remote incoming queue closed"))?;
+        Ok(())
+    }
+
+    async fn tcpip_forward(
+        &mut self,
+        _address: &str,
+        _port: &mut u32,
+        _session: &mut server::Session,
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+
+    async fn streamlocal_forward(
+        &mut self,
+        _socket_path: &str,
+        _session: &mut server::Session,
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+}
+
 pub async fn run(config_path: Option<PathBuf>) -> Result<()> {
     run_with_overrides(
         config_path,
@@ -103,14 +323,80 @@ pub async fn run_with_overrides(
         cli_start_options,
     };
 
-    ensure_socket_parent(&state).await?;
-    let socket_path = PathBuf::from(state.config.read().await.server.socket_path.clone());
-    if socket_path.exists() {
-        let _ = fs::remove_file(&socket_path).await;
+    let local_socket_path = if state.config.read().await.server.local.enable {
+        let socket_path = PathBuf::from(state.config.read().await.server.local.socket_path.clone());
+        ensure_socket_parent(&socket_path).await?;
+        if socket_path.exists() {
+            let _ = fs::remove_file(&socket_path).await;
+        }
+        Some(socket_path)
+    } else {
+        None
+    };
+
+    let remote_listener = if state.config.read().await.server.remote.enable {
+        let remote_config = state.config.read().await.server.remote.clone();
+        ensure_remote_parent(&remote_config).await?;
+        ensure_remote_host_key(&remote_config).await?;
+        Some(
+            TcpListener::bind(&remote_config.listen_addr)
+                .await
+                .with_context(|| format!("failed to bind {}", remote_config.listen_addr))?,
+        )
+    } else {
+        None
+    };
+
+    let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingConn>(32);
+
+    if let Some(socket_path) = local_socket_path.clone() {
+        let listener = UnixListener::bind(&socket_path)
+            .with_context(|| format!("failed to bind {}", socket_path.display()))?;
+        info!(socket_path = %socket_path.display(), "listening on local socket");
+        let local_tx = incoming_tx.clone();
+        tokio::spawn(async move {
+            let mut incoming = UnixListenerStream::new(listener);
+            use tokio_stream::StreamExt;
+            while let Some(result) = incoming.next().await {
+                match result {
+                    Ok(stream) => {
+                        if local_tx.send(IncomingConn::Local(stream)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "failed to accept local socket connection");
+                    }
+                }
+            }
+        });
     }
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("failed to bind {}", socket_path.display()))?;
-    info!(socket_path = %socket_path.display(), "listening on socket");
+
+    if let Some(listener) = remote_listener {
+        let remote_config = state.config.read().await.server.remote.clone();
+        let host_keys = load_host_keys(Path::new(&remote_config.host_key_path))?;
+        let mut server = RemoteSshServer {
+            state: state.clone(),
+            accepted_tx: incoming_tx.clone(),
+        };
+        let config = Arc::new(server::Config {
+            auth_rejection_time: Duration::from_secs(1),
+            auth_rejection_time_initial: Some(Duration::from_secs(0)),
+            keys: host_keys,
+            inactivity_timeout: Some(Duration::from_secs(600)),
+            ..Default::default()
+        });
+        info!(listen_addr = %remote_config.listen_addr, "listening on remote SSH");
+        let running = async move {
+            let listener = listener;
+            server.run_on_socket(config, &listener).await
+        };
+        tokio::spawn(async move {
+            if let Err(error) = running.await {
+                error!(error = %error, "remote SSH listener stopped");
+            }
+        });
+    }
 
     let reaper_state = state.clone();
     tokio::spawn(async move {
@@ -134,7 +420,7 @@ pub async fn run_with_overrides(
         }
     });
 
-    let incoming = UnixListenerStream::new(listener);
+    let incoming = ReceiverStream::new(receiver_map_incoming(incoming_rx));
     Server::builder()
         .add_service(rpc::rhop_rpc_server::RhopRpcServer::new(RhopRpcService {
             state,
@@ -143,17 +429,18 @@ pub async fn run_with_overrides(
             let _ = shutdown_rx.recv().await;
         })
         .await?;
-    if socket_path.exists() {
-        let _ = fs::remove_file(&socket_path).await;
+    if let Some(socket_path) = local_socket_path {
+        if socket_path.exists() {
+            let _ = fs::remove_file(&socket_path).await;
+        }
     }
     Ok(())
 }
 
-async fn ensure_socket_parent(state: &DaemonState) -> Result<()> {
-    let socket_path = state.config.read().await.server.socket_path.clone();
-    let parent = Path::new(&socket_path)
+async fn ensure_socket_parent(socket_path: &Path) -> Result<()> {
+    let parent = socket_path
         .parent()
-        .ok_or_else(|| anyhow!("invalid socket path {}", socket_path))?;
+        .ok_or_else(|| anyhow!("invalid socket path {}", socket_path.display()))?;
     fs::create_dir_all(parent).await?;
     Ok(())
 }
@@ -164,6 +451,90 @@ async fn shutdown_daemon(state: &DaemonState) -> Result<()> {
     }
     let _ = state.shutdown_tx.send(()).await;
     Ok(())
+}
+
+fn receiver_map_incoming(
+    receiver: mpsc::Receiver<IncomingConn>,
+) -> mpsc::Receiver<Result<IncomingConn, io::Error>> {
+    let (tx, rx) = mpsc::channel(32);
+    tokio::spawn(async move {
+        let mut receiver = receiver;
+        while let Some(conn) = receiver.recv().await {
+            if tx.send(Ok(conn)).await.is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+async fn ensure_remote_parent(config: &crate::config::RemoteServerConfig) -> Result<()> {
+    let host_parent = Path::new(&config.host_key_path)
+        .parent()
+        .ok_or_else(|| anyhow!("invalid host key path {}", config.host_key_path))?;
+    fs::create_dir_all(host_parent).await?;
+    let auth_parent = Path::new(&config.authorized_keys_path)
+        .parent()
+        .ok_or_else(|| anyhow!("invalid authorized_keys path {}", config.authorized_keys_path))?;
+    fs::create_dir_all(auth_parent).await?;
+    Ok(())
+}
+
+async fn ensure_remote_host_key(config: &crate::config::RemoteServerConfig) -> Result<()> {
+    let path = Path::new(&config.host_key_path);
+    if path.exists() {
+        return Ok(());
+    }
+    let mut rng = rand_core::UnwrapErr(getrandom::SysRng);
+    let mut key = ssh_key::PrivateKey::random(&mut rng, ssh_key::Algorithm::Ed25519)
+        .context("failed to generate Ed25519 host key")?;
+    key.set_comment("rhopd host key");
+    key.write_openssh_file(path, LineEnding::LF)
+        .with_context(|| format!("failed to write host key {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn load_host_keys(path: &Path) -> Result<Vec<ssh_key::PrivateKey>> {
+    Ok(vec![
+        ssh_key::PrivateKey::read_openssh_file(path)
+            .with_context(|| format!("failed to read host key {}", path.display()))?,
+    ])
+}
+
+fn is_authorized_key(path: &Path, candidate: &ssh_key::PublicKey) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    for (idx, raw_line) in content.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let first = line
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| anyhow!("invalid authorized_keys line {}", idx + 1))?;
+        if first.contains('=') || first.contains(',') {
+            bail!(
+                "authorized_keys options are not supported in {} line {}",
+                path.display(),
+                idx + 1
+            );
+        }
+        let parsed = ssh_key::PublicKey::from_openssh(line)
+            .with_context(|| format!("failed to parse {} line {}", path.display(), idx + 1))?;
+        if &parsed == candidate {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn process_execute(
@@ -554,12 +925,13 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
         _request: Request<rpc::StatusRequest>,
     ) -> Result<Response<rpc::StatusResponse>, Status> {
         info!("status request");
-        let socket_path = self.state.config.read().await.server.socket_path.clone();
+        let config = self.state.config.read().await.clone();
+        let socket_path = config.server.local.socket_path.clone();
         let pools = self.state.pool.status();
         let active_executions = pools.iter().map(|entry| entry.busy).sum::<usize>() as u64;
         let response = rpc::StatusResponse {
             daemon_running: true,
-            socket_path,
+            local_socket_path: socket_path,
             active_executions,
             pools: pools
                 .into_iter()
@@ -579,6 +951,10 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 .log_level
                 .clone()
                 .unwrap_or_default(),
+            local_enabled: config.server.local.enable,
+            remote_enabled: config.server.remote.enable,
+            remote_listen_addr: config.server.remote.listen_addr,
+            remote_user: config.server.remote.user,
         };
         Ok(Response::new(response))
     }
@@ -592,10 +968,16 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
             config_path: self.state.config_path.display().to_string(),
             server_config_path: config.ssh.server_config_path,
             ssh_config_path: config.ssh.ssh_config_path,
-            socket_path: config.server.socket_path,
+            local_socket_path: config.server.local.socket_path,
             fallback: config.ssh.fallback.iter().map(ToString::to_string).collect(),
             jumpserver_enabled: config.jumpserver.enabled,
             jumpserver_host: config.jumpserver.host,
+            local_enabled: config.server.local.enable,
+            remote_enabled: config.server.remote.enable,
+            remote_listen_addr: config.server.remote.listen_addr,
+            remote_user: config.server.remote.user,
+            authorized_keys_path: config.server.remote.authorized_keys_path,
+            host_key_path: config.server.remote.host_key_path,
         }))
     }
 

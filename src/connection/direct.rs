@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use russh::ChannelMsg;
 use russh::client::Handle;
 use russh_sftp::client::SftpSession;
@@ -13,7 +13,9 @@ use crate::protocol::ServerEvent;
 use super::Connection;
 use super::shared::{
     ClientHandler, PtyShell, authenticate_with_key, authenticate_with_password,
-    build_interactive_shell_command, build_remote_command, connect_handle, request_default_pty,
+    build_interactive_shell_command, build_remote_command, connect_handle,
+    join_remote_path, maybe_local_download_target, remote_path_needs_expansion,
+    request_default_pty, split_tilde_path, upload_destination_for_directory,
 };
 use super::AuthPrompter;
 use super::types::{CopyDirection, CopySpec, DirectTarget};
@@ -154,18 +156,25 @@ impl DirectSshConnection {
         validate_direct_copy_spec(spec)?;
         let sftp = self.open_sftp().await?;
         let local = PathBuf::from(&spec.local_path);
+        let remote_path = self
+            .normalize_remote_upload_path(spec, &local, &sftp)
+            .await?;
         if spec.recursive {
-            copy_local_dir_to_remote(&sftp, &local, Path::new(&spec.remote_path)).await
+            copy_local_dir_to_remote(&sftp, &local, Path::new(&remote_path)).await
         } else {
-            copy_local_file_to_remote(&sftp, &local, Path::new(&spec.remote_path)).await
+            copy_local_file_to_remote(&sftp, &local, Path::new(&remote_path)).await
         }
     }
 
     async fn copy_download(&mut self, spec: &CopySpec) -> Result<()> {
         validate_direct_copy_spec(spec)?;
         let sftp = self.open_sftp().await?;
-        let local = PathBuf::from(&spec.local_path);
-        let remote = Path::new(&spec.remote_path);
+        let remote_path = self.expand_remote_copy_path(&spec.remote_path).await?;
+        let local = PathBuf::from(maybe_local_download_target(
+            Path::new(&spec.local_path),
+            &remote_path,
+        )?);
+        let remote = Path::new(&remote_path);
         let metadata = sftp
             .metadata(path_to_string(remote)?)
             .await
@@ -185,6 +194,73 @@ impl DirectSshConnection {
         channel.request_subsystem(true, "sftp").await?;
         let sftp = SftpSession::new(channel.into_stream()).await?;
         Ok(sftp)
+    }
+
+    async fn expand_remote_copy_path(&mut self, remote_path: &str) -> Result<String> {
+        if !remote_path_needs_expansion(remote_path) {
+            return Ok(remote_path.to_string());
+        }
+        let (user, suffix) = split_tilde_path(remote_path)
+            .ok_or_else(|| anyhow!("invalid remote path {}", remote_path))?;
+        let home = match user {
+            Some(user) => self.remote_home_for_user(user).await?,
+            None => self.remote_home_for_current_user().await?,
+        };
+        Ok(join_remote_path(&home, suffix))
+    }
+
+    async fn normalize_remote_upload_path(
+        &mut self,
+        spec: &CopySpec,
+        local_path: &Path,
+        sftp: &SftpSession,
+    ) -> Result<String> {
+        let remote_path = self.expand_remote_copy_path(&spec.remote_path).await?;
+        if spec.recursive {
+            return Ok(remote_path);
+        }
+        match sftp.metadata(remote_path.clone()).await {
+            Ok(metadata) if metadata.is_dir() => upload_destination_for_directory(local_path, &remote_path),
+            Ok(_) => Ok(remote_path),
+            Err(_) => Ok(remote_path),
+        }
+    }
+
+    async fn remote_home_for_current_user(&mut self) -> Result<String> {
+        let home = self.run_probe_command("printf %s \"$HOME\"").await?;
+        if !home.is_empty() && home.starts_with('/') {
+            return Ok(home);
+        }
+        self.run_probe_command("getent passwd \"$(id -un)\" | cut -d: -f6")
+            .await
+    }
+
+    async fn remote_home_for_user(&mut self, user: &str) -> Result<String> {
+        self.run_probe_command(&format!(
+            "getent passwd {} | cut -d: -f6",
+            super::shared::shell_quote(user)
+        ))
+        .await
+    }
+
+    async fn run_probe_command(&mut self, command: &str) -> Result<String> {
+        let mut channel = self.handle.channel_open_session().await?;
+        channel.exec(true, command).await?;
+        let mut stdout = Vec::new();
+        let mut exit_code = None;
+        while let Some(message) = channel.wait().await {
+            match message {
+                ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+                ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status as i32),
+                ChannelMsg::ExitSignal { .. } => exit_code = Some(255),
+                _ => {}
+            }
+        }
+        let output = String::from_utf8_lossy(&stdout).trim().to_string();
+        if exit_code.unwrap_or(255) != 0 || output.is_empty() || !output.starts_with('/') {
+            bail!("failed to resolve remote path via `{}`", command);
+        }
+        Ok(output)
     }
 }
 

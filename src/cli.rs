@@ -1,7 +1,7 @@
 use std::env;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -15,13 +15,18 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
-use crate::config::AppConfig;
+use crate::config::{ClientConfig, ClientMode, default_config_path};
 use crate::connection::{CopyDirection, CopySpec};
 use crate::protocol::rpc;
+use crate::remote::{
+    KnownHostState, apply_remote_target, client_mode, connect_remote_client, disable_remote_mode,
+    enable_remote_mode, fetch_remote_host_key, inspect_known_host, load_client_config,
+    normalize_remote_paths, parse_remote_target, save_client_config,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "rhop")]
-#[command(about = "Remote Hop command runner with a local daemon", version)]
+#[command(about = "Remote Hop command runner with a local or remote daemon", version)]
 pub struct ArunCli {
     #[command(subcommand)]
     pub command: ArunCommand,
@@ -55,21 +60,38 @@ pub enum ArunCommand {
     },
     #[command(about = "Show daemon and connection pool status")]
     Status,
+    #[command(about = "Manage remote daemon target selection")]
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommand,
+    },
     #[command(about = "Manage the local daemon")]
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
     },
-    #[command(about = "Manage daemon configuration")]
-    Config {
-        #[command(subcommand)]
-        command: ConfigCommand,
-    },
-    #[command(about = "Query configured servers", visible_alias = "sever")]
+    #[command(about = "Query configured servers")]
     Server {
         #[command(subcommand)]
         command: ServerCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RemoteCommand {
+    #[command(about = "Connect to a remote daemon and trust its host key if needed")]
+    Connect {
+        #[arg(value_name = "TARGET")]
+        target: String,
+        #[arg(long = "identity-file", value_name = "FILE")]
+        identity_file: Option<String>,
+        #[arg(long = "known-hosts", value_name = "FILE")]
+        known_hosts: Option<String>,
+    },
+    #[command(about = "Use the saved remote daemon as the default target")]
+    Enable,
+    #[command(about = "Switch the default target back to the local daemon")]
+    Disable,
 }
 
 #[derive(Debug, Subcommand)]
@@ -85,12 +107,6 @@ pub enum DaemonCommand {
     Stop,
     #[command(about = "Restart the daemon")]
     Restart,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum ConfigCommand {
-    #[command(about = "Show the daemon's effective config paths")]
-    List,
 }
 
 #[derive(Debug, Subcommand)]
@@ -113,22 +129,14 @@ pub async fn run_cli(cli: ArunCli) -> Result<i32> {
             dest,
         } => run_copy(recursive, source, dest).await,
         ArunCommand::Status => status().await,
+        ArunCommand::Remote { command } => run_remote_command(command).await,
         ArunCommand::Daemon { command } => run_daemon_command(command).await,
-        ArunCommand::Config { command } => run_config_command(command).await,
         ArunCommand::Server { command } => run_server_command(command).await,
     }
 }
 
 async fn run_command(target: String, argv: Vec<String>) -> Result<i32> {
-    let socket_path = socket_path()?;
-    let mut client = match connect_client(&socket_path).await {
-        Ok(client) => client,
-        Err(_) => {
-            spawn_daemon(&CliDaemonStartOptions::default())?;
-            wait_for_socket(&socket_path).await?;
-            connect_client(&socket_path).await?
-        }
-    };
+    let mut client = connect_data_client(ClientAccess::AutoStart).await?;
 
     let (tx, rx) = mpsc::channel(8);
     tx.send(rpc::ExecuteRequest {
@@ -195,35 +203,36 @@ async fn run_command(target: String, argv: Vec<String>) -> Result<i32> {
 }
 
 async fn status() -> Result<i32> {
-    let socket_path = socket_path()?;
-    let mut client = match connect_client(&socket_path).await {
-        Ok(client) => client,
-        Err(_) => {
-            eprintln!("rhopd is not running");
-            return Ok(1);
-        }
-    };
+    let mut client = connect_data_client(ClientAccess::NoAutoStart).await?;
     let response = client.status(rpc::StatusRequest {}).await?.into_inner();
-    println!("socket: {}", response.socket_path);
-    println!("active executions: {}", response.active_executions);
-    println!("daemon_origin: {}", response.daemon_origin);
-    println!("cli_controllable: {}", response.cli_controllable);
-    println!(
-        "cli_start_config_path: {}",
-        if response.cli_start_config_path.is_empty() {
-            "<none>"
-        } else {
-            &response.cli_start_config_path
+    println!("daemon:");
+    println!("  origin: {}", response.daemon_origin);
+    println!("  cli_controllable: {}", response.cli_controllable);
+    println!("  active_executions: {}", response.active_executions);
+    if !response.cli_start_config_path.is_empty() {
+        println!("  cli_start_config_path: {}", response.cli_start_config_path);
+    }
+    if !response.cli_start_log_level.is_empty() {
+        println!("  cli_start_log_level: {}", response.cli_start_log_level);
+    }
+
+    println!("local:");
+    println!("  enabled: {}", response.local_enabled);
+    if response.local_enabled {
+        println!("  socket_path: {}", response.local_socket_path);
+    }
+
+    if response.remote_enabled {
+        println!("remote:");
+        println!("  enabled: true");
+        if !response.remote_listen_addr.is_empty() {
+            println!("  listen_addr: {}", response.remote_listen_addr);
         }
-    );
-    println!(
-        "cli_start_log_level: {}",
-        if response.cli_start_log_level.is_empty() {
-            "<none>"
-        } else {
-            &response.cli_start_log_level
+        if !response.remote_user.is_empty() {
+            println!("  user: {}", response.remote_user);
         }
-    );
+    }
+
     for pool in response.pools {
         println!(
             "{} total={} busy={} idle={} queued={}",
@@ -235,15 +244,7 @@ async fn status() -> Result<i32> {
 
 async fn run_copy(recursive: bool, source: String, dest: String) -> Result<i32> {
     let (target, spec) = parse_copy_operands(recursive, &source, &dest)?;
-    let socket_path = socket_path()?;
-    let mut client = match connect_client(&socket_path).await {
-        Ok(client) => client,
-        Err(_) => {
-            spawn_daemon(&CliDaemonStartOptions::default())?;
-            wait_for_socket(&socket_path).await?;
-            connect_client(&socket_path).await?
-        }
-    };
+    let mut client = connect_data_client(ClientAccess::AutoStart).await?;
     let (tx, rx) = mpsc::channel(8);
     tx.send(crate::protocol::copy_spec_to_rpc(target, spec))
         .await
@@ -281,7 +282,20 @@ async fn run_copy(recursive: bool, source: String, dest: String) -> Result<i32> 
     Ok(0)
 }
 
+async fn run_remote_command(command: RemoteCommand) -> Result<i32> {
+    match command {
+        RemoteCommand::Connect {
+            target,
+            identity_file,
+            known_hosts,
+        } => remote_connect(target, identity_file, known_hosts).await,
+        RemoteCommand::Enable => remote_enable(),
+        RemoteCommand::Disable => remote_disable(),
+    }
+}
+
 async fn run_daemon_command(command: DaemonCommand) -> Result<i32> {
+    ensure_local_mode("daemon commands")?;
     match command {
         DaemonCommand::Start { config, log_level } => daemon_start(CliDaemonStartOptions {
             config,
@@ -292,46 +306,14 @@ async fn run_daemon_command(command: DaemonCommand) -> Result<i32> {
     }
 }
 
-async fn run_config_command(command: ConfigCommand) -> Result<i32> {
-    match command {
-        ConfigCommand::List => list_config().await,
-    }
-}
-
 async fn run_server_command(command: ServerCommand) -> Result<i32> {
     match command {
         ServerCommand::List => list_servers().await,
     }
 }
 
-async fn list_config() -> Result<i32> {
-    let socket_path = socket_path()?;
-    let mut client = connect_client(&socket_path)
-        .await
-        .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
-    let response = client.list_config(rpc::ConfigListRequest {}).await?.into_inner();
-    println!("config_path: {}", response.config_path);
-    println!("server_config_path: {}", response.server_config_path);
-    println!("ssh_config_path: {}", response.ssh_config_path);
-    println!("socket_path: {}", response.socket_path);
-    println!("fallback: {}", response.fallback.join(", "));
-    println!("jumpserver_enabled: {}", response.jumpserver_enabled);
-    if !response.jumpserver_host.is_empty() {
-        println!("jumpserver_host: {}", response.jumpserver_host);
-    }
-    Ok(0)
-}
-
 async fn list_servers() -> Result<i32> {
-    let socket_path = socket_path()?;
-    let mut client = match connect_client(&socket_path).await {
-        Ok(client) => client,
-        Err(_) => {
-            spawn_daemon(&CliDaemonStartOptions::default())?;
-            wait_for_socket(&socket_path).await?;
-            connect_client(&socket_path).await?
-        }
-    };
+    let mut client = connect_data_client(ClientAccess::AutoStart).await?;
     let response = client.list_servers(rpc::ServerListRequest {}).await?.into_inner();
     let name_width = response
         .servers
@@ -389,10 +371,55 @@ async fn list_servers() -> Result<i32> {
     Ok(0)
 }
 
-async fn connect_client(
-    socket_path: &PathBuf,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClientAccess {
+    AutoStart,
+    NoAutoStart,
+}
+
+async fn connect_data_client(
+    access: ClientAccess,
 ) -> Result<rpc::rhop_rpc_client::RhopRpcClient<Channel>> {
-    let path = socket_path.clone();
+    let client_config = load_client_config()?;
+    match client_mode(&client_config) {
+        ClientMode::Local => connect_local_data_client(&client_config, access).await,
+        ClientMode::Remote => connect_remote_data_client(&client_config, access).await,
+    }
+}
+
+async fn connect_local_data_client(
+    client_config: &ClientConfig,
+    access: ClientAccess,
+) -> Result<rpc::rhop_rpc_client::RhopRpcClient<Channel>> {
+    let socket_path = PathBuf::from(&client_config.local.socket_path);
+    match connect_unix_client(&socket_path).await {
+        Ok(client) => Ok(client),
+        Err(_error) if access == ClientAccess::AutoStart && client_config.local.auto_start => {
+            spawn_daemon(&CliDaemonStartOptions::default())?;
+            wait_for_socket(&socket_path).await?;
+            connect_unix_client(&socket_path).await
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!("failed to connect to local daemon socket {}", socket_path.display())
+        }),
+    }
+}
+
+async fn connect_remote_data_client(
+    client_config: &ClientConfig,
+    access: ClientAccess,
+) -> Result<rpc::rhop_rpc_client::RhopRpcClient<Channel>> {
+    if access == ClientAccess::AutoStart {
+        connect_remote_client(&client_config.remote).await
+    } else {
+        connect_remote_client(&client_config.remote).await
+    }
+}
+
+async fn connect_unix_client(
+    socket_path: &Path,
+) -> Result<rpc::rhop_rpc_client::RhopRpcClient<Channel>> {
+    let path = socket_path.to_path_buf();
     let endpoint = Endpoint::from_static("http://[::]:50051");
     let channel = endpoint
         .connect_with_connector(service_fn(move |_: Uri| {
@@ -416,8 +443,8 @@ fn daemon_start(options: CliDaemonStartOptions) -> Result<i32> {
 }
 
 async fn daemon_stop() -> Result<i32> {
-    let socket_path = socket_path()?;
-    let mut client = match connect_client(&socket_path).await {
+    let socket_path = local_socket_path()?;
+    let mut client = match connect_unix_client(&socket_path).await {
         Ok(client) => client,
         Err(_) => {
             eprintln!("rhopd is not running");
@@ -498,14 +525,13 @@ fn daemon_path() -> Result<PathBuf> {
     Ok(directory.join("rhopd"))
 }
 
-fn socket_path() -> Result<PathBuf> {
-    let mut config = AppConfig::load(None)?;
-    config.expand_paths()?;
-    Ok(PathBuf::from(config.server.socket_path))
+fn local_socket_path() -> Result<PathBuf> {
+    let client_config = load_client_config()?;
+    Ok(PathBuf::from(client_config.local.socket_path))
 }
 
 fn local_config_path_if_exists() -> Result<Option<PathBuf>> {
-    let path = crate::config::default_config_path();
+    let path = default_config_path();
     if path.exists() {
         Ok(Some(path))
     } else {
@@ -514,8 +540,8 @@ fn local_config_path_if_exists() -> Result<Option<PathBuf>> {
 }
 
 async fn current_cli_start_options() -> Result<CliDaemonStartOptions> {
-    let socket_path = socket_path()?;
-    let mut client = connect_client(&socket_path)
+    let socket_path = local_socket_path()?;
+    let mut client = connect_unix_client(&socket_path)
         .await
         .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
     let response = client.status(rpc::StatusRequest {}).await?.into_inner();
@@ -526,8 +552,81 @@ async fn current_cli_start_options() -> Result<CliDaemonStartOptions> {
     })
 }
 
+async fn remote_connect(
+    target: String,
+    identity_file_override: Option<String>,
+    known_hosts_override: Option<String>,
+) -> Result<i32> {
+    let target = parse_remote_target(&target)?;
+    let mut client_config = load_client_config()?;
+    let (identity_file, known_hosts_path) =
+        normalize_remote_paths(identity_file_override, known_hosts_override)?;
+    let public_key = fetch_remote_host_key(&target, &identity_file).await?;
+    let state = inspect_known_host(&target, &public_key, &PathBuf::from(&known_hosts_path));
+    match state {
+        KnownHostState::Known => {}
+        KnownHostState::Unknown {
+            algorithm,
+            fingerprint,
+        } => {
+            eprintln!("The authenticity of host '{}' can't be established.", target.address());
+            eprintln!("{} key fingerprint is {}.", algorithm, fingerprint);
+            if !prompt_for_confirmation("trust this host key and continue")? {
+                bail!("host key not trusted");
+            }
+            crate::remote::trust_known_host(
+                &target,
+                &public_key,
+                &PathBuf::from(&known_hosts_path),
+            )?;
+        }
+        KnownHostState::Changed {
+            algorithm,
+            fingerprint,
+        } => {
+            bail!(
+                "host key for {} changed; refusing to connect ({} {})",
+                target.address(),
+                algorithm,
+                fingerprint
+            );
+        }
+    }
+
+    apply_remote_target(&mut client_config, &target);
+    client_config.remote.identity_file = identity_file;
+    client_config.remote.known_hosts_path = known_hosts_path;
+    save_client_config(&client_config)?;
+    println!("saved remote daemon target {}", target.address());
+    Ok(0)
+}
+
+fn remote_enable() -> Result<i32> {
+    let mut client_config = load_client_config()?;
+    enable_remote_mode(&mut client_config)?;
+    save_client_config(&client_config)?;
+    println!("default daemon target switched to remote");
+    Ok(0)
+}
+
+fn remote_disable() -> Result<i32> {
+    let mut client_config = load_client_config()?;
+    disable_remote_mode(&mut client_config);
+    save_client_config(&client_config)?;
+    println!("default daemon target switched to local");
+    Ok(0)
+}
+
+fn ensure_local_mode(what: &str) -> Result<()> {
+    let client_config = load_client_config()?;
+    if matches!(client_mode(&client_config), ClientMode::Remote) {
+        bail!("{} are only supported in local mode; run `rhop remote disable` first", what);
+    }
+    Ok(())
+}
+
 fn prompt_for_confirmation(reason: &str) -> Result<bool> {
-    eprintln!("command requires confirmation: {}", reason);
+    eprintln!("confirmation required: {}", reason);
     eprint!("Continue? [y/N] ");
     io::stderr().flush()?;
     let mut input = String::new();
@@ -551,7 +650,6 @@ fn read_secret_line() -> Result<String> {
     let stdin = io::stdin();
     let fd = stdin.as_raw_fd();
     let mut term = std::mem::MaybeUninit::<libc::termios>::uninit();
-    // SAFETY: tcgetattr/tcsetattr operate on a valid stdin fd in this Unix CLI process.
     unsafe {
         if libc::tcgetattr(fd, term.as_mut_ptr()) != 0 {
             return Err(anyhow!("failed to read terminal attributes"));
