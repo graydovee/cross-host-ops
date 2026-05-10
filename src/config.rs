@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 pub struct AppConfig {
     pub server: ServerConfig,
     pub ssh: SshConfig,
+    pub copy: CopyConfig,
     pub jumpserver: JumpserverConfig,
     pub review: ReviewConfig,
 }
@@ -26,6 +27,7 @@ impl Default for AppConfig {
         Self {
             server: ServerConfig::default(),
             ssh: SshConfig::default(),
+            copy: CopyConfig::default(),
             jumpserver: JumpserverConfig::default(),
             review: ReviewConfig::default(),
         }
@@ -228,6 +230,20 @@ impl Default for SshConfig {
             keepalive_interval: Duration::from_secs(30),
             max_idle_time: Duration::from_secs(600),
             max_connections_per_ip: 10,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CopyConfig {
+    pub preserve_mode: bool,
+}
+
+impl Default for CopyConfig {
+    fn default() -> Self {
+        Self {
+            preserve_mode: true,
         }
     }
 }
@@ -994,6 +1010,7 @@ mod tests {
             config.server.remote.authorized_keys_path,
             "~/.rhop/authorized_keys"
         );
+        assert!(config.copy.preserve_mode);
         let client = ClientConfig::default();
         assert_eq!(client.local.socket_path, "~/.rhop/rhopd.sock");
         assert_eq!(client.remote.identity_file, "~/.ssh/id_ed25519");

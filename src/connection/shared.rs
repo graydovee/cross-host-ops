@@ -11,6 +11,7 @@ use russh::ChannelMsg;
 use russh::client::KeyboardInteractiveAuthResponse;
 use russh::client::{self, AuthResult, Handle};
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, load_secret_key};
+use russh_sftp::client::fs::Metadata as SftpMetadata;
 use sha1::Sha1;
 use tokio::time::timeout;
 use tracing::info;
@@ -245,6 +246,53 @@ pub(super) fn maybe_local_download_target(local_path: &Path, remote_path: &str) 
         return download_destination_for_directory(remote_path, local_path);
     }
     Ok(local_path.display().to_string())
+}
+
+#[cfg(unix)]
+pub(super) fn local_mode(path: &Path) -> Result<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("failed to stat {}", path.display()))?;
+    Ok(metadata.mode())
+}
+
+#[cfg(not(unix))]
+pub(super) fn local_mode(_path: &Path) -> Result<u32> {
+    Ok(0)
+}
+
+#[cfg(unix)]
+pub(super) fn remote_mode(metadata: &SftpMetadata) -> Result<u32> {
+    metadata
+        .permissions
+        .ok_or_else(|| anyhow!("remote metadata is missing permissions"))
+}
+
+#[cfg(not(unix))]
+pub(super) fn remote_mode(_metadata: &SftpMetadata) -> Result<u32> {
+    Ok(0)
+}
+
+#[cfg(unix)]
+pub(super) fn chmod_octal(mode: u32) -> String {
+    format!("{:o}", mode & 0o7777)
+}
+
+#[cfg(not(unix))]
+pub(super) fn chmod_octal(_mode: u32) -> String {
+    "0".to_string()
+}
+
+#[cfg(unix)]
+pub(super) fn apply_local_mode(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777))
+        .with_context(|| format!("failed to set permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+pub(super) fn apply_local_mode(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
 }
 
 pub(super) struct PtyShell {
@@ -567,9 +615,10 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        build_remote_command, download_destination_for_directory, extract_sentinel,
-        is_tilde_user_path, join_remote_path, maybe_local_download_target, remote_path_needs_expansion,
-        shell_quote, split_tilde_path, upload_destination_for_directory,
+        build_remote_command, chmod_octal, download_destination_for_directory,
+        extract_sentinel, is_tilde_user_path, join_remote_path, maybe_local_download_target,
+        remote_path_needs_expansion, shell_quote, split_tilde_path,
+        upload_destination_for_directory,
     };
 
     #[test]
@@ -627,5 +676,13 @@ mod tests {
         let local = maybe_local_download_target(&dir, "/root/frp.sh").unwrap();
         assert_eq!(local, dir.join("frp.sh").display().to_string());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn formats_octal_modes() {
+        assert_eq!(chmod_octal(0o100755), "755");
+        assert_eq!(chmod_octal(0o40755), "755");
+        assert_eq!(chmod_octal(0o100644), "644");
     }
 }

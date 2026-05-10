@@ -38,6 +38,9 @@
 # max_idle_time = "10m"
 # max_connections_per_ip = 10
 
+# [copy]
+# preserve_mode = true
+
 # Enable this only when a target is not reachable through ~/.ssh/config direct SSH.
 # [jumpserver]
 # enabled = true

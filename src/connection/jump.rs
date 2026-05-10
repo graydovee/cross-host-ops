@@ -17,10 +17,10 @@ use crate::protocol::ServerEvent;
 
 use super::{AuthPromptRequest, AuthPrompter, Connection};
 use super::shared::{
-    ClientHandler, PtyShell, authenticate_with_key, build_interactive_shell_command,
-    connect_handle, join_remote_path, maybe_local_download_target,
-    remote_path_needs_expansion, request_default_pty, split_tilde_path,
-    upload_destination_for_directory,
+    ClientHandler, PtyShell, apply_local_mode, authenticate_with_key,
+    build_interactive_shell_command, chmod_octal, connect_handle, join_remote_path,
+    local_mode, maybe_local_download_target, remote_path_needs_expansion,
+    request_default_pty, split_tilde_path, upload_destination_for_directory,
 };
 use super::types::{CopyDirection, CopySpec, ResolvedTarget};
 
@@ -204,7 +204,7 @@ fn upload_here_doc_command(spec: &CopySpec, marker: &str) -> String {
     }
 }
 
-fn download_command(spec: &CopySpec) -> Result<String> {
+fn download_command(spec: &CopySpec, preserve_mode: bool) -> Result<String> {
     if spec.recursive {
         let remote = Path::new(&spec.remote_path);
         let name = remote
@@ -229,10 +229,18 @@ fn download_command(spec: &CopySpec) -> Result<String> {
             shell_single_quote(&name)
         ))
     } else {
-        Ok(format!(
-            "base64 -w 0 {} ; printf '\\n'",
-            shell_single_quote(&spec.remote_path)
-        ))
+        if preserve_mode {
+            Ok(format!(
+                "printf '__RHOP_MODE__%s\\n' \"$(stat -c %a {})\"; base64 -w 0 {} ; printf '\\n'",
+                shell_single_quote(&spec.remote_path),
+                shell_single_quote(&spec.remote_path)
+            ))
+        } else {
+            Ok(format!(
+                "base64 -w 0 {} ; printf '\\n'",
+                shell_single_quote(&spec.remote_path)
+            ))
+        }
     }
 }
 
@@ -243,9 +251,14 @@ async fn build_upload_payload(spec: &CopySpec) -> Result<Vec<u8>> {
         .map_err(|error| anyhow!("upload payload task failed: {}", error))?
 }
 
-async fn consume_download_payload(spec: &CopySpec, payload: Vec<u8>) -> Result<()> {
+async fn consume_download_payload(
+    spec: &CopySpec,
+    payload: Vec<u8>,
+    preserve_mode: bool,
+    mode: Option<u32>,
+) -> Result<()> {
     let spec = spec.clone();
-    task::spawn_blocking(move || consume_download_payload_blocking(&spec, payload))
+    task::spawn_blocking(move || consume_download_payload_blocking(&spec, payload, preserve_mode, mode))
         .await
         .map_err(|error| anyhow!("download payload task failed: {}", error))?
 }
@@ -283,7 +296,12 @@ fn build_upload_payload_blocking(spec: &CopySpec) -> Result<Vec<u8>> {
     }
 }
 
-fn consume_download_payload_blocking(spec: &CopySpec, payload: Vec<u8>) -> Result<()> {
+fn consume_download_payload_blocking(
+    spec: &CopySpec,
+    payload: Vec<u8>,
+    preserve_mode: bool,
+    mode: Option<u32>,
+) -> Result<()> {
     let data = BASE64_STANDARD
         .decode(payload)
         .context("failed to decode base64 download payload")?;
@@ -317,8 +335,26 @@ fn consume_download_payload_blocking(spec: &CopySpec, payload: Vec<u8>) -> Resul
         }
         std::fs::write(&spec.local_path, data)
             .with_context(|| format!("failed to write {}", spec.local_path))?;
+        if preserve_mode {
+            if let Some(mode) = mode {
+                apply_local_mode(Path::new(&spec.local_path), mode)?;
+            }
+        }
         Ok(())
     }
+}
+
+fn parse_mode_header(payload: Vec<u8>) -> Result<(Option<u32>, Vec<u8>)> {
+    let text = String::from_utf8_lossy(&payload);
+    let Some(rest) = text.strip_prefix("__RHOP_MODE__") else {
+        return Ok((None, strip_trailing_newlines(payload)));
+    };
+    let Some((mode_line, remaining)) = rest.split_once('\n') else {
+        bail!("missing mode header terminator");
+    };
+    let mode = u32::from_str_radix(mode_line.trim(), 8)
+        .with_context(|| format!("invalid remote mode {}", mode_line.trim()))?;
+    Ok((Some(mode), strip_trailing_newlines(remaining.as_bytes().to_vec())))
 }
 
 fn strip_trailing_newlines(mut bytes: Vec<u8>) -> Vec<u8> {
@@ -349,17 +385,17 @@ impl Connection for JumpSshConnection {
             .await
     }
 
-    async fn copy(&mut self, spec: &CopySpec, _config: &AppConfig) -> Result<()> {
+    async fn copy(&mut self, spec: &CopySpec, config: &AppConfig) -> Result<()> {
         validate_copy_spec(spec)?;
         match spec.direction {
-            CopyDirection::Upload => self.copy_upload(spec).await,
-            CopyDirection::Download => self.copy_download(spec).await,
+            CopyDirection::Upload => self.copy_upload(spec, config.copy.preserve_mode).await,
+            CopyDirection::Download => self.copy_download(spec, config.copy.preserve_mode).await,
         }
     }
 }
 
 impl JumpSshConnection {
-    async fn copy_upload(&mut self, spec: &CopySpec) -> Result<()> {
+    async fn copy_upload(&mut self, spec: &CopySpec, preserve_mode: bool) -> Result<()> {
         let local = Path::new(&spec.local_path);
         let remote_path = self
             .normalize_remote_upload_path(spec, local)
@@ -367,18 +403,27 @@ impl JumpSshConnection {
         let mut spec = spec.clone();
         spec.remote_path = remote_path;
         let payload = build_upload_payload(&spec).await?;
-        let command = upload_here_doc_command(&spec, "{}");
+        let command = if preserve_mode && !spec.recursive {
+            format!(
+                "{}; chmod {} {}",
+                upload_here_doc_command(&spec, "{}"),
+                chmod_octal(local_mode(local)?),
+                shell_single_quote(&spec.remote_path)
+            )
+        } else {
+            upload_here_doc_command(&spec, "{}")
+        };
         self.run_shell_heredoc_upload(&command, &payload, COPY_HEREDOC_PREFIX)
             .await
     }
 
-    async fn copy_download(&mut self, spec: &CopySpec) -> Result<()> {
+    async fn copy_download(&mut self, spec: &CopySpec, preserve_mode: bool) -> Result<()> {
         let remote_path = self.expand_remote_copy_path(&spec.remote_path).await?;
         let local_path = maybe_local_download_target(Path::new(&spec.local_path), &remote_path)?;
         let mut spec = spec.clone();
         spec.remote_path = remote_path;
         spec.local_path = local_path;
-        let command = download_command(&spec)?;
+        let command = download_command(&spec, preserve_mode)?;
         let outcome = self
             .run_shell_command_capture(&command, COPY_SENTINEL_PREFIX)
             .await?;
@@ -388,7 +433,12 @@ impl JumpSshConnection {
                 outcome.exit_code
             );
         }
-        consume_download_payload(&spec, strip_trailing_newlines(outcome.payload)).await
+        let (mode, payload) = if preserve_mode && !spec.recursive {
+            parse_mode_header(outcome.payload)?
+        } else {
+            (None, strip_trailing_newlines(outcome.payload))
+        };
+        consume_download_payload(&spec, payload, preserve_mode, mode).await
     }
 
     async fn stream_shell_payload(&mut self, payload: &[u8]) -> Result<()> {

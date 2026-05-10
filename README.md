@@ -10,6 +10,8 @@
 
 CLI 通过本地 `gRPC over Unix socket` 或远程 `gRPC over SSH subsystem` 与 daemon 通信。daemon 负责 SSH 连接管理、连接池、可选 `server.toml` 目标解析、可选 jumpserver、可选 LLM 命令审查，以及远端输出流式转发。
 
+`rhop cp` 默认会尽量对齐 `scp` 语义：支持 remote `~` / `~user` 展开、目录目标自动拼接 basename，并默认保留文件 mode；可通过配置关闭 mode 保留。
+
 ## 功能
 
 - CLI 用法：`rhop exec <target> <cmd> [arg...]`

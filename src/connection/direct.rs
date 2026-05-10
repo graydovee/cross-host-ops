@@ -4,6 +4,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use russh::ChannelMsg;
 use russh::client::Handle;
 use russh_sftp::client::SftpSession;
+use russh_sftp::protocol::OpenFlags;
+use russh_sftp::protocol::FileAttributes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -12,10 +14,11 @@ use crate::protocol::ServerEvent;
 
 use super::Connection;
 use super::shared::{
-    ClientHandler, PtyShell, authenticate_with_key, authenticate_with_password,
+    ClientHandler, PtyShell, apply_local_mode, authenticate_with_key, authenticate_with_password,
     build_interactive_shell_command, build_remote_command, connect_handle,
-    join_remote_path, maybe_local_download_target, remote_path_needs_expansion,
-    request_default_pty, split_tilde_path, upload_destination_for_directory,
+    join_remote_path, local_mode, maybe_local_download_target, remote_mode,
+    remote_path_needs_expansion, request_default_pty, split_tilde_path,
+    upload_destination_for_directory,
 };
 use super::AuthPrompter;
 use super::types::{CopyDirection, CopySpec, DirectTarget};
@@ -72,10 +75,10 @@ impl Connection for DirectSshConnection {
         self.execute_without_pty(&command, sender).await
     }
 
-    async fn copy(&mut self, spec: &CopySpec, _config: &AppConfig) -> Result<()> {
+    async fn copy(&mut self, spec: &CopySpec, config: &AppConfig) -> Result<()> {
         match spec.direction {
-            CopyDirection::Upload => self.copy_upload(spec).await,
-            CopyDirection::Download => self.copy_download(spec).await,
+            CopyDirection::Upload => self.copy_upload(spec, config).await,
+            CopyDirection::Download => self.copy_download(spec, config).await,
         }
     }
 }
@@ -152,7 +155,7 @@ async fn probe_session(handle: &mut Handle<ClientHandler>) -> Result<()> {
 }
 
 impl DirectSshConnection {
-    async fn copy_upload(&mut self, spec: &CopySpec) -> Result<()> {
+    async fn copy_upload(&mut self, spec: &CopySpec, config: &AppConfig) -> Result<()> {
         validate_direct_copy_spec(spec)?;
         let sftp = self.open_sftp().await?;
         let local = PathBuf::from(&spec.local_path);
@@ -160,13 +163,13 @@ impl DirectSshConnection {
             .normalize_remote_upload_path(spec, &local, &sftp)
             .await?;
         if spec.recursive {
-            copy_local_dir_to_remote(&sftp, &local, Path::new(&remote_path)).await
+            copy_local_dir_to_remote(&sftp, &local, Path::new(&remote_path), config.copy.preserve_mode).await
         } else {
-            copy_local_file_to_remote(&sftp, &local, Path::new(&remote_path)).await
+            copy_local_file_to_remote(&sftp, &local, Path::new(&remote_path), config.copy.preserve_mode).await
         }
     }
 
-    async fn copy_download(&mut self, spec: &CopySpec) -> Result<()> {
+    async fn copy_download(&mut self, spec: &CopySpec, config: &AppConfig) -> Result<()> {
         validate_direct_copy_spec(spec)?;
         let sftp = self.open_sftp().await?;
         let remote_path = self.expand_remote_copy_path(&spec.remote_path).await?;
@@ -183,9 +186,9 @@ impl DirectSshConnection {
             if !spec.recursive {
                 bail!("copying a remote directory requires -r");
             }
-            copy_remote_dir_to_local(&sftp, remote, &local).await
+            copy_remote_dir_to_local(&sftp, remote, &local, config.copy.preserve_mode).await
         } else {
-            copy_remote_file_to_local(&sftp, remote, &local).await
+            copy_remote_file_to_local(&sftp, remote, &local, config.copy.preserve_mode).await
         }
     }
 
@@ -275,27 +278,58 @@ fn validate_direct_copy_spec(spec: &CopySpec) -> Result<()> {
     Ok(())
 }
 
-async fn copy_local_file_to_remote(sftp: &SftpSession, local: &Path, remote: &Path) -> Result<()> {
+async fn copy_local_file_to_remote(
+    sftp: &SftpSession,
+    local: &Path,
+    remote: &Path,
+    preserve_mode: bool,
+) -> Result<()> {
     let bytes = tokio::fs::read(local)
         .await
         .with_context(|| format!("failed to read {}", local.display()))?;
     if let Some(parent) = remote.parent() {
         create_remote_dirs(sftp, parent).await?;
     }
-    let mut file = sftp
-        .create(path_to_string(remote)?)
+    let mut file = if preserve_mode {
+        let mut attrs = FileAttributes::empty();
+        attrs.permissions = Some(local_mode(local)?);
+        sftp.open_with_flags_and_attributes(
+            path_to_string(remote)?,
+            OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+            attrs,
+        )
         .await
-        .with_context(|| format!("failed to create remote {}", remote.display()))?;
+        .with_context(|| format!("failed to create remote {}", remote.display()))?
+    } else {
+        sftp.create(path_to_string(remote)?)
+            .await
+            .with_context(|| format!("failed to create remote {}", remote.display()))?
+    };
     file.write_all(&bytes).await?;
+    if preserve_mode {
+        let mut attrs = file.metadata().await?;
+        attrs.permissions = Some(local_mode(local)?);
+        file.set_metadata(attrs).await?;
+    }
     file.shutdown().await?;
     Ok(())
 }
 
-async fn copy_remote_file_to_local(sftp: &SftpSession, remote: &Path, local: &Path) -> Result<()> {
+async fn copy_remote_file_to_local(
+    sftp: &SftpSession,
+    remote: &Path,
+    local: &Path,
+    preserve_mode: bool,
+) -> Result<()> {
     let mut file = sftp
         .open(path_to_string(remote)?)
         .await
         .with_context(|| format!("failed to open remote {}", remote.display()))?;
+    let mode = if preserve_mode {
+        Some(remote_mode(&file.metadata().await?)?)
+    } else {
+        None
+    };
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).await?;
     if let Some(parent) = local.parent() {
@@ -306,6 +340,9 @@ async fn copy_remote_file_to_local(sftp: &SftpSession, remote: &Path, local: &Pa
     tokio::fs::write(local, bytes)
         .await
         .with_context(|| format!("failed to write {}", local.display()))?;
+    if let Some(mode) = mode {
+        apply_local_mode(local, mode)?;
+    }
     Ok(())
 }
 
@@ -313,15 +350,20 @@ async fn copy_local_dir_to_remote(
     sftp: &SftpSession,
     local_root: &Path,
     remote_root: &Path,
+    preserve_mode: bool,
 ) -> Result<()> {
     create_remote_dirs(sftp, remote_root).await?;
-    copy_local_dir_to_remote_recursive(sftp, local_root, remote_root).await
+    if preserve_mode {
+        set_remote_path_mode(sftp, remote_root, local_mode(local_root)?).await?;
+    }
+    copy_local_dir_to_remote_recursive(sftp, local_root, remote_root, preserve_mode).await
 }
 
 async fn copy_local_dir_to_remote_recursive(
     sftp: &SftpSession,
     local_dir: &Path,
     remote_dir: &Path,
+    preserve_mode: bool,
 ) -> Result<()> {
     let mut entries = tokio::fs::read_dir(local_dir).await?;
     while let Some(entry) = entries.next_entry().await? {
@@ -330,14 +372,18 @@ async fn copy_local_dir_to_remote_recursive(
         let remote_path = remote_dir.join(entry.file_name());
         if file_type.is_dir() {
             create_remote_dirs(sftp, &remote_path).await?;
+            if preserve_mode {
+                set_remote_path_mode(sftp, &remote_path, local_mode(&local_path)?).await?;
+            }
             Box::pin(copy_local_dir_to_remote_recursive(
                 sftp,
                 &local_path,
                 &remote_path,
+                preserve_mode,
             ))
             .await?;
         } else if file_type.is_file() {
-            copy_local_file_to_remote(sftp, &local_path, &remote_path).await?;
+            copy_local_file_to_remote(sftp, &local_path, &remote_path, preserve_mode).await?;
         }
     }
     Ok(())
@@ -347,12 +393,18 @@ async fn copy_remote_dir_to_local(
     sftp: &SftpSession,
     remote_root: &Path,
     local_root: &Path,
+    preserve_mode: bool,
 ) -> Result<()> {
     tokio::fs::create_dir_all(local_root).await?;
+    if preserve_mode {
+        let mode = remote_mode(&sftp.metadata(path_to_string(remote_root)?).await?)?;
+        apply_local_mode(local_root, mode)?;
+    }
     Box::pin(copy_remote_dir_to_local_recursive(
         sftp,
         remote_root,
         local_root,
+        preserve_mode,
     ))
     .await
 }
@@ -361,6 +413,7 @@ async fn copy_remote_dir_to_local_recursive(
     sftp: &SftpSession,
     remote_dir: &Path,
     local_dir: &Path,
+    preserve_mode: bool,
 ) -> Result<()> {
     let mut entries = sftp
         .read_dir(path_to_string(remote_dir)?)
@@ -376,14 +429,19 @@ async fn copy_remote_dir_to_local_recursive(
         let metadata = entry.metadata();
         if metadata.is_dir() {
             tokio::fs::create_dir_all(&local_path).await?;
+            if preserve_mode {
+                let mode = remote_mode(&metadata)?;
+                apply_local_mode(&local_path, mode)?;
+            }
             Box::pin(copy_remote_dir_to_local_recursive(
                 sftp,
                 &remote_path,
                 &local_path,
+                preserve_mode,
             ))
             .await?;
         } else {
-            copy_remote_file_to_local(sftp, &remote_path, &local_path).await?;
+            copy_remote_file_to_local(sftp, &remote_path, &local_path, preserve_mode).await?;
         }
     }
     Ok(())
@@ -398,11 +456,19 @@ async fn create_remote_dirs(sftp: &SftpSession, remote_path: &Path) -> Result<()
         }
         let current_str = path_to_string(&current)?;
         if !sftp.try_exists(current_str.clone()).await? {
-            sftp.create_dir(current_str)
+            sftp.create_dir(current_str.clone())
                 .await
                 .with_context(|| format!("failed to create remote dir {}", current.display()))?;
         }
     }
+    Ok(())
+}
+
+async fn set_remote_path_mode(sftp: &SftpSession, remote_path: &Path, mode: u32) -> Result<()> {
+    let remote = path_to_string(remote_path)?;
+    let mut attrs = sftp.metadata(remote.clone()).await?;
+    attrs.permissions = Some(mode);
+    sftp.set_metadata(remote, attrs).await?;
     Ok(())
 }
 
