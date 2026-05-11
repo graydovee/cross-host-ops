@@ -1,0 +1,13 @@
+[Unit]
+Description=Remote Hop daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rhopd --config /etc/rhop/config.toml --origin external
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

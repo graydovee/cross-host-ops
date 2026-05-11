@@ -12,10 +12,6 @@ name = "rhop"
 path = "src/bin/rhop.rs"
 
 [[bin]]
-name = "rhup"
-path = "src/bin/rhup.rs"
-
-[[bin]]
 name = "rhopd"
 path = "src/bin/rhopd.rs"
 

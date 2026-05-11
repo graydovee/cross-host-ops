@@ -1,0 +1,6 @@
+.git
+target
+logs
+config.toml
+server.toml
+README.md

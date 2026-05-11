@@ -5,7 +5,6 @@
 它拆分为两个二进制：
 
 - `rhop`：CLI 前端
-- `rhup`：CLI 前端别名
 - `rhopd`：本地 daemon 后端
 
 CLI 通过本地 `gRPC over Unix socket` 或远程 `gRPC over SSH subsystem` 与 daemon 通信。daemon 负责 SSH 连接管理、连接池、可选 `server.toml` 目标解析、可选 jumpserver、可选 LLM 命令审查，以及远端输出流式转发。
@@ -60,10 +59,70 @@ cargo build
 
 daemon 管理保护：
 
-- 由 `rhop`/`rhup` 拉起的 daemon 会标记为 `cli_spawned`
+- 由 `rhop` 拉起的 daemon 会标记为 `cli_spawned`
 - 由 systemd、docker 或手工 `rhopd` 启动的 daemon 会标记为 `external`
 - 只有 `cli_spawned` 的 daemon 允许执行 `daemon stop` 和 `daemon restart`
 - 可通过 `rhop status` 查看 `daemon_origin`、`cli_controllable` 和记录的 CLI 启动参数
+
+### systemd
+
+如果你想用 systemd 托管 `rhopd`：
+
+- 配置目录放在 `/etc/rhop`
+- 配置文件路径是 `/etc/rhop/config.toml`
+- 可直接使用仓库里的 unit 模板：
+  - [packaging/systemd/rhopd.service](/home/graydove/projects/remote-hop/packaging/systemd/rhopd.service)
+
+典型安装步骤：
+
+```bash
+sudo install -d /etc/rhop
+sudo install -m 0644 config.example.toml /etc/rhop/config.toml
+sudo install -m 0755 target/release/rhopd /usr/local/bin/rhopd
+sudo install -m 0644 packaging/systemd/rhopd.service /etc/systemd/system/rhopd.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now rhopd
+```
+
+systemd 应以前台方式运行 `rhopd`，不要在 unit 里传 `--daemon`。
+
+### Docker
+
+仓库根目录提供了一个二阶段构建的 `Dockerfile`，最终镜像包含 `rhop` 和 `rhopd`，并保持较小体积。
+
+构建镜像：
+
+```bash
+docker build -t rhopd:latest .
+```
+
+运行示例：
+
+```bash
+docker run --rm \
+  -p 2222:2222 \
+  -v /etc/rhop:/etc/rhop \
+  rhopd:latest
+```
+
+容器默认执行：
+
+```bash
+/usr/local/bin/rhopd --config /etc/rhop/config.toml --origin external
+```
+
+### Release
+
+使用 `v*` tag（例如 `v0.1.0`）推送到 GitHub 后，会自动触发 GitHub Actions：
+
+- 构建并发布 GHCR 多架构镜像：
+  - `linux/amd64`
+  - `linux/arm64`
+- 构建并发布 GitHub Release 二进制 tar.gz：
+  - `x86_64-unknown-linux-gnu`
+  - `aarch64-unknown-linux-gnu`
+  - `x86_64-apple-darwin`
+  - `aarch64-apple-darwin`
 
 ## 工作方式
 
