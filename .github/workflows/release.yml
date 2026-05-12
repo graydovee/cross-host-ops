@@ -32,7 +32,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -64,9 +64,9 @@ jobs:
           tar -czf "${PKG}.tar.gz" "${PKG}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
-          name: ${{ matrix.target }}
+          name: release-${{ matrix.target }}
           path: remote-hop-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
 
   docker-ghcr:
@@ -74,7 +74,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -100,6 +100,8 @@ jobs:
 
       - name: Build and push image
         uses: docker/build-push-action@v6
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -115,8 +117,10 @@ jobs:
       - docker-ghcr
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
+          pattern: release-*
+          merge-multiple: true
           path: dist
 
       - name: Publish release
