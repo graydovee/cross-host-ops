@@ -31,6 +31,10 @@ impl fmt::Display for TargetTransport {
     }
 }
 
+#[deprecated(
+    since = "0.1.0",
+    note = "Use `Resolver::resolve` returning `Vec<TargetRoute>` instead. Will be removed once all callers migrate."
+)]
 #[derive(Clone, Debug)]
 pub struct ResolvedTarget {
     pub input: String,

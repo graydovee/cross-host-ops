@@ -1,17 +1,13 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
-use hyper_util::rt::TokioIo;
 use russh::client;
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, known_hosts, load_secret_key, ssh_key};
-use tonic::transport::{Channel, Endpoint, Uri};
-use tower::service_fn;
 
 use crate::config::{
-    ClientConfig, ClientMode, RemoteClientConfig, default_known_hosts_path, expand_tilde,
+    ClientConfig, default_known_hosts_path, expand_tilde,
 };
-use crate::protocol::rpc;
 
 const REMOTE_SUBSYSTEM_NAME: &str = "rhop-rpc";
 const DEFAULT_REMOTE_PORT: u16 = 2222;
@@ -78,14 +74,6 @@ pub fn load_client_config() -> Result<ClientConfig> {
     ClientConfig::load()
 }
 
-pub fn save_client_config(config: &ClientConfig) -> Result<()> {
-    config.save()
-}
-
-pub fn client_mode(config: &ClientConfig) -> ClientMode {
-    config.mode.clone()
-}
-
 pub fn parse_remote_target(input: &str) -> Result<RemoteTarget> {
     if input.trim().is_empty() {
         bail!("remote target must not be empty");
@@ -113,22 +101,6 @@ pub fn parse_remote_target(input: &str) -> Result<RemoteTarget> {
     Ok(RemoteTarget { host, port, user })
 }
 
-pub fn apply_remote_target(config: &mut ClientConfig, target: &RemoteTarget) {
-    config.remote.address = target.address();
-    config.remote.user = target.user.clone();
-}
-
-pub fn enable_remote_mode(config: &mut ClientConfig) -> Result<()> {
-    if !config.remote.is_configured() {
-        bail!("no remote daemon configured; run `rhop remote connect <host>` first");
-    }
-    config.mode = ClientMode::Remote;
-    Ok(())
-}
-
-pub fn disable_remote_mode(config: &mut ClientConfig) {
-    config.mode = ClientMode::Local;
-}
 
 pub fn normalize_remote_paths(
     identity_file: Option<String>,
@@ -190,61 +162,6 @@ pub async fn fetch_remote_host_key(target: &RemoteTarget, identity_file: &str) -
     Ok(key)
 }
 
-pub async fn connect_remote_client(
-    config: &RemoteClientConfig,
-) -> Result<rpc::rhop_rpc_client::RhopRpcClient<Channel>> {
-    let config = config.clone();
-    let endpoint = Endpoint::from_static("http://[::]:50051");
-    let channel = endpoint
-        .connect_with_connector(service_fn(move |_: Uri| {
-            let config = config.clone();
-            async move { connect_remote_stream(&config).await }
-        }))
-        .await?;
-    Ok(rpc::rhop_rpc_client::RhopRpcClient::new(channel))
-}
-
-pub fn remote_target_from_config(config: &RemoteClientConfig) -> Result<RemoteTarget> {
-    if config.address.trim().is_empty() {
-        bail!("no remote daemon configured; run `rhop remote connect <host>` first");
-    }
-    let address = if config.user.trim().is_empty() {
-        config.address.clone()
-    } else {
-        format!("{}@{}", config.user, config.address)
-    };
-    parse_remote_target(&address)
-}
-
-async fn connect_remote_stream(
-    config: &RemoteClientConfig,
-) -> Result<TokioIo<russh::ChannelStream<russh::client::Msg>>> {
-    let target = remote_target_from_config(config)?;
-    let expected_host_key =
-        load_known_host_key(&target, Path::new(&config.known_hosts_path))?;
-    let shared = Arc::new(Mutex::new(HostKeyState {
-        expected: Some(expected_host_key),
-        seen: None,
-    }));
-    let handler = RemoteClientHandler {
-        shared: shared.clone(),
-    };
-    let client_config = Arc::new(client::Config::default());
-    let mut handle = client::connect(client_config, (target.host.as_str(), target.port), handler)
-        .await
-        .with_context(|| format!("failed to connect to {}", target.address()))?;
-    authenticate_remote_handle(&mut handle, &target.user, &config.identity_file).await?;
-    let channel = handle
-        .channel_open_session()
-        .await
-        .context("failed to open SSH session channel")?;
-    channel
-        .request_subsystem(true, REMOTE_SUBSYSTEM_NAME)
-        .await
-        .context("failed to request rhop-rpc subsystem")?;
-    let _ = handle; // Keep SSH session alive until stream closes.
-    Ok(TokioIo::new(channel.into_stream()))
-}
 
 async fn authenticate_remote_handle(
     handle: &mut client::Handle<RemoteClientHandler>,
@@ -264,27 +181,6 @@ async fn authenticate_remote_handle(
         return Ok(());
     }
     bail!("SSH publickey authentication failed for {}", user)
-}
-
-fn load_known_host_key(target: &RemoteTarget, path: &Path) -> Result<ssh_key::PublicKey> {
-    let entries = known_hosts::known_host_keys_path(&target.host, target.port, path)
-        .map_err(|error| anyhow!("failed to read known_hosts: {}", error))?;
-    if entries.is_empty() {
-        bail!(
-            "unknown host {}; run `rhop remote connect {}` first",
-            target.address(),
-            target.address()
-        );
-    }
-    Ok(entries[0].1.clone())
-}
-
-pub fn known_hosts_path(config: &ClientConfig) -> PathBuf {
-    PathBuf::from(&config.remote.known_hosts_path)
-}
-
-pub fn identity_file(config: &ClientConfig) -> &str {
-    &config.remote.identity_file
 }
 
 #[cfg(test)]

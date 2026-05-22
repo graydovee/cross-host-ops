@@ -10,6 +10,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task;
 use tracing::{debug, info};
 
+#[allow(deprecated)]
 use crate::config::{
     AppConfig, JumpserverConfig, MfaConfig, SshHostEntry, parse_ssh_config, resolve_ssh_host,
 };
@@ -22,6 +23,7 @@ use super::shared::{
     local_mode, maybe_local_download_target, remote_path_needs_expansion,
     request_default_pty, split_tilde_path, upload_destination_for_directory,
 };
+#[allow(deprecated)]
 use super::types::{CopyDirection, CopySpec, ResolvedTarget};
 
 const EXEC_SENTINEL_PREFIX: &str = "__ARUN_EXEC__";
@@ -38,6 +40,7 @@ pub struct JumpSshConnection {
     shell: PtyShell,
 }
 
+#[allow(deprecated)]
 impl JumpSshConnection {
     pub async fn connect(
         target: &ResolvedTarget,
@@ -518,6 +521,7 @@ impl JumpSshConnection {
     }
 }
 
+#[allow(deprecated)]
 fn merge_jumpserver_target(config: &AppConfig) -> Result<JumpserverConfig> {
     let mut jump = config.jumpserver.clone();
     if jump.host.is_empty() {
@@ -536,6 +540,7 @@ fn merge_jumpserver_target(config: &AppConfig) -> Result<JumpserverConfig> {
     Ok(jump)
 }
 
+#[allow(deprecated)]
 fn apply_jumpserver_host_defaults(jump: &mut JumpserverConfig, host: &SshHostEntry) {
     if jump.port == 22 {
         if let Some(port) = host.port {

@@ -9,6 +9,8 @@ service RhopRpc {
   rpc ListConfig(ConfigListRequest) returns (ConfigListResponse);
   rpc ListServers(ServerListRequest) returns (ServerListResponse);
   rpc Shutdown(ShutdownRequest) returns (InfoResponse);
+  rpc UpdateConfig(UpdateConfigRequest) returns (UpdateConfigResponse);
+  rpc ListJumpHosts(ListJumpHostsRequest) returns (ListJumpHostsResponse);
 }
 
 message ExecuteRequest {
@@ -120,6 +122,7 @@ message InfoResponse {
 
 message StatusRequest {}
 
+// Deprecated: use ListJumpHosts instead
 message ConfigListRequest {}
 
 message ServerListRequest {}
@@ -135,12 +138,12 @@ message StatusResponse {
   bool cli_controllable = 6;
   string cli_start_config_path = 7;
   string cli_start_log_level = 8;
-  bool local_enabled = 9;
-  bool remote_enabled = 10;
-  string remote_listen_addr = 11;
-  string remote_user = 12;
+  reserved 9, 10, 11, 12;
+  reserved "local_enabled", "remote_enabled", "remote_listen_addr", "remote_user";
+  repeated JumpHostStatus jump_hosts = 13;
 }
 
+// Deprecated: use ListJumpHosts instead
 message ConfigListResponse {
   string config_path = 1;
   string server_config_path = 2;
@@ -160,6 +163,7 @@ message ConfigListResponse {
 message ServerListResponse {
   string server_config_path = 1;
   repeated ServerEntry servers = 2;
+  MergedServerList merged = 3;
 }
 
 message ServerEntry {
@@ -176,4 +180,47 @@ message PoolStatus {
   uint64 busy = 3;
   uint64 idle = 4;
   uint64 queued = 5;
+}
+
+message JumpHostStatus {
+  string alias = 1;
+  string kind = 2;
+  string address = 3;
+  StatusResponse sub_status = 4;
+}
+
+message MergedServerList {
+  repeated ServerListRow rows = 1;
+  repeated SourceStatus source_status = 2;
+}
+
+message ServerListRow {
+  ServerEntry server = 1;
+  string source = 2;
+}
+
+message SourceStatus {
+  string source = 1;
+  string status = 2;
+  string detail = 3;
+}
+
+message UpdateConfigRequest {
+  string mutation_type = 1;
+  string alias = 2;
+  string kind = 3;
+  string address = 4;
+  string identity_file = 5;
+  string known_hosts_path = 6;
+}
+
+message UpdateConfigResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message ListJumpHostsRequest {}
+
+message ListJumpHostsResponse {
+  repeated JumpHostStatus jump_hosts = 1;
 }

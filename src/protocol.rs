@@ -1,8 +1,9 @@
 use anyhow::{Result, anyhow};
 use uuid::Uuid;
 
-use crate::config::{ReviewAction, RiskLevel};
+use crate::config::{ReviewAction, RiskLevel, ServerEntry};
 use crate::connection::{CopyDirection, CopySpec};
+use crate::jump::ServerListSource;
 
 pub mod rpc {
     tonic::include_proto!("rhop.rpc");
@@ -215,5 +216,174 @@ pub fn copy_error_response(message: impl Into<String>) -> rpc::CopyResponse {
         event: Some(rpc::copy_response::Event::Error(rpc::ErrorResponse {
             message: message.into(),
         })),
+    }
+}
+
+// --- JumpHostStatus helpers ---
+
+/// Domain representation of a jump host's status, including optional nested
+/// sub-status from a remote daemon.
+#[derive(Clone, Debug)]
+pub struct JumpHostStatus {
+    pub alias: String,
+    pub kind: String,
+    pub address: String,
+    pub sub_status: Option<Box<rpc::StatusResponse>>,
+}
+
+pub fn jump_host_status_to_rpc(status: JumpHostStatus) -> rpc::JumpHostStatus {
+    rpc::JumpHostStatus {
+        alias: status.alias,
+        kind: status.kind,
+        address: status.address,
+        sub_status: status.sub_status.map(|s| *s),
+    }
+}
+
+pub fn jump_host_status_from_rpc(rpc_status: rpc::JumpHostStatus) -> JumpHostStatus {
+    JumpHostStatus {
+        alias: rpc_status.alias,
+        kind: rpc_status.kind,
+        address: rpc_status.address,
+        sub_status: rpc_status.sub_status.map(Box::new),
+    }
+}
+
+// --- ServerEntry helpers ---
+
+pub fn server_entry_to_rpc(entry: ServerEntry) -> rpc::ServerEntry {
+    let auth_kind = entry.auth_kind().to_string();
+    rpc::ServerEntry {
+        alias: entry.alias,
+        host: entry.host,
+        port: entry.port as u32,
+        user: entry.user,
+        auth_kind,
+    }
+}
+
+pub fn server_entry_from_rpc(entry: rpc::ServerEntry) -> ServerEntry {
+    use crate::config::DirectAuth;
+    ServerEntry {
+        alias: entry.alias,
+        host: entry.host,
+        port: entry.port as u16,
+        user: entry.user,
+        auth: match entry.auth_kind.as_str() {
+            "password" => DirectAuth::Password {
+                password: String::new(),
+            },
+            _ => DirectAuth::Key {
+                identity_file: String::new(),
+            },
+        },
+    }
+}
+
+// --- MergedServerList / ServerListRow / SourceStatus helpers ---
+
+/// Domain representation of a source's status in the merged server list.
+#[derive(Clone, Debug)]
+pub enum ServerListSourceStatus {
+    Ok,
+    Unsupported,
+    Error(String),
+}
+
+/// Domain representation of a single row in the merged server list.
+#[derive(Clone, Debug)]
+pub struct ServerListRow {
+    pub source: ServerListSource,
+    pub server: ServerEntry,
+}
+
+/// Domain representation of the merged server list response.
+#[derive(Clone, Debug)]
+pub struct MergedServerList {
+    pub rows: Vec<ServerListRow>,
+    pub source_status: Vec<(ServerListSource, ServerListSourceStatus)>,
+}
+
+pub fn server_list_source_to_string(source: &ServerListSource) -> String {
+    match source {
+        ServerListSource::Local => "local".to_string(),
+        ServerListSource::JumpHost(alias) => alias.clone(),
+    }
+}
+
+pub fn server_list_source_from_string(s: &str) -> ServerListSource {
+    if s == "local" {
+        ServerListSource::Local
+    } else {
+        ServerListSource::JumpHost(s.to_string())
+    }
+}
+
+pub fn source_status_to_rpc(
+    source: &ServerListSource,
+    status: &ServerListSourceStatus,
+) -> rpc::SourceStatus {
+    let (status_str, detail) = match status {
+        ServerListSourceStatus::Ok => ("ok".to_string(), String::new()),
+        ServerListSourceStatus::Unsupported => ("unsupported".to_string(), String::new()),
+        ServerListSourceStatus::Error(msg) => ("error".to_string(), msg.clone()),
+    };
+    rpc::SourceStatus {
+        source: server_list_source_to_string(source),
+        status: status_str,
+        detail,
+    }
+}
+
+pub fn source_status_from_rpc(
+    rpc_status: rpc::SourceStatus,
+) -> (ServerListSource, ServerListSourceStatus) {
+    let source = server_list_source_from_string(&rpc_status.source);
+    let status = match rpc_status.status.as_str() {
+        "ok" => ServerListSourceStatus::Ok,
+        "unsupported" => ServerListSourceStatus::Unsupported,
+        _ => ServerListSourceStatus::Error(rpc_status.detail),
+    };
+    (source, status)
+}
+
+pub fn server_list_row_to_rpc(row: ServerListRow) -> rpc::ServerListRow {
+    rpc::ServerListRow {
+        server: Some(server_entry_to_rpc(row.server)),
+        source: server_list_source_to_string(&row.source),
+    }
+}
+
+pub fn server_list_row_from_rpc(rpc_row: rpc::ServerListRow) -> Option<ServerListRow> {
+    let server_entry = rpc_row.server?;
+    Some(ServerListRow {
+        source: server_list_source_from_string(&rpc_row.source),
+        server: server_entry_from_rpc(server_entry),
+    })
+}
+
+pub fn merged_server_list_to_rpc(list: MergedServerList) -> rpc::MergedServerList {
+    rpc::MergedServerList {
+        rows: list.rows.into_iter().map(server_list_row_to_rpc).collect(),
+        source_status: list
+            .source_status
+            .iter()
+            .map(|(source, status)| source_status_to_rpc(source, status))
+            .collect(),
+    }
+}
+
+pub fn merged_server_list_from_rpc(rpc_list: rpc::MergedServerList) -> MergedServerList {
+    MergedServerList {
+        rows: rpc_list
+            .rows
+            .into_iter()
+            .filter_map(server_list_row_from_rpc)
+            .collect(),
+        source_status: rpc_list
+            .source_status
+            .into_iter()
+            .map(source_status_from_rpc)
+            .collect(),
     }
 }

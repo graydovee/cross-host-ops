@@ -8,14 +8,69 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, mpsc::UnboundedSender};
 use tracing::info;
 
 use crate::config::AppConfig;
-use crate::connection::{AuthPrompter, Connection, CopySpec, ResolvedTarget, connect};
+#[allow(deprecated)]
+use crate::connection::resolver::to_target_route;
+#[allow(deprecated)]
+use crate::connection::{AuthPrompter, CopySpec, ResolvedTarget, TargetTransport};
+use crate::jump::{JumpHost, JumpHostKind};
+use crate::jump::direct::DirectJumpHost;
+use crate::jump::jumpserver::JumpserverJumpHost;
+use crate::jump::types::EndTargetId;
 use crate::protocol::PoolStatus;
 use crate::protocol::ServerEvent;
+
+/// Key used to look up a sub-pool in the connection pool.
+///
+/// Direct routes are keyed by end-target so two direct SSH connections to the
+/// same end target share a slot, but different end targets do not.
+///
+/// All other kinds are keyed solely by jump-host alias. The same alias always
+/// shares a slot; the pool transparently multiplexes requests for different end
+/// targets on it.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum PoolKey {
+    /// Direct routes have no jump-host alias; key by end-target so two direct
+    /// SSH connections to the same end target share a slot, but different end
+    /// targets do not.
+    Direct { end_target: EndTargetId },
+    /// Every other kind is keyed solely by jump-host alias. The same alias
+    /// always shares a slot; the pool transparently multiplexes requests for
+    /// different end targets on it.
+    Aliased { alias: String, kind: JumpHostKind },
+}
+
+impl std::fmt::Display for PoolKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PoolKey::Direct { end_target } => write!(f, "direct:{}", end_target.0),
+            PoolKey::Aliased { alias, kind } => write!(f, "{}:{}", kind, alias),
+        }
+    }
+}
+
+/// Derive a `PoolKey` from a `ResolvedTarget` using the target route logic.
+#[allow(deprecated)]
+fn pool_key_for_target(target: &ResolvedTarget) -> PoolKey {
+    let route = to_target_route(target);
+    if route.hops.is_empty() {
+        // Direct route: key by end-target
+        PoolKey::Direct {
+            end_target: route.end_target.id,
+        }
+    } else {
+        // Aliased route: key by first hop's alias + kind
+        let hop = &route.hops[0];
+        PoolKey::Aliased {
+            alias: hop.alias.clone(),
+            kind: hop.kind,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct ConnectionPool {
     config: Arc<RwLock<AppConfig>>,
-    pools: Arc<Mutex<HashMap<String, Arc<TargetPool>>>>,
+    pools: Arc<Mutex<HashMap<PoolKey, Arc<TargetPool>>>>,
 }
 
 impl ConnectionPool {
@@ -26,6 +81,7 @@ impl ConnectionPool {
         }
     }
 
+    #[allow(deprecated)]
     pub async fn execute(
         &self,
         targets: Vec<ResolvedTarget>,
@@ -37,30 +93,30 @@ impl ConnectionPool {
             .first()
             .cloned()
             .ok_or_else(|| anyhow!("no resolved targets available"))?;
-        let pool = self.get_or_create_pool(target.clone());
+        let pool = self.get_or_create_pool(&target);
         let slot = pool.acquire(self.config.clone()).await?;
         let result = async {
-            let mut guard = slot.connection.connection.lock().await;
+            let mut guard = slot.hop.hop.lock().await;
             if guard.is_none() {
-                *guard = Some(self.open_any_connection(&targets, auth_prompter.clone()).await?);
+                *guard = Some(self.open_any_jump_host(&targets, auth_prompter.clone()).await?);
             }
             let config = self.config.read().await.clone();
             let first_result = guard
                 .as_mut()
-                .expect("connection initialized")
-                .execute(&argv, &sender, &config)
+                .expect("hop initialized")
+                .exec(&argv, &sender, &config)
                 .await;
             match first_result {
                 Ok(code) => Ok(code),
-                Err(error) if should_reconnect(&error.to_string()) => {
-                    info!(target = %target.key, error = %error, "reopening stale pooled SSH connection");
+                Err(error) if classify_transport_error(&error) == ErrorClass::Transport => {
+                    info!(target = %target.key, error = %error, "reopening stale pooled connection");
                     *guard = None;
-                    *guard = Some(self.open_any_connection(&targets, auth_prompter.clone()).await?);
+                    *guard = Some(self.open_any_jump_host(&targets, auth_prompter.clone()).await?);
                     let config = self.config.read().await.clone();
                     guard
                         .as_mut()
-                        .expect("connection reinitialized")
-                        .execute(&argv, &sender, &config)
+                        .expect("hop reinitialized")
+                        .exec(&argv, &sender, &config)
                         .await
                 }
                 Err(error) => Err(error),
@@ -71,6 +127,7 @@ impl ConnectionPool {
         result
     }
 
+    #[allow(deprecated)]
     pub async fn copy(
         &self,
         targets: Vec<ResolvedTarget>,
@@ -81,29 +138,29 @@ impl ConnectionPool {
             .first()
             .cloned()
             .ok_or_else(|| anyhow!("no resolved targets available"))?;
-        let pool = self.get_or_create_pool(target.clone());
+        let pool = self.get_or_create_pool(&target);
         let slot = pool.acquire(self.config.clone()).await?;
         let result = async {
-            let mut guard = slot.connection.connection.lock().await;
+            let mut guard = slot.hop.hop.lock().await;
             if guard.is_none() {
-                *guard = Some(self.open_any_connection(&targets, auth_prompter.clone()).await?);
+                *guard = Some(self.open_any_jump_host(&targets, auth_prompter.clone()).await?);
             }
             let config = self.config.read().await.clone();
             let first_result = guard
                 .as_mut()
-                .expect("connection initialized")
+                .expect("hop initialized")
                 .copy(&spec, &config)
                 .await;
             match first_result {
                 Ok(()) => Ok(()),
-                Err(error) if should_reconnect(&error.to_string()) => {
-                    info!(target = %target.key, error = %error, "reopening stale pooled SSH connection");
+                Err(error) if classify_transport_error(&error) == ErrorClass::Transport => {
+                    info!(target = %target.key, error = %error, "reopening stale pooled connection");
                     *guard = None;
-                    *guard = Some(self.open_any_connection(&targets, auth_prompter.clone()).await?);
+                    *guard = Some(self.open_any_jump_host(&targets, auth_prompter.clone()).await?);
                     let config = self.config.read().await.clone();
                     guard
                         .as_mut()
-                        .expect("connection reinitialized")
+                        .expect("hop reinitialized")
                         .copy(&spec, &config)
                         .await
                 }
@@ -115,23 +172,63 @@ impl ConnectionPool {
         result
     }
 
-    async fn open_any_connection(
+    /// Open a JumpHost connection by trying each resolved target candidate in order.
+    /// Wraps the underlying `Connection` in the appropriate `JumpHost` wrapper.
+    #[allow(deprecated)]
+    async fn open_any_jump_host(
         &self,
         targets: &[ResolvedTarget],
         auth_prompter: Arc<AuthPrompter>,
-    ) -> Result<Box<dyn Connection>> {
+    ) -> Result<Box<dyn JumpHost>> {
         let config = self.config.read().await.clone();
         let mut last_error = None;
         for target in targets {
-            info!(target = %target.key, transport = %target.transport, "opening candidate SSH connection");
-            match connect(target, &config, auth_prompter.as_ref()).await {
-                Ok(connection) => return Ok(connection),
+            info!(target = %target.key, transport = %target.transport, "opening candidate connection");
+            match self.connect_as_jump_host(target, &config, auth_prompter.clone()).await {
+                Ok(hop) => return Ok(hop),
                 Err(error) => {
                     last_error = Some(error);
                 }
             }
         }
         Err(last_error.unwrap_or_else(|| anyhow!("failed to open any candidate connection")))
+    }
+
+    /// Connect to a single target and wrap the result in the appropriate JumpHost impl.
+    #[allow(deprecated)]
+    async fn connect_as_jump_host(
+        &self,
+        target: &ResolvedTarget,
+        config: &AppConfig,
+        auth_prompter: Arc<AuthPrompter>,
+    ) -> Result<Box<dyn JumpHost>> {
+        match target.transport {
+            TargetTransport::Direct => {
+                let connection = crate::connection::DirectSshConnection::connect(
+                    target
+                        .direct
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("missing direct target details"))?,
+                    config,
+                    auth_prompter.as_ref(),
+                )
+                .await?;
+                Ok(Box::new(DirectJumpHost::new(
+                    target.target_label.clone(),
+                    connection,
+                )))
+            }
+            TargetTransport::Jump => {
+                let hop = JumpserverJumpHost::connect(
+                    target.target_label.clone(),
+                    target,
+                    config,
+                    auth_prompter.as_ref(),
+                )
+                .await?;
+                Ok(Box::new(hop))
+            }
+        }
     }
 
     pub async fn prune_idle(&self) {
@@ -158,25 +255,27 @@ impl ConnectionPool {
         pools.values().map(|pool| pool.status()).collect()
     }
 
-    fn get_or_create_pool(&self, target: ResolvedTarget) -> Arc<TargetPool> {
+    #[allow(deprecated)]
+    fn get_or_create_pool(&self, target: &ResolvedTarget) -> Arc<TargetPool> {
+        let key = pool_key_for_target(target);
         let mut pools = self.pools.lock();
         pools
-            .entry(target.key.clone())
-            .or_insert_with(|| Arc::new(TargetPool::new(target)))
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(TargetPool::new(key)))
             .clone()
     }
 }
 
 struct TargetPool {
-    target: ResolvedTarget,
+    key: PoolKey,
     state: Mutex<TargetPoolState>,
     notify: Notify,
 }
 
 impl TargetPool {
-    fn new(target: ResolvedTarget) -> Self {
+    fn new(key: PoolKey) -> Self {
         Self {
-            target,
+            key,
             state: Mutex::new(TargetPoolState {
                 slots: Vec::new(),
                 waiters: 0,
@@ -213,23 +312,23 @@ impl TargetPool {
                     slot.busy = true;
                     return Ok(Some(Lease {
                         id: slot.id,
-                        connection: slot.connection.clone(),
+                        hop: slot.hop.clone(),
                     }));
                 }
             }
             if state.slots.len() < cfg.ssh.max_connections_per_ip {
                 let id = state.next_id;
                 state.next_id += 1;
-                let connection = Arc::new(PooledConnection {
-                    connection: AsyncMutex::new(None),
+                let hop = Arc::new(PooledJumpHost {
+                    hop: AsyncMutex::new(None),
                 });
                 state.slots.push(SlotState {
                     id,
                     busy: true,
                     last_idle: Instant::now(),
-                    connection: connection.clone(),
+                    hop: hop.clone(),
                 });
-                create = Some(Lease { id, connection });
+                create = Some(Lease { id, hop });
             }
         }
         Ok(create)
@@ -247,11 +346,11 @@ impl TargetPool {
     fn prune_idle(&self, max_idle_time: std::time::Duration) {
         let now = Instant::now();
         let mut state = self.state.lock();
-        let target_key = self.target.key.clone();
+        let key_display = self.key.to_string();
         state.slots.retain(|slot| {
             let expired = !slot.busy && now.duration_since(slot.last_idle) >= max_idle_time;
             if expired {
-                info!(target = %target_key, slot_id = slot.id, "closing idle pooled SSH connection");
+                info!(target = %key_display, slot_id = slot.id, "closing idle pooled connection");
             }
             !expired
         });
@@ -263,7 +362,7 @@ impl TargetPool {
         let busy = state.slots.iter().filter(|slot| slot.busy).count();
         let idle = total.saturating_sub(busy);
         PoolStatus {
-            key: self.target.key.clone(),
+            key: self.key.to_string(),
             total,
             busy,
             idle,
@@ -286,19 +385,65 @@ struct SlotState {
     id: usize,
     busy: bool,
     last_idle: Instant,
-    connection: Arc<PooledConnection>,
+    hop: Arc<PooledJumpHost>,
 }
 
-struct PooledConnection {
-    connection: AsyncMutex<Option<Box<dyn Connection>>>,
+struct PooledJumpHost {
+    hop: AsyncMutex<Option<Box<dyn JumpHost>>>,
 }
 
 struct Lease {
     id: usize,
-    connection: Arc<PooledConnection>,
+    hop: Arc<PooledJumpHost>,
 }
 
-fn should_reconnect(error: &str) -> bool {
+/// Classification of an error for retry decisions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ErrorClass {
+    /// Transport-level failure (connection lost, gRPC channel broken, SSH error).
+    /// The pool should retry exactly once on a fresh connection.
+    Transport,
+    /// Application-level failure (permission denied, command not found, etc.).
+    /// The pool should return the error immediately without retrying.
+    Application,
+}
+
+/// Classify an `anyhow::Error` as either a transport-level or application-level error.
+///
+/// Transport errors trigger a single reconnect attempt; application errors are
+/// returned immediately to the caller.
+///
+/// The classification checks, in order:
+/// 1. `tonic::Status` with codes `Unavailable`, `Cancelled`, `Unknown`, or `Internal`.
+/// 2. Any `russh::Error` variant (SSH-level failures are always transport).
+/// 3. Legacy string heuristic for common connection-closed messages.
+pub fn classify_transport_error(error: &anyhow::Error) -> ErrorClass {
+    // Check for tonic::Status with transport-indicative codes
+    if let Some(status) = error.downcast_ref::<tonic::Status>() {
+        match status.code() {
+            tonic::Code::Unavailable
+            | tonic::Code::Cancelled
+            | tonic::Code::Unknown
+            | tonic::Code::Internal => return ErrorClass::Transport,
+            _ => {}
+        }
+    }
+
+    // Check for russh::Error (any variant is a transport-level SSH failure)
+    if error.downcast_ref::<russh::Error>().is_some() {
+        return ErrorClass::Transport;
+    }
+
+    // Fall back to the string heuristic for errors that don't carry typed context
+    if should_reconnect_by_message(&error.to_string()) {
+        return ErrorClass::Transport;
+    }
+
+    ErrorClass::Application
+}
+
+/// Legacy string-based heuristic for detecting transport failures from error messages.
+fn should_reconnect_by_message(error: &str) -> bool {
     let lowered = error.to_ascii_lowercase();
     lowered.contains("channel closed")
         || lowered.contains("channel send error")
@@ -310,23 +455,294 @@ fn should_reconnect(error: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
-    use super::should_reconnect;
+    use super::*;
+    use proptest::prelude::*;
 
-    #[test]
-    fn reconnects_on_channel_send_error() {
-        assert!(should_reconnect("Channel send error"));
+    // Feature: rhopd-jumpserver-architecture, Property 6: Pool reuse invariant
+
+    /// Operations that can be performed against a TargetPool.
+    #[derive(Clone, Debug)]
+    enum PoolOp {
+        Acquire,
+        /// Release the slot at the given index in our held-leases vec.
+        Release(usize),
+        /// Prune idle slots (simulates the reaper tick).
+        Prune,
+    }
+
+    /// Strategy to generate a sequence of pool operations.
+    fn arb_pool_ops(max_ops: usize) -> impl Strategy<Value = Vec<PoolOp>> {
+        proptest::collection::vec(
+            prop_oneof![
+                3 => Just(PoolOp::Acquire),
+                2 => (0..10usize).prop_map(PoolOp::Release),
+                1 => Just(PoolOp::Prune),
+            ],
+            1..=max_ops,
+        )
+    }
+
+    /// Strategy to generate a max_connections_per_ip value (1..=8 to keep tests fast).
+    fn arb_max_connections() -> impl Strategy<Value = usize> {
+        1..=8usize
+    }
+
+    /// Strategy to generate arbitrary TargetTransport values.
+    fn arb_target_transport() -> impl Strategy<Value = TargetTransport> {
+        prop_oneof![Just(TargetTransport::Direct), Just(TargetTransport::Jump),]
+    }
+
+    /// Strategy to generate non-empty key strings.
+    fn arb_key_string() -> impl Strategy<Value = String> {
+        "[a-zA-Z0-9_]{1,20}"
+    }
+
+    /// Strategy to generate arbitrary ResolvedTarget values for pool-key testing.
+    fn arb_resolved_target() -> impl Strategy<Value = ResolvedTarget> {
+        (
+            arb_key_string(),
+            arb_key_string(),
+            arb_key_string(),
+            arb_target_transport(),
+            arb_key_string(),
+        )
+            .prop_map(|(input, ip, key, transport, target_label)| ResolvedTarget {
+                input,
+                ip,
+                key,
+                transport,
+                direct: None,
+                target_label,
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 100, .. ProptestConfig::default() })]
+
+        /// **Validates: Requirements 3.7, 4.3, 5.1, 5.2, 5.3, 5.4, 7.5**
+        ///
+        /// For any sequence of acquire/release/prune operations against a single
+        /// PoolKey, the pool satisfies:
+        /// 1. Idle slots are reused before creating new ones.
+        /// 2. Live slot count never exceeds max_connections_per_ip.
+        /// 3. PoolKey is a pure function of route's first hop alias + kind for
+        ///    non-direct routes, or end_target_id for direct routes.
+        #[test]
+        fn prop_pool_reuse_invariant(
+            ops in arb_pool_ops(30),
+            max_conns in arb_max_connections(),
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                // Build a config with the generated max_connections_per_ip and
+                // a very large max_idle_time so prune only fires when we want.
+                let mut config = AppConfig::default();
+                config.ssh.max_connections_per_ip = max_conns;
+                // Use a zero idle time for prune operations so they always prune idle slots.
+                config.ssh.max_idle_time = std::time::Duration::from_secs(0);
+                let config = Arc::new(RwLock::new(config));
+
+                let key = PoolKey::Aliased {
+                    alias: "test-host".to_string(),
+                    kind: JumpHostKind::Jumpserver,
+                };
+                let pool = TargetPool::new(key);
+
+                // Track held leases (slot ids that are currently acquired/busy).
+                let mut held_leases: Vec<usize> = Vec::new();
+                // Track the total number of unique slot ids ever created.
+                let mut created_ids: Vec<usize> = Vec::new();
+
+                for op in &ops {
+                    match op {
+                        PoolOp::Acquire => {
+                            let result = pool.try_acquire(&config).await.unwrap();
+                            if let Some(lease) = result {
+                                // Check invariant 1: if we got a brand new slot
+                                // (not in created_ids), there should have been no
+                                // idle slots available — they would have been
+                                // returned instead of creating a new one.
+                                if !created_ids.contains(&lease.id) {
+                                    // This is a newly created slot. After acquire,
+                                    // the slot is busy, so verify all other slots
+                                    // are also busy (no idle slots were skipped).
+                                    let state = pool.state.lock();
+                                    let other_idle = state.slots.iter()
+                                        .filter(|s| s.id != lease.id && !s.busy)
+                                        .count();
+                                    prop_assert_eq!(
+                                        other_idle, 0,
+                                        "New slot created but idle slots exist"
+                                    );
+                                    drop(state);
+                                    created_ids.push(lease.id);
+                                }
+
+                                held_leases.push(lease.id);
+                            }
+                            // If result is None, pool is at capacity — that's fine.
+                        }
+                        PoolOp::Release(idx) => {
+                            if !held_leases.is_empty() {
+                                let actual_idx = idx % held_leases.len();
+                                let id = held_leases.remove(actual_idx);
+                                pool.release(id);
+                            }
+                        }
+                        PoolOp::Prune => {
+                            // Small sleep to ensure idle time has elapsed (we set
+                            // max_idle_time to 0, so any idle slot is prunable).
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                            let cfg = config.read().await.clone();
+                            pool.prune_idle(cfg.ssh.max_idle_time);
+                            // Remove pruned slot ids from created_ids.
+                            let state = pool.state.lock();
+                            let live_ids: Vec<usize> = state.slots.iter().map(|s| s.id).collect();
+                            drop(state);
+                            created_ids.retain(|id| live_ids.contains(id));
+                            // Also remove from held_leases any that were pruned
+                            // (shouldn't happen since prune only removes !busy slots,
+                            // but be safe).
+                            held_leases.retain(|id| live_ids.contains(id));
+                        }
+                    }
+
+                    // Invariant 2: live slot count never exceeds max_connections_per_ip.
+                    let state = pool.state.lock();
+                    prop_assert!(
+                        state.slots.len() <= max_conns,
+                        "Slot count {} exceeds max_connections_per_ip {}",
+                        state.slots.len(),
+                        max_conns
+                    );
+                    drop(state);
+                }
+
+                Ok(())
+            })?;
+        }
+
+        /// **Validates: Requirements 3.7, 4.3, 5.1, 7.5**
+        ///
+        /// PoolKey derivation is deterministic: for non-direct routes it's
+        /// Aliased { alias, kind } from the first hop; for direct routes it's
+        /// Direct { end_target_id }. Same input always produces the same key.
+        #[test]
+        fn prop_pool_key_deterministic(
+            target in arb_resolved_target(),
+        ) {
+            let key1 = pool_key_for_target(&target);
+            let key2 = pool_key_for_target(&target);
+
+            // Same input always produces the same key.
+            prop_assert_eq!(&key1, &key2, "pool_key_for_target is not deterministic");
+
+            // Verify the key structure matches the route type.
+            match target.transport {
+                TargetTransport::Direct => {
+                    match &key1 {
+                        PoolKey::Direct { end_target } => {
+                            // For direct routes, the end_target_id should be derived
+                            // from the target's key field.
+                            prop_assert_eq!(
+                                &end_target.0, &target.key,
+                                "Direct pool key should use target.key as end_target_id"
+                            );
+                        }
+                        PoolKey::Aliased { .. } => {
+                            prop_assert!(false, "Direct transport should produce PoolKey::Direct");
+                        }
+                    }
+                }
+                TargetTransport::Jump => {
+                    match &key1 {
+                        PoolKey::Aliased { alias, kind } => {
+                            // For jump routes, the alias comes from the first hop
+                            // (which is target_label in to_target_route) and kind
+                            // is Jumpserver.
+                            prop_assert_eq!(
+                                alias, &target.target_label,
+                                "Aliased pool key alias should match first hop alias"
+                            );
+                            prop_assert_eq!(
+                                *kind, JumpHostKind::Jumpserver,
+                                "Jump transport should produce Jumpserver kind"
+                            );
+                        }
+                        PoolKey::Direct { .. } => {
+                            prop_assert!(false, "Jump transport should produce PoolKey::Aliased");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
-    fn reconnects_on_closed_transport_errors() {
-        assert!(should_reconnect("shell closed unexpectedly"));
-        assert!(should_reconnect("broken pipe"));
-        assert!(should_reconnect("connection reset by peer"));
+    fn classifies_tonic_unavailable_as_transport() {
+        let err: anyhow::Error = tonic::Status::unavailable("service unavailable").into();
+        assert_eq!(classify_transport_error(&err), ErrorClass::Transport);
     }
 
     #[test]
-    fn ignores_non_transport_errors() {
-        assert!(!should_reconnect("permission denied"));
+    fn classifies_tonic_cancelled_as_transport() {
+        let err: anyhow::Error = tonic::Status::cancelled("request cancelled").into();
+        assert_eq!(classify_transport_error(&err), ErrorClass::Transport);
+    }
+
+    #[test]
+    fn classifies_tonic_unknown_as_transport() {
+        let err: anyhow::Error = tonic::Status::unknown("unknown error").into();
+        assert_eq!(classify_transport_error(&err), ErrorClass::Transport);
+    }
+
+    #[test]
+    fn classifies_tonic_internal_as_transport() {
+        let err: anyhow::Error = tonic::Status::internal("internal error").into();
+        assert_eq!(classify_transport_error(&err), ErrorClass::Transport);
+    }
+
+    #[test]
+    fn classifies_tonic_permission_denied_as_application() {
+        let err: anyhow::Error = tonic::Status::permission_denied("denied").into();
+        assert_eq!(classify_transport_error(&err), ErrorClass::Application);
+    }
+
+    #[test]
+    fn classifies_tonic_not_found_as_application() {
+        let err: anyhow::Error = tonic::Status::not_found("not found").into();
+        assert_eq!(classify_transport_error(&err), ErrorClass::Application);
+    }
+
+    #[test]
+    fn classifies_channel_send_error_string_as_transport() {
+        let err = anyhow::anyhow!("Channel send error");
+        assert_eq!(classify_transport_error(&err), ErrorClass::Transport);
+    }
+
+    #[test]
+    fn classifies_closed_transport_errors_as_transport() {
+        let err1 = anyhow::anyhow!("shell closed unexpectedly");
+        assert_eq!(classify_transport_error(&err1), ErrorClass::Transport);
+
+        let err2 = anyhow::anyhow!("broken pipe");
+        assert_eq!(classify_transport_error(&err2), ErrorClass::Transport);
+
+        let err3 = anyhow::anyhow!("connection reset by peer");
+        assert_eq!(classify_transport_error(&err3), ErrorClass::Transport);
+    }
+
+    #[test]
+    fn classifies_permission_denied_string_as_application() {
+        let err = anyhow::anyhow!("permission denied");
+        assert_eq!(classify_transport_error(&err), ErrorClass::Application);
+    }
+
+    #[test]
+    fn classifies_generic_error_as_application() {
+        let err = anyhow::anyhow!("file not found: /tmp/foo");
+        assert_eq!(classify_transport_error(&err), ErrorClass::Application);
     }
 }

@@ -7,20 +7,36 @@
 - `rhop`：CLI 前端
 - `rhopd`：本地 daemon 后端
 
-CLI 通过本地 `gRPC over Unix socket` 或远程 `gRPC over SSH subsystem` 与 daemon 通信。daemon 负责 SSH 连接管理、连接池、可选 `server.toml` 目标解析、可选 jumpserver、可选 LLM 命令审查，以及远端输出流式转发。
+CLI 通过本地 `gRPC over Unix socket` 与 daemon 通信。daemon 负责 SSH 连接管理、连接池、可选 `server.toml` 目标解析、可选 jump hosts（直连、jumpserver、远程 rhopd）、可选 LLM 命令审查，以及远端输出流式转发。
 
 `rhop cp` 默认会尽量对齐 `scp` 语义：支持 remote `~` / `~user` 展开、目录目标自动拼接 basename，并默认保留文件 mode；可通过配置关闭 mode 保留。
+
+## 架构
+
+所有 CLI 命令都通过本地 `rhopd` daemon 执行。到达远端目标的路径统一表示为零个或多个 Jump Host 加上一个 End Target：
+
+```
+rhop (CLI)  ──Unix socket──▶  Local rhopd  ──Jump Hosts──▶  End target
+```
+
+Jump Host 是一个统一的 trait，有三种实现：
+
+- **direct**：直连 SSH（通过 `~/.ssh/config` 或 `server.toml`）
+- **jumpserver**：交互式跳板机 + 可选 MFA
+- **rhopd**：另一台机器上运行的 `rhopd`，通过 SSH `rhop-rpc` subsystem 连接
+
+这三种方式在连接池、目标解析、命令执行中完全互换。添加新的 Jump Host 类型只需实现 trait + 在 `[[jump_hosts]]` 中添加配置。
 
 ## 功能
 
 - CLI 用法：`rhop exec <target> <cmd> [arg...]`
-- 前后端分离，支持本地 `gRPC over Unix socket` 与远程 `gRPC over SSH subsystem`
+- 统一架构：CLI 始终通过本地 daemon，不再有 local/remote 双模式
 - 按目标 IP 复用 SSH 连接
 - 没有空闲连接时自动新建连接
 - 单 IP 连接数上限可配置，默认 `10`
 - 空闲连接超时自动关闭
 - 支持 `server.toml` 机器清单、密码或 SSH key 直连
-- 支持可选 jumpserver + TOTP MFA
+- 支持 `[[jump_hosts]]` 配置多种跳板方式（direct、jumpserver、rhopd）
 - 支持可选 OpenAI 兼容接口的命令审查
 - 无配置文件也可运行，前提是 `~/.ssh/config` 已配置好直连目标
 
@@ -34,6 +50,7 @@ CLI 通过本地 `gRPC over Unix socket` 或远程 `gRPC over SSH subsystem` 与
 可选依赖：
 
 - 如果要走 jumpserver，需要 jumpserver 账号信息和 TOTP 秘钥
+- 如果要连接远程 rhopd，需要远端机器运行 `rhopd` 并开启 `server.remote`
 - 如果要开启命令审查，需要 OpenAI 兼容接口的 API key
 
 ## 构建
@@ -71,7 +88,7 @@ daemon 管理保护：
 - 配置目录放在 `/etc/rhop`
 - 配置文件路径是 `/etc/rhop/config.toml`
 - 可直接使用仓库里的 unit 模板：
-  - [packaging/systemd/rhopd.service](/home/graydove/projects/remote-hop/packaging/systemd/rhopd.service)
+  - [packaging/systemd/rhopd.service](packaging/systemd/rhopd.service)
 
 典型安装步骤：
 
@@ -127,13 +144,13 @@ docker run --rm \
 ## 工作方式
 
 1. `rhop exec` 接收目标和命令。
-2. `rhop` 默认通过本地 `gRPC over Unix socket` 连接 `rhopd`。
+2. `rhop` 通过本地 `gRPC over Unix socket` 连接 `rhopd`。
 3. 如果 `rhopd` 尚未运行，`rhop` 会自动以 `--daemon` 模式拉起它。
 4. daemon 根据第一个参数推导目标 IP。
 5. daemon 先检查 `server.toml`，支持按别名或 `host` 字段命中目标。
 6. 如果 `server.toml` 命中，则优先尝试该条目配置的直连认证。
 7. 如果 `server.toml` 未命中，或连接/认证失败，则按 `ssh.fallback` 继续尝试 `~/.ssh/config` 或 jumpserver。
-8. 如果 jumpserver 要求 MFA 且未配置 TOTP secret，CLI 会提示输入一次性验证码。
+8. 如果配置了 `[[jump_hosts]]`，daemon 可通过对应的 jump host 到达目标。
 9. 同一逻辑目标有空闲连接时优先复用。
 10. 如果没有空闲连接，则在上限内新建连接。
 11. 如果启用了 review，daemon 会先做命令审查。
@@ -144,7 +161,7 @@ docker run --rm \
 前后端使用统一的 gRPC RPC：
 
 - local：`gRPC over Unix socket`
-- remote：`gRPC over SSH subsystem (rhop-rpc)`
+- remote（rhopd jump host）：`gRPC over SSH subsystem (rhop-rpc)`
 
 - `Execute`：双向流 RPC
 - `Copy`：双向流 RPC
@@ -155,6 +172,66 @@ docker run --rm \
 - CLI 先发送开始执行请求
 - daemon 回流 review、stdout、stderr、confirm、auth prompt、exit 等事件
 - 如果需要确认或输入 MFA，CLI 会在同一条流里回发对应消息
+
+## Jump Hosts
+
+Jump Host 是 daemon 到达远端目标的中间跳板。通过 `[[jump_hosts]]` 配置：
+
+```toml
+# 远程 rhopd daemon
+[[jump_hosts]]
+alias = "prod"
+kind = "rhopd"
+address = "rhop@prod-bastion.example.com:2222"
+identity_file = "~/.ssh/id_ed25519"
+known_hosts_path = "~/.rhop/known_hosts"
+
+# 交互式 jumpserver
+[[jump_hosts]]
+alias = "corp-jump"
+kind = "jumpserver"
+host = "jumpserver.example.com"
+port = 20221
+user = "user@example.com"
+identity_file = "~/.ssh/id_rsa"
+menu_prompt_contains = "Opt"
+mfa_prompt_contains = "MFA"
+shell_prompt_suffixes = ["$ ", "# "]
+```
+
+使用时可以通过 `<jump_alias>:<server_alias>` 显式指定路由：
+
+```bash
+rhop exec prod:webserver hostname
+```
+
+或者直接使用 server alias（如果在所有 source 中唯一）：
+
+```bash
+rhop exec webserver hostname
+```
+
+### 管理 rhopd Jump Hosts
+
+添加远程 rhopd：
+
+```bash
+rhop remote connect prod rhop@prod-bastion.example.com:2222
+```
+
+首次连接时会展示 SSH host key 指纹并等待确认。确认后会把主机记录写入 `~/.rhop/known_hosts`，并把 jump host 配置写入 `~/.rhop/config.toml`。
+
+查看已配置的 jump hosts：
+
+```bash
+rhop remote list
+```
+
+移除一个 rhopd jump host：
+
+```bash
+rhop remote remove prod
+```
 
 ## One By One：零配置首次运行
 
@@ -209,6 +286,7 @@ cargo build
 - socket 路径
 - 当前活跃执行数
 - 每个目标连接池的状态
+- 已配置的 jump hosts 及其状态
 
 ### 第 5 步：在同一 IP 上再次执行命令
 
@@ -230,7 +308,7 @@ cargo build
 
 仓库中提供了一个完整但全部注释掉的示例：
 
-- [config.example.toml](/home/admin/Projects/agora/arun/config.example.toml)
+- [config.example.toml](config.example.toml)
 
 ### 第 1 步：创建配置目录
 
@@ -250,7 +328,7 @@ cp config.example.toml ~/.rhop/config.toml
 
 - 配置 `server.toml` 机器清单
 - 调整 `ssh.pty`
-- 开启 jumpserver
+- 配置 `[[jump_hosts]]`（rhopd、jumpserver 或 direct）
 - 开启 review
 - 修改 socket 路径
 - 调整连接池上限和空闲超时
@@ -316,49 +394,53 @@ pty = true
 
 如果 daemon 还没有运行，那么第一次执行命令时会自动读取新配置。
 
-## One By One：连接远程 daemon
+## One By One：连接远程 rhopd
 
-远程模式的默认体验接近 `ssh`：
+远程 rhopd 是一种 Jump Host，通过 `rhop remote connect` 添加：
 
 1. 在远端机器上开启 `server.remote.enable = true`
-2. 首次连接：
+2. 添加远程 rhopd jump host：
 
 ```bash
-./target/debug/rhop remote connect rhop@example.com:2222
+./target/debug/rhop remote connect prod rhop@example.com:2222
 ```
 
-如果主机还不在 `~/.rhop/known_hosts` 中，CLI 会展示 SSH host key 的 SHA256 指纹并等待确认。确认后会把主机记录写入 `~/.rhop/known_hosts`，并把远程目标保存到 `~/.rhop/client.toml`。
+如果主机还不在 `~/.rhop/known_hosts` 中，CLI 会展示 SSH host key 的 SHA256 指纹并等待确认。确认后会把主机记录写入 `~/.rhop/known_hosts`，并把 jump host 配置写入 `~/.rhop/config.toml`。
 
-3. 切换默认执行目标到远程 daemon：
+3. 之后可以通过该 jump host 执行命令：
 
 ```bash
-./target/debug/rhop remote enable
+./target/debug/rhop exec prod:webserver hostname
 ```
 
-4. 之后普通命令默认走远程 daemon：
+或者如果 server alias 在所有 source 中唯一，直接：
 
 ```bash
-./target/debug/rhop status
-./target/debug/rhop exec foo-192-0-2-163 hostname
+./target/debug/rhop exec webserver hostname
 ```
 
-5. 切回本地 daemon：
+4. 查看已配置的 jump hosts：
 
 ```bash
-./target/debug/rhop remote disable
+./target/debug/rhop remote list
+```
+
+5. 移除一个 rhopd jump host：
+
+```bash
+./target/debug/rhop remote remove prod
 ```
 
 ## One By One：开启 jumpserver
 
-只有当目标既不能通过 `server.toml` 成功直连，也不能通过 `~/.ssh/config` 成功直连时，才需要启用 jumpserver。
+jumpserver 现在通过 `[[jump_hosts]]` 配置。只有当目标既不能通过 `server.toml` 成功直连，也不能通过 `~/.ssh/config` 成功直连时，才需要启用 jumpserver。
 
-### 第 1 步：打开 jumpserver 配置段
-
-在 `~/.rhop/config.toml` 中取消注释并填写：
+### 第 1 步：在 `~/.rhop/config.toml` 中添加 jumpserver jump host
 
 ```toml
-[jumpserver]
-enabled = true
+[[jump_hosts]]
+alias = "corp-jump"
+kind = "jumpserver"
 host = "bastion.example.com"
 port = 20221
 user = "user@example.com"
@@ -367,7 +449,7 @@ menu_prompt_contains = "Opt"
 mfa_prompt_contains = "MFA"
 shell_prompt_suffixes = ["$ ", "# "]
 
-[jumpserver.mfa]
+[jump_hosts.mfa]
 totp_secret_base32 = "REPLACE_ME"
 digits = 6
 period = 30
@@ -500,10 +582,18 @@ review 现在分两层：
 
 如果 `daemon_origin=external`，则 `daemon stop` 和 `daemon restart` 会被拒绝。
 
-查看 daemon 当前使用的 `server.toml` 中有哪些服务器：
+查看所有 source 的服务器列表（本地 server.toml + 各 jump host）：
 
 ```bash
 ./target/debug/rhop server list
+```
+
+管理 rhopd jump hosts：
+
+```bash
+./target/debug/rhop remote connect <name> [user@]host[:port]
+./target/debug/rhop remote remove <name>
+./target/debug/rhop remote list
 ```
 
 手动启动 daemon：
@@ -558,9 +648,13 @@ review 现在分两层：
 
 ## 目标解析规则
 
-第一个 CLI 参数会按约定格式转换为 IP。
+CLI 目标字符串按以下规则解析：
 
-示例：
+1. `<jump_alias>:<server_alias>` — 显式指定 jump host 和 server alias
+2. `<server_alias>` — 在所有 source（local + jump hosts）中查找，唯一则命中，多个则报错并列出候选
+3. `<host_or_ip>` — 回退到 IP 推导 + `~/.ssh/config` 匹配
+
+IP 推导示例：
 
 ```text
 foo-192-0-2-163 -> 192.0.2.163
@@ -569,10 +663,10 @@ foo-192-0-2-163 -> 192.0.2.163
 解析顺序：
 
 1. 根据 CLI 第一个参数推导 IP
-2. 在 `~/.ssh/config` 中查找匹配的 `Host`
-3. 如果命中，则走直连 SSH
-4. 如果未命中且 jumpserver 已启用，则走 jumpserver
-5. 否则直接报错
+2. 在 `server.toml` 中查找匹配的别名或 host
+3. 如果命中，则走对应认证方式
+4. 如果未命中，按 `ssh.fallback` 顺序尝试 `~/.ssh/config` 或 jumpserver
+5. 否则报错
 
 ## 配置说明
 
@@ -603,6 +697,7 @@ foo-192-0-2-163 -> 192.0.2.163
 - jumpserver 模式依赖交互提示匹配
 - 直连模式暂不支持 `ProxyCommand`
 - review 目前使用 OpenAI 兼容的 `chat/completions` 风格接口
+- `tui_shell` 通过 rhopd jump host 暂不支持（返回 UnsupportedCapability）
 
 ## 开发
 

@@ -14,8 +14,11 @@ use crate::protocol::ServerEvent;
 
 pub use direct::DirectSshConnection;
 pub use jump::JumpSshConnection;
-pub use resolver::{derive_target_ip, resolve_target};
+#[allow(deprecated)]
+pub use resolver::{Resolver, derive_target_ip, resolve_target};
+pub use crate::config::JumpHostConfig;
 pub use shared::{build_remote_command, shell_quote};
+#[allow(deprecated)]
 pub use types::{CopyDirection, CopySpec, DirectTarget, ResolvedTarget, TargetTransport};
 
 pub type AuthFuture = Pin<Box<dyn Future<Output = Result<String>> + Send>>;
@@ -41,6 +44,7 @@ pub trait Connection: Send {
     async fn copy(&mut self, spec: &CopySpec, config: &AppConfig) -> Result<()>;
 }
 
+#[allow(deprecated)]
 pub async fn connect(
     target: &ResolvedTarget,
     config: &AppConfig,

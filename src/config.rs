@@ -12,16 +12,23 @@ use home::home_dir;
 use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize};
 
+use crate::jump::JumpHostKind;
+
+#[allow(deprecated)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub server: ServerConfig,
     pub ssh: SshConfig,
     pub copy: CopyConfig,
+    /// Deprecated: use `[[jump_hosts]]` entries with `kind = "jumpserver"` instead.
     pub jumpserver: JumpserverConfig,
     pub review: ReviewConfig,
+    #[serde(default)]
+    pub jump_hosts: Vec<JumpHostConfig>,
 }
 
+#[allow(deprecated)]
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -30,6 +37,7 @@ impl Default for AppConfig {
             copy: CopyConfig::default(),
             jumpserver: JumpserverConfig::default(),
             review: ReviewConfig::default(),
+            jump_hosts: Vec::new(),
         }
     }
 }
@@ -52,6 +60,7 @@ impl AppConfig {
         Ok(config)
     }
 
+    #[allow(deprecated)]
     pub fn expand_paths(&mut self) -> Result<()> {
         if let Some(log_path) = &self.server.log_path {
             self.server.log_path = Some(expand_tilde(log_path)?);
@@ -207,6 +216,7 @@ pub struct SshConfig {
     pub server_config_path: String,
     pub fallback: Vec<FallbackTransport>,
     pub pty: bool,
+    pub auto_pty_detect: bool,
     #[serde(deserialize_with = "deserialize_duration")]
     pub connect_timeout: Duration,
     #[serde(deserialize_with = "deserialize_duration")]
@@ -226,6 +236,7 @@ impl Default for SshConfig {
                 FallbackTransport::Jumpserver,
             ],
             pty: true,
+            auto_pty_detect: true,
             connect_timeout: Duration::from_secs(10),
             keepalive_interval: Duration::from_secs(30),
             max_idle_time: Duration::from_secs(600),
@@ -248,6 +259,9 @@ impl Default for CopyConfig {
     }
 }
 
+#[deprecated(
+    note = "Use [[jump_hosts]] entries with kind = \"jumpserver\" instead. This top-level [jumpserver] block will be removed in a future release."
+)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct JumpserverConfig {
@@ -263,6 +277,7 @@ pub struct JumpserverConfig {
     pub mfa: MfaConfig,
 }
 
+#[allow(deprecated)]
 impl Default for JumpserverConfig {
     fn default() -> Self {
         Self {
@@ -339,7 +354,8 @@ pub struct ServerHostConfig {
     pub password: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DirectAuth {
     Key { identity_file: String },
     Password { password: String },
@@ -536,28 +552,16 @@ pub struct SemanticWhitelistEntry {
     pub examples: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ClientMode {
-    #[default]
-    Local,
-    Remote,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ClientConfig {
-    pub mode: ClientMode,
     pub local: LocalClientConfig,
-    pub remote: RemoteClientConfig,
 }
 
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
-            mode: ClientMode::Local,
             local: LocalClientConfig::default(),
-            remote: RemoteClientConfig::default(),
         }
     }
 }
@@ -595,8 +599,6 @@ impl ClientConfig {
 
     pub fn expand_paths(&mut self) -> Result<()> {
         self.local.socket_path = expand_tilde(&self.local.socket_path)?;
-        self.remote.identity_file = expand_tilde(&self.remote.identity_file)?;
-        self.remote.known_hosts_path = expand_tilde(&self.remote.known_hosts_path)?;
         Ok(())
     }
 }
@@ -617,31 +619,7 @@ impl Default for LocalClientConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default)]
-pub struct RemoteClientConfig {
-    pub address: String,
-    pub user: String,
-    pub identity_file: String,
-    pub known_hosts_path: String,
-}
 
-impl RemoteClientConfig {
-    pub fn is_configured(&self) -> bool {
-        !self.address.trim().is_empty()
-    }
-}
-
-impl Default for RemoteClientConfig {
-    fn default() -> Self {
-        Self {
-            address: String::new(),
-            user: "rhop".to_string(),
-            identity_file: "~/.ssh/id_ed25519".to_string(),
-            known_hosts_path: "~/.rhop/known_hosts".to_string(),
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -956,12 +934,171 @@ fn glob_match_inner(pattern: &[char], text: &[char], pi: usize, ti: usize) -> bo
     }
 }
 
+// ---------------------------------------------------------------------------
+// Jump host configuration types (task 7.1)
+// ---------------------------------------------------------------------------
+
+/// Aliases that are reserved by the system and cannot be assigned to any
+/// Jump_Host entry. Currently only `"local"` is reserved (it names the
+/// Local_Daemon's own server.toml source).
+pub const RESERVED_ALIASES: &[&str] = &["local"];
+
+/// Validation errors for the `[[jump_hosts]]` configuration section.
+#[derive(Debug, thiserror::Error)]
+pub enum JumpHostValidationError {
+    #[error("jump host alias must not be empty")]
+    EmptyAlias,
+
+    #[error("jump host alias '{alias}' is reserved (reserved aliases: {reserved:?})")]
+    ReservedAlias {
+        alias: String,
+        reserved: &'static [&'static str],
+    },
+
+    #[error("jump host alias '{alias}' is already used by a {existing_kind} jump host")]
+    AliasCollision {
+        alias: String,
+        existing_kind: JumpHostKind,
+    },
+
+    #[error("jump host '{alias}' has kind '{kind}' but fields do not match that kind")]
+    KindFieldsMismatch { alias: String, kind: JumpHostKind },
+}
+
+/// Validates the `[[jump_hosts]]` entries in the daemon configuration.
+///
+/// Checks:
+/// - alias must not be empty
+/// - alias must not be in `RESERVED_ALIASES`
+/// - alias must not duplicate any other entry's alias (regardless of kind)
+/// - fields variant must match kind
+pub fn validate_jump_hosts(jump_hosts: &[JumpHostConfig]) -> Result<(), JumpHostValidationError> {
+    let mut seen: HashMap<&str, JumpHostKind> = HashMap::new();
+
+    for entry in jump_hosts {
+        // Empty alias check
+        if entry.alias.is_empty() {
+            return Err(JumpHostValidationError::EmptyAlias);
+        }
+
+        // Reserved alias check
+        if RESERVED_ALIASES.contains(&entry.alias.as_str()) {
+            return Err(JumpHostValidationError::ReservedAlias {
+                alias: entry.alias.clone(),
+                reserved: RESERVED_ALIASES,
+            });
+        }
+
+        // Duplicate alias check
+        if let Some(&existing_kind) = seen.get(entry.alias.as_str()) {
+            return Err(JumpHostValidationError::AliasCollision {
+                alias: entry.alias.clone(),
+                existing_kind,
+            });
+        }
+        seen.insert(&entry.alias, entry.kind);
+
+        // Kind-fields mismatch check
+        let fields_match = match (&entry.kind, &entry.fields) {
+            (JumpHostKind::Rhopd, JumpHostFields::Rhopd(_)) => true,
+            (JumpHostKind::Jumpserver, JumpHostFields::Jumpserver(_)) => true,
+            (JumpHostKind::Direct, JumpHostFields::Direct(_)) => true,
+            _ => false,
+        };
+        if !fields_match {
+            return Err(JumpHostValidationError::KindFieldsMismatch {
+                alias: entry.alias.clone(),
+                kind: entry.kind,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn default_port() -> u16 {
+    22
+}
+
+fn default_menu_prompt_contains() -> String {
+    "Opt".to_string()
+}
+
+fn default_mfa_prompt_contains() -> String {
+    "MFA".to_string()
+}
+
+fn default_shell_prompt_suffixes() -> Vec<String> {
+    vec!["$ ".to_string(), "# ".to_string()]
+}
+
+/// Configuration for a single jump host entry in `[[jump_hosts]]`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct JumpHostConfig {
+    pub alias: String,
+    pub kind: JumpHostKind,
+    #[serde(flatten)]
+    pub fields: JumpHostFields,
+}
+
+/// Kind-specific fields for a jump host, dispatched by `kind`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum JumpHostFields {
+    Rhopd(RhopdJumpHostFields),
+    Jumpserver(JumpserverJumpHostFields),
+    Direct(DirectJumpHostFields),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RhopdJumpHostFields {
+    pub address: String,
+    #[serde(default)]
+    pub identity_file: String,
+    #[serde(default)]
+    pub known_hosts_path: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct JumpserverJumpHostFields {
+    pub host: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    pub user: String,
+    #[serde(default)]
+    pub identity_file: String,
+    #[serde(default)]
+    pub pubkey_accepted_algorithms: Option<String>,
+    #[serde(default = "default_menu_prompt_contains")]
+    pub menu_prompt_contains: String,
+    #[serde(default = "default_mfa_prompt_contains")]
+    pub mfa_prompt_contains: String,
+    #[serde(default = "default_shell_prompt_suffixes")]
+    pub shell_prompt_suffixes: Vec<String>,
+    #[serde(default)]
+    pub mfa: MfaConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DirectJumpHostFields {
+    pub host: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    pub user: String,
+    pub auth: DirectAuth,
+}
+
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::{
-        AppConfig, ClientConfig, SshHostEntry, default_client_config_path, default_config_path,
-        default_known_hosts_path, glob_match, parse_duration, resolve_ssh_host,
+        AppConfig, ClientConfig, DirectAuth, DirectJumpHostFields, JumpHostConfig,
+        JumpHostFields, JumpHostValidationError, JumpserverJumpHostFields, RhopdJumpHostFields,
+        SshHostEntry, default_client_config_path, default_config_path, default_known_hosts_path,
+        glob_match, parse_duration, resolve_ssh_host, validate_jump_hosts, RESERVED_ALIASES,
     };
+    use crate::jump::JumpHostKind;
+    use proptest::prelude::*;
 
     #[test]
     fn parses_duration() {
@@ -1013,8 +1150,6 @@ mod tests {
         assert!(config.copy.preserve_mode);
         let client = ClientConfig::default();
         assert_eq!(client.local.socket_path, "~/.rhop/rhopd.sock");
-        assert_eq!(client.remote.identity_file, "~/.ssh/id_ed25519");
-        assert_eq!(client.remote.known_hosts_path, "~/.rhop/known_hosts");
     }
 
     #[test]
@@ -1023,5 +1158,242 @@ mod tests {
         config.server.local.enable = false;
         config.server.remote.enable = false;
         assert!(config.validate().is_err());
+    }
+
+    // --- validate_jump_hosts tests ---
+
+    fn make_rhopd_entry(alias: &str) -> JumpHostConfig {
+        JumpHostConfig {
+            alias: alias.to_string(),
+            kind: JumpHostKind::Rhopd,
+            fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
+                address: "10.0.0.1:2222".to_string(),
+                identity_file: "/tmp/key".to_string(),
+                known_hosts_path: "/tmp/known_hosts".to_string(),
+            }),
+        }
+    }
+
+    fn make_jumpserver_entry(alias: &str) -> JumpHostConfig {
+        JumpHostConfig {
+            alias: alias.to_string(),
+            kind: JumpHostKind::Jumpserver,
+            fields: JumpHostFields::Jumpserver(JumpserverJumpHostFields {
+                host: "jump.example.com".to_string(),
+                port: 22,
+                user: "admin".to_string(),
+                identity_file: "/tmp/key".to_string(),
+                pubkey_accepted_algorithms: None,
+                menu_prompt_contains: "Opt".to_string(),
+                mfa_prompt_contains: "MFA".to_string(),
+                shell_prompt_suffixes: vec!["$ ".to_string(), "# ".to_string()],
+                mfa: super::MfaConfig::default(),
+            }),
+        }
+    }
+
+    fn make_direct_entry(alias: &str) -> JumpHostConfig {
+        JumpHostConfig {
+            alias: alias.to_string(),
+            kind: JumpHostKind::Direct,
+            fields: JumpHostFields::Direct(DirectJumpHostFields {
+                host: "10.0.0.2".to_string(),
+                port: 22,
+                user: "root".to_string(),
+                auth: DirectAuth::Password {
+                    password: "secret".to_string(),
+                },
+            }),
+        }
+    }
+
+    #[test]
+    fn validate_jump_hosts_accepts_valid_entries() {
+        let entries = vec![
+            make_rhopd_entry("prod"),
+            make_jumpserver_entry("staging"),
+            make_direct_entry("dev"),
+        ];
+        assert!(validate_jump_hosts(&entries).is_ok());
+    }
+
+    #[test]
+    fn validate_jump_hosts_accepts_empty_list() {
+        assert!(validate_jump_hosts(&[]).is_ok());
+    }
+
+    #[test]
+    fn validate_jump_hosts_rejects_empty_alias() {
+        let entries = vec![make_rhopd_entry("")];
+        let err = validate_jump_hosts(&entries).unwrap_err();
+        assert!(matches!(err, JumpHostValidationError::EmptyAlias));
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn validate_jump_hosts_rejects_reserved_alias() {
+        let entries = vec![make_rhopd_entry("local")];
+        let err = validate_jump_hosts(&entries).unwrap_err();
+        match &err {
+            JumpHostValidationError::ReservedAlias { alias, reserved } => {
+                assert_eq!(alias, "local");
+                assert_eq!(*reserved, RESERVED_ALIASES);
+            }
+            other => panic!("expected ReservedAlias, got: {:?}", other),
+        }
+        assert!(err.to_string().contains("reserved"));
+    }
+
+    #[test]
+    fn validate_jump_hosts_rejects_duplicate_alias_across_kinds() {
+        let entries = vec![make_rhopd_entry("shared"), make_jumpserver_entry("shared")];
+        let err = validate_jump_hosts(&entries).unwrap_err();
+        match &err {
+            JumpHostValidationError::AliasCollision {
+                alias,
+                existing_kind,
+            } => {
+                assert_eq!(alias, "shared");
+                assert_eq!(*existing_kind, JumpHostKind::Rhopd);
+            }
+            other => panic!("expected AliasCollision, got: {:?}", other),
+        }
+        assert!(err.to_string().contains("already used"));
+    }
+
+    #[test]
+    fn validate_jump_hosts_rejects_kind_fields_mismatch() {
+        // kind is Rhopd but fields are Jumpserver
+        let entry = JumpHostConfig {
+            alias: "bad".to_string(),
+            kind: JumpHostKind::Rhopd,
+            fields: JumpHostFields::Jumpserver(JumpserverJumpHostFields {
+                host: "jump.example.com".to_string(),
+                port: 22,
+                user: "admin".to_string(),
+                identity_file: "/tmp/key".to_string(),
+                pubkey_accepted_algorithms: None,
+                menu_prompt_contains: "Opt".to_string(),
+                mfa_prompt_contains: "MFA".to_string(),
+                shell_prompt_suffixes: vec!["$ ".to_string(), "# ".to_string()],
+                mfa: super::MfaConfig::default(),
+            }),
+        };
+        let err = validate_jump_hosts(&[entry]).unwrap_err();
+        match &err {
+            JumpHostValidationError::KindFieldsMismatch { alias, kind } => {
+                assert_eq!(alias, "bad");
+                assert_eq!(*kind, JumpHostKind::Rhopd);
+            }
+            other => panic!("expected KindFieldsMismatch, got: {:?}", other),
+        }
+        assert!(err.to_string().contains("do not match"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Property-based tests
+    // -----------------------------------------------------------------------
+
+    // Feature: rhopd-jumpserver-architecture, Property 10: Alias-uniqueness validation rejects collisions deterministically
+
+    /// Strategy to generate a non-empty alphanumeric alias string (1–20 chars).
+    fn arb_alias_string() -> impl Strategy<Value = String> {
+        "[a-zA-Z0-9]{1,20}"
+    }
+
+    /// Strategy to generate a valid `JumpHostConfig` with `JumpHostFields::Rhopd`
+    /// and the given alias.
+    fn arb_jump_host_config_with_alias(alias: String) -> JumpHostConfig {
+        JumpHostConfig {
+            alias,
+            kind: JumpHostKind::Rhopd,
+            fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
+                address: "10.0.0.1:2222".to_string(),
+                identity_file: "/tmp/key".to_string(),
+                known_hosts_path: "/tmp/known_hosts".to_string(),
+            }),
+        }
+    }
+
+    /// Strategy to generate a `Vec<JumpHostConfig>` of 0–5 entries with unique,
+    /// non-reserved aliases (used as a valid prefix before injecting a collision).
+    fn arb_valid_jump_host_vec() -> impl Strategy<Value = Vec<JumpHostConfig>> {
+        proptest::collection::hash_set(arb_alias_string(), 0..=5)
+            .prop_filter("aliases must not be reserved", |aliases| {
+                aliases.iter().all(|a| !RESERVED_ALIASES.contains(&a.as_str()))
+            })
+            .prop_map(|aliases| {
+                aliases
+                    .into_iter()
+                    .map(arb_jump_host_config_with_alias)
+                    .collect::<Vec<_>>()
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 100, .. ProptestConfig::default() })]
+
+        /// **Validates: Requirements 10.6, 10.7, 14.2, 14.3, 14.5, 14.6**
+        ///
+        /// For any `Vec<JumpHostConfig>` containing two entries with equal `alias`,
+        /// `validate_jump_hosts` returns `Err(AliasCollision { .. })`.
+        #[test]
+        fn prop_alias_collision_rejected(
+            prefix in arb_valid_jump_host_vec(),
+            dup_alias in arb_alias_string().prop_filter("not reserved", |a| {
+                !RESERVED_ALIASES.contains(&a.as_str())
+            }),
+        ) {
+            // Build a config with two entries sharing the same alias
+            let entry1 = arb_jump_host_config_with_alias(dup_alias.clone());
+            let entry2 = arb_jump_host_config_with_alias(dup_alias.clone());
+
+            // Filter out any prefix entry that already uses dup_alias to avoid
+            // the collision being triggered by prefix vs entry1 instead of entry1 vs entry2
+            let mut entries: Vec<JumpHostConfig> = prefix
+                .into_iter()
+                .filter(|e| e.alias != dup_alias)
+                .collect();
+            entries.push(entry1);
+            entries.push(entry2);
+
+            let result = validate_jump_hosts(&entries);
+            prop_assert!(result.is_err(), "expected Err for duplicate alias '{}'", dup_alias);
+            match result.unwrap_err() {
+                JumpHostValidationError::AliasCollision { alias, .. } => {
+                    prop_assert_eq!(alias, dup_alias);
+                }
+                other => {
+                    prop_assert!(false, "expected AliasCollision, got: {:?}", other);
+                }
+            }
+        }
+
+        /// **Validates: Requirements 10.6, 10.7, 14.2, 14.3, 14.5, 14.6**
+        ///
+        /// For any `Vec<JumpHostConfig>` containing an entry with `alias == "local"`,
+        /// `validate_jump_hosts` returns `Err(ReservedAlias { .. })`.
+        #[test]
+        fn prop_reserved_alias_rejected(
+            prefix in arb_valid_jump_host_vec(),
+        ) {
+            // Insert an entry with the reserved alias "local"
+            let reserved_entry = arb_jump_host_config_with_alias("local".to_string());
+
+            let mut entries = prefix;
+            entries.push(reserved_entry);
+
+            let result = validate_jump_hosts(&entries);
+            prop_assert!(result.is_err(), "expected Err for reserved alias 'local'");
+            match result.unwrap_err() {
+                JumpHostValidationError::ReservedAlias { alias, reserved } => {
+                    prop_assert_eq!(alias, "local");
+                    prop_assert_eq!(reserved, RESERVED_ALIASES);
+                }
+                other => {
+                    prop_assert!(false, "expected ReservedAlias, got: {:?}", other);
+                }
+            }
+        }
     }
 }
