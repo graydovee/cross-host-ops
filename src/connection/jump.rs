@@ -8,23 +8,21 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use russh::client;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task;
-use tracing::{debug, info};
 
-#[allow(deprecated)]
 use crate::config::{
-    AppConfig, JumpserverConfig, MfaConfig, SshHostEntry, parse_ssh_config, resolve_ssh_host,
+    AppConfig, JumpserverJumpHostFields, MfaConfig,
 };
 use crate::protocol::ServerEvent;
 
+use super::resolver::derive_target_ip;
 use super::{AuthPromptRequest, AuthPrompter, Connection};
 use super::shared::{
-    ClientHandler, PtyShell, apply_local_mode, authenticate_with_key,
-    build_interactive_shell_command, chmod_octal, connect_handle, join_remote_path,
+    ClientHandler, PtyShell, apply_local_mode, authenticate_with_key, connect_handle,
+    build_interactive_shell_command, chmod_octal, join_remote_path,
     local_mode, maybe_local_download_target, remote_path_needs_expansion,
     request_default_pty, split_tilde_path, upload_destination_for_directory,
 };
-#[allow(deprecated)]
-use super::types::{CopyDirection, CopySpec, ResolvedTarget};
+use super::types::{CopyDirection, CopySpec};
 
 const EXEC_SENTINEL_PREFIX: &str = "__ARUN_EXEC__";
 const COPY_SENTINEL_PREFIX: &str = "__ARUN_COPY__";
@@ -40,24 +38,23 @@ pub struct JumpSshConnection {
     shell: PtyShell,
 }
 
-#[allow(deprecated)]
 impl JumpSshConnection {
+    /// Connect to a jumpserver, authenticate, open a PTY shell, and navigate
+    /// the interactive menu to reach the target host.
     pub async fn connect(
-        target: &ResolvedTarget,
+        target_label: &str,
+        fields: &JumpserverJumpHostFields,
         config: &AppConfig,
         auth_prompter: &AuthPrompter,
     ) -> Result<Self> {
-        let jump = merge_jumpserver_target(config)?;
-        let mut handle = connect_handle(&jump.host, jump.port, config).await?;
+        let mut handle = connect_handle(&fields.host, fields.port, config).await?;
         authenticate_with_key(
             &mut handle,
-            &jump.user,
-            jump.identity_file
-                .as_deref()
-                .ok_or_else(|| anyhow!("jumpserver identity_file is required"))?,
-            &target.target_label,
-            Some(&jump.mfa),
-            jump.pubkey_accepted_algorithms.as_deref(),
+            &fields.user,
+            &fields.identity_file,
+            target_label,
+            Some(&fields.mfa),
+            fields.pubkey_accepted_algorithms.as_deref(),
             Some(auth_prompter),
         )
         .await?;
@@ -65,45 +62,44 @@ impl JumpSshConnection {
         request_default_pty(&channel).await?;
         let shell = PtyShell::new(
             channel,
-            jump.shell_prompt_suffixes.clone(),
+            fields.shell_prompt_suffixes.clone(),
             config.ssh.connect_timeout,
         );
-        let mut connection = Self { _handle: handle, shell };
+        let mut connection = Self {
+            _handle: handle,
+            shell,
+        };
         connection.shell.request_shell().await?;
         connection
-            .establish_jump_shell(target, &jump, &config.jumpserver.mfa, auth_prompter)
+            .establish_jump_shell(target_label, fields, auth_prompter)
             .await?;
         Ok(connection)
     }
 
+    /// Navigate the jumpserver interactive shell: handle MFA prompt, select the
+    /// target from the menu, and wait for the final shell prompt.
     async fn establish_jump_shell(
         &mut self,
-        target: &ResolvedTarget,
-        jump: &JumpserverConfig,
-        mfa: &MfaConfig,
+        target_label: &str,
+        fields: &JumpserverJumpHostFields,
         auth_prompter: &AuthPrompter,
     ) -> Result<()> {
-        debug!(target_ip = %target.ip, "waiting for jumpserver shell output");
+        let ip = derive_target_ip(target_label);
+        tracing::debug!(target_ip = %ip, "waiting for jumpserver shell output");
         let mut selected = false;
         let mut mfa_sent = false;
         loop {
             let chunk = self.shell.read_chunk().await?;
             self.shell.extend_pending(&chunk);
             let text = self.shell.pending_text();
-            if !mfa_sent
-                && text.contains(&jump.mfa_prompt_contains)
-            {
-                debug!(target_ip = %target.ip, "jumpserver requested MFA");
-                let code = if !mfa.totp_secret_base32.is_empty() {
-                    generate_totp(mfa)?
+            if !mfa_sent && text.contains(&fields.mfa_prompt_contains) {
+                let code = if !fields.mfa.totp_secret_base32.is_empty() {
+                    generate_totp(&fields.mfa)?
                 } else {
                     auth_prompter(AuthPromptRequest {
-                        target_label: target.target_label.clone(),
+                        target_label: target_label.to_string(),
                         kind: "jump_mfa".to_string(),
-                        message: format!(
-                            "jumpserver requested MFA for {}",
-                            target.target_label
-                        ),
+                        message: format!("jumpserver requested MFA for {}", target_label),
                         secret: true,
                     })
                     .await?
@@ -111,18 +107,15 @@ impl JumpSshConnection {
                 self.shell.write_line(&code).await?;
                 self.shell.clear_pending();
                 mfa_sent = true;
-                info!(target_ip = %target.ip, "jumpserver MFA completed");
                 continue;
             }
-            if !selected && text.contains(&jump.menu_prompt_contains) {
-                debug!(target_ip = %target.ip, "jumpserver menu detected, selecting target");
-                self.shell.write_line(&target.ip).await?;
+            if !selected && text.contains(&fields.menu_prompt_contains) {
+                self.shell.write_line(&ip).await?;
                 self.shell.clear_pending();
                 selected = true;
                 continue;
             }
             if selected && self.shell.pending_has_prompt() {
-                debug!(target_ip = %target.ip, "remote shell prompt detected");
                 break;
             }
         }
@@ -518,45 +511,6 @@ impl JumpSshConnection {
             bail!("failed to resolve remote path via `{}`", command);
         }
         Ok(output)
-    }
-}
-
-#[allow(deprecated)]
-fn merge_jumpserver_target(config: &AppConfig) -> Result<JumpserverConfig> {
-    let mut jump = config.jumpserver.clone();
-    if jump.host.is_empty() {
-        bail!("jumpserver is enabled but jumpserver.host is missing");
-    }
-    let entries = parse_ssh_config(Path::new(&config.ssh.ssh_config_path))?;
-    if let Some(host_entry) = resolve_ssh_host(&entries, &jump.host) {
-        apply_jumpserver_host_defaults(&mut jump, &host_entry);
-    }
-    if jump.identity_file.is_none() {
-        bail!("jumpserver identity_file is missing");
-    }
-    if jump.user.is_empty() {
-        bail!("jumpserver user is missing");
-    }
-    Ok(jump)
-}
-
-#[allow(deprecated)]
-fn apply_jumpserver_host_defaults(jump: &mut JumpserverConfig, host: &SshHostEntry) {
-    if jump.port == 22 {
-        if let Some(port) = host.port {
-            jump.port = port;
-        }
-    }
-    if jump.user.is_empty() {
-        if let Some(user) = &host.user {
-            jump.user = user.clone();
-        }
-    }
-    if jump.identity_file.is_none() {
-        jump.identity_file = host.identity_file.clone();
-    }
-    if jump.pubkey_accepted_algorithms.is_none() {
-        jump.pubkey_accepted_algorithms = host.pubkey_accepted_algorithms.clone();
     }
 }
 

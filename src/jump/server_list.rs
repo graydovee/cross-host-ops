@@ -81,10 +81,10 @@ impl<'a> ServerListAggregator<'a> {
         let mut fetch_indices: Vec<usize> = Vec::new();
 
         for (idx, jh) in self.jump_hosts.iter().enumerate() {
-            let source = ServerListSource::JumpHost(jh.alias().to_string());
+            let source = ServerListSource::JumpHost(jh.name().to_string());
             if let Some((cached_at, entries)) = self.cache.get(&source) {
                 if now.duration_since(*cached_at) < ttl {
-                    cached_results.push((jh.alias().to_string(), entries.clone()));
+                    cached_results.push((jh.name().to_string(), entries.clone()));
                     continue;
                 }
             }
@@ -154,7 +154,7 @@ impl<'a> ServerListAggregator<'a> {
 
         for &idx in indices {
             let jh = &mut self.jump_hosts[idx];
-            let alias = jh.alias().to_string();
+            let alias = jh.name().to_string();
             let outcome = timeout(connect_timeout, jh.list_servers(self.config)).await;
             let result = match outcome {
                 Ok(Ok(entries)) => Ok(entries),
@@ -235,7 +235,7 @@ mod tests {
             JumpHostKind::Rhopd
         }
 
-        fn alias(&self) -> &str {
+        fn name(&self) -> &str {
             &self.host_alias
         }
     }
@@ -264,7 +264,7 @@ mod tests {
             JumpHostKind::Direct
         }
 
-        fn alias(&self) -> &str {
+        fn name(&self) -> &str {
             &self.host_alias
         }
     }
@@ -297,7 +297,7 @@ mod tests {
             JumpHostKind::Rhopd
         }
 
-        fn alias(&self) -> &str {
+        fn name(&self) -> &str {
             &self.host_alias
         }
     }
@@ -629,7 +629,7 @@ mod tests {
                 JumpHostOutcome::Ok(entries) => Ok(entries.clone()),
                 JumpHostOutcome::Unsupported => Err(UnsupportedCapability {
                     kind: self.kind(),
-                    alias: self.alias().to_string(),
+                    name: self.name().to_string(),
                     method: "list_servers",
                 }
                 .into()),
@@ -641,7 +641,7 @@ mod tests {
             JumpHostKind::Rhopd
         }
 
-        fn alias(&self) -> &str {
+        fn name(&self) -> &str {
             &self.host_alias
         }
     }

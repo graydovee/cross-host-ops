@@ -362,7 +362,7 @@ impl JumpHost for RhopdJumpHost {
         // Until interactive shell ships, return UnsupportedCapability per Req 4.5.
         Err(UnsupportedCapability {
             kind: JumpHostKind::Rhopd,
-            alias: self.alias.clone(),
+            name: self.alias.clone(),
             method: "tui_shell",
         }
         .into())
@@ -406,7 +406,7 @@ impl JumpHost for RhopdJumpHost {
         JumpHostKind::Rhopd
     }
 
-    fn alias(&self) -> &str {
+    fn name(&self) -> &str {
         &self.alias
     }
 }

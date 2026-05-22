@@ -67,7 +67,7 @@ pub trait JumpHost: Send {
     async fn tui_shell(&mut self, _config: &AppConfig) -> Result<()> {
         Err(UnsupportedCapability {
             kind: self.kind(),
-            alias: self.alias().to_string(),
+            name: self.name().to_string(),
             method: "tui_shell",
         }
         .into())
@@ -78,7 +78,7 @@ pub trait JumpHost: Send {
     async fn list_servers(&mut self, _config: &AppConfig) -> Result<Vec<ServerEntry>> {
         Err(UnsupportedCapability {
             kind: self.kind(),
-            alias: self.alias().to_string(),
+            name: self.name().to_string(),
             method: "list_servers",
         }
         .into())
@@ -86,7 +86,7 @@ pub trait JumpHost: Send {
 
     /// Identity for pool keying and diagnostics.
     fn kind(&self) -> JumpHostKind;
-    fn alias(&self) -> &str;
+    fn name(&self) -> &str;
 }
 
 #[cfg(test)]
@@ -97,10 +97,10 @@ mod tests {
     // Feature: rhopd-jumpserver-architecture, Property 5: UnsupportedCapability error contract
 
     /// A mock JumpHost that only implements the required methods (exec, copy,
-    /// kind, alias) and does NOT override tui_shell or list_servers, so the
+    /// kind, name) and does NOT override tui_shell or list_servers, so the
     /// default implementations fire.
     struct MockJumpHost {
-        host_alias: String,
+        host_name: String,
         host_kind: JumpHostKind,
     }
 
@@ -123,8 +123,8 @@ mod tests {
             self.host_kind
         }
 
-        fn alias(&self) -> &str {
-            &self.host_alias
+        fn name(&self) -> &str {
+            &self.host_name
         }
     }
 
@@ -138,7 +138,7 @@ mod tests {
     }
 
     /// Strategy to generate non-empty alias strings (the Display format always
-    /// includes the alias, so we need at least one character to verify containment).
+    /// includes the name, so we need at least one character to verify containment).
     fn arb_alias() -> impl Strategy<Value = String> {
         "[a-zA-Z0-9_][a-zA-Z0-9_\\-]{0,30}".prop_map(|s| s)
     }
@@ -156,7 +156,7 @@ mod tests {
         /// For arbitrary alias strings and method names in {"tui_shell", "list_servers"},
         /// calling the default trait method on a synthesized JumpHost returns Err,
         /// the error downcasts to UnsupportedCapability, and its Display rendering
-        /// contains the alias, the textual JumpHostKind, and the method name.
+        /// contains the name, the textual JumpHostKind, and the method name.
         #[test]
         fn prop_unsupported_capability_error_contract(
             alias in arb_alias(),
@@ -167,7 +167,7 @@ mod tests {
             rt.block_on(async {
                 let config = AppConfig::default();
                 let mut mock = MockJumpHost {
-                    host_alias: alias.clone(),
+                    host_name: alias.clone(),
                     host_kind: kind,
                 };
 
@@ -189,14 +189,14 @@ mod tests {
 
                 // Verify the fields match
                 prop_assert_eq!(unsupported.kind, kind);
-                prop_assert_eq!(&unsupported.alias, &alias);
+                prop_assert_eq!(&unsupported.name, &alias);
                 prop_assert_eq!(unsupported.method, method);
 
-                // Verify Display rendering contains alias, kind name, and method name
+                // Verify Display rendering contains name, kind name, and method name
                 let display = format!("{}", err);
                 prop_assert!(
                     display.contains(&alias),
-                    "Display should contain alias '{}', got: {}",
+                    "Display should contain name '{}', got: {}",
                     alias,
                     display
                 );

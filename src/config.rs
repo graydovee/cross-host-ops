@@ -14,28 +14,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::jump::JumpHostKind;
 
-#[allow(deprecated)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub server: ServerConfig,
     pub ssh: SshConfig,
     pub copy: CopyConfig,
-    /// Deprecated: use `[[jump_hosts]]` entries with `kind = "jumpserver"` instead.
-    pub jumpserver: JumpserverConfig,
     pub review: ReviewConfig,
     #[serde(default)]
     pub jump_hosts: Vec<JumpHostConfig>,
 }
 
-#[allow(deprecated)]
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             server: ServerConfig::default(),
             ssh: SshConfig::default(),
             copy: CopyConfig::default(),
-            jumpserver: JumpserverConfig::default(),
             review: ReviewConfig::default(),
             jump_hosts: Vec::new(),
         }
@@ -60,7 +55,6 @@ impl AppConfig {
         Ok(config)
     }
 
-    #[allow(deprecated)]
     pub fn expand_paths(&mut self) -> Result<()> {
         if let Some(log_path) = &self.server.log_path {
             self.server.log_path = Some(expand_tilde(log_path)?);
@@ -71,9 +65,6 @@ impl AppConfig {
             expand_tilde(&self.server.remote.authorized_keys_path)?;
         self.ssh.ssh_config_path = expand_tilde(&self.ssh.ssh_config_path)?;
         self.ssh.server_config_path = expand_tilde(&self.ssh.server_config_path)?;
-        if let Some(identity) = &self.jumpserver.identity_file {
-            self.jumpserver.identity_file = Some(expand_tilde(identity)?);
-        }
         Ok(())
     }
 
@@ -124,7 +115,7 @@ pub fn expand_tilde(value: &str) -> Result<String> {
 pub struct ServerConfig {
     pub log_path: Option<String>,
     pub log_level: String,
-    #[serde(deserialize_with = "deserialize_duration")]
+    #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]
     pub reaper_interval: Duration,
     pub local: LocalServerConfig,
     pub remote: RemoteServerConfig,
@@ -214,14 +205,14 @@ impl Default for RemoteServerConfig {
 pub struct SshConfig {
     pub ssh_config_path: String,
     pub server_config_path: String,
-    pub fallback: Vec<FallbackTransport>,
+    pub fallback: Vec<FallbackEntry>,
     pub pty: bool,
     pub auto_pty_detect: bool,
-    #[serde(deserialize_with = "deserialize_duration")]
+    #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]
     pub connect_timeout: Duration,
-    #[serde(deserialize_with = "deserialize_duration")]
+    #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]
     pub keepalive_interval: Duration,
-    #[serde(deserialize_with = "deserialize_duration")]
+    #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]
     pub max_idle_time: Duration,
     pub max_connections_per_ip: usize,
 }
@@ -231,10 +222,7 @@ impl Default for SshConfig {
         Self {
             ssh_config_path: "~/.ssh/config".to_string(),
             server_config_path: "~/.rhop/server.toml".to_string(),
-            fallback: vec![
-                FallbackTransport::SshConfig,
-                FallbackTransport::Jumpserver,
-            ],
+            fallback: vec![FallbackEntry::Local],
             pty: true,
             auto_pty_detect: true,
             connect_timeout: Duration::from_secs(10),
@@ -259,41 +247,7 @@ impl Default for CopyConfig {
     }
 }
 
-#[deprecated(
-    note = "Use [[jump_hosts]] entries with kind = \"jumpserver\" instead. This top-level [jumpserver] block will be removed in a future release."
-)]
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default)]
-pub struct JumpserverConfig {
-    pub enabled: bool,
-    pub host: String,
-    pub port: u16,
-    pub user: String,
-    pub identity_file: Option<String>,
-    pub pubkey_accepted_algorithms: Option<String>,
-    pub menu_prompt_contains: String,
-    pub mfa_prompt_contains: String,
-    pub shell_prompt_suffixes: Vec<String>,
-    pub mfa: MfaConfig,
-}
 
-#[allow(deprecated)]
-impl Default for JumpserverConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            host: String::new(),
-            port: 22,
-            user: String::new(),
-            identity_file: None,
-            pubkey_accepted_algorithms: None,
-            menu_prompt_contains: "Opt".to_string(),
-            mfa_prompt_contains: "MFA".to_string(),
-            shell_prompt_suffixes: vec!["$ ".to_string(), "# ".to_string()],
-            mfa: MfaConfig::default(),
-        }
-    }
-}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -315,18 +269,49 @@ impl Default for MfaConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum FallbackTransport {
-    SshConfig,
-    Jumpserver,
+/// A single entry in the `ssh.fallback` list.
+///
+/// - `"local"` deserializes to `FallbackEntry::Local` (resolve via ~/.ssh/config)
+/// - Any other string deserializes to `FallbackEntry::JumpHost(name)` (route through named jump host)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FallbackEntry {
+    /// Resolve via local ~/.ssh/config
+    Local,
+    /// Route through the named jump host
+    JumpHost(String),
 }
 
-impl fmt::Display for FallbackTransport {
+impl<'de> Deserialize<'de> for FallbackEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        if s == "local" {
+            Ok(FallbackEntry::Local)
+        } else {
+            Ok(FallbackEntry::JumpHost(s))
+        }
+    }
+}
+
+impl Serialize for FallbackEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            FallbackEntry::Local => serializer.serialize_str("local"),
+            FallbackEntry::JumpHost(name) => serializer.serialize_str(name),
+        }
+    }
+}
+
+impl fmt::Display for FallbackEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            FallbackTransport::SshConfig => write!(f, "ssh_config"),
-            FallbackTransport::Jumpserver => write!(f, "jumpserver"),
+            FallbackEntry::Local => write!(f, "local"),
+            FallbackEntry::JumpHost(name) => write!(f, "{}", name),
         }
     }
 }
@@ -386,7 +371,7 @@ pub struct ReviewConfig {
     pub endpoint: String,
     pub model: String,
     pub api_key: Option<String>,
-    #[serde(deserialize_with = "deserialize_duration")]
+    #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]
     pub timeout: Duration,
     pub failure_action: ReviewAction,
     pub headers: HashMap<String, String>,
@@ -657,6 +642,15 @@ impl fmt::Display for RiskLevel {
             RiskLevel::Dangerous => write!(f, "dangerous"),
         }
     }
+}
+
+fn serialize_duration<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let secs = duration.as_secs();
+    let s = format!("{}s", secs);
+    serializer.serialize_str(&s)
 }
 
 fn deserialize_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
@@ -939,64 +933,65 @@ fn glob_match_inner(pattern: &[char], text: &[char], pi: usize, ti: usize) -> bo
 // ---------------------------------------------------------------------------
 
 /// Aliases that are reserved by the system and cannot be assigned to any
-/// Jump_Host entry. Currently only `"local"` is reserved (it names the
-/// Local_Daemon's own server.toml source).
-pub const RESERVED_ALIASES: &[&str] = &["local"];
+/// Jump host names that are reserved by the system and cannot be assigned to any
+/// jump host entry. Currently only `"local"` is reserved (it names the
+/// local daemon's own server.toml source).
+pub const RESERVED_NAMES: &[&str] = &["local"];
 
 /// Validation errors for the `[[jump_hosts]]` configuration section.
 #[derive(Debug, thiserror::Error)]
 pub enum JumpHostValidationError {
-    #[error("jump host alias must not be empty")]
-    EmptyAlias,
+    #[error("jump host name must not be empty")]
+    EmptyName,
 
-    #[error("jump host alias '{alias}' is reserved (reserved aliases: {reserved:?})")]
-    ReservedAlias {
-        alias: String,
+    #[error("jump host name '{name}' is reserved (reserved names: {reserved:?})")]
+    ReservedName {
+        name: String,
         reserved: &'static [&'static str],
     },
 
-    #[error("jump host alias '{alias}' is already used by a {existing_kind} jump host")]
-    AliasCollision {
-        alias: String,
+    #[error("jump host name '{name}' is already used by a {existing_kind} jump host")]
+    NameCollision {
+        name: String,
         existing_kind: JumpHostKind,
     },
 
-    #[error("jump host '{alias}' has kind '{kind}' but fields do not match that kind")]
-    KindFieldsMismatch { alias: String, kind: JumpHostKind },
+    #[error("jump host '{name}' has kind '{kind}' but fields do not match that kind")]
+    KindFieldsMismatch { name: String, kind: JumpHostKind },
 }
 
 /// Validates the `[[jump_hosts]]` entries in the daemon configuration.
 ///
 /// Checks:
-/// - alias must not be empty
-/// - alias must not be in `RESERVED_ALIASES`
-/// - alias must not duplicate any other entry's alias (regardless of kind)
+/// - name must not be empty
+/// - name must not be in `RESERVED_NAMES`
+/// - name must not duplicate any other entry's name (regardless of kind)
 /// - fields variant must match kind
 pub fn validate_jump_hosts(jump_hosts: &[JumpHostConfig]) -> Result<(), JumpHostValidationError> {
     let mut seen: HashMap<&str, JumpHostKind> = HashMap::new();
 
     for entry in jump_hosts {
-        // Empty alias check
-        if entry.alias.is_empty() {
-            return Err(JumpHostValidationError::EmptyAlias);
+        // Empty name check
+        if entry.name.is_empty() {
+            return Err(JumpHostValidationError::EmptyName);
         }
 
-        // Reserved alias check
-        if RESERVED_ALIASES.contains(&entry.alias.as_str()) {
-            return Err(JumpHostValidationError::ReservedAlias {
-                alias: entry.alias.clone(),
-                reserved: RESERVED_ALIASES,
+        // Reserved name check
+        if RESERVED_NAMES.contains(&entry.name.as_str()) {
+            return Err(JumpHostValidationError::ReservedName {
+                name: entry.name.clone(),
+                reserved: RESERVED_NAMES,
             });
         }
 
-        // Duplicate alias check
-        if let Some(&existing_kind) = seen.get(entry.alias.as_str()) {
-            return Err(JumpHostValidationError::AliasCollision {
-                alias: entry.alias.clone(),
+        // Duplicate name check
+        if let Some(&existing_kind) = seen.get(entry.name.as_str()) {
+            return Err(JumpHostValidationError::NameCollision {
+                name: entry.name.clone(),
                 existing_kind,
             });
         }
-        seen.insert(&entry.alias, entry.kind);
+        seen.insert(&entry.name, entry.kind);
 
         // Kind-fields mismatch check
         let fields_match = match (&entry.kind, &entry.fields) {
@@ -1007,7 +1002,7 @@ pub fn validate_jump_hosts(jump_hosts: &[JumpHostConfig]) -> Result<(), JumpHost
         };
         if !fields_match {
             return Err(JumpHostValidationError::KindFieldsMismatch {
-                alias: entry.alias.clone(),
+                name: entry.name.clone(),
                 kind: entry.kind,
             });
         }
@@ -1035,7 +1030,8 @@ fn default_shell_prompt_suffixes() -> Vec<String> {
 /// Configuration for a single jump host entry in `[[jump_hosts]]`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JumpHostConfig {
-    pub alias: String,
+    #[serde(alias = "alias")]
+    pub name: String,
     pub kind: JumpHostKind,
     #[serde(flatten)]
     pub fields: JumpHostFields,
@@ -1089,16 +1085,16 @@ pub struct DirectJumpHostFields {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::{
-        AppConfig, ClientConfig, DirectAuth, DirectJumpHostFields, JumpHostConfig,
+        AppConfig, ClientConfig, DirectAuth, DirectJumpHostFields, FallbackEntry, JumpHostConfig,
         JumpHostFields, JumpHostValidationError, JumpserverJumpHostFields, RhopdJumpHostFields,
         SshHostEntry, default_client_config_path, default_config_path, default_known_hosts_path,
-        glob_match, parse_duration, resolve_ssh_host, validate_jump_hosts, RESERVED_ALIASES,
+        glob_match, parse_duration, resolve_ssh_host, validate_jump_hosts, RESERVED_NAMES,
     };
     use crate::jump::JumpHostKind;
     use proptest::prelude::*;
+    use serde::{Deserialize, Serialize};
 
     #[test]
     fn parses_duration() {
@@ -1162,9 +1158,9 @@ mod tests {
 
     // --- validate_jump_hosts tests ---
 
-    fn make_rhopd_entry(alias: &str) -> JumpHostConfig {
+    fn make_rhopd_entry(name: &str) -> JumpHostConfig {
         JumpHostConfig {
-            alias: alias.to_string(),
+            name: name.to_string(),
             kind: JumpHostKind::Rhopd,
             fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
                 address: "10.0.0.1:2222".to_string(),
@@ -1174,9 +1170,9 @@ mod tests {
         }
     }
 
-    fn make_jumpserver_entry(alias: &str) -> JumpHostConfig {
+    fn make_jumpserver_entry(name: &str) -> JumpHostConfig {
         JumpHostConfig {
-            alias: alias.to_string(),
+            name: name.to_string(),
             kind: JumpHostKind::Jumpserver,
             fields: JumpHostFields::Jumpserver(JumpserverJumpHostFields {
                 host: "jump.example.com".to_string(),
@@ -1192,9 +1188,9 @@ mod tests {
         }
     }
 
-    fn make_direct_entry(alias: &str) -> JumpHostConfig {
+    fn make_direct_entry(name: &str) -> JumpHostConfig {
         JumpHostConfig {
-            alias: alias.to_string(),
+            name: name.to_string(),
             kind: JumpHostKind::Direct,
             fields: JumpHostFields::Direct(DirectJumpHostFields {
                 host: "10.0.0.2".to_string(),
@@ -1223,40 +1219,40 @@ mod tests {
     }
 
     #[test]
-    fn validate_jump_hosts_rejects_empty_alias() {
+    fn validate_jump_hosts_rejects_empty_name() {
         let entries = vec![make_rhopd_entry("")];
         let err = validate_jump_hosts(&entries).unwrap_err();
-        assert!(matches!(err, JumpHostValidationError::EmptyAlias));
+        assert!(matches!(err, JumpHostValidationError::EmptyName));
         assert!(err.to_string().contains("must not be empty"));
     }
 
     #[test]
-    fn validate_jump_hosts_rejects_reserved_alias() {
+    fn validate_jump_hosts_rejects_reserved_name() {
         let entries = vec![make_rhopd_entry("local")];
         let err = validate_jump_hosts(&entries).unwrap_err();
         match &err {
-            JumpHostValidationError::ReservedAlias { alias, reserved } => {
-                assert_eq!(alias, "local");
-                assert_eq!(*reserved, RESERVED_ALIASES);
+            JumpHostValidationError::ReservedName { name, reserved } => {
+                assert_eq!(name, "local");
+                assert_eq!(*reserved, RESERVED_NAMES);
             }
-            other => panic!("expected ReservedAlias, got: {:?}", other),
+            other => panic!("expected ReservedName, got: {:?}", other),
         }
         assert!(err.to_string().contains("reserved"));
     }
 
     #[test]
-    fn validate_jump_hosts_rejects_duplicate_alias_across_kinds() {
+    fn validate_jump_hosts_rejects_duplicate_name_across_kinds() {
         let entries = vec![make_rhopd_entry("shared"), make_jumpserver_entry("shared")];
         let err = validate_jump_hosts(&entries).unwrap_err();
         match &err {
-            JumpHostValidationError::AliasCollision {
-                alias,
+            JumpHostValidationError::NameCollision {
+                name,
                 existing_kind,
             } => {
-                assert_eq!(alias, "shared");
+                assert_eq!(name, "shared");
                 assert_eq!(*existing_kind, JumpHostKind::Rhopd);
             }
-            other => panic!("expected AliasCollision, got: {:?}", other),
+            other => panic!("expected NameCollision, got: {:?}", other),
         }
         assert!(err.to_string().contains("already used"));
     }
@@ -1265,7 +1261,7 @@ mod tests {
     fn validate_jump_hosts_rejects_kind_fields_mismatch() {
         // kind is Rhopd but fields are Jumpserver
         let entry = JumpHostConfig {
-            alias: "bad".to_string(),
+            name: "bad".to_string(),
             kind: JumpHostKind::Rhopd,
             fields: JumpHostFields::Jumpserver(JumpserverJumpHostFields {
                 host: "jump.example.com".to_string(),
@@ -1281,8 +1277,8 @@ mod tests {
         };
         let err = validate_jump_hosts(&[entry]).unwrap_err();
         match &err {
-            JumpHostValidationError::KindFieldsMismatch { alias, kind } => {
-                assert_eq!(alias, "bad");
+            JumpHostValidationError::KindFieldsMismatch { name, kind } => {
+                assert_eq!(name, "bad");
                 assert_eq!(*kind, JumpHostKind::Rhopd);
             }
             other => panic!("expected KindFieldsMismatch, got: {:?}", other),
@@ -1294,18 +1290,16 @@ mod tests {
     // Property-based tests
     // -----------------------------------------------------------------------
 
-    // Feature: rhopd-jumpserver-architecture, Property 10: Alias-uniqueness validation rejects collisions deterministically
-
-    /// Strategy to generate a non-empty alphanumeric alias string (1–20 chars).
-    fn arb_alias_string() -> impl Strategy<Value = String> {
+    /// Strategy to generate a non-empty alphanumeric name string (1–20 chars).
+    fn arb_name_string() -> impl Strategy<Value = String> {
         "[a-zA-Z0-9]{1,20}"
     }
 
     /// Strategy to generate a valid `JumpHostConfig` with `JumpHostFields::Rhopd`
-    /// and the given alias.
-    fn arb_jump_host_config_with_alias(alias: String) -> JumpHostConfig {
+    /// and the given name.
+    fn arb_jump_host_config_with_name(name: String) -> JumpHostConfig {
         JumpHostConfig {
-            alias,
+            name,
             kind: JumpHostKind::Rhopd,
             fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
                 address: "10.0.0.1:2222".to_string(),
@@ -1316,16 +1310,16 @@ mod tests {
     }
 
     /// Strategy to generate a `Vec<JumpHostConfig>` of 0–5 entries with unique,
-    /// non-reserved aliases (used as a valid prefix before injecting a collision).
+    /// non-reserved names (used as a valid prefix before injecting a collision).
     fn arb_valid_jump_host_vec() -> impl Strategy<Value = Vec<JumpHostConfig>> {
-        proptest::collection::hash_set(arb_alias_string(), 0..=5)
-            .prop_filter("aliases must not be reserved", |aliases| {
-                aliases.iter().all(|a| !RESERVED_ALIASES.contains(&a.as_str()))
+        proptest::collection::hash_set(arb_name_string(), 0..=5)
+            .prop_filter("names must not be reserved", |names| {
+                names.iter().all(|a| !RESERVED_NAMES.contains(&a.as_str()))
             })
-            .prop_map(|aliases| {
-                aliases
+            .prop_map(|names| {
+                names
                     .into_iter()
-                    .map(arb_jump_host_config_with_alias)
+                    .map(arb_jump_host_config_with_name)
                     .collect::<Vec<_>>()
             })
     }
@@ -1333,67 +1327,133 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig { cases: 100, .. ProptestConfig::default() })]
 
-        /// **Validates: Requirements 10.6, 10.7, 14.2, 14.3, 14.5, 14.6**
+        // Feature: remove-deprecated-jumpserver-config, Property 8: Name collision rejection
+        /// **Validates: Requirements 2.4**
         ///
-        /// For any `Vec<JumpHostConfig>` containing two entries with equal `alias`,
-        /// `validate_jump_hosts` returns `Err(AliasCollision { .. })`.
+        /// For any `Vec<JumpHostConfig>` containing two entries with equal `name`,
+        /// `validate_jump_hosts` returns `Err(NameCollision { .. })`.
         #[test]
-        fn prop_alias_collision_rejected(
+        fn prop_name_collision_rejected(
             prefix in arb_valid_jump_host_vec(),
-            dup_alias in arb_alias_string().prop_filter("not reserved", |a| {
-                !RESERVED_ALIASES.contains(&a.as_str())
+            dup_name in arb_name_string().prop_filter("not reserved", |a| {
+                !RESERVED_NAMES.contains(&a.as_str())
             }),
         ) {
-            // Build a config with two entries sharing the same alias
-            let entry1 = arb_jump_host_config_with_alias(dup_alias.clone());
-            let entry2 = arb_jump_host_config_with_alias(dup_alias.clone());
+            // Build a config with two entries sharing the same name
+            let entry1 = arb_jump_host_config_with_name(dup_name.clone());
+            let entry2 = arb_jump_host_config_with_name(dup_name.clone());
 
-            // Filter out any prefix entry that already uses dup_alias to avoid
+            // Filter out any prefix entry that already uses dup_name to avoid
             // the collision being triggered by prefix vs entry1 instead of entry1 vs entry2
             let mut entries: Vec<JumpHostConfig> = prefix
                 .into_iter()
-                .filter(|e| e.alias != dup_alias)
+                .filter(|e| e.name != dup_name)
                 .collect();
             entries.push(entry1);
             entries.push(entry2);
 
             let result = validate_jump_hosts(&entries);
-            prop_assert!(result.is_err(), "expected Err for duplicate alias '{}'", dup_alias);
+            prop_assert!(result.is_err(), "expected Err for duplicate name '{}'", dup_name);
             match result.unwrap_err() {
-                JumpHostValidationError::AliasCollision { alias, .. } => {
-                    prop_assert_eq!(alias, dup_alias);
+                JumpHostValidationError::NameCollision { name, .. } => {
+                    prop_assert_eq!(name, dup_name);
                 }
                 other => {
-                    prop_assert!(false, "expected AliasCollision, got: {:?}", other);
+                    prop_assert!(false, "expected NameCollision, got: {:?}", other);
                 }
             }
         }
 
-        /// **Validates: Requirements 10.6, 10.7, 14.2, 14.3, 14.5, 14.6**
+        // Feature: remove-deprecated-jumpserver-config, Property 7: Reserved name rejection
+        /// **Validates: Requirements 2.4, 3.3**
         ///
-        /// For any `Vec<JumpHostConfig>` containing an entry with `alias == "local"`,
-        /// `validate_jump_hosts` returns `Err(ReservedAlias { .. })`.
+        /// For any `JumpHostConfig` with `name` in `RESERVED_NAMES`,
+        /// `validate_jump_hosts` returns `Err(ReservedName { .. })`.
         #[test]
-        fn prop_reserved_alias_rejected(
+        fn prop_reserved_name_rejected(
             prefix in arb_valid_jump_host_vec(),
         ) {
-            // Insert an entry with the reserved alias "local"
-            let reserved_entry = arb_jump_host_config_with_alias("local".to_string());
+            // Insert an entry with the reserved name "local"
+            let reserved_entry = arb_jump_host_config_with_name("local".to_string());
 
             let mut entries = prefix;
             entries.push(reserved_entry);
 
             let result = validate_jump_hosts(&entries);
-            prop_assert!(result.is_err(), "expected Err for reserved alias 'local'");
+            prop_assert!(result.is_err(), "expected Err for reserved name 'local'");
             match result.unwrap_err() {
-                JumpHostValidationError::ReservedAlias { alias, reserved } => {
-                    prop_assert_eq!(alias, "local");
-                    prop_assert_eq!(reserved, RESERVED_ALIASES);
+                JumpHostValidationError::ReservedName { name, reserved } => {
+                    prop_assert_eq!(name, "local");
+                    prop_assert_eq!(reserved, RESERVED_NAMES);
                 }
                 other => {
-                    prop_assert!(false, "expected ReservedAlias, got: {:?}", other);
+                    prop_assert!(false, "expected ReservedName, got: {:?}", other);
                 }
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Feature: remove-deprecated-jumpserver-config, Property 1: FallbackEntry serialization round-trip
+    // Feature: remove-deprecated-jumpserver-config, Property 2: Non-"local" strings deserialize as JumpHost
+    // -----------------------------------------------------------------------
+
+    /// Wrapper struct for TOML round-trip testing since TOML requires a top-level table.
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct FallbackWrapper {
+        fallback: Vec<FallbackEntry>,
+    }
+
+    /// Strategy to generate a valid `FallbackEntry`.
+    fn arb_fallback_entry() -> impl Strategy<Value = FallbackEntry> {
+        prop_oneof![
+            Just(FallbackEntry::Local),
+            // Non-empty alphanumeric strings that are not "local"
+            "[a-zA-Z][a-zA-Z0-9_-]{0,19}"
+                .prop_filter("must not be 'local'", |s| s != "local")
+                .prop_map(FallbackEntry::JumpHost),
+        ]
+    }
+
+    /// Strategy to generate a `Vec<FallbackEntry>` of 0–8 entries.
+    fn arb_fallback_vec() -> impl Strategy<Value = Vec<FallbackEntry>> {
+        proptest::collection::vec(arb_fallback_entry(), 0..=8)
+    }
+
+    /// Strategy to generate a non-empty string that is not "local".
+    fn arb_non_local_string() -> impl Strategy<Value = String> {
+        "[a-zA-Z][a-zA-Z0-9_-]{0,19}"
+            .prop_filter("must not be 'local'", |s| s != "local")
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 100, .. ProptestConfig::default() })]
+
+        // Feature: remove-deprecated-jumpserver-config, Property 1: FallbackEntry serialization round-trip
+        /// **Validates: Requirements 1.3, 1.7**
+        ///
+        /// For any valid `Vec<FallbackEntry>`, serializing to TOML then deserializing
+        /// produces an equivalent vector.
+        #[test]
+        fn prop_fallback_entry_round_trip(entries in arb_fallback_vec()) {
+            let wrapper = FallbackWrapper { fallback: entries.clone() };
+            let toml_str = toml::to_string(&wrapper).expect("serialize to TOML");
+            let deserialized: FallbackWrapper = toml::from_str(&toml_str).expect("deserialize from TOML");
+            prop_assert_eq!(deserialized.fallback, entries);
+        }
+
+        // Feature: remove-deprecated-jumpserver-config, Property 2: Non-"local" strings deserialize as JumpHost
+        /// **Validates: Requirements 1.3, 1.7**
+        ///
+        /// For any non-empty string that is not "local", deserializing it as a
+        /// `FallbackEntry` produces `FallbackEntry::JumpHost(value)`.
+        #[test]
+        fn prop_non_local_string_deserializes_as_jump_host(value in arb_non_local_string()) {
+            // Wrap in a TOML table with a single-element array
+            let toml_str = format!("fallback = [\"{}\"]", value);
+            let deserialized: FallbackWrapper = toml::from_str(&toml_str).expect("deserialize from TOML");
+            prop_assert_eq!(deserialized.fallback.len(), 1);
+            prop_assert_eq!(&deserialized.fallback[0], &FallbackEntry::JumpHost(value));
         }
     }
 }

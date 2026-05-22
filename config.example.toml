@@ -31,7 +31,12 @@
 # [ssh]
 # ssh_config_path = "~/.ssh/config"
 # server_config_path = "~/.rhop/server.toml"
-# fallback = ["ssh_config", "jumpserver"]
+#
+# Fallback resolution order. Each entry is either:
+#   "local"       — resolve via local ~/.ssh/config
+#   "<name>"      — route through the named [[jump_hosts]] entry
+# Default: ["local"]
+# fallback = ["local", "corp-jump"]
 # pty = true
 # connect_timeout = "10s"
 # keepalive_interval = "30s"
@@ -44,25 +49,17 @@
 # --- Jump Hosts ---
 #
 # Jump hosts define how the local daemon reaches end targets that are not
-# directly reachable via ~/.ssh/config. Each entry has a unique alias, a kind,
-# and kind-specific fields. The alias is used in target resolution:
-#   rhop exec <jump_alias>:<server_alias> <cmd>
+# directly reachable via ~/.ssh/config. Each entry has a unique name, a kind,
+# and kind-specific fields. The name is used in target resolution:
+#   rhop exec <name>:<server_alias> <cmd>
 #
 # Supported kinds: "rhopd", "jumpserver", "direct"
 
-# Example: a remote rhopd daemon reachable over SSH
-# [[jump_hosts]]
-# alias = "prod"
-# kind = "rhopd"
-# address = "rhop@prod-bastion.example.com:2222"
-# identity_file = "~/.ssh/id_ed25519"
-# known_hosts_path = "~/.rhop/known_hosts"
-
 # Example: an interactive jumpserver with MFA
 # [[jump_hosts]]
-# alias = "corp-jump"
+# name = "corp-jump"
 # kind = "jumpserver"
-# host = "jumpserver.example.com"
+# host = "bastion.example.com"
 # port = 20221
 # user = "user@example.com"
 # identity_file = "~/.ssh/id_rsa"
@@ -75,33 +72,23 @@
 # period = 30
 # digest = "sha1"
 
+# Example: a remote rhopd daemon reachable over SSH
+# [[jump_hosts]]
+# name = "prod"
+# kind = "rhopd"
+# address = "rhop@prod-bastion.example.com:2222"
+# identity_file = "~/.ssh/id_ed25519"
+# known_hosts_path = "~/.rhop/known_hosts"
+
 # Example: a named direct SSH entry (useful for explicit routing)
 # [[jump_hosts]]
-# alias = "lab"
+# name = "lab"
 # kind = "direct"
 # host = "10.0.1.50"
 # port = 22
 # user = "admin"
 # [jump_hosts.auth]
 # key = { identity_file = "~/.ssh/id_rsa" }
-
-# DEPRECATED: The top-level [jumpserver] block is deprecated.
-# Use a [[jump_hosts]] entry with kind = "jumpserver" instead.
-# It will be removed in a future release.
-# [jumpserver]
-# enabled = true
-# host = "bastion.example.com"
-# port = 20221
-# user = "user@example.com"
-# identity_file = "~/.ssh/id_rsa"
-# menu_prompt_contains = "Opt"
-# mfa_prompt_contains = "MFA"
-# shell_prompt_suffixes = ["$ ", "# "]
-# [jumpserver.mfa]
-# totp_secret_base32 = "REPLACE_ME"
-# digits = 6
-# period = 30
-# digest = "sha1"
 
 # Enable this only when you want LLM command review before execution.
 # If api_key is omitted, rhop will try RHOP_REVIEW_API_KEY first, then OPENAI_API_KEY.

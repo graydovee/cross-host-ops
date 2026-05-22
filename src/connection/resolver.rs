@@ -3,15 +3,12 @@ use std::path::Path;
 use anyhow::{Result, anyhow, bail};
 
 use crate::config::{
-    AppConfig, FallbackTransport, JumpHostConfig, ServerConfigFile, load_server_config,
-    parse_ssh_config, resolve_server_entry, resolve_ssh_host,
+    AppConfig, DirectAuth, FallbackEntry, JumpHostConfig, ServerConfigFile,
+    load_server_config, parse_ssh_config, resolve_server_entry, resolve_ssh_host,
 };
 use crate::jump::JumpHostKind;
 use crate::jump::types::{EndTarget, EndTargetId, JumpHopRef, ServerListSource, TargetRoute};
 use crate::protocol::ServerListRow;
-
-#[allow(deprecated)]
-use super::types::{DirectTarget, ResolvedTarget, TargetTransport};
 
 // ---------------------------------------------------------------------------
 // Resolver — new struct producing Vec<TargetRoute> directly (task 6.2)
@@ -29,7 +26,7 @@ pub struct Resolver<'a> {
     jump_hosts: &'a [JumpHostConfig],
     /// Optional pre-computed merged server-list view from the aggregator.
     /// When provided, bare-alias resolution checks all sources for uniqueness
-    /// and explicit `<jump_alias>:<server_alias>` lookups verify the alias
+    /// and explicit `<jump_name>:<server_alias>` lookups verify the alias
     /// exists in the named source.
     merged_rows: &'a [ServerListRow],
 }
@@ -67,7 +64,7 @@ impl<'a> Resolver<'a> {
     /// Resolve a CLI target string into candidate `TargetRoute`s.
     ///
     /// Parsing rules:
-    /// 1. `<jump_alias>:<server_alias>` — explicit qualification.
+    /// 1. `<jump_name>:<server_alias>` — explicit qualification.
     /// 2. `<server_alias>` — bare, merged-view lookup.
     /// 3. `<host_or_ip>` — legacy SSH-config / IP fallback.
     ///
@@ -76,9 +73,9 @@ impl<'a> Resolver<'a> {
     /// 2. `ssh.fallback`-driven candidates in declared order.
     /// 3. No implicit fan-out to all `rhopd` jump hosts.
     pub fn resolve(&self, input: &str) -> Result<Vec<TargetRoute>> {
-        // Try explicit `<jump_alias>:<server_alias>` form first.
-        if let Some((jump_alias, server_alias)) = parse_explicit_qualified(input) {
-            return self.resolve_explicit(jump_alias, server_alias);
+        // Try explicit `<jump_name>:<server_alias>` form first.
+        if let Some((jump_name, server_alias)) = parse_explicit_qualified(input) {
+            return self.resolve_explicit(jump_name, server_alias);
         }
 
         // Try bare `<server_alias>` against the merged server-list view.
@@ -115,9 +112,9 @@ impl<'a> Resolver<'a> {
         Ok(candidates)
     }
 
-    /// Resolve an explicitly qualified `<jump_alias>:<server_alias>`.
-    fn resolve_explicit(&self, jump_alias: &str, server_alias: &str) -> Result<Vec<TargetRoute>> {
-        if jump_alias == LOCAL_SOURCE_ALIAS {
+    /// Resolve an explicitly qualified `<jump_name>:<server_alias>`.
+    fn resolve_explicit(&self, jump_name: &str, server_alias: &str) -> Result<Vec<TargetRoute>> {
+        if jump_name == LOCAL_SOURCE_ALIAS {
             // Look up in the local server config only.
             if let Some(route) = self.lookup_local_server(server_alias) {
                 return Ok(vec![route]);
@@ -128,16 +125,16 @@ impl<'a> Resolver<'a> {
             );
         }
 
-        // Look up the jump host by alias.
+        // Look up the jump host by name.
         let jh = self
             .jump_hosts
             .iter()
-            .find(|jh| jh.alias == jump_alias)
-            .ok_or_else(|| anyhow!("jump host alias '{}' not found", jump_alias))?;
+            .find(|jh| jh.name == jump_name)
+            .ok_or_else(|| anyhow!("jump host name '{}' not found", jump_name))?;
 
         // If we have a merged view, verify the server alias exists on this source.
         if !self.merged_rows.is_empty() {
-            let source = ServerListSource::JumpHost(jump_alias.to_string());
+            let source = ServerListSource::JumpHost(jump_name.to_string());
             let found = self
                 .merged_rows
                 .iter()
@@ -146,7 +143,7 @@ impl<'a> Resolver<'a> {
                 bail!(
                     "server alias '{}' not found on jump host '{}'",
                     server_alias,
-                    jump_alias
+                    jump_name
                 );
             }
         }
@@ -154,7 +151,7 @@ impl<'a> Resolver<'a> {
         // Build a route through this jump host to the named server alias.
         let route = TargetRoute {
             hops: vec![JumpHopRef {
-                alias: jh.alias.clone(),
+                name: jh.name.clone(),
                 kind: jh.kind,
             }],
             end_target: EndTarget {
@@ -210,12 +207,12 @@ impl<'a> Resolver<'a> {
                     let kind = self
                         .jump_hosts
                         .iter()
-                        .find(|jh| &jh.alias == jump_alias)
+                        .find(|jh| &jh.name == jump_alias)
                         .map(|jh| jh.kind)
                         .unwrap_or(JumpHostKind::Rhopd);
                     TargetRoute {
                         hops: vec![JumpHopRef {
-                            alias: jump_alias.clone(),
+                            name: jump_alias.clone(),
                             kind,
                         }],
                         end_target: EndTarget {
@@ -270,7 +267,6 @@ impl<'a> Resolver<'a> {
     /// Append fallback-driven candidates in the order declared in `ssh.fallback`.
     /// When `ssh.fallback` is empty or all entries are disabled, this contributes
     /// zero candidates.
-    #[allow(deprecated)]
     fn append_fallback_routes(
         &self,
         candidates: &mut Vec<TargetRoute>,
@@ -278,29 +274,33 @@ impl<'a> Resolver<'a> {
     ) -> Result<()> {
         let ip = derive_target_ip(input);
 
-        for transport in &self.config.ssh.fallback {
-            match transport {
-                FallbackTransport::SshConfig => {
+        for entry in &self.config.ssh.fallback {
+            match entry {
+                FallbackEntry::Local => {
                     if let Some(route) = self.resolve_ssh_config_route(input, &ip)? {
                         candidates.push(route);
                     }
                 }
-                FallbackTransport::Jumpserver if self.config.jumpserver.enabled => {
-                    // Legacy jumpserver fallback — single hop through the
-                    // configured jumpserver to the target.
+                FallbackEntry::JumpHost(name) => {
+                    // Look up the named [[jump_hosts]] entry
+                    let jh = self
+                        .jump_hosts
+                        .iter()
+                        .find(|jh| jh.name == *name)
+                        .ok_or_else(|| anyhow!(
+                            "ssh.fallback references jump host '{}' which is not defined in [[jump_hosts]]",
+                            name
+                        ))?;
                     candidates.push(TargetRoute {
                         hops: vec![JumpHopRef {
-                            alias: input.to_string(),
-                            kind: JumpHostKind::Jumpserver,
+                            name: jh.name.clone(),
+                            kind: jh.kind,
                         }],
                         end_target: EndTarget {
                             id: EndTargetId(format!("target:{}", input)),
                             alias: input.to_string(),
                         },
                     });
-                }
-                FallbackTransport::Jumpserver => {
-                    // Jumpserver disabled — contribute zero candidates.
                 }
             }
         }
@@ -364,18 +364,18 @@ impl<'a> Resolver<'a> {
     }
 }
 
-/// Parse an input string as `<jump_alias>:<server_alias>`.
+/// Parse an input string as `<jump_name>:<server_alias>`.
 /// Returns `None` if the input does not contain exactly one colon that is not
 /// at the start or end, or if either part is empty.
 fn parse_explicit_qualified(input: &str) -> Option<(&str, &str)> {
     // Avoid matching bare IPv6 addresses or port-like patterns.
     // A valid explicit form has exactly one colon with non-empty parts on both sides.
     let colon_pos = input.find(':')?;
-    let jump_alias = &input[..colon_pos];
+    let jump_name = &input[..colon_pos];
     let server_alias = &input[colon_pos + 1..];
 
     // Both parts must be non-empty.
-    if jump_alias.is_empty() || server_alias.is_empty() {
+    if jump_name.is_empty() || server_alias.is_empty() {
         return None;
     }
 
@@ -391,171 +391,23 @@ fn parse_explicit_qualified(input: &str) -> Option<(&str, &str)> {
         return None;
     }
 
-    Some((jump_alias, server_alias))
+    Some((jump_name, server_alias))
 }
 
-/// Convert a `ResolvedTarget` into a `TargetRoute`.
-///
-/// - Direct transport → zero hops, end target derived from the resolved target.
-/// - Jump transport → single hop with kind `Jumpserver`, end target derived from
-///   the resolved target.
-#[deprecated(
-    since = "0.1.0",
-    note = "Use `Resolver::resolve` to produce `Vec<TargetRoute>` directly instead of converting from `ResolvedTarget`."
-)]
-#[allow(deprecated)]
-pub fn to_target_route(resolved: &ResolvedTarget) -> TargetRoute {
-    let end_target = EndTarget {
-        id: EndTargetId(resolved.key.clone()),
-        alias: resolved.target_label.clone(),
-    };
-
-    match resolved.transport {
-        TargetTransport::Direct => TargetRoute {
-            hops: vec![],
-            end_target,
-        },
-        TargetTransport::Jump => TargetRoute {
-            hops: vec![JumpHopRef {
-                alias: resolved.target_label.clone(),
-                kind: JumpHostKind::Jumpserver,
-            }],
-            end_target,
-        },
-    }
-}
-
-#[deprecated(
-    since = "0.1.0",
-    note = "Use `Resolver::resolve` returning `Vec<TargetRoute>` instead."
-)]
-#[allow(deprecated)]
-pub fn resolve_target(input: &str, config: &AppConfig) -> Result<Vec<ResolvedTarget>> {
-    let ip = derive_target_ip(input);
-    let mut candidates = Vec::new();
-
-    append_server_candidates(&mut candidates, input, &ip, config)?;
-    append_fallback_candidates(&mut candidates, input, &ip, config)?;
-
-    if candidates.is_empty() {
-        bail!(
-            "target {} does not match server.toml or ~/.ssh/config and jumpserver is disabled",
-            ip
-        );
-    }
-    Ok(candidates)
-}
-
-#[allow(deprecated)]
-fn append_server_candidates(
-    candidates: &mut Vec<ResolvedTarget>,
+/// Resolve a direct target (for pool use) by looking up the end target alias
+/// in server.toml or SSH config. Returns a `DirectTarget` suitable for
+/// `DirectSshConnection::connect`.
+pub fn resolve_direct_target_for_route(
     input: &str,
-    ip: &str,
     config: &AppConfig,
-) -> Result<()> {
-    let server_config = load_server_config(Path::new(&config.ssh.server_config_path))?;
+) -> anyhow::Result<super::types::DirectTarget> {
+    let ip = derive_target_ip(input);
 
+    // Try server.toml first
+    let server_config = load_server_config(Path::new(&config.ssh.server_config_path))?;
     if let Some(server) = server_config.servers.get(input) {
         let entry = resolve_server_entry(input, server, &server_config.defaults)?;
-        candidates.push(make_server_target(input, ip, &entry));
-        return Ok(());
-    }
-
-    if let Some((alias, server)) = server_config
-        .servers
-        .iter()
-        .find(|(_, server)| server.host == input)
-    {
-        let entry = resolve_server_entry(alias, server, &server_config.defaults)?;
-        candidates.push(make_server_target(input, ip, &entry));
-        return Ok(());
-    }
-
-    if let Some((alias, server)) = server_config.servers.iter().find(|(_, server)| server.host == ip)
-    {
-        let entry = resolve_server_entry(alias, server, &server_config.defaults)?;
-        candidates.push(make_server_target(input, ip, &entry));
-    }
-    Ok(())
-}
-
-#[allow(deprecated)]
-fn append_fallback_candidates(
-    candidates: &mut Vec<ResolvedTarget>,
-    input: &str,
-    ip: &str,
-    config: &AppConfig,
-) -> Result<()> {
-    for transport in &config.ssh.fallback {
-        match transport {
-            FallbackTransport::SshConfig => {
-                if let Some(target) = resolve_ssh_config_target(input, ip, config)? {
-                    candidates.push(target);
-                }
-            }
-            FallbackTransport::Jumpserver if config.jumpserver.enabled => {
-                candidates.push(ResolvedTarget {
-                    input: input.to_string(),
-                    ip: ip.to_string(),
-                    key: format!("target:{}", input),
-                    transport: TargetTransport::Jump,
-                    direct: None,
-                    target_label: input.to_string(),
-                });
-            }
-            FallbackTransport::Jumpserver => {}
-        }
-    }
-    Ok(())
-}
-
-#[allow(deprecated)]
-fn resolve_ssh_config_target(
-    input: &str,
-    ip: &str,
-    config: &AppConfig,
-) -> Result<Option<ResolvedTarget>> {
-    let ssh_path = Path::new(&config.ssh.ssh_config_path);
-    let entries = parse_ssh_config(ssh_path)?;
-    if let Some(entry) = resolve_ssh_host(&entries, &ip) {
-        if entry.proxy_command.is_some() {
-            bail!("ProxyCommand is not supported for direct SSH targets");
-        }
-        let direct = DirectTarget {
-            host: ip.to_string(),
-            host_name: entry.host_name.unwrap_or_else(|| ip.to_string()),
-            port: entry.port.unwrap_or(22),
-            user: entry
-                .user
-                .ok_or_else(|| anyhow!("missing User for SSH host {}", ip))?,
-            auth: crate::config::DirectAuth::Key {
-                identity_file: entry
-                    .identity_file
-                    .ok_or_else(|| anyhow!("missing IdentityFile for SSH host {}", ip))?,
-            },
-            proxy_command: entry.proxy_command,
-            pubkey_accepted_algorithms: entry.pubkey_accepted_algorithms,
-        };
-        return Ok(Some(ResolvedTarget {
-            input: input.to_string(),
-            key: format!("target:{}", input),
-            ip: ip.to_string(),
-            transport: TargetTransport::Direct,
-            direct: Some(direct),
-            target_label: input.to_string(),
-        }));
-    }
-    Ok(None)
-}
-
-#[allow(deprecated)]
-fn make_server_target(input: &str, ip: &str, entry: &crate::config::ServerEntry) -> ResolvedTarget {
-    ResolvedTarget {
-        input: input.to_string(),
-        ip: ip.to_string(),
-        key: format!("target:{}", input),
-        transport: TargetTransport::Direct,
-        direct: Some(DirectTarget {
+        return Ok(super::types::DirectTarget {
             host: entry.host.clone(),
             host_name: entry.host.clone(),
             port: entry.port,
@@ -563,9 +415,60 @@ fn make_server_target(input: &str, ip: &str, entry: &crate::config::ServerEntry)
             auth: entry.auth.clone(),
             proxy_command: None,
             pubkey_accepted_algorithms: None,
-        }),
-        target_label: entry.alias.clone(),
+        });
     }
+    if let Some((alias, server)) = server_config.servers.iter().find(|(_, s)| s.host == input) {
+        let entry = resolve_server_entry(alias, server, &server_config.defaults)?;
+        return Ok(super::types::DirectTarget {
+            host: entry.host.clone(),
+            host_name: entry.host.clone(),
+            port: entry.port,
+            user: entry.user.clone(),
+            auth: entry.auth.clone(),
+            proxy_command: None,
+            pubkey_accepted_algorithms: None,
+        });
+    }
+    if ip != input {
+        if let Some((alias, server)) = server_config.servers.iter().find(|(_, s)| s.host == ip) {
+            let entry = resolve_server_entry(alias, server, &server_config.defaults)?;
+            return Ok(super::types::DirectTarget {
+                host: entry.host.clone(),
+                host_name: entry.host.clone(),
+                port: entry.port,
+                user: entry.user.clone(),
+                auth: entry.auth.clone(),
+                proxy_command: None,
+                pubkey_accepted_algorithms: None,
+            });
+        }
+    }
+
+    // Try SSH config
+    let ssh_path = Path::new(&config.ssh.ssh_config_path);
+    let entries = parse_ssh_config(ssh_path)?;
+    if let Some(entry) = resolve_ssh_host(&entries, &ip) {
+        if entry.proxy_command.is_some() {
+            anyhow::bail!("ProxyCommand is not supported for direct SSH targets");
+        }
+        return Ok(super::types::DirectTarget {
+            host: ip.to_string(),
+            host_name: entry.host_name.unwrap_or_else(|| ip.to_string()),
+            port: entry.port.unwrap_or(22),
+            user: entry
+                .user
+                .ok_or_else(|| anyhow!("missing User for SSH host {}", ip))?,
+            auth: DirectAuth::Key {
+                identity_file: entry
+                    .identity_file
+                    .ok_or_else(|| anyhow!("missing IdentityFile for SSH host {}", ip))?,
+            },
+            proxy_command: None,
+            pubkey_accepted_algorithms: entry.pubkey_accepted_algorithms,
+        });
+    }
+
+    anyhow::bail!("no direct target details found for '{}'", input)
 }
 
 pub fn derive_target_ip(input: &str) -> String {
@@ -583,11 +486,10 @@ pub fn derive_target_ip(input: &str) -> String {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::config::{
-        AppConfig, FallbackTransport, JumpHostConfig, JumpHostFields, RhopdJumpHostFields,
+        AppConfig, FallbackEntry, JumpHostConfig, JumpHostFields, RhopdJumpHostFields,
         JumpserverJumpHostFields, ServerConfigFile, ServerDefaults, ServerHostConfig,
     };
     use proptest::prelude::*;
@@ -690,7 +592,7 @@ mod tests {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![]);
         let jump_hosts = vec![JumpHostConfig {
-            alias: "remote1".to_string(),
+            name: "remote1".to_string(),
             kind: JumpHostKind::Rhopd,
             fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
                 address: "10.0.0.99:2222".to_string(),
@@ -704,7 +606,7 @@ mod tests {
 
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].hops.len(), 1);
-        assert_eq!(routes[0].hops[0].alias, "remote1");
+        assert_eq!(routes[0].hops[0].name, "remote1");
         assert_eq!(routes[0].hops[0].kind, JumpHostKind::Rhopd);
         assert_eq!(routes[0].end_target.alias, "db01");
     }
@@ -754,15 +656,28 @@ mod tests {
     #[test]
     fn resolver_fallback_jumpserver_enabled() {
         let mut config = AppConfig::default();
-        config.jumpserver.enabled = true;
-        config.ssh.fallback = vec![FallbackTransport::Jumpserver];
+        config.ssh.fallback = vec![FallbackEntry::JumpHost("test-jump".to_string())];
         // Use a non-existent path so server config is empty
         config.ssh.server_config_path = "/tmp/nonexistent_server.toml".to_string();
         // Use a non-existent ssh config path
         config.ssh.ssh_config_path = "/tmp/nonexistent_ssh_config".to_string();
 
         let server_config = ServerConfigFile::default();
-        let jump_hosts: Vec<JumpHostConfig> = vec![];
+        let jump_hosts = vec![JumpHostConfig {
+            name: "test-jump".to_string(),
+            kind: JumpHostKind::Jumpserver,
+            fields: JumpHostFields::Jumpserver(JumpserverJumpHostFields {
+                host: "jump.example.com".to_string(),
+                port: 22,
+                user: "admin".to_string(),
+                identity_file: String::new(),
+                pubkey_accepted_algorithms: None,
+                menu_prompt_contains: "Opt".to_string(),
+                mfa_prompt_contains: "MFA".to_string(),
+                shell_prompt_suffixes: vec!["$ ".to_string(), "# ".to_string()],
+                mfa: crate::config::MfaConfig::default(),
+            }),
+        }];
 
         let resolver = Resolver::new(&config, &server_config, &jump_hosts);
         let routes = resolver.resolve("somehost").unwrap();
@@ -776,8 +691,8 @@ mod tests {
     #[test]
     fn resolver_fallback_jumpserver_disabled() {
         let mut config = AppConfig::default();
-        config.jumpserver.enabled = false;
-        config.ssh.fallback = vec![FallbackTransport::Jumpserver];
+        // Reference a jump host name that doesn't exist in jump_hosts
+        config.ssh.fallback = vec![FallbackEntry::JumpHost("nonexistent-jump".to_string())];
         config.ssh.server_config_path = "/tmp/nonexistent_server.toml".to_string();
         config.ssh.ssh_config_path = "/tmp/nonexistent_ssh_config".to_string();
 
@@ -787,7 +702,7 @@ mod tests {
         let resolver = Resolver::new(&config, &server_config, &jump_hosts);
         let result = resolver.resolve("somehost");
 
-        // Should fail because jumpserver is disabled and no other candidates
+        // Should fail because the referenced jump host doesn't exist and no other candidates
         assert!(result.is_err());
     }
 
@@ -810,13 +725,26 @@ mod tests {
     #[test]
     fn resolver_server_config_takes_priority_over_fallback() {
         let mut config = AppConfig::default();
-        config.jumpserver.enabled = true;
-        config.ssh.fallback = vec![FallbackTransport::Jumpserver];
+        config.ssh.fallback = vec![FallbackEntry::JumpHost("test-jump".to_string())];
         config.ssh.server_config_path = "/tmp/nonexistent_server.toml".to_string();
         config.ssh.ssh_config_path = "/tmp/nonexistent_ssh_config".to_string();
 
         let server_config = make_server_config_with(vec![("web01", "10.0.0.1")]);
-        let jump_hosts: Vec<JumpHostConfig> = vec![];
+        let jump_hosts = vec![JumpHostConfig {
+            name: "test-jump".to_string(),
+            kind: JumpHostKind::Jumpserver,
+            fields: JumpHostFields::Jumpserver(JumpserverJumpHostFields {
+                host: "jump.example.com".to_string(),
+                port: 22,
+                user: "admin".to_string(),
+                identity_file: String::new(),
+                pubkey_accepted_algorithms: None,
+                menu_prompt_contains: "Opt".to_string(),
+                mfa_prompt_contains: "MFA".to_string(),
+                shell_prompt_suffixes: vec!["$ ".to_string(), "# ".to_string()],
+                mfa: crate::config::MfaConfig::default(),
+            }),
+        }];
 
         let resolver = Resolver::new(&config, &server_config, &jump_hosts);
         let routes = resolver.resolve("web01").unwrap();
@@ -830,7 +758,6 @@ mod tests {
     #[test]
     fn resolver_no_implicit_fanout_to_rhopd_hosts() {
         let mut config = AppConfig::default();
-        config.jumpserver.enabled = false;
         config.ssh.fallback = vec![];
         config.ssh.server_config_path = "/tmp/nonexistent_server.toml".to_string();
         config.ssh.ssh_config_path = "/tmp/nonexistent_ssh_config".to_string();
@@ -838,7 +765,7 @@ mod tests {
         let server_config = ServerConfigFile::default();
         let jump_hosts = vec![
             JumpHostConfig {
-                alias: "remote1".to_string(),
+                name: "remote1".to_string(),
                 kind: JumpHostKind::Rhopd,
                 fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
                     address: "10.0.0.99:2222".to_string(),
@@ -847,7 +774,7 @@ mod tests {
                 }),
             },
             JumpHostConfig {
-                alias: "remote2".to_string(),
+                name: "remote2".to_string(),
                 kind: JumpHostKind::Rhopd,
                 fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
                     address: "10.0.0.100:2222".to_string(),
@@ -959,7 +886,7 @@ mod tests {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("web01", "10.0.0.1")]);
         let jump_hosts = vec![JumpHostConfig {
-            alias: "remote1".to_string(),
+            name: "remote1".to_string(),
             kind: JumpHostKind::Rhopd,
             fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
                 address: "10.0.0.99:2222".to_string(),
@@ -976,7 +903,7 @@ mod tests {
         let routes = resolver.resolve("db01").unwrap();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].hops.len(), 1);
-        assert_eq!(routes[0].hops[0].alias, "remote1");
+        assert_eq!(routes[0].hops[0].name, "remote1");
         assert_eq!(routes[0].end_target.alias, "db01");
     }
 
@@ -985,7 +912,7 @@ mod tests {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("web01", "10.0.0.1")]);
         let jump_hosts = vec![JumpHostConfig {
-            alias: "remote1".to_string(),
+            name: "remote1".to_string(),
             kind: JumpHostKind::Rhopd,
             fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
                 address: "10.0.0.99:2222".to_string(),
@@ -1010,7 +937,7 @@ mod tests {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("shared", "10.0.0.5")]);
         let jump_hosts = vec![JumpHostConfig {
-            alias: "remote1".to_string(),
+            name: "remote1".to_string(),
             kind: JumpHostKind::Rhopd,
             fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
                 address: "10.0.0.99:2222".to_string(),
@@ -1041,7 +968,7 @@ mod tests {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("web01", "10.0.0.1")]);
         let jump_hosts = vec![JumpHostConfig {
-            alias: "remote1".to_string(),
+            name: "remote1".to_string(),
             kind: JumpHostKind::Rhopd,
             fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
                 address: "10.0.0.99:2222".to_string(),
@@ -1058,7 +985,7 @@ mod tests {
         let routes = resolver.resolve("remote1:db01").unwrap();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].hops.len(), 1);
-        assert_eq!(routes[0].hops[0].alias, "remote1");
+        assert_eq!(routes[0].hops[0].name, "remote1");
         assert_eq!(routes[0].end_target.alias, "db01");
     }
 
@@ -1067,7 +994,7 @@ mod tests {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("web01", "10.0.0.1")]);
         let jump_hosts = vec![JumpHostConfig {
-            alias: "remote1".to_string(),
+            name: "remote1".to_string(),
             kind: JumpHostKind::Rhopd,
             fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
                 address: "10.0.0.99:2222".to_string(),
@@ -1107,13 +1034,26 @@ mod tests {
     #[test]
     fn resolver_merged_view_bare_not_found_falls_through() {
         let mut config = AppConfig::default();
-        config.jumpserver.enabled = true;
-        config.ssh.fallback = vec![FallbackTransport::Jumpserver];
+        config.ssh.fallback = vec![FallbackEntry::JumpHost("test-jump".to_string())];
         config.ssh.server_config_path = "/tmp/nonexistent_server.toml".to_string();
         config.ssh.ssh_config_path = "/tmp/nonexistent_ssh_config".to_string();
 
         let server_config = ServerConfigFile::default();
-        let jump_hosts: Vec<JumpHostConfig> = vec![];
+        let jump_hosts = vec![JumpHostConfig {
+            name: "test-jump".to_string(),
+            kind: JumpHostKind::Jumpserver,
+            fields: JumpHostFields::Jumpserver(JumpserverJumpHostFields {
+                host: "jump.example.com".to_string(),
+                port: 22,
+                user: "admin".to_string(),
+                identity_file: String::new(),
+                pubkey_accepted_algorithms: None,
+                menu_prompt_contains: "Opt".to_string(),
+                mfa_prompt_contains: "MFA".to_string(),
+                shell_prompt_suffixes: vec!["$ ".to_string(), "# ".to_string()],
+                mfa: crate::config::MfaConfig::default(),
+            }),
+        }];
         let merged_rows = make_merged_rows();
 
         let resolver =
@@ -1157,9 +1097,8 @@ mod tests {
         // Disable ssh config fallback to avoid filesystem access
         config.ssh.ssh_config_path = "/tmp/nonexistent_prop_ssh_config".to_string();
         config.ssh.server_config_path = "/tmp/nonexistent_prop_server.toml".to_string();
-        // Enable jumpserver fallback so some inputs produce routes
-        config.jumpserver.enabled = true;
-        config.ssh.fallback = vec![FallbackTransport::Jumpserver];
+        // Use a jump host fallback so some inputs produce routes
+        config.ssh.fallback = vec![FallbackEntry::JumpHost("test-jump".to_string())];
         config
     }
 
@@ -1176,7 +1115,22 @@ mod tests {
     fn make_prop_jump_hosts() -> Vec<JumpHostConfig> {
         vec![
             JumpHostConfig {
-                alias: "remote1".to_string(),
+                name: "test-jump".to_string(),
+                kind: JumpHostKind::Jumpserver,
+                fields: JumpHostFields::Jumpserver(JumpserverJumpHostFields {
+                    host: "jump.example.com".to_string(),
+                    port: 22,
+                    user: "admin".to_string(),
+                    identity_file: String::new(),
+                    pubkey_accepted_algorithms: None,
+                    menu_prompt_contains: "Opt".to_string(),
+                    mfa_prompt_contains: "MFA".to_string(),
+                    shell_prompt_suffixes: vec!["$ ".to_string(), "# ".to_string()],
+                    mfa: crate::config::MfaConfig::default(),
+                }),
+            },
+            JumpHostConfig {
+                name: "remote1".to_string(),
                 kind: JumpHostKind::Rhopd,
                 fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
                     address: "10.0.0.99:2222".to_string(),
@@ -1185,7 +1139,7 @@ mod tests {
                 }),
             },
             JumpHostConfig {
-                alias: "bastion".to_string(),
+                name: "bastion".to_string(),
                 kind: JumpHostKind::Jumpserver,
                 fields: JumpHostFields::Jumpserver(JumpserverJumpHostFields {
                     host: "bastion.example.com".to_string(),
@@ -1249,8 +1203,8 @@ mod tests {
                         );
                         for (j, (h1, h2)) in r1.hops.iter().zip(r2.hops.iter()).enumerate() {
                             prop_assert_eq!(
-                                &h1.alias, &h2.alias,
-                                "Route {} hop {} alias differs for input '{}'", i, j, input
+                                &h1.name, &h2.name,
+                                "Route {} hop {} name differs for input '{}'", i, j, input
                             );
                             prop_assert_eq!(
                                 h1.kind, h2.kind,
@@ -1268,13 +1222,13 @@ mod tests {
                         "Third resolve call returned different count for input '{}'", input
                     );
 
-                    // Invariant: every JumpHopRef has non-empty alias and a
+                    // Invariant: every JumpHopRef has non-empty name and a
                     // populated JumpHostKind.
                     for (i, route) in routes1.iter().enumerate() {
                         for (j, hop) in route.hops.iter().enumerate() {
                             prop_assert!(
-                                !hop.alias.is_empty(),
-                                "Route {} hop {} has empty alias for input '{}'", i, j, input
+                                !hop.name.is_empty(),
+                                "Route {} hop {} has empty name for input '{}'", i, j, input
                             );
                             // JumpHostKind is an enum — any variant is "populated".
                             // Verify it matches one of the known variants.
@@ -1340,7 +1294,7 @@ mod tests {
         /// For arbitrary configs in which a `<server_alias>` appears in two or
         /// more `Server_List_Source` values, resolving the bare `<server_alias>`
         /// returns an error whose message contains every
-        /// `<jump_alias>:<server_alias>` form (including `local:`) where the
+        /// `<jump_name>:<server_alias>` form (including `local:`) where the
         /// server appears.
         #[test]
         fn prop_bare_alias_ambiguity_reporting(
@@ -1384,7 +1338,7 @@ mod tests {
             let jump_host_configs: Vec<JumpHostConfig> = jump_aliases
                 .iter()
                 .map(|alias| JumpHostConfig {
-                    alias: alias.clone(),
+                    name: alias.clone(),
                     kind: JumpHostKind::Rhopd,
                     fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
                         address: "10.0.0.99:2222".to_string(),
@@ -1438,6 +1392,280 @@ mod tests {
                     err_msg
                 );
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Feature: remove-deprecated-jumpserver-config, Property 3: Resolver fallback ordering preservation
+    // Feature: remove-deprecated-jumpserver-config, Property 4: Resolver idempotence
+    // Feature: remove-deprecated-jumpserver-config, Property 5: Server.toml match short-circuits fallback
+    // Feature: remove-deprecated-jumpserver-config, Property 9: Missing jump host in fallback produces error
+    // -----------------------------------------------------------------------
+
+    /// Strategy to generate a permutation of jump host names for fallback ordering tests.
+    /// Returns a subset (1..=count) of the provided names in a random order.
+    fn arb_fallback_jump_entries(names: Vec<String>) -> impl Strategy<Value = Vec<FallbackEntry>> {
+        let len = names.len();
+        proptest::collection::vec(proptest::sample::select(names), 1..=len)
+            .prop_map(|selected| {
+                // Deduplicate while preserving order
+                let mut seen = std::collections::HashSet::new();
+                selected
+                    .into_iter()
+                    .filter(|n| seen.insert(n.clone()))
+                    .map(|n| FallbackEntry::JumpHost(n))
+                    .collect()
+            })
+    }
+
+    /// Strategy to generate a non-empty target input string that won't match
+    /// server config or trigger explicit qualification parsing.
+    fn arb_bare_target() -> impl Strategy<Value = String> {
+        "[a-z][a-z0-9]{2,10}".prop_filter(
+            "must not contain colon or match server entries",
+            |s| !s.contains(':') && s != "web01" && s != "db01" && s != "cache01",
+        )
+    }
+
+    /// Strategy to generate a server alias that matches one of the prop server config entries.
+    fn arb_server_alias_match() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("web01".to_string()),
+            Just("db01".to_string()),
+            Just("cache01".to_string()),
+        ]
+    }
+
+    /// Strategy to generate a jump host name that does NOT exist in the prop jump hosts.
+    fn arb_nonexistent_jump_name() -> impl Strategy<Value = String> {
+        "[a-z][a-z0-9]{3,12}".prop_filter(
+            "must not match any existing jump host name",
+            |s| s != "test-jump" && s != "remote1" && s != "bastion",
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 100, .. ProptestConfig::default() })]
+
+        // Feature: remove-deprecated-jumpserver-config, Property 3: Resolver fallback ordering preservation
+        /// **Validates: Requirements 1.6, 6.3**
+        ///
+        /// For any permutation of valid `FallbackEntry::JumpHost` entries (all
+        /// referencing existing jump hosts), the resolver output order matches
+        /// the fallback declaration order.
+        #[test]
+        fn prop_resolver_fallback_ordering_preservation(
+            fallback in arb_fallback_jump_entries(vec![
+                "test-jump".to_string(),
+                "remote1".to_string(),
+                "bastion".to_string(),
+            ]),
+            target in arb_bare_target(),
+        ) {
+            let mut config = AppConfig::default();
+            config.ssh.ssh_config_path = "/tmp/nonexistent_prop_ssh_config".to_string();
+            config.ssh.server_config_path = "/tmp/nonexistent_prop_server.toml".to_string();
+            config.ssh.fallback = fallback.clone();
+
+            let server_config = ServerConfigFile::default();
+            let jump_hosts = make_prop_jump_hosts();
+
+            let resolver = Resolver::new(&config, &server_config, &jump_hosts);
+            let routes = resolver.resolve(&target).unwrap();
+
+            // The number of routes should equal the number of fallback entries
+            // (all are JumpHost entries referencing valid hosts, no Local entries
+            // that might not produce a route).
+            prop_assert_eq!(
+                routes.len(),
+                fallback.len(),
+                "Expected {} routes for {} fallback entries, got {} for target '{}'",
+                fallback.len(),
+                fallback.len(),
+                routes.len(),
+                target
+            );
+
+            // Verify ordering: each route's first hop name matches the
+            // corresponding fallback entry's jump host name.
+            for (i, (route, entry)) in routes.iter().zip(fallback.iter()).enumerate() {
+                if let FallbackEntry::JumpHost(expected_name) = entry {
+                    prop_assert_eq!(
+                        routes[i].hops.len(),
+                        1,
+                        "Route {} should have exactly 1 hop for target '{}'",
+                        i,
+                        target
+                    );
+                    prop_assert_eq!(
+                        &route.hops[0].name,
+                        expected_name,
+                        "Route {} hop name should be '{}' but got '{}' for target '{}'",
+                        i,
+                        expected_name,
+                        route.hops[0].name,
+                        target
+                    );
+                }
+            }
+        }
+
+        // Feature: remove-deprecated-jumpserver-config, Property 4: Resolver idempotence
+        /// **Validates: Requirements 6.8**
+        ///
+        /// For any target input string and configuration, calling
+        /// `Resolver::resolve(input)` twice with the same config produces
+        /// identical `Vec<TargetRoute>` results.
+        #[test]
+        fn prop_resolver_idempotence(input in arb_cli_input()) {
+            let config = make_prop_app_config();
+            let server_config = make_prop_server_config();
+            let jump_hosts = make_prop_jump_hosts();
+
+            let resolver = Resolver::new(&config, &server_config, &jump_hosts);
+
+            let result1 = resolver.resolve(&input);
+            let result2 = resolver.resolve(&input);
+
+            match (result1, result2) {
+                (Ok(routes1), Ok(routes2)) => {
+                    prop_assert_eq!(
+                        routes1.len(),
+                        routes2.len(),
+                        "Idempotence violated: different route counts for input '{}'",
+                        input
+                    );
+                    for (i, (r1, r2)) in routes1.iter().zip(routes2.iter()).enumerate() {
+                        prop_assert_eq!(
+                            &r1.end_target.alias, &r2.end_target.alias,
+                            "Route {} end_target.alias differs for input '{}'", i, input
+                        );
+                        prop_assert_eq!(
+                            &r1.end_target.id, &r2.end_target.id,
+                            "Route {} end_target.id differs for input '{}'", i, input
+                        );
+                        prop_assert_eq!(
+                            r1.hops.len(), r2.hops.len(),
+                            "Route {} hops count differs for input '{}'", i, input
+                        );
+                        for (j, (h1, h2)) in r1.hops.iter().zip(r2.hops.iter()).enumerate() {
+                            prop_assert_eq!(
+                                &h1.name, &h2.name,
+                                "Route {} hop {} name differs for input '{}'", i, j, input
+                            );
+                            prop_assert_eq!(
+                                h1.kind, h2.kind,
+                                "Route {} hop {} kind differs for input '{}'", i, j, input
+                            );
+                        }
+                    }
+                }
+                (Err(_), Err(_)) => {
+                    // Both calls returned Err — idempotence holds for the error case.
+                }
+                (Ok(_), Err(e)) => {
+                    prop_assert!(
+                        false,
+                        "First call Ok but second call Err({}) for input '{}'", e, input
+                    );
+                }
+                (Err(e), Ok(_)) => {
+                    prop_assert!(
+                        false,
+                        "First call Err({}) but second call Ok for input '{}'", e, input
+                    );
+                }
+            }
+        }
+
+        // Feature: remove-deprecated-jumpserver-config, Property 5: Server.toml match short-circuits fallback
+        /// **Validates: Requirements 6.4**
+        ///
+        /// For any target that matches an entry in server.toml, the Resolver
+        /// returns that match without producing any fallback candidates (the
+        /// result contains only direct routes from server config).
+        #[test]
+        fn prop_server_toml_match_short_circuits_fallback(
+            server_alias in arb_server_alias_match(),
+        ) {
+            let mut config = AppConfig::default();
+            config.ssh.ssh_config_path = "/tmp/nonexistent_prop_ssh_config".to_string();
+            config.ssh.server_config_path = "/tmp/nonexistent_prop_server.toml".to_string();
+            // Configure fallback with jump hosts that would produce routes
+            config.ssh.fallback = vec![
+                FallbackEntry::JumpHost("test-jump".to_string()),
+                FallbackEntry::JumpHost("remote1".to_string()),
+            ];
+
+            let server_config = make_prop_server_config();
+            let jump_hosts = make_prop_jump_hosts();
+
+            let resolver = Resolver::new(&config, &server_config, &jump_hosts);
+            let routes = resolver.resolve(&server_alias).unwrap();
+
+            // Server config match should short-circuit: only direct routes returned
+            prop_assert_eq!(
+                routes.len(),
+                1,
+                "Expected exactly 1 route for server config match '{}', got {}",
+                server_alias,
+                routes.len()
+            );
+
+            // The route should be direct (zero hops)
+            prop_assert!(
+                routes[0].hops.is_empty(),
+                "Server config match '{}' should produce a direct route (0 hops), got {} hops",
+                server_alias,
+                routes[0].hops.len()
+            );
+
+            // The end target alias should match the server alias
+            prop_assert_eq!(
+                &routes[0].end_target.alias,
+                &server_alias,
+                "End target alias should be '{}' but got '{}'",
+                server_alias,
+                routes[0].end_target.alias
+            );
+        }
+
+        // Feature: remove-deprecated-jumpserver-config, Property 9: Missing jump host in fallback produces error
+        /// **Validates: Requirements 3.4**
+        ///
+        /// For any `FallbackEntry::JumpHost(name)` where `name` does not match
+        /// any `[[jump_hosts]]` entry's `name` field, the Resolver returns an error.
+        #[test]
+        fn prop_missing_jump_host_in_fallback_produces_error(
+            missing_name in arb_nonexistent_jump_name(),
+            target in arb_bare_target(),
+        ) {
+            let mut config = AppConfig::default();
+            config.ssh.ssh_config_path = "/tmp/nonexistent_prop_ssh_config".to_string();
+            config.ssh.server_config_path = "/tmp/nonexistent_prop_server.toml".to_string();
+            config.ssh.fallback = vec![FallbackEntry::JumpHost(missing_name.clone())];
+
+            let server_config = ServerConfigFile::default();
+            // Use jump hosts that do NOT contain the missing_name
+            let jump_hosts = make_prop_jump_hosts();
+
+            let resolver = Resolver::new(&config, &server_config, &jump_hosts);
+            let result = resolver.resolve(&target);
+
+            prop_assert!(
+                result.is_err(),
+                "Expected error for missing jump host '{}' in fallback, got Ok for target '{}'",
+                missing_name,
+                target
+            );
+
+            let err_msg = result.unwrap_err().to_string();
+            prop_assert!(
+                err_msg.contains(&missing_name),
+                "Error message should mention the missing jump host name '{}', got: {}",
+                missing_name,
+                err_msg
+            );
         }
     }
 }

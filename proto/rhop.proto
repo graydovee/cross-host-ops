@@ -6,7 +6,6 @@ service RhopRpc {
   rpc Execute(stream ExecuteRequest) returns (stream ExecuteResponse);
   rpc Copy(stream CopyRequest) returns (stream CopyResponse);
   rpc Status(StatusRequest) returns (StatusResponse);
-  rpc ListConfig(ConfigListRequest) returns (ConfigListResponse);
   rpc ListServers(ServerListRequest) returns (ServerListResponse);
   rpc Shutdown(ShutdownRequest) returns (InfoResponse);
   rpc UpdateConfig(UpdateConfigRequest) returns (UpdateConfigResponse);
@@ -122,9 +121,6 @@ message InfoResponse {
 
 message StatusRequest {}
 
-// Deprecated: use ListJumpHosts instead
-message ConfigListRequest {}
-
 message ServerListRequest {}
 
 message ShutdownRequest {}
@@ -141,23 +137,9 @@ message StatusResponse {
   reserved 9, 10, 11, 12;
   reserved "local_enabled", "remote_enabled", "remote_listen_addr", "remote_user";
   repeated JumpHostStatus jump_hosts = 13;
-}
-
-// Deprecated: use ListJumpHosts instead
-message ConfigListResponse {
-  string config_path = 1;
-  string server_config_path = 2;
-  string ssh_config_path = 3;
-  string local_socket_path = 4;
-  repeated string fallback = 5;
-  bool jumpserver_enabled = 6;
-  string jumpserver_host = 7;
-  bool local_enabled = 8;
-  bool remote_enabled = 9;
-  string remote_listen_addr = 10;
-  string remote_user = 11;
-  string authorized_keys_path = 12;
-  string host_key_path = 13;
+  bool remote_listening = 14;
+  string remote_addr = 15;
+  string remote_ssh_user = 16;
 }
 
 message ServerListResponse {
@@ -183,7 +165,7 @@ message PoolStatus {
 }
 
 message JumpHostStatus {
-  string alias = 1;
+  string name = 1;
   string kind = 2;
   string address = 3;
   StatusResponse sub_status = 4;
@@ -207,7 +189,7 @@ message SourceStatus {
 
 message UpdateConfigRequest {
   string mutation_type = 1;
-  string alias = 2;
+  string name = 2;
   string kind = 3;
   string address = 4;
   string identity_file = 5;

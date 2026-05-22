@@ -17,7 +17,7 @@ pub struct TargetRoute {
 /// A reference to a jump host in a target route.
 #[derive(Clone, Debug)]
 pub struct JumpHopRef {
-    pub alias: String,
+    pub name: String,
     pub kind: JumpHostKind,
 }
 

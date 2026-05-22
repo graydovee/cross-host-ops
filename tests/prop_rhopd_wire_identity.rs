@@ -89,13 +89,6 @@ impl RhopRpc for MockRhopService {
         Ok(tonic::Response::new(rpc::StatusResponse::default()))
     }
 
-    async fn list_config(
-        &self,
-        _request: tonic::Request<rpc::ConfigListRequest>,
-    ) -> Result<tonic::Response<rpc::ConfigListResponse>, tonic::Status> {
-        Ok(tonic::Response::new(rpc::ConfigListResponse::default()))
-    }
-
     async fn list_servers(
         &self,
         _request: tonic::Request<rpc::ServerListRequest>,

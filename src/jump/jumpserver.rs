@@ -2,10 +2,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, JumpserverJumpHostFields};
 use crate::connection::types::CopySpec;
-#[allow(deprecated)]
-use crate::connection::{AuthPrompter, Connection, JumpSshConnection, ResolvedTarget};
+use crate::connection::{AuthPrompter, Connection, JumpSshConnection};
 use crate::protocol::ServerEvent;
 
 use super::{JumpHost, JumpHostKind};
@@ -16,22 +15,26 @@ use super::{JumpHost, JumpHostKind};
 /// `tui_shell` and `list_servers` fall through to the trait defaults, which
 /// return `UnsupportedCapability`.
 pub struct JumpserverJumpHost {
-    alias: String,
+    name: String,
     inner: JumpSshConnection,
 }
 
-#[allow(deprecated)]
 impl JumpserverJumpHost {
     /// Connect through the jumpserver to the given target, performing MFA and
     /// menu selection as needed.
     pub async fn connect(
-        alias: String,
-        target: &ResolvedTarget,
+        name: String,
+        target_label: &str,
+        fields: &JumpserverJumpHostFields,
         config: &AppConfig,
         auth_prompter: &AuthPrompter,
     ) -> Result<Self> {
-        let inner = JumpSshConnection::connect(target, config, auth_prompter).await?;
-        Ok(Self { alias, inner })
+        let inner =
+            JumpSshConnection::connect(target_label, fields, config, auth_prompter).await?;
+        Ok(Self {
+            name,
+            inner,
+        })
     }
 }
 
@@ -54,7 +57,7 @@ impl JumpHost for JumpserverJumpHost {
         JumpHostKind::Jumpserver
     }
 
-    fn alias(&self) -> &str {
-        &self.alias
+    fn name(&self) -> &str {
+        &self.name
     }
 }

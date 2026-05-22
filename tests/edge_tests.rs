@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use rhop::config::{
     AppConfig, JumpHostConfig, JumpHostFields, JumpHostValidationError, RhopdJumpHostFields,
-    ServerConfigFile, ServerDefaults, ServerHostConfig, RESERVED_ALIASES, validate_jump_hosts,
+    ServerConfigFile, ServerDefaults, ServerHostConfig, RESERVED_NAMES, validate_jump_hosts,
 };
 use rhop::connection::resolver::Resolver;
 use rhop::jump::JumpHostKind;
@@ -73,7 +73,7 @@ async fn edge_5_5_idle_reaper_closes_idle_slot() {
 // Verify the error message when removing a non-existent alias.
 // ---------------------------------------------------------------------------
 
-/// This test verifies the logic that `remote_remove` would use: when the alias
+/// This test verifies the logic that `remote_remove` would use: when the name
 /// is not found in the jump_hosts list, an appropriate error is produced.
 /// We test the underlying config lookup logic directly.
 #[test]
@@ -81,16 +81,16 @@ fn edge_10_8_remote_remove_missing_alias_error() {
     // Simulate an empty jump_hosts config (no entries)
     let jump_hosts: Vec<JumpHostConfig> = vec![];
 
-    // The alias "nonexistent" should not be found
-    let entry = jump_hosts.iter().find(|e| e.alias == "nonexistent");
+    // The name "nonexistent" should not be found
+    let entry = jump_hosts.iter().find(|e| e.name == "nonexistent");
     assert!(
         entry.is_none(),
-        "alias 'nonexistent' should not be found in empty jump_hosts"
+        "name 'nonexistent' should not be found in empty jump_hosts"
     );
 
     // Verify the error message format matches what cli.rs produces
     let error_msg = format!(
-        "error: alias '{}' not found in jump hosts configuration",
+        "error: name '{}' not found in jump hosts configuration",
         "nonexistent"
     );
     assert!(error_msg.contains("not found"));
@@ -106,7 +106,7 @@ fn edge_10_8_remote_remove_missing_alias_error() {
 fn edge_10_9_remote_remove_non_rhopd_alias_error() {
     // Create a jump_hosts config with a jumpserver-kind entry
     let jump_hosts = vec![JumpHostConfig {
-        alias: "legacy-jump".to_string(),
+        name: "legacy-jump".to_string(),
         kind: JumpHostKind::Jumpserver,
         fields: JumpHostFields::Jumpserver(
             rhop::config::JumpserverJumpHostFields {
@@ -124,8 +124,8 @@ fn edge_10_9_remote_remove_non_rhopd_alias_error() {
     }];
 
     // Find the entry
-    let entry = jump_hosts.iter().find(|e| e.alias == "legacy-jump");
-    assert!(entry.is_some(), "alias 'legacy-jump' should be found");
+    let entry = jump_hosts.iter().find(|e| e.name == "legacy-jump");
+    assert!(entry.is_some(), "name 'legacy-jump' should be found");
 
     let entry = entry.unwrap();
     // Verify it's not rhopd kind
@@ -137,8 +137,8 @@ fn edge_10_9_remote_remove_non_rhopd_alias_error() {
 
     // Verify the error message format matches what cli.rs produces
     let error_msg = format!(
-        "error: alias '{}' is a {} jump host; quick-remove only manages rhopd entries",
-        entry.alias, entry.kind
+        "error: name '{}' is a {} jump host; quick-remove only manages rhopd entries",
+        entry.name, entry.kind
     );
     assert!(error_msg.contains("legacy-jump"));
     assert!(error_msg.contains("quick-remove only manages rhopd entries"));
@@ -152,7 +152,7 @@ fn edge_10_9_remote_remove_non_rhopd_alias_error() {
 #[test]
 fn edge_14_2_reserved_alias_local_rejected() {
     let jump_hosts = vec![JumpHostConfig {
-        alias: "local".to_string(),
+        name: "local".to_string(),
         kind: JumpHostKind::Rhopd,
         fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
             address: "10.0.0.1:2222".to_string(),
@@ -164,26 +164,26 @@ fn edge_14_2_reserved_alias_local_rejected() {
     let result = validate_jump_hosts(&jump_hosts);
     assert!(
         result.is_err(),
-        "validate_jump_hosts should reject 'local' alias"
+        "validate_jump_hosts should reject 'local' name"
     );
 
     match result.unwrap_err() {
-        JumpHostValidationError::ReservedAlias { alias, reserved } => {
-            assert_eq!(alias, "local");
-            assert_eq!(reserved, RESERVED_ALIASES);
+        JumpHostValidationError::ReservedName { name, reserved } => {
+            assert_eq!(name, "local");
+            assert_eq!(reserved, RESERVED_NAMES);
         }
         other => panic!(
-            "expected ReservedAlias error, got: {:?}",
+            "expected ReservedName error, got: {:?}",
             other
         ),
     }
 }
 
 #[test]
-fn edge_14_2_reserved_aliases_constant_contains_local() {
+fn edge_14_2_reserved_names_constant_contains_local() {
     assert!(
-        RESERVED_ALIASES.contains(&"local"),
-        "RESERVED_ALIASES should contain 'local'"
+        RESERVED_NAMES.contains(&"local"),
+        "RESERVED_NAMES should contain 'local'"
     );
 }
 
@@ -202,7 +202,7 @@ fn edge_15_5_explicit_jump_server_lookup() {
         servers: HashMap::new(),
     };
     let jump_hosts = vec![JumpHostConfig {
-        alias: "prod-jump".to_string(),
+        name: "prod-jump".to_string(),
         kind: JumpHostKind::Rhopd,
         fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
             address: "10.0.0.99:2222".to_string(),
@@ -218,7 +218,7 @@ fn edge_15_5_explicit_jump_server_lookup() {
 
     assert_eq!(routes.len(), 1, "should produce exactly one route");
     assert_eq!(routes[0].hops.len(), 1, "should have one hop");
-    assert_eq!(routes[0].hops[0].alias, "prod-jump");
+    assert_eq!(routes[0].hops[0].name, "prod-jump");
     assert_eq!(routes[0].hops[0].kind, JumpHostKind::Rhopd);
     assert_eq!(routes[0].end_target.alias, "web01");
 }

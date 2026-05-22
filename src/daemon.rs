@@ -25,8 +25,7 @@ use uuid::Uuid;
 
 use crate::config::{AppConfig, ReviewAction, default_config_path, load_server_config, validate_jump_hosts};
 use crate::connection::CopySpec;
-#[allow(deprecated)]
-use crate::connection::{AuthPrompter, AuthPromptRequest, build_remote_command, resolve_target};
+use crate::connection::{AuthPrompter, AuthPromptRequest, build_remote_command, Resolver};
 use crate::jump::auth::AuthPromptRouter;
 use crate::jump::server_list::ServerListAggregator;
 use crate::jump::JumpHost;
@@ -576,7 +575,6 @@ fn is_authorized_key(path: &Path, candidate: &ssh_key::PublicKey) -> Result<bool
     Ok(false)
 }
 
-#[allow(deprecated)]
 async fn process_execute(
     request: ExecRequest,
     state: &DaemonState,
@@ -589,24 +587,26 @@ async fn process_execute(
 
     let execution_id = Uuid::new_v4();
     let config = state.config.read().await.clone();
-    let targets = resolve_target(&request.target, &config)?;
+    let server_config = load_server_config(std::path::Path::new(&config.ssh.server_config_path))
+        .unwrap_or_default();
+    let resolver = Resolver::new(&config, &server_config, &config.jump_hosts);
+    let targets = resolver.resolve(&request.target)?;
     let target = targets
         .first()
-        .cloned()
         .ok_or_else(|| anyhow!("no resolved target candidates"))?;
     let shell_command = build_remote_command(&request.argv);
 
     info!(
         execution_id = %execution_id,
-        input = %target.input,
-        ip = %target.ip,
-        transport = %target.transport,
+        input = %request.target,
+        end_target = %target.end_target.alias,
+        hops = target.hops.len(),
         "resolved target"
     );
 
     let decision = match state
         .reviewer
-        .review(&config.review, &target.ip, &request.argv, &shell_command)
+        .review(&config.review, &target.end_target.alias, &request.argv, &shell_command)
         .await
     {
         Ok(result) => result,
@@ -695,7 +695,7 @@ async fn process_execute(
     let exec_targets = targets.clone();
     let (prompt_upstream_tx, mut prompt_upstream_rx) = mpsc::unbounded_channel();
     let router = Arc::new(AuthPromptRouter::new(prompt_upstream_tx));
-    let auth_prompter = make_auth_prompter(router.clone(), target.target_label.clone());
+    let auth_prompter = make_auth_prompter(router.clone(), target.end_target.alias.clone());
     let exec_task = tokio::spawn(async move {
         pool.execute(exec_targets, argv, tx, auth_prompter).await
     });
@@ -856,7 +856,6 @@ async fn wait_for_auth_input_copy(
 }
 
 #[tonic::async_trait]
-#[allow(deprecated)]
 impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
     type ExecuteStream = ReceiverStream<Result<rpc::ExecuteResponse, Status>>;
     type CopyStream = ReceiverStream<Result<rpc::CopyResponse, Status>>;
@@ -927,13 +926,15 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
 
                 let (target_input, spec): (String, CopySpec) = protocol::copy_spec_from_rpc(start)?;
                 let config = state.config.read().await.clone();
-                let targets = resolve_target(&target_input, &config)?;
+                let server_config = load_server_config(std::path::Path::new(&config.ssh.server_config_path))
+                    .unwrap_or_default();
+                let resolver = Resolver::new(&config, &server_config, &config.jump_hosts);
+                let targets = resolver.resolve(&target_input)?;
                 let target = targets
                     .first()
-                    .cloned()
                     .ok_or_else(|| anyhow!("no resolved target candidates"))?;
                 info!(
-                    target = %target.key,
+                    target = %target.end_target.alias,
                     direction = ?spec.direction,
                     local_path = %spec.local_path,
                     remote_path = %spec.remote_path,
@@ -944,7 +945,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 let pool = state.pool.clone();
                 let (prompt_upstream_tx, mut prompt_upstream_rx) = mpsc::unbounded_channel();
                 let router = Arc::new(AuthPromptRouter::new(prompt_upstream_tx));
-                let auth_prompter = make_auth_prompter(router.clone(), target.target_label.clone());
+                let auth_prompter = make_auth_prompter(router.clone(), target.end_target.alias.clone());
                 let copy_task = tokio::spawn(async move { pool.copy(targets, spec, auth_prompter).await });
                 tokio::pin!(copy_task);
 
@@ -1013,7 +1014,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                     }
                 };
                 rpc::JumpHostStatus {
-                    alias: entry.alias.clone(),
+                    name: entry.name.clone(),
                     kind: entry.kind.to_string(),
                     address,
                     sub_status: None,
@@ -1043,31 +1044,19 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 .clone()
                 .unwrap_or_default(),
             jump_hosts,
+            remote_listening: config.server.remote.enable,
+            remote_addr: if config.server.remote.enable {
+                config.server.remote.listen_addr.clone()
+            } else {
+                String::new()
+            },
+            remote_ssh_user: if config.server.remote.enable {
+                config.server.remote.user.clone()
+            } else {
+                String::new()
+            },
         };
         Ok(Response::new(response))
-    }
-
-    #[allow(deprecated)]
-    async fn list_config(
-        &self,
-        _request: Request<rpc::ConfigListRequest>,
-    ) -> Result<Response<rpc::ConfigListResponse>, Status> {
-        let config = self.state.config.read().await.clone();
-        Ok(Response::new(rpc::ConfigListResponse {
-            config_path: self.state.config_path.display().to_string(),
-            server_config_path: config.ssh.server_config_path,
-            ssh_config_path: config.ssh.ssh_config_path,
-            local_socket_path: config.server.local.socket_path,
-            fallback: config.ssh.fallback.iter().map(ToString::to_string).collect(),
-            jumpserver_enabled: config.jumpserver.enabled,
-            jumpserver_host: config.jumpserver.host,
-            local_enabled: config.server.local.enable,
-            remote_enabled: config.server.remote.enable,
-            remote_listen_addr: config.server.remote.listen_addr,
-            remote_user: config.server.remote.user,
-            authorized_keys_path: config.server.remote.authorized_keys_path,
-            host_key_path: config.server.remote.host_key_path,
-        }))
     }
 
     async fn list_servers(
@@ -1125,31 +1114,31 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
         let req = request.into_inner();
         match req.mutation_type.as_str() {
             "add_jump_host" => {
-                let alias = req.alias.trim().to_string();
+                let alias = req.name.trim().to_string();
                 if alias.is_empty() {
                     return Ok(Response::new(rpc::UpdateConfigResponse {
                         success: false,
-                        message: "alias must not be empty".to_string(),
+                        message: "name must not be empty".to_string(),
                     }));
                 }
-                if crate::config::RESERVED_ALIASES.contains(&alias.as_str()) {
+                if crate::config::RESERVED_NAMES.contains(&alias.as_str()) {
                     return Ok(Response::new(rpc::UpdateConfigResponse {
                         success: false,
                         message: format!(
-                            "alias '{}' is reserved (reserved aliases: {:?})",
+                            "name '{}' is reserved (reserved names: {:?})",
                             alias,
-                            crate::config::RESERVED_ALIASES
+                            crate::config::RESERVED_NAMES
                         ),
                     }));
                 }
                 // Check for collision with existing jump hosts
                 {
                     let config = self.state.config.read().await;
-                    if let Some(existing) = config.jump_hosts.iter().find(|e| e.alias == alias) {
+                    if let Some(existing) = config.jump_hosts.iter().find(|e| e.name == alias) {
                         return Ok(Response::new(rpc::UpdateConfigResponse {
                             success: false,
                             message: format!(
-                                "alias '{}' is already used by a {} jump host",
+                                "name '{}' is already used by a {} jump host",
                                 alias, existing.kind
                             ),
                         }));
@@ -1170,7 +1159,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 };
 
                 let new_entry = crate::config::JumpHostConfig {
-                    alias: alias.clone(),
+                    name: alias.clone(),
                     kind,
                     fields: match kind {
                         crate::jump::JumpHostKind::Rhopd => {
@@ -1200,7 +1189,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 if let Err(e) = atomic_write_config(&self.state).await {
                     // Rollback the in-memory change
                     let mut config = self.state.config.write().await;
-                    config.jump_hosts.retain(|e| e.alias != alias);
+                    config.jump_hosts.retain(|e| e.name != alias);
                     return Ok(Response::new(rpc::UpdateConfigResponse {
                         success: false,
                         message: format!("failed to write config: {}", e),
@@ -1210,18 +1199,18 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 // Hot-reload to validate
                 self.state.reload_jump_hosts().await;
 
-                info!(alias = %alias, "added jump host via UpdateConfig");
+                info!(name = %alias, "added jump host via UpdateConfig");
                 Ok(Response::new(rpc::UpdateConfigResponse {
                     success: true,
                     message: format!("jump host '{}' added successfully", alias),
                 }))
             }
             "remove_jump_host" => {
-                let alias = req.alias.trim().to_string();
+                let alias = req.name.trim().to_string();
                 if alias.is_empty() {
                     return Ok(Response::new(rpc::UpdateConfigResponse {
                         success: false,
-                        message: "alias must not be empty".to_string(),
+                        message: "name must not be empty".to_string(),
                     }));
                 }
 
@@ -1229,7 +1218,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 let removed = {
                     let mut config = self.state.config.write().await;
                     let before_len = config.jump_hosts.len();
-                    config.jump_hosts.retain(|e| e.alias != alias);
+                    config.jump_hosts.retain(|e| e.name != alias);
                     before_len != config.jump_hosts.len()
                 };
 
@@ -1252,7 +1241,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 // Hot-reload to ensure consistency
                 self.state.reload_jump_hosts().await;
 
-                info!(alias = %alias, "removed jump host via UpdateConfig");
+                info!(name = %alias, "removed jump host via UpdateConfig");
                 Ok(Response::new(rpc::UpdateConfigResponse {
                     success: true,
                     message: format!("jump host '{}' removed successfully", alias),
@@ -1284,7 +1273,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                     }
                 };
                 rpc::JumpHostStatus {
-                    alias: entry.alias.clone(),
+                    name: entry.name.clone(),
                     kind: entry.kind.to_string(),
                     address,
                     sub_status: None,
@@ -1383,7 +1372,7 @@ mod tests {
             file,
             r#"
 [[jump_hosts]]
-alias = "prod"
+name = "prod"
 kind = "rhopd"
 address = "admin@prod.example.com:22"
 identity_file = "/tmp/id"
@@ -1399,7 +1388,7 @@ known_hosts_path = "/tmp/kh"
 
         let config = state.config.read().await;
         assert_eq!(config.jump_hosts.len(), 1);
-        assert_eq!(config.jump_hosts[0].alias, "prod");
+        assert_eq!(config.jump_hosts[0].name, "prod");
     }
 
     #[tokio::test]
@@ -1410,7 +1399,7 @@ known_hosts_path = "/tmp/kh"
             file,
             r#"
 [[jump_hosts]]
-alias = "existing"
+name = "existing"
 kind = "rhopd"
 address = "admin@host.example.com:22"
 identity_file = "/tmp/id"
@@ -1424,7 +1413,7 @@ known_hosts_path = "/tmp/kh"
         state.reload_jump_hosts().await;
         assert_eq!(state.config.read().await.jump_hosts.len(), 1);
 
-        // Now write an invalid config (reserved alias "local")
+        // Now write an invalid config (reserved name "local")
         file.as_file_mut().set_len(0).unwrap();
         file.as_file_mut()
             .seek(std::io::SeekFrom::Start(0))
@@ -1433,7 +1422,7 @@ known_hosts_path = "/tmp/kh"
             file,
             r#"
 [[jump_hosts]]
-alias = "local"
+name = "local"
 kind = "rhopd"
 address = "admin@host.example.com:22"
 identity_file = "/tmp/id"
@@ -1447,7 +1436,7 @@ known_hosts_path = "/tmp/kh"
         // Should still have the prior valid config
         let config = state.config.read().await;
         assert_eq!(config.jump_hosts.len(), 1);
-        assert_eq!(config.jump_hosts[0].alias, "existing");
+        assert_eq!(config.jump_hosts[0].name, "existing");
     }
 
     #[tokio::test]
@@ -1464,7 +1453,7 @@ known_hosts_path = "/tmp/kh"
         {
             let mut config = state.config.write().await;
             config.jump_hosts.push(crate::config::JumpHostConfig {
-                alias: "keep-me".to_string(),
+                name: "keep-me".to_string(),
                 kind: crate::jump::JumpHostKind::Rhopd,
                 fields: crate::config::JumpHostFields::Rhopd(
                     crate::config::RhopdJumpHostFields {
@@ -1481,6 +1470,6 @@ known_hosts_path = "/tmp/kh"
         // Should still have the prior config since reading a directory as a file fails
         let config = state.config.read().await;
         assert_eq!(config.jump_hosts.len(), 1);
-        assert_eq!(config.jump_hosts[0].alias, "keep-me");
+        assert_eq!(config.jump_hosts[0].name, "keep-me");
     }
 }

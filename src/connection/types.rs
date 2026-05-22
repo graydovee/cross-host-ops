@@ -1,5 +1,3 @@
-use std::fmt;
-
 use crate::config::DirectAuth;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -14,35 +12,6 @@ pub struct CopySpec {
     pub local_path: String,
     pub remote_path: String,
     pub recursive: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum TargetTransport {
-    Direct,
-    Jump,
-}
-
-impl fmt::Display for TargetTransport {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TargetTransport::Direct => write!(f, "direct"),
-            TargetTransport::Jump => write!(f, "jump"),
-        }
-    }
-}
-
-#[deprecated(
-    since = "0.1.0",
-    note = "Use `Resolver::resolve` returning `Vec<TargetRoute>` instead. Will be removed once all callers migrate."
-)]
-#[derive(Clone, Debug)]
-pub struct ResolvedTarget {
-    pub input: String,
-    pub ip: String,
-    pub key: String,
-    pub transport: TargetTransport,
-    pub direct: Option<DirectTarget>,
-    pub target_label: String,
 }
 
 #[derive(Clone, Debug)]

@@ -14,12 +14,10 @@ use crate::protocol::ServerEvent;
 
 pub use direct::DirectSshConnection;
 pub use jump::JumpSshConnection;
-#[allow(deprecated)]
-pub use resolver::{Resolver, derive_target_ip, resolve_target};
+pub use resolver::{Resolver, derive_target_ip};
 pub use crate::config::JumpHostConfig;
 pub use shared::{build_remote_command, shell_quote};
-#[allow(deprecated)]
-pub use types::{CopyDirection, CopySpec, DirectTarget, ResolvedTarget, TargetTransport};
+pub use types::{CopyDirection, CopySpec, DirectTarget};
 
 pub type AuthFuture = Pin<Box<dyn Future<Output = Result<String>> + Send>>;
 pub type AuthPrompter = dyn Fn(AuthPromptRequest) -> AuthFuture + Send + Sync;
@@ -42,28 +40,4 @@ pub trait Connection: Send {
     ) -> Result<i32>;
 
     async fn copy(&mut self, spec: &CopySpec, config: &AppConfig) -> Result<()>;
-}
-
-#[allow(deprecated)]
-pub async fn connect(
-    target: &ResolvedTarget,
-    config: &AppConfig,
-    auth_prompter: &AuthPrompter,
-) -> Result<Box<dyn Connection>> {
-    match target.transport {
-        TargetTransport::Direct => Ok(Box::new(
-            DirectSshConnection::connect(
-                target
-                    .direct
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("missing direct target details"))?,
-                config,
-                auth_prompter,
-            )
-            .await?,
-        )),
-        TargetTransport::Jump => Ok(Box::new(
-            JumpSshConnection::connect(target, config, auth_prompter).await?,
-        )),
-    }
 }

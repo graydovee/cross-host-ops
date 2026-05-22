@@ -225,7 +225,7 @@ pub fn copy_error_response(message: impl Into<String>) -> rpc::CopyResponse {
 /// sub-status from a remote daemon.
 #[derive(Clone, Debug)]
 pub struct JumpHostStatus {
-    pub alias: String,
+    pub name: String,
     pub kind: String,
     pub address: String,
     pub sub_status: Option<Box<rpc::StatusResponse>>,
@@ -233,7 +233,7 @@ pub struct JumpHostStatus {
 
 pub fn jump_host_status_to_rpc(status: JumpHostStatus) -> rpc::JumpHostStatus {
     rpc::JumpHostStatus {
-        alias: status.alias,
+        name: status.name,
         kind: status.kind,
         address: status.address,
         sub_status: status.sub_status.map(|s| *s),
@@ -242,7 +242,7 @@ pub fn jump_host_status_to_rpc(status: JumpHostStatus) -> rpc::JumpHostStatus {
 
 pub fn jump_host_status_from_rpc(rpc_status: rpc::JumpHostStatus) -> JumpHostStatus {
     JumpHostStatus {
-        alias: rpc_status.alias,
+        name: rpc_status.name,
         kind: rpc_status.kind,
         address: rpc_status.address,
         sub_status: rpc_status.sub_status.map(Box::new),

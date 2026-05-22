@@ -4,8 +4,6 @@ use anyhow::Result;
 
 use crate::config::{AppConfig, JumpHostConfig, JumpHostFields};
 use crate::connection::{AuthPrompter, DirectSshConnection, DirectTarget};
-#[allow(deprecated)]
-use crate::connection::ResolvedTarget;
 
 use super::direct::DirectJumpHost;
 use super::jumpserver::JumpserverJumpHost;
@@ -19,6 +17,7 @@ use super::JumpHost;
 /// and write the impl.
 pub async fn build_jump_host(
     spec: &JumpHostConfig,
+    target_label: &str,
     auth_prompter: &Arc<AuthPrompter>,
     config: &AppConfig,
 ) -> Result<Box<dyn JumpHost>> {
@@ -34,22 +33,14 @@ pub async fn build_jump_host(
                 pubkey_accepted_algorithms: None,
             };
             let conn = DirectSshConnection::connect(&target, config, auth_prompter.as_ref()).await?;
-            Ok(Box::new(DirectJumpHost::new(spec.alias.clone(), conn)))
+            Ok(Box::new(DirectJumpHost::new(spec.name.clone(), conn)))
         }
 
         JumpHostFields::Jumpserver(fields) => {
-            #[allow(deprecated)]
-            let target = ResolvedTarget {
-                input: spec.alias.clone(),
-                ip: fields.host.clone(),
-                key: format!("{}:{}", fields.host, fields.port),
-                transport: crate::connection::TargetTransport::Jump,
-                direct: None,
-                target_label: spec.alias.clone(),
-            };
             let host = JumpserverJumpHost::connect(
-                spec.alias.clone(),
-                &target,
+                spec.name.clone(),
+                target_label,
+                fields,
                 config,
                 auth_prompter.as_ref(),
             )
@@ -59,7 +50,7 @@ pub async fn build_jump_host(
 
         JumpHostFields::Rhopd(fields) => {
             let host = RhopdJumpHost::connect(
-                spec.alias.clone(),
+                spec.name.clone(),
                 fields.address.clone(),
             )
             .await?;

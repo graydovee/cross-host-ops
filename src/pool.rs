@@ -8,14 +8,11 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, mpsc::UnboundedSender};
 use tracing::info;
 
 use crate::config::AppConfig;
-#[allow(deprecated)]
-use crate::connection::resolver::to_target_route;
-#[allow(deprecated)]
-use crate::connection::{AuthPrompter, CopySpec, ResolvedTarget, TargetTransport};
+use crate::connection::{AuthPrompter, CopySpec};
 use crate::jump::{JumpHost, JumpHostKind};
 use crate::jump::direct::DirectJumpHost;
-use crate::jump::jumpserver::JumpserverJumpHost;
-use crate::jump::types::EndTargetId;
+use crate::jump::factory::build_jump_host;
+use crate::jump::types::{EndTargetId, TargetRoute};
 use crate::protocol::PoolStatus;
 use crate::protocol::ServerEvent;
 
@@ -24,44 +21,40 @@ use crate::protocol::ServerEvent;
 /// Direct routes are keyed by end-target so two direct SSH connections to the
 /// same end target share a slot, but different end targets do not.
 ///
-/// All other kinds are keyed solely by jump-host alias. The same alias always
+/// All other kinds are keyed solely by jump-host name. The same name always
 /// shares a slot; the pool transparently multiplexes requests for different end
 /// targets on it.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum PoolKey {
-    /// Direct routes have no jump-host alias; key by end-target so two direct
+    /// Direct routes have no jump-host name; key by end-target so two direct
     /// SSH connections to the same end target share a slot, but different end
     /// targets do not.
     Direct { end_target: EndTargetId },
-    /// Every other kind is keyed solely by jump-host alias. The same alias
+    /// Every other kind is keyed solely by jump-host name. The same name
     /// always shares a slot; the pool transparently multiplexes requests for
     /// different end targets on it.
-    Aliased { alias: String, kind: JumpHostKind },
+    Aliased { name: String, kind: JumpHostKind },
 }
 
 impl std::fmt::Display for PoolKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PoolKey::Direct { end_target } => write!(f, "direct:{}", end_target.0),
-            PoolKey::Aliased { alias, kind } => write!(f, "{}:{}", kind, alias),
+            PoolKey::Aliased { name, kind } => write!(f, "{}:{}", kind, name),
         }
     }
 }
 
-/// Derive a `PoolKey` from a `ResolvedTarget` using the target route logic.
-#[allow(deprecated)]
-fn pool_key_for_target(target: &ResolvedTarget) -> PoolKey {
-    let route = to_target_route(target);
+/// Derive a `PoolKey` from a `TargetRoute`.
+fn pool_key_for_target(route: &TargetRoute) -> PoolKey {
     if route.hops.is_empty() {
-        // Direct route: key by end-target
         PoolKey::Direct {
-            end_target: route.end_target.id,
+            end_target: route.end_target.id.clone(),
         }
     } else {
-        // Aliased route: key by first hop's alias + kind
         let hop = &route.hops[0];
         PoolKey::Aliased {
-            alias: hop.alias.clone(),
+            name: hop.name.clone(),
             kind: hop.kind,
         }
     }
@@ -81,19 +74,18 @@ impl ConnectionPool {
         }
     }
 
-    #[allow(deprecated)]
     pub async fn execute(
         &self,
-        targets: Vec<ResolvedTarget>,
+        targets: Vec<TargetRoute>,
         argv: Vec<String>,
         sender: UnboundedSender<ServerEvent>,
         auth_prompter: Arc<AuthPrompter>,
     ) -> Result<i32> {
         let target = targets
             .first()
-            .cloned()
             .ok_or_else(|| anyhow!("no resolved targets available"))?;
-        let pool = self.get_or_create_pool(&target);
+        let pool = self.get_or_create_pool(target);
+        let key_display = pool_key_for_target(target).to_string();
         let slot = pool.acquire(self.config.clone()).await?;
         let result = async {
             let mut guard = slot.hop.hop.lock().await;
@@ -109,7 +101,7 @@ impl ConnectionPool {
             match first_result {
                 Ok(code) => Ok(code),
                 Err(error) if classify_transport_error(&error) == ErrorClass::Transport => {
-                    info!(target = %target.key, error = %error, "reopening stale pooled connection");
+                    info!(target = %key_display, error = %error, "reopening stale pooled connection");
                     *guard = None;
                     *guard = Some(self.open_any_jump_host(&targets, auth_prompter.clone()).await?);
                     let config = self.config.read().await.clone();
@@ -127,18 +119,17 @@ impl ConnectionPool {
         result
     }
 
-    #[allow(deprecated)]
     pub async fn copy(
         &self,
-        targets: Vec<ResolvedTarget>,
+        targets: Vec<TargetRoute>,
         spec: CopySpec,
         auth_prompter: Arc<AuthPrompter>,
     ) -> Result<()> {
         let target = targets
             .first()
-            .cloned()
             .ok_or_else(|| anyhow!("no resolved targets available"))?;
-        let pool = self.get_or_create_pool(&target);
+        let pool = self.get_or_create_pool(target);
+        let key_display = pool_key_for_target(target).to_string();
         let slot = pool.acquire(self.config.clone()).await?;
         let result = async {
             let mut guard = slot.hop.hop.lock().await;
@@ -154,7 +145,7 @@ impl ConnectionPool {
             match first_result {
                 Ok(()) => Ok(()),
                 Err(error) if classify_transport_error(&error) == ErrorClass::Transport => {
-                    info!(target = %target.key, error = %error, "reopening stale pooled connection");
+                    info!(target = %key_display, error = %error, "reopening stale pooled connection");
                     *guard = None;
                     *guard = Some(self.open_any_jump_host(&targets, auth_prompter.clone()).await?);
                     let config = self.config.read().await.clone();
@@ -172,19 +163,19 @@ impl ConnectionPool {
         result
     }
 
-    /// Open a JumpHost connection by trying each resolved target candidate in order.
-    /// Wraps the underlying `Connection` in the appropriate `JumpHost` wrapper.
-    #[allow(deprecated)]
+    /// Open a JumpHost connection by trying each target route candidate in order.
+    /// Uses the factory to build JumpHost instances from TargetRoute.
     async fn open_any_jump_host(
         &self,
-        targets: &[ResolvedTarget],
+        targets: &[TargetRoute],
         auth_prompter: Arc<AuthPrompter>,
     ) -> Result<Box<dyn JumpHost>> {
         let config = self.config.read().await.clone();
         let mut last_error = None;
-        for target in targets {
-            info!(target = %target.key, transport = %target.transport, "opening candidate connection");
-            match self.connect_as_jump_host(target, &config, auth_prompter.clone()).await {
+        for route in targets {
+            let key_display = pool_key_for_target(route).to_string();
+            info!(target = %key_display, "opening candidate connection");
+            match self.build_jump_host_for_route(route, &auth_prompter, &config).await {
                 Ok(hop) => return Ok(hop),
                 Err(error) => {
                     last_error = Some(error);
@@ -194,40 +185,39 @@ impl ConnectionPool {
         Err(last_error.unwrap_or_else(|| anyhow!("failed to open any candidate connection")))
     }
 
-    /// Connect to a single target and wrap the result in the appropriate JumpHost impl.
-    #[allow(deprecated)]
-    async fn connect_as_jump_host(
+    /// Build a JumpHost from a TargetRoute by looking up the JumpHostConfig
+    /// for the first hop, or building a DirectJumpHost for direct routes.
+    async fn build_jump_host_for_route(
         &self,
-        target: &ResolvedTarget,
+        route: &TargetRoute,
+        auth_prompter: &Arc<AuthPrompter>,
         config: &AppConfig,
-        auth_prompter: Arc<AuthPrompter>,
     ) -> Result<Box<dyn JumpHost>> {
-        match target.transport {
-            TargetTransport::Direct => {
-                let connection = crate::connection::DirectSshConnection::connect(
-                    target
-                        .direct
-                        .as_ref()
-                        .ok_or_else(|| anyhow!("missing direct target details"))?,
-                    config,
-                    auth_prompter.as_ref(),
-                )
-                .await?;
-                Ok(Box::new(DirectJumpHost::new(
-                    target.target_label.clone(),
-                    connection,
-                )))
-            }
-            TargetTransport::Jump => {
-                let hop = JumpserverJumpHost::connect(
-                    target.target_label.clone(),
-                    target,
-                    config,
-                    auth_prompter.as_ref(),
-                )
-                .await?;
-                Ok(Box::new(hop))
-            }
+        if route.hops.is_empty() {
+            // Direct route: build a DirectJumpHost from SSH config
+            let target = crate::connection::resolver::resolve_direct_target_for_route(
+                &route.end_target.alias,
+                config,
+            )?;
+            let connection = crate::connection::DirectSshConnection::connect(
+                &target,
+                config,
+                auth_prompter.as_ref(),
+            )
+            .await?;
+            Ok(Box::new(DirectJumpHost::new(
+                route.end_target.alias.clone(),
+                connection,
+            )))
+        } else {
+            // Aliased route: look up the JumpHostConfig by name and use the factory
+            let hop = &route.hops[0];
+            let jh_config = config
+                .jump_hosts
+                .iter()
+                .find(|jh| jh.name == hop.name)
+                .ok_or_else(|| anyhow!("jump host '{}' not found in config", hop.name))?;
+            build_jump_host(jh_config, route.end_target.alias.as_str(), auth_prompter, config).await
         }
     }
 
@@ -255,9 +245,8 @@ impl ConnectionPool {
         pools.values().map(|pool| pool.status()).collect()
     }
 
-    #[allow(deprecated)]
-    fn get_or_create_pool(&self, target: &ResolvedTarget) -> Arc<TargetPool> {
-        let key = pool_key_for_target(target);
+    fn get_or_create_pool(&self, route: &TargetRoute) -> Arc<TargetPool> {
+        let key = pool_key_for_target(route);
         let mut pools = self.pools.lock();
         pools
             .entry(key.clone())
@@ -455,7 +444,6 @@ fn should_reconnect_by_message(error: &str) -> bool {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
@@ -489,33 +477,35 @@ mod tests {
         1..=8usize
     }
 
-    /// Strategy to generate arbitrary TargetTransport values.
-    fn arb_target_transport() -> impl Strategy<Value = TargetTransport> {
-        prop_oneof![Just(TargetTransport::Direct), Just(TargetTransport::Jump),]
-    }
-
-    /// Strategy to generate non-empty key strings.
-    fn arb_key_string() -> impl Strategy<Value = String> {
-        "[a-zA-Z0-9_]{1,20}"
-    }
-
-    /// Strategy to generate arbitrary ResolvedTarget values for pool-key testing.
-    fn arb_resolved_target() -> impl Strategy<Value = ResolvedTarget> {
-        (
-            arb_key_string(),
-            arb_key_string(),
-            arb_key_string(),
-            arb_target_transport(),
-            arb_key_string(),
-        )
-            .prop_map(|(input, ip, key, transport, target_label)| ResolvedTarget {
-                input,
-                ip,
-                key,
-                transport,
-                direct: None,
-                target_label,
-            })
+    /// Strategy to generate arbitrary TargetRoute values for pool-key testing.
+    fn arb_target_route() -> impl Strategy<Value = TargetRoute> {
+        let arb_key = "[a-zA-Z0-9_]{1,20}";
+        let arb_kind = prop_oneof![
+            Just(JumpHostKind::Direct),
+            Just(JumpHostKind::Jumpserver),
+            Just(JumpHostKind::Rhopd),
+        ];
+        prop_oneof![
+            // Direct route (empty hops)
+            arb_key.prop_map(|alias| TargetRoute {
+                hops: vec![],
+                end_target: crate::jump::types::EndTarget {
+                    id: EndTargetId(format!("target:{}", alias)),
+                    alias,
+                },
+            }),
+            // Aliased route (one hop)
+            (arb_key.clone(), arb_kind, arb_key).prop_map(|(hop_name, kind, alias)| TargetRoute {
+                hops: vec![crate::jump::types::JumpHopRef {
+                    name: hop_name,
+                    kind,
+                }],
+                end_target: crate::jump::types::EndTarget {
+                    id: EndTargetId(format!("target:{}", alias)),
+                    alias,
+                },
+            }),
+        ]
     }
 
     proptest! {
@@ -545,7 +535,7 @@ mod tests {
                 let config = Arc::new(RwLock::new(config));
 
                 let key = PoolKey::Aliased {
-                    alias: "test-host".to_string(),
+                    name: "test-host".to_string(),
                     kind: JumpHostKind::Jumpserver,
                 };
                 let pool = TargetPool::new(key);
@@ -624,56 +614,49 @@ mod tests {
             })?;
         }
 
-        /// **Validates: Requirements 3.7, 4.3, 5.1, 7.5**
+        // Feature: remove-deprecated-jumpserver-config, Property 6: PoolKey derivation from TargetRoute
+        /// **Validates: Requirements 7.3**
         ///
         /// PoolKey derivation is deterministic: for non-direct routes it's
-        /// Aliased { alias, kind } from the first hop; for direct routes it's
+        /// Aliased { name, kind } from the first hop; for direct routes it's
         /// Direct { end_target_id }. Same input always produces the same key.
         #[test]
         fn prop_pool_key_deterministic(
-            target in arb_resolved_target(),
+            route in arb_target_route(),
         ) {
-            let key1 = pool_key_for_target(&target);
-            let key2 = pool_key_for_target(&target);
+            let key1 = pool_key_for_target(&route);
+            let key2 = pool_key_for_target(&route);
 
             // Same input always produces the same key.
             prop_assert_eq!(&key1, &key2, "pool_key_for_target is not deterministic");
 
             // Verify the key structure matches the route type.
-            match target.transport {
-                TargetTransport::Direct => {
-                    match &key1 {
-                        PoolKey::Direct { end_target } => {
-                            // For direct routes, the end_target_id should be derived
-                            // from the target's key field.
-                            prop_assert_eq!(
-                                &end_target.0, &target.key,
-                                "Direct pool key should use target.key as end_target_id"
-                            );
-                        }
-                        PoolKey::Aliased { .. } => {
-                            prop_assert!(false, "Direct transport should produce PoolKey::Direct");
-                        }
+            if route.hops.is_empty() {
+                match &key1 {
+                    PoolKey::Direct { end_target } => {
+                        prop_assert_eq!(
+                            &end_target.0, &route.end_target.id.0,
+                            "Direct pool key should use route end_target.id"
+                        );
+                    }
+                    PoolKey::Aliased { .. } => {
+                        prop_assert!(false, "Empty hops should produce PoolKey::Direct");
                     }
                 }
-                TargetTransport::Jump => {
-                    match &key1 {
-                        PoolKey::Aliased { alias, kind } => {
-                            // For jump routes, the alias comes from the first hop
-                            // (which is target_label in to_target_route) and kind
-                            // is Jumpserver.
-                            prop_assert_eq!(
-                                alias, &target.target_label,
-                                "Aliased pool key alias should match first hop alias"
-                            );
-                            prop_assert_eq!(
-                                *kind, JumpHostKind::Jumpserver,
-                                "Jump transport should produce Jumpserver kind"
-                            );
-                        }
-                        PoolKey::Direct { .. } => {
-                            prop_assert!(false, "Jump transport should produce PoolKey::Aliased");
-                        }
+            } else {
+                match &key1 {
+                    PoolKey::Aliased { name, kind } => {
+                        prop_assert_eq!(
+                            name, &route.hops[0].name,
+                            "Aliased pool key name should match first hop name"
+                        );
+                        prop_assert_eq!(
+                            *kind, route.hops[0].kind,
+                            "Aliased pool key kind should match first hop kind"
+                        );
+                    }
+                    PoolKey::Direct { .. } => {
+                        prop_assert!(false, "Non-empty hops should produce PoolKey::Aliased");
                     }
                 }
             }

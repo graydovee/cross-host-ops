@@ -43,7 +43,7 @@ impl JumpHost for DirectJumpHost {
         JumpHostKind::Direct
     }
 
-    fn alias(&self) -> &str {
+    fn name(&self) -> &str {
         &self.alias
     }
 }

@@ -17,7 +17,7 @@ use tower::service_fn;
 
 use crate::config::{
     AppConfig, ClientConfig, JumpHostConfig, JumpHostFields, RhopdJumpHostFields,
-    default_config_path, expand_tilde, RESERVED_ALIASES,
+    default_config_path, expand_tilde, RESERVED_NAMES,
 };
 use crate::connection::{CopyDirection, CopySpec};
 use crate::exit_codes::cap_remote_exit_code;
@@ -114,7 +114,7 @@ pub enum ArunCommand {
 pub enum RemoteCommand {
     #[command(about = "Connect to a remote daemon and trust its host key if needed")]
     Connect {
-        #[arg(value_name = "NAME", help = "Alias for the remote jump host")]
+        #[arg(value_name = "NAME", help = "Name for the remote jump host")]
         name: String,
         #[arg(value_name = "ADDRESS", help = "[user@]host[:port] of the remote daemon")]
         address: String,
@@ -131,7 +131,7 @@ pub enum RemoteCommand {
     },
     #[command(about = "Remove a rhopd jump host entry from the configuration")]
     Remove {
-        #[arg(value_name = "NAME", help = "Alias of the rhopd jump host to remove")]
+        #[arg(value_name = "NAME", help = "Name of the rhopd jump host to remove")]
         name: String,
     },
     #[command(about = "List all configured jump hosts")]
@@ -305,12 +305,17 @@ async fn status() -> Result<i32> {
     if !response.cli_start_log_level.is_empty() {
         println!("  cli_start_log_level: {}", response.cli_start_log_level);
     }
+    if response.remote_listening {
+        println!("remote:");
+        println!("  listening: {}", response.remote_addr);
+        println!("  user: {}", response.remote_ssh_user);
+    }
 
     // Print jump hosts from the daemon's StatusResponse.
     if !response.jump_hosts.is_empty() {
         println!("jump_hosts:");
         for jh in &response.jump_hosts {
-            println!("  - alias: {}", jh.alias);
+            println!("  - name: {}", jh.name);
             println!("    kind: {}", jh.kind);
             println!("    address: {}", jh.address);
             if let Some(sub) = &jh.sub_status {
@@ -768,23 +773,23 @@ async fn remote_connect(
     _accept_new_host_key: bool,
     _fingerprint: Option<String>,
 ) -> Result<i32> {
-    // --- Step 1: Validate <name> against RESERVED_ALIASES ---
-    if RESERVED_ALIASES.contains(&name.as_str()) {
+    // --- Step 1: Validate <name> against RESERVED_NAMES ---
+    if RESERVED_NAMES.contains(&name.as_str()) {
         eprintln!(
-            "error: alias '{}' is reserved (reserved aliases: {:?})",
-            name, RESERVED_ALIASES
+            "error: name '{}' is reserved (reserved names: {:?})",
+            name, RESERVED_NAMES
         );
         return Ok(1);
     }
 
-    // --- Step 2: Validate <name> against existing jump host aliases ---
-    // Load the daemon config to check for alias collisions.
+    // --- Step 2: Validate <name> against existing jump host names ---
+    // Load the daemon config to check for name collisions.
     let config_path = default_config_path();
     let config = AppConfig::load(Some(&config_path)).unwrap_or_default();
     for entry in &config.jump_hosts {
-        if entry.alias == name {
+        if entry.name == name {
             eprintln!(
-                "error: alias '{}' is already used by a {} jump host",
+                "error: name '{}' is already used by a {} jump host",
                 name, entry.kind
             );
             return Ok(1);
@@ -846,7 +851,7 @@ async fn remote_connect(
 
     // --- Step 5: Persist the new entry to the config file ---
     let new_entry = JumpHostConfig {
-        alias: name.clone(),
+        name: name.clone(),
         kind: JumpHostKind::Rhopd,
         fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
             address: remote_addr.format(),
@@ -881,20 +886,20 @@ async fn remote_remove(name: String) -> Result<i32> {
     let config_path = default_config_path();
     let config = AppConfig::load(Some(&config_path)).unwrap_or_default();
 
-    // Find the entry with the given alias
-    let entry = config.jump_hosts.iter().find(|e| e.alias == name);
+    // Find the entry with the given name
+    let entry = config.jump_hosts.iter().find(|e| e.name == name);
 
     match entry {
         None => {
             eprintln!(
-                "error: alias '{}' not found in jump hosts configuration",
+                "error: name '{}' not found in jump hosts configuration",
                 name
             );
             Ok(1)
         }
         Some(entry) if entry.kind != JumpHostKind::Rhopd => {
             eprintln!(
-                "error: alias '{}' is a {} jump host; quick-remove only manages rhopd entries",
+                "error: name '{}' is a {} jump host; quick-remove only manages rhopd entries",
                 name, entry.kind
             );
             Ok(1)
@@ -902,7 +907,7 @@ async fn remote_remove(name: String) -> Result<i32> {
         Some(_) => {
             // Remove the entry and persist
             let mut config = config;
-            config.jump_hosts.retain(|e| e.alias != name);
+            config.jump_hosts.retain(|e| e.name != name);
 
             let raw = toml::to_string_pretty(&config)
                 .context("failed to serialize config")?;
@@ -927,14 +932,14 @@ fn remote_list() -> Result<i32> {
         return Ok(0);
     }
 
-    println!("{:<10}  {:<12}  {}", "ALIAS", "KIND", "ADDRESS");
+    println!("{:<10}  {:<12}  {}", "NAME", "KIND", "ADDRESS");
     for entry in &config.jump_hosts {
         let address = match &entry.fields {
             JumpHostFields::Rhopd(fields) => fields.address.clone(),
             JumpHostFields::Jumpserver(fields) => format!("{}:{}", fields.host, fields.port),
             JumpHostFields::Direct(fields) => format!("{}:{}", fields.host, fields.port),
         };
-        println!("{:<10}  {:<12}  {}", entry.alias, entry.kind, address);
+        println!("{:<10}  {:<12}  {}", entry.name, entry.kind, address);
     }
 
     Ok(0)
