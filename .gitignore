@@ -1,6 +1,8 @@
 target
 logs
 
+.kiro
+
 arun
 
 config.toml

@@ -3,6 +3,7 @@
 //! These tests verify protocol-level invariants at the gRPC boundary using a
 //! mock RhopRpc server connected via `tokio::io::duplex`. Since the daemon
 //! cannot perform real SSH connections in tests, we verify that the correct
+#![allow(clippy::collapsible_if)]
 //! fields reach the daemon and that the protocol contracts hold.
 
 mod support;
@@ -18,7 +19,7 @@ use hyper_util::rt::TokioIo;
 
 use rhop::config::AppConfig;
 use rhop::connection::{CopyDirection, CopySpec};
-use rhop::jump::rhopd::{RhopdJumpHost, RhopdTransport};
+use rhop::jump::rhopd::RhopdJumpHost;
 use rhop::jump::{JumpHost, JumpHostKind};
 use rhop::protocol::rpc;
 use rhop::protocol::rpc::rhop_rpc_server::{RhopRpc, RhopRpcServer};
@@ -195,8 +196,10 @@ fn build_rhopd_jump_host(
     alias: String,
     client: rpc::rhop_rpc_client::RhopRpcClient<Channel>,
 ) -> RhopdJumpHost {
-    let transport = RhopdTransport::new_test();
-    RhopdJumpHost::from_parts(alias, "test@localhost:22".to_string(), transport, client)
+    // In-process tests don't have a real SSH session backing the client, so
+    // the optional transport slot is left empty. Production paths always
+    // populate it via `RhopdJumpHost::connect`.
+    RhopdJumpHost::from_parts(alias, "test@localhost:22".to_string(), None, client)
 }
 
 // ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@
 //!
 //! These tests exercise specific code paths identified in the spec's coverage
 //! matrix. Each test is tagged with its matrix ID for traceability.
+#![allow(clippy::useless_vec)]
 
 use std::collections::HashMap;
 use std::time::Duration;

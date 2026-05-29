@@ -52,6 +52,9 @@ pub async fn build_jump_host(
             let host = RhopdJumpHost::connect(
                 spec.name.clone(),
                 fields.address.clone(),
+                fields.identity_file.clone(),
+                fields.known_hosts_path.clone(),
+                target_label.to_string(),
             )
             .await?;
             Ok(Box::new(host))

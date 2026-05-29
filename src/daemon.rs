@@ -27,11 +27,12 @@ use crate::config::{AppConfig, ReviewAction, default_config_path, load_server_co
 use crate::connection::CopySpec;
 use crate::connection::{AuthPrompter, AuthPromptRequest, build_remote_command, Resolver};
 use crate::jump::auth::AuthPromptRouter;
+use crate::jump::factory::build_jump_host;
 use crate::jump::server_list::ServerListAggregator;
-use crate::jump::JumpHost;
+use crate::jump::{JumpHost, ServerListSource};
 use crate::logging::{init_logging, reopen_log_output};
 use crate::pool::ConnectionPool;
-use crate::protocol::{self, AuthPromptMessage, ExecRequest, ServerEvent, rpc};
+use crate::protocol::{self, AuthPromptMessage, ExecRequest, ServerEvent, ServerListSourceStatus, rpc};
 use crate::remote::remote_subsystem_name;
 use crate::review::CommandReviewer;
 
@@ -1068,15 +1069,43 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
         let server_config = load_server_config(&path)
             .map_err(|error| Status::internal(error.to_string()))?;
 
-        // Use the aggregator with local entries only (no jump hosts wired yet).
-        let mut jump_hosts: Vec<Box<dyn JumpHost>> = vec![];
+        // Build jump hosts from the current config. Per-entry construction
+        // failures are captured as `(JumpHost(name), Error(msg))` rows so a
+        // single misconfigured or unreachable entry does not turn the whole
+        // RPC into `Status::Internal`. The `format!("{error}")` text is kept
+        // verbatim so callers see the upstream Display message untouched.
+        //
+        // `list_servers` runs without an interactive client connection, so we
+        // wire a router whose upstream channel is dropped immediately. Any
+        // keyboard-interactive prompt during jump-host construction will fail
+        // with a closed-channel error, which is the correct behavior since
+        // `list_servers` cannot solicit input from the caller.
+        let (prompt_tx, _prompt_rx) = mpsc::unbounded_channel();
+        let router = Arc::new(AuthPromptRouter::new(prompt_tx));
+        let auth_prompter = make_auth_prompter(router, String::new());
+
+        let mut jump_hosts: Vec<Box<dyn JumpHost>> = Vec::new();
+        let mut prebuilt_status: Vec<(ServerListSource, ServerListSourceStatus)> = Vec::new();
+        for entry in &config.jump_hosts {
+            match build_jump_host(entry, "", &auth_prompter, &config).await {
+                Ok(host) => jump_hosts.push(host),
+                Err(error) => {
+                    prebuilt_status.push((
+                        ServerListSource::JumpHost(entry.name.clone()),
+                        ServerListSourceStatus::Error(format!("{error}")),
+                    ));
+                }
+            }
+        }
+
         let mut aggregator = ServerListAggregator {
             local: &server_config,
             jump_hosts: &mut jump_hosts,
             config: &config,
             cache: HashMap::new(),
         };
-        let merged = aggregator.aggregate(false).await;
+        let mut merged = aggregator.aggregate(false).await;
+        merged.source_status.extend(prebuilt_status);
 
         // Populate the legacy `servers` field for backward compatibility.
         let servers: Vec<rpc::ServerEntry> = merged

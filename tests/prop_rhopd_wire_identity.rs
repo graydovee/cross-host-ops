@@ -2,6 +2,7 @@
 //! RhopdJumpHost::list_servers.
 //!
 //! Feature: rhopd-jumpserver-architecture, Property 11: Wire-level identity for RhopdJumpHost::exec and RhopdJumpHost::list_servers
+#![allow(clippy::collapsible_if)]
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -13,7 +14,7 @@ use tower::service_fn;
 use hyper_util::rt::TokioIo;
 
 use rhop::config::AppConfig;
-use rhop::jump::rhopd::{RhopdJumpHost, RhopdTransport};
+use rhop::jump::rhopd::RhopdJumpHost;
 use rhop::jump::JumpHost;
 use rhop::protocol::rpc;
 use rhop::protocol::rpc::rhop_rpc_server::{RhopRpc, RhopRpcServer};
@@ -175,8 +176,10 @@ fn build_rhopd_jump_host(
     alias: String,
     client: rpc::rhop_rpc_client::RhopRpcClient<Channel>,
 ) -> RhopdJumpHost {
-    let transport = RhopdTransport::new_test();
-    RhopdJumpHost::from_parts(alias, "test@localhost:22".to_string(), transport, client)
+    // In-process tests don't have a real SSH session backing the client, so
+    // the optional transport slot is left empty. Production paths always
+    // populate it via `RhopdJumpHost::connect`.
+    RhopdJumpHost::from_parts(alias, "test@localhost:22".to_string(), None, client)
 }
 
 // ---------------------------------------------------------------------------
