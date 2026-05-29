@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -17,7 +18,7 @@ use tower::service_fn;
 
 use crate::config::{
     AppConfig, ClientConfig, JumpHostConfig, JumpHostFields, RhopdJumpHostFields,
-    default_config_path, expand_tilde, RESERVED_NAMES,
+    default_config_path, expand_tilde, parse_duration, RESERVED_NAMES,
 };
 use crate::connection::{CopyDirection, CopySpec};
 use crate::exit_codes::cap_remote_exit_code;
@@ -56,7 +57,13 @@ pub struct ArunCli {
 
 #[derive(Debug, Subcommand)]
 pub enum ArunCommand {
-    #[command(about = "Execute a remote command on the target host", trailing_var_arg = true)]
+    #[command(
+        about = "Execute a remote command: rhop exec <TARGET> [--] <CMD> [ARGS...]",
+        long_about = "Execute a remote command on the target host.\n\n\
+            Use -- to separate rhop options from remote arguments when remote \
+            arguments begin with a hyphen that could conflict with rhop options.",
+        trailing_var_arg = true,
+    )]
     Exec {
         /// Allocate a PTY for the remote command.
         #[arg(long = "pty", conflicts_with = "no_pty")]
@@ -70,14 +77,16 @@ pub enum ArunCommand {
         /// Abort the operation after this duration (e.g. 30s, 2m).
         #[arg(long = "timeout", value_name = "DURATION")]
         timeout: Option<String>,
-        /// Target and command: <TARGET> <CMD>...
+        /// Remote target name.
+        #[arg(value_name = "TARGET")]
+        target: String,
+        /// Remote command and arguments (use -- to separate from rhop options).
         #[arg(
-            value_name = "TARGET_AND_CMD",
-            required = true,
+            value_name = "CMD",
+            trailing_var_arg = true,
             allow_hyphen_values = true,
-            help = "Target name followed by remote command and arguments"
         )]
-        target_and_argv: Vec<String>,
+        cmd: Vec<String>,
     },
     #[command(about = "Copy files between local and remote host")]
     Cp {
@@ -93,7 +102,18 @@ pub enum ArunCommand {
     },
     #[command(about = "Show daemon and connection pool status")]
     Status,
-    #[command(about = "Manage remote daemon target selection")]
+    #[command(about = "List reachable servers from all configured sources")]
+    Ls {
+        /// Re-fetch every server list source bypassing the in-memory cache.
+        #[arg(long, alias = "no-cache")]
+        refresh: bool,
+    },
+    #[command(about = "Manage jump host entries")]
+    Host {
+        #[command(subcommand)]
+        command: HostCommand,
+    },
+    #[command(about = "Manage remote daemon target selection", hide = true)]
     Remote {
         #[command(subcommand)]
         command: RemoteCommand,
@@ -103,7 +123,7 @@ pub enum ArunCommand {
         #[command(subcommand)]
         command: DaemonCommand,
     },
-    #[command(about = "Query configured servers")]
+    #[command(about = "Query configured servers", hide = true)]
     Server {
         #[command(subcommand)]
         command: ServerCommand,
@@ -163,13 +183,106 @@ pub enum ServerCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum HostCommand {
+    /// Add a new jump host entry.
+    #[command(about = "Add a new jump host entry")]
+    Add {
+        #[arg(value_name = "NAME")]
+        name: String,
+        #[arg(value_name = "ADDRESS", help = "[user@]host[:port]")]
+        address: String,
+        #[arg(long = "identity-file", value_name = "FILE")]
+        identity_file: Option<String>,
+        #[arg(long = "known-hosts", value_name = "FILE")]
+        known_hosts: Option<String>,
+        #[arg(long = "accept-new-host-key", conflicts_with = "fingerprint")]
+        accept_new_host_key: bool,
+        #[arg(long = "fingerprint", value_name = "SHA256", conflicts_with = "accept_new_host_key")]
+        fingerprint: Option<String>,
+    },
+    /// Remove a jump host entry.
+    #[command(about = "Remove a jump host entry")]
+    Remove {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// List all configured jump hosts.
+    #[command(about = "List all configured jump hosts")]
+    List,
+}
+
+/// Print a deprecation warning to stderr guiding the user to the replacement command.
+fn emit_deprecation_warning(old_cmd: &str, new_cmd: &str) {
+    eprintln!("warning: '{}' is deprecated; use '{}' instead", old_cmd, new_cmd);
+}
+
+/// Convert a deprecated `RemoteCommand` variant into the equivalent `HostCommand`.
+fn remote_to_host(cmd: RemoteCommand) -> HostCommand {
+    match cmd {
+        RemoteCommand::Connect {
+            name,
+            address,
+            identity_file,
+            known_hosts,
+            accept_new_host_key,
+            fingerprint,
+        } => HostCommand::Add {
+            name,
+            address,
+            identity_file,
+            known_hosts,
+            accept_new_host_key,
+            fingerprint,
+        },
+        RemoteCommand::Remove { name } => HostCommand::Remove { name },
+        RemoteCommand::List => HostCommand::List,
+    }
+}
+
 pub async fn run_cli(cli: ArunCli) -> Result<i32> {
     match cli.command {
-        ArunCommand::Exec { target_and_argv, .. } => {
-            let (target, argv) = split_target_and_argv(target_and_argv)?;
-            if argv.is_empty() {
-                bail!("at least one command argument is required");
+        ArunCommand::Exec { target, cmd, timeout, .. } => {
+            // Validate --timeout if provided: parse and bounds-check (1–86400 seconds).
+            if let Some(ref timeout_str) = timeout {
+                match parse_duration(timeout_str) {
+                    Ok(dur) => {
+                        let secs = dur.as_secs();
+                        if secs < 1 || secs > 86400 {
+                            eprintln!("error: timeout must be between 1s and 86400s");
+                            return Ok(125);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("error: invalid timeout '{}': {}", timeout_str, e);
+                        return Ok(125);
+                    }
+                }
             }
+
+            if cmd.is_empty() {
+                eprintln!("error: at least one command argument is required");
+                return Ok(125);
+            }
+
+            // Detect whether `--` was used by scanning raw process args.
+            let has_separator = detect_double_dash_separator(&target);
+
+            if !has_separator && cmd.len() > 1 {
+                eprintln!(
+                    "error: multiple command arguments require a `--` separator or quoting as a single string"
+                );
+                return Ok(125);
+            }
+
+            let argv = if !has_separator && cmd.len() == 1 {
+                // Single-string mode: wrap in sh -c
+                vec!["sh".to_string(), "-c".to_string(), cmd[0].clone()]
+            } else {
+                // Multi-arg mode (with --): pass directly
+                cmd
+            };
+
             run_command(target, argv).await
         }
         ArunCommand::Cp {
@@ -179,9 +292,23 @@ pub async fn run_cli(cli: ArunCli) -> Result<i32> {
             ..
         } => run_copy(recursive, source, dest).await,
         ArunCommand::Status => status().await,
-        ArunCommand::Remote { command } => run_remote_command(command).await,
+        ArunCommand::Ls { refresh } => list_servers(refresh).await,
+        ArunCommand::Host { command } => run_host_command(command).await,
+        ArunCommand::Remote { command } => {
+            let (old_name, new_name) = match &command {
+                RemoteCommand::Connect { .. } => ("rhop remote connect", "rhop host add"),
+                RemoteCommand::Remove { .. } => ("rhop remote remove", "rhop host remove"),
+                RemoteCommand::List => ("rhop remote list", "rhop host list"),
+            };
+            emit_deprecation_warning(old_name, new_name);
+            run_host_command(remote_to_host(command)).await
+        }
         ArunCommand::Daemon { command } => run_daemon_command(command).await,
-        ArunCommand::Server { command } => run_server_command(command).await,
+        ArunCommand::Server { command } => {
+            emit_deprecation_warning("rhop server list", "rhop ls");
+            let ServerCommand::List { refresh } = command;
+            list_servers(refresh).await
+        }
     }
 }
 
@@ -215,14 +342,35 @@ pub fn print_version_json() {
     println!("{}", serde_json::to_string_pretty(&version_info).unwrap());
 }
 
-/// Split the combined target_and_argv vec into (target, argv).
-/// The first element is the target; the rest is the argv.
-fn split_target_and_argv(mut args: Vec<String>) -> Result<(String, Vec<String>)> {
-    if args.is_empty() {
-        bail!("target is required");
-    }
-    let target = args.remove(0);
-    Ok((target, args))
+/// Detect whether a `--` separator was used between the target and the first cmd token.
+///
+/// Scans `std::env::args_os()` for a literal `--` that appears after the target positional.
+/// This is necessary because clap's `trailing_var_arg` consumes all tokens after target
+/// into `cmd`, stripping the `--` from the parsed result.
+fn detect_double_dash_separator(target: &str) -> bool {
+    let raw_args: Vec<_> = env::args_os().collect();
+    let target_os = OsStr::new(target);
+
+    // Find the position of "exec" subcommand in raw args.
+    let exec_pos = match raw_args.iter().position(|a| a == OsStr::new("exec")) {
+        Some(p) => p,
+        None => return false,
+    };
+
+    // Find the target position after "exec" (skip options like --pty, --timeout, etc.)
+    let target_pos = match raw_args[exec_pos + 1..]
+        .iter()
+        .position(|a| a == target_os)
+    {
+        Some(p) => exec_pos + 1 + p,
+        None => return false,
+    };
+
+    // Check if the token immediately after target is `--`.
+    raw_args
+        .get(target_pos + 1)
+        .map(|a| a == OsStr::new("--"))
+        .unwrap_or(false)
 }
 
 async fn run_command(target: String, argv: Vec<String>) -> Result<i32> {
@@ -387,9 +535,10 @@ async fn run_copy(recursive: bool, source: String, dest: String) -> Result<i32> 
     Ok(0)
 }
 
-async fn run_remote_command(command: RemoteCommand) -> Result<i32> {
+/// Dispatch a HostCommand to the appropriate handler function.
+async fn run_host_command(command: HostCommand) -> Result<i32> {
     match command {
-        RemoteCommand::Connect {
+        HostCommand::Add {
             name,
             address,
             identity_file,
@@ -407,10 +556,12 @@ async fn run_remote_command(command: RemoteCommand) -> Result<i32> {
             )
             .await
         }
-        RemoteCommand::Remove { name } => remote_remove(name).await,
-        RemoteCommand::List => remote_list(),
+        HostCommand::Remove { name } => remote_remove(name).await,
+        HostCommand::List => remote_list(),
     }
 }
+
+
 
 async fn run_daemon_command(command: DaemonCommand) -> Result<i32> {
     match command {
@@ -423,11 +574,7 @@ async fn run_daemon_command(command: DaemonCommand) -> Result<i32> {
     }
 }
 
-async fn run_server_command(command: ServerCommand) -> Result<i32> {
-    match command {
-        ServerCommand::List { refresh } => list_servers(refresh).await,
-    }
-}
+
 
 async fn list_servers(refresh: bool) -> Result<i32> {
     let mut client = connect_data_client(ClientAccess::AutoStart).await?;
@@ -1045,7 +1192,7 @@ mod tests {
     //
     // For any TARGET T and any Vec<String> argv V (including elements that look like
     // rhop flags such as --non-interactive, --pty, --output, --), parsing
-    // `rhop exec <target> <argv>...` produces the exact same argv in the parsed struct.
+    // `rhop exec <target> -- <argv>...` produces the exact same argv in the parsed struct.
     //
     // Validates: Requirements 17.1, 17.2, 17.4
 
@@ -1084,17 +1231,17 @@ mod tests {
         fn prop_argv_passthrough_transparency(
             argv in proptest::collection::vec(argv_element_strategy(), 1..10),
         ) {
-            // Build the CLI args: rhop exec <target> <argv...>
+            // Build the CLI args: rhop exec <target> -- <argv...>
+            // Using `--` separator to pass arbitrary argv through (multi-arg mode).
             let target = "my-target";
-            let mut args = vec!["rhop".to_string(), "exec".to_string(), target.to_string()];
+            let mut args = vec!["rhop".to_string(), "exec".to_string(), target.to_string(), "--".to_string()];
             args.extend(argv.clone());
 
             let parsed = ArunCli::try_parse_from(&args).unwrap();
             match parsed.command {
-                ArunCommand::Exec { target_and_argv, .. } => {
-                    let (parsed_target, parsed_argv) = split_target_and_argv(target_and_argv).unwrap();
+                ArunCommand::Exec { target: parsed_target, cmd, .. } => {
                     prop_assert_eq!(&parsed_target, target);
-                    prop_assert_eq!(&parsed_argv, &argv);
+                    prop_assert_eq!(&cmd, &argv);
                 }
                 _ => panic!("expected Exec command"),
             }
