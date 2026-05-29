@@ -40,6 +40,7 @@ impl JumpHost for OkMockJumpHost {
         _argv: &[String],
         _sender: &UnboundedSender<ServerEvent>,
         _config: &AppConfig,
+        _pty: bool,
     ) -> Result<i32> {
         Ok(0)
     }

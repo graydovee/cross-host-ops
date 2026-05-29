@@ -375,7 +375,12 @@ impl Connection for JumpSshConnection {
         argv: &[String],
         sender: &UnboundedSender<ServerEvent>,
         _config: &AppConfig,
+        _pty: bool,
     ) -> Result<i32> {
+        // Jump connections always use a PTY shell for the transport layer.
+        // The `pty` parameter controls whether the *remote command* gets PTY
+        // allocation, but since jump connections run commands through an
+        // interactive shell session, PTY is always implicitly present.
         let command = build_interactive_shell_command(argv);
         self.run_shell_command_stream(&command, sender, EXEC_SENTINEL_PREFIX)
             .await

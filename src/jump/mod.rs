@@ -56,6 +56,7 @@ pub trait JumpHost: Send {
         argv: &[String],
         sender: &UnboundedSender<ServerEvent>,
         config: &AppConfig,
+        pty: bool,
     ) -> Result<i32>;
 
     /// Required. Carry out the remote-side half of a copy. The local-side I/O
@@ -111,6 +112,7 @@ mod tests {
             _argv: &[String],
             _sender: &UnboundedSender<ServerEvent>,
             _config: &AppConfig,
+            _pty: bool,
         ) -> Result<i32> {
             Ok(0)
         }

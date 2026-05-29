@@ -134,6 +134,7 @@ impl InProcessRpcHarness {
             request: Some(rpc::execute_request::Request::Start(rpc::StartRequest {
                 target: target.to_string(),
                 argv: argv.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
             })),
         };
 
@@ -175,6 +176,7 @@ impl InProcessRpcHarness {
                 remote_path: remote_path.to_string(),
                 recursive,
                 direction: direction as i32,
+                ..Default::default()
             })),
         };
 

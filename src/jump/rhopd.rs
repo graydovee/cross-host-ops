@@ -349,6 +349,7 @@ impl JumpHost for RhopdJumpHost {
         argv: &[String],
         sender: &UnboundedSender<ServerEvent>,
         config: &AppConfig,
+        _pty: bool,
     ) -> Result<i32> {
         // Build the initial StartRequest and send it as the first message on
         // the Execute streaming RPC. We use an mpsc channel so we can send
@@ -357,6 +358,7 @@ impl JumpHost for RhopdJumpHost {
             request: Some(rpc::execute_request::Request::Start(rpc::StartRequest {
                 target: self.target_label.clone(),
                 argv: argv.to_vec(),
+                ..Default::default()
             })),
         };
 
@@ -517,6 +519,7 @@ impl JumpHost for RhopdJumpHost {
                 remote_path: spec.remote_path.clone(),
                 recursive: spec.recursive,
                 direction,
+                ..Default::default()
             })),
         };
 

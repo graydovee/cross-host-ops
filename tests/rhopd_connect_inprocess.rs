@@ -230,7 +230,7 @@ async fn connect_end_to_end_in_process() {
     // --- exec ---
     let (sender, mut rx) = mpsc::unbounded_channel();
     let exit_code = jump_host
-        .exec(&["echo".to_string(), "hello".to_string()], &sender, &config)
+        .exec(&["echo".to_string(), "hello".to_string()], &sender, &config, config.ssh.pty)
         .await
         .expect("exec should succeed");
     assert_eq!(exit_code, 42, "stub returns exit code 42");

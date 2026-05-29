@@ -13,6 +13,10 @@ pub mod rpc {
 pub struct ExecRequest {
     pub target: String,
     pub argv: Vec<String>,
+    pub pty: bool,
+    pub no_pty: bool,
+    pub stdin: bool,
+    pub timeout_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -24,7 +28,7 @@ pub struct AuthPromptMessage {
     pub message: String,
 }
 
-pub fn copy_spec_to_rpc(target: String, spec: CopySpec) -> rpc::CopyRequest {
+pub fn copy_spec_to_rpc(target: String, spec: CopySpec, timeout_ms: u64) -> rpc::CopyRequest {
     rpc::CopyRequest {
         request: Some(rpc::copy_request::Request::Start(rpc::CopyStartRequest {
             target,
@@ -35,11 +39,12 @@ pub fn copy_spec_to_rpc(target: String, spec: CopySpec) -> rpc::CopyRequest {
                 CopyDirection::Upload => rpc::CopyDirection::Upload as i32,
                 CopyDirection::Download => rpc::CopyDirection::Download as i32,
             },
+            timeout_ms,
         })),
     }
 }
 
-pub fn copy_spec_from_rpc(request: rpc::CopyStartRequest) -> Result<(String, CopySpec)> {
+pub fn copy_spec_from_rpc(request: rpc::CopyStartRequest) -> Result<(String, CopySpec, u64)> {
     let direction = match rpc::CopyDirection::try_from(request.direction)
         .unwrap_or(rpc::CopyDirection::Unspecified)
     {
@@ -57,6 +62,7 @@ pub fn copy_spec_from_rpc(request: rpc::CopyStartRequest) -> Result<(String, Cop
             remote_path: request.remote_path,
             recursive: request.recursive,
         },
+        request.timeout_ms,
     ))
 }
 

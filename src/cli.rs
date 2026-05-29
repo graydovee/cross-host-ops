@@ -1,6 +1,6 @@
 use std::env;
 use std::ffi::OsStr;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use hyper_util::rt::TokioIo;
+use tokio::io::AsyncReadExt;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -23,6 +24,7 @@ use crate::config::{
 use crate::connection::{CopyDirection, CopySpec};
 use crate::exit_codes::cap_remote_exit_code;
 use crate::jump::address::{AddressDefaults, RemoteAddress};
+use crate::jump::pty::{ExecPtyFlags, effective_pty_decision};
 use crate::jump::JumpHostKind;
 use crate::protocol::rpc;
 use crate::remote::{
@@ -242,9 +244,9 @@ fn remote_to_host(cmd: RemoteCommand) -> HostCommand {
 
 pub async fn run_cli(cli: ArunCli) -> Result<i32> {
     match cli.command {
-        ArunCommand::Exec { target, cmd, timeout, .. } => {
+        ArunCommand::Exec { target, cmd, timeout, pty, no_pty, stdin } => {
             // Validate --timeout if provided: parse and bounds-check (1–86400 seconds).
-            if let Some(ref timeout_str) = timeout {
+            let timeout_ms: u64 = if let Some(ref timeout_str) = timeout {
                 match parse_duration(timeout_str) {
                     Ok(dur) => {
                         let secs = dur.as_secs();
@@ -252,13 +254,16 @@ pub async fn run_cli(cli: ArunCli) -> Result<i32> {
                             eprintln!("error: timeout must be between 1s and 86400s");
                             return Ok(125);
                         }
+                        dur.as_millis() as u64
                     }
                     Err(e) => {
                         eprintln!("error: invalid timeout '{}': {}", timeout_str, e);
                         return Ok(125);
                     }
                 }
-            }
+            } else {
+                0
+            };
 
             if cmd.is_empty() {
                 eprintln!("error: at least one command argument is required");
@@ -283,14 +288,40 @@ pub async fn run_cli(cli: ArunCli) -> Result<i32> {
                 cmd
             };
 
-            run_command(target, argv).await
+            // Resolve PTY decision using effective_pty_decision.
+            let stdout_is_tty = std::io::stdout().is_terminal();
+            let config = AppConfig::load(None).unwrap_or_default();
+            let flags = ExecPtyFlags { force_pty: pty, force_no_pty: no_pty };
+            let resolved_pty = effective_pty_decision(&flags, &config.ssh, stdout_is_tty);
+
+            run_command(target, argv, resolved_pty, no_pty, stdin, timeout_ms).await
         }
         ArunCommand::Cp {
             recursive,
             source,
             dest,
-            ..
-        } => run_copy(recursive, source, dest).await,
+            timeout,
+        } => {
+            let timeout_ms: u64 = if let Some(ref timeout_str) = timeout {
+                match parse_duration(timeout_str) {
+                    Ok(dur) => {
+                        let secs = dur.as_secs();
+                        if secs < 1 || secs > 86400 {
+                            eprintln!("error: timeout must be between 1s and 86400s");
+                            return Ok(125);
+                        }
+                        dur.as_millis() as u64
+                    }
+                    Err(e) => {
+                        eprintln!("error: invalid timeout '{}': {}", timeout_str, e);
+                        return Ok(125);
+                    }
+                }
+            } else {
+                0
+            };
+            run_copy(recursive, source, dest, timeout_ms).await
+        }
         ArunCommand::Status => status().await,
         ArunCommand::Ls { refresh } => list_servers(refresh).await,
         ArunCommand::Host { command } => run_host_command(command).await,
@@ -373,7 +404,7 @@ fn detect_double_dash_separator(target: &str) -> bool {
         .unwrap_or(false)
 }
 
-async fn run_command(target: String, argv: Vec<String>) -> Result<i32> {
+async fn run_command(target: String, argv: Vec<String>, pty: bool, no_pty: bool, stdin: bool, timeout_ms: u64) -> Result<i32> {
     let mut client = connect_data_client(ClientAccess::AutoStart).await?;
 
     let (tx, rx) = mpsc::channel(8);
@@ -381,10 +412,46 @@ async fn run_command(target: String, argv: Vec<String>) -> Result<i32> {
         request: Some(rpc::execute_request::Request::Start(rpc::StartRequest {
             target,
             argv,
+            pty,
+            no_pty,
+            stdin,
+            timeout_ms,
         })),
     })
     .await
     .map_err(|_| anyhow!("failed to send execute request"))?;
+
+    // If stdin forwarding is requested, spawn a task that reads from tokio stdin
+    // and sends data on the bidirectional stream.
+    if stdin {
+        let stdin_tx = tx.clone();
+        tokio::spawn(async move {
+            let mut tokio_stdin = tokio::io::stdin();
+            let mut buf = [0u8; 4096];
+            loop {
+                match tokio_stdin.read(&mut buf).await {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        let data = buf[..n].to_vec();
+                        // Send stdin data as a raw message. The daemon will
+                        // recognize this as stdin input on the execute stream.
+                        let msg = rpc::ExecuteRequest {
+                            request: Some(rpc::execute_request::Request::AuthInput(
+                                rpc::AuthInputRequest {
+                                    prompt_id: "__stdin__".to_string(),
+                                    value: String::from_utf8_lossy(&data).to_string(),
+                                },
+                            )),
+                        };
+                        if stdin_tx.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
 
     let response = client.execute(ReceiverStream::new(rx)).await?;
     let mut stream = response.into_inner();
@@ -437,7 +504,14 @@ async fn run_command(target: String, argv: Vec<String>) -> Result<i32> {
         }
     }
 
-    Ok(cap_remote_exit_code(exit_code))
+    // Exit code 124 from the daemon means timeout fired. If the client
+    // requested a timeout, pass 124 through directly (it's rhop's own
+    // semantic, not a remote process exit code). Otherwise cap normally.
+    if exit_code == 124 && timeout_ms > 0 {
+        Ok(124)
+    } else {
+        Ok(cap_remote_exit_code(exit_code))
+    }
 }
 
 async fn status() -> Result<i32> {
@@ -495,11 +569,11 @@ async fn status() -> Result<i32> {
     Ok(0)
 }
 
-async fn run_copy(recursive: bool, source: String, dest: String) -> Result<i32> {
+async fn run_copy(recursive: bool, source: String, dest: String, timeout_ms: u64) -> Result<i32> {
     let (target, spec) = parse_copy_operands(recursive, &source, &dest)?;
     let mut client = connect_local_copy_client().await?;
     let (tx, rx) = mpsc::channel(8);
-    tx.send(crate::protocol::copy_spec_to_rpc(target, spec))
+    tx.send(crate::protocol::copy_spec_to_rpc(target, spec, timeout_ms))
         .await
         .map_err(|_| anyhow!("failed to send copy start request"))?;
     let response = client.copy(ReceiverStream::new(rx)).await?;

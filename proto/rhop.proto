@@ -23,6 +23,10 @@ message ExecuteRequest {
 message StartRequest {
   string target = 1;
   repeated string argv = 2;
+  bool pty = 3;
+  bool no_pty = 4;
+  bool stdin = 5;
+  uint64 timeout_ms = 6;
 }
 
 message ConfirmRequest {
@@ -54,6 +58,7 @@ message CopyStartRequest {
   string remote_path = 3;
   bool recursive = 4;
   CopyDirection direction = 5;
+  uint64 timeout_ms = 6;
 }
 
 message ExecuteResponse {

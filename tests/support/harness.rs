@@ -178,6 +178,7 @@ impl TestHarness {
             request: Some(rpc::execute_request::Request::Start(rpc::StartRequest {
                 target: target.to_string(),
                 argv: argv.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
             })),
         };
 
@@ -238,6 +239,7 @@ impl TestHarness {
                 remote_path: remote_path.to_string(),
                 recursive: false,
                 direction: rpc_direction as i32,
+                ..Default::default()
             })),
         };
 

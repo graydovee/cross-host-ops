@@ -28,6 +28,7 @@ use crate::connection::CopySpec;
 use crate::connection::{AuthPrompter, AuthPromptRequest, build_remote_command, Resolver};
 use crate::jump::auth::AuthPromptRouter;
 use crate::jump::factory::build_jump_host;
+use crate::jump::pty::{ExecPtyFlags, effective_pty_decision};
 use crate::jump::server_list::ServerListAggregator;
 use crate::jump::{JumpHost, ServerListSource};
 use crate::logging::{init_logging, reopen_log_output};
@@ -690,6 +691,18 @@ async fn process_execute(
         }
     }
 
+    // Resolve PTY decision using effective_pty_decision.
+    // The daemon has no TTY (stdout_is_tty = false). When both pty and no_pty
+    // are false (proto3 defaults from old client), this falls back to
+    // config.ssh.pty — preserving backward compatibility.
+    let pty_flags = ExecPtyFlags {
+        force_pty: request.pty,
+        force_no_pty: request.no_pty,
+    };
+    let pty = effective_pty_decision(&pty_flags, &config.ssh, false);
+    let timeout_ms = request.timeout_ms;
+    let wants_stdin = request.stdin;
+
     let (tx, mut rx) = mpsc::unbounded_channel();
     let pool = state.pool.clone();
     let argv = request.argv.clone();
@@ -698,9 +711,18 @@ async fn process_execute(
     let router = Arc::new(AuthPromptRouter::new(prompt_upstream_tx));
     let auth_prompter = make_auth_prompter(router.clone(), target.end_target.alias.clone());
     let exec_task = tokio::spawn(async move {
-        pool.execute(exec_targets, argv, tx, auth_prompter).await
+        pool.execute(exec_targets, argv, tx, auth_prompter, pty).await
     });
     tokio::pin!(exec_task);
+
+    // If timeout is specified, create a deadline future.
+    let timeout_deadline = if timeout_ms > 0 {
+        Some(tokio::time::sleep(Duration::from_millis(timeout_ms)))
+    } else {
+        None
+    };
+    // Pin the optional timeout so we can poll it in select!
+    tokio::pin!(timeout_deadline);
 
     loop {
         tokio::select! {
@@ -719,7 +741,7 @@ async fn process_execute(
                         message: prompt_msg.message,
                     },
                 ).await?;
-                let reply = wait_for_auth_input_execute(inbound, &prompt_id).await;
+                let reply = wait_for_auth_input_execute(inbound, &prompt_id, wants_stdin).await;
                 match reply {
                     Ok(value) => router.deliver_response(&prompt_id, value).await,
                     Err(e) => {
@@ -729,6 +751,58 @@ async fn process_execute(
                         warn!(prompt_id = %prompt_id, error = %e, "auth input failed");
                     }
                 }
+            }
+            // Handle inbound messages for stdin forwarding
+            msg = inbound.message(), if wants_stdin => {
+                match msg {
+                    Ok(Some(message)) => {
+                        match message.request {
+                            Some(rpc::execute_request::Request::AuthInput(input))
+                                if input.prompt_id == "__stdin__" =>
+                            {
+                                // Stdin data forwarding: the client sends stdin
+                                // chunks as AuthInputRequest with prompt_id "__stdin__".
+                                // NOTE: The current connection architecture does not
+                                // expose a direct stdin write channel to the remote
+                                // process. This is a known limitation — stdin data is
+                                // received but cannot be forwarded to the SSH channel
+                                // without additional plumbing in the Connection trait.
+                                debug!(
+                                    execution_id = %execution_id,
+                                    bytes = input.value.len(),
+                                    "received stdin data (forwarding not yet supported)"
+                                );
+                            }
+                            _ => {
+                                // Other messages (confirm, non-stdin auth_input) are
+                                // handled by the auth prompt path; ignore here.
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // Client disconnected
+                        debug!(execution_id = %execution_id, "client disconnected (stdin stream ended)");
+                    }
+                    Err(e) => {
+                        warn!(execution_id = %execution_id, error = %e, "inbound stream error during stdin");
+                    }
+                }
+            }
+            // Timeout enforcement: abort execution with exit code 124
+            _ = async {
+                match timeout_deadline.as_mut().as_pin_mut() {
+                    Some(deadline) => deadline.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                warn!(execution_id = %execution_id, timeout_ms, "execution timed out");
+                exec_task.abort();
+                // Drain any remaining events
+                while let Ok(event) = rx.try_recv() {
+                    send_execute_event(sender, event).await?;
+                }
+                send_execute_event(sender, ServerEvent::ExitStatus { code: 124 }).await?;
+                break;
             }
             result = &mut exec_task => {
                 let code = result??;
@@ -824,6 +898,7 @@ async fn send_execute_event(
 async fn wait_for_auth_input_execute(
     inbound: &mut Streaming<rpc::ExecuteRequest>,
     prompt_id: &str,
+    wants_stdin: bool,
 ) -> Result<String> {
     loop {
         let Some(message) = inbound.message().await? else {
@@ -832,6 +907,10 @@ async fn wait_for_auth_input_execute(
         match message.request {
             Some(rpc::execute_request::Request::AuthInput(input)) if input.prompt_id == prompt_id => {
                 return Ok(input.value);
+            }
+            Some(rpc::execute_request::Request::AuthInput(input)) if wants_stdin && input.prompt_id == "__stdin__" => {
+                // Skip stdin data messages while waiting for auth input
+                continue;
             }
             Some(rpc::execute_request::Request::Confirm(_)) => continue,
             _ => bail!("unexpected request while awaiting auth input"),
@@ -881,6 +960,10 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 let exec = ExecRequest {
                     target: start.target,
                     argv: start.argv,
+                    pty: start.pty,
+                    no_pty: start.no_pty,
+                    stdin: start.stdin,
+                    timeout_ms: start.timeout_ms,
                 };
                 process_execute(exec, &state, &mut inbound, &sender).await
             }
@@ -925,7 +1008,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                     bail!("Copy requests received over rhop-rpc must not specify local_path");
                 }
 
-                let (target_input, spec): (String, CopySpec) = protocol::copy_spec_from_rpc(start)?;
+                let (target_input, spec, timeout_ms): (String, CopySpec, u64) = protocol::copy_spec_from_rpc(start)?;
                 let config = state.config.read().await.clone();
                 let server_config = load_server_config(std::path::Path::new(&config.ssh.server_config_path))
                     .unwrap_or_default();
@@ -940,6 +1023,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                     local_path = %spec.local_path,
                     remote_path = %spec.remote_path,
                     recursive = spec.recursive,
+                    timeout_ms,
                     "copy request"
                 );
 
@@ -949,6 +1033,14 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 let auth_prompter = make_auth_prompter(router.clone(), target.end_target.alias.clone());
                 let copy_task = tokio::spawn(async move { pool.copy(targets, spec, auth_prompter).await });
                 tokio::pin!(copy_task);
+
+                // If timeout is specified, create a deadline future.
+                let copy_timeout = if timeout_ms > 0 {
+                    Some(tokio::time::sleep(Duration::from_millis(timeout_ms)))
+                } else {
+                    None
+                };
+                tokio::pin!(copy_timeout);
 
                 loop {
                     tokio::select! {
@@ -966,6 +1058,21 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                                     warn!(prompt_id = %prompt_id, error = %e, "copy auth input failed");
                                 }
                             }
+                        }
+                        // Timeout enforcement: abort copy with exit code 124
+                        _ = async {
+                            match copy_timeout.as_mut().as_pin_mut() {
+                                Some(deadline) => deadline.await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            warn!(timeout_ms, "copy timed out");
+                            copy_task.abort();
+                            sender
+                                .send(Ok(protocol::copy_error_response("copy timed out (exit code 124)")))
+                                .await
+                                .map_err(|_| anyhow!("copy client stream closed"))?;
+                            break;
                         }
                         result = &mut copy_task => {
                             result??;

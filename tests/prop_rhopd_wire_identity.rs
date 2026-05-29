@@ -248,7 +248,7 @@ proptest! {
             let (sender, _receiver) = mpsc::unbounded_channel();
 
             // Call exec with the target alias and argv
-            let result = jump_host.exec(&argv, &sender, &config).await;
+            let result = jump_host.exec(&argv, &sender, &config, config.ssh.pty).await;
             prop_assert!(result.is_ok(), "exec should succeed, got: {:?}", result.err());
             prop_assert_eq!(result.unwrap(), 0);
 

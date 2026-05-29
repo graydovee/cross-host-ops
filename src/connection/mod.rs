@@ -37,6 +37,7 @@ pub trait Connection: Send {
         argv: &[String],
         sender: &UnboundedSender<ServerEvent>,
         config: &AppConfig,
+        pty: bool,
     ) -> Result<i32>;
 
     async fn copy(&mut self, spec: &CopySpec, config: &AppConfig) -> Result<()>;

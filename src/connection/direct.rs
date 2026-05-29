@@ -63,13 +63,14 @@ impl Connection for DirectSshConnection {
         argv: &[String],
         sender: &UnboundedSender<ServerEvent>,
         config: &AppConfig,
+        pty: bool,
     ) -> Result<i32> {
-        let command = if config.ssh.pty {
+        let command = if pty {
             build_interactive_shell_command(argv)
         } else {
             build_remote_command(argv)
         };
-        if config.ssh.pty {
+        if pty {
             return self.execute_with_pty(&command, sender, config).await;
         }
         self.execute_without_pty(&command, sender).await

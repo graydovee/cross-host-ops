@@ -80,6 +80,7 @@ impl ConnectionPool {
         argv: Vec<String>,
         sender: UnboundedSender<ServerEvent>,
         auth_prompter: Arc<AuthPrompter>,
+        pty: bool,
     ) -> Result<i32> {
         let target = targets
             .first()
@@ -96,7 +97,7 @@ impl ConnectionPool {
             let first_result = guard
                 .as_mut()
                 .expect("hop initialized")
-                .exec(&argv, &sender, &config)
+                .exec(&argv, &sender, &config, pty)
                 .await;
             match first_result {
                 Ok(code) => Ok(code),
@@ -108,7 +109,7 @@ impl ConnectionPool {
                     guard
                         .as_mut()
                         .expect("hop reinitialized")
-                        .exec(&argv, &sender, &config)
+                        .exec(&argv, &sender, &config, pty)
                         .await
                 }
                 Err(error) => Err(error),
