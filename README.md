@@ -1,714 +1,144 @@
 # Remote Hop
 
-`Remote Hop` 是一个基于 Rust 实现的远端命令执行与文件复制工具。
+远程命令执行与文件复制工具。通过本地 daemon 管理 SSH 连接池，支持直连、跳板机、远程 rhopd 三种路由方式到达目标服务器。
 
-它拆分为两个二进制：
+## 特性
 
-- `rhop`：CLI 前端
-- `rhopd`：本地 daemon 后端
+- **交互式 PTY** — 运行 vim、htop 等全屏程序，体验与原生 SSH 一致
+- **连接池** — 按目标 IP 复用 SSH 连接，避免重复握手
+- **多种跳板** — 直连 SSH、企业 jumpserver（MFA）、远程 rhopd daemon
+- **统一目标解析** — server.toml 别名、显式路由、IP 推导、fallback 链
+- **命令审查** — 可选 LLM 安全审查，本地白名单 + AI 语义分析
+- **文件复制** — `rhop cp` 对齐 scp 语义，支持递归和 mode 保留
+- **零配置可用** — 只要有 `~/.ssh/config`，无需任何配置文件
 
-CLI 通过本地 `gRPC over Unix socket` 与 daemon 通信。daemon 负责 SSH 连接管理、连接池、可选 `server.toml` 目标解析、可选 jump hosts（直连、jumpserver、远程 rhopd）、可选 LLM 命令审查，以及远端输出流式转发。
-
-`rhop cp` 默认会尽量对齐 `scp` 语义：支持 remote `~` / `~user` 展开、目录目标自动拼接 basename，并默认保留文件 mode；可通过配置关闭 mode 保留。
-
-## 架构
-
-所有 CLI 命令都通过本地 `rhopd` daemon 执行。到达远端目标的路径统一表示为零个或多个 Jump Host 加上一个 End Target：
-
-```
-rhop (CLI)  ──Unix socket──▶  Local rhopd  ──Jump Hosts──▶  End target
-```
-
-Jump Host 是一个统一的 trait，有三种实现：
-
-- **direct**：直连 SSH（通过 `~/.ssh/config` 或 `server.toml`）
-- **jumpserver**：交互式跳板机 + 可选 MFA
-- **rhopd**：另一台机器上运行的 `rhopd`，通过 SSH `rhop-rpc` subsystem 连接
-
-这三种方式在连接池、目标解析、命令执行中完全互换。添加新的 Jump Host 类型只需实现 trait + 在 `[[jump_hosts]]` 中添加配置。
-
-## 功能
-
-- CLI 用法：`rhop exec <target> <cmd> [arg...]`
-- 统一架构：CLI 始终通过本地 daemon，不再有 local/remote 双模式
-- 按目标 IP 复用 SSH 连接
-- 没有空闲连接时自动新建连接
-- 单 IP 连接数上限可配置，默认 `10`
-- 空闲连接超时自动关闭
-- 支持 `server.toml` 机器清单、密码或 SSH key 直连
-- 支持 `[[jump_hosts]]` 配置多种跳板方式（direct、jumpserver、rhopd）
-- 支持可选 OpenAI 兼容接口的命令审查
-- 无配置文件也可运行，前提是 `~/.ssh/config` 已配置好直连目标
-
-## 依赖前提
-
-- 本机已安装 Rust 工具链和 `cargo`
-- 本机已安装 `protoc`
-- 当前用户有可用的 `~/.ssh/config`
-- 当前用户可以访问对应 SSH 私钥
-
-可选依赖：
-
-- 如果要走 jumpserver，需要 jumpserver 账号信息和 TOTP 秘钥
-- 如果要连接远程 rhopd，需要远端机器运行 `rhopd` 并开启 `server.remote`
-- 如果要开启命令审查，需要 OpenAI 兼容接口的 API key
-
-## 构建
+## 快速开始
 
 ```bash
-cargo build
+# 构建
+cargo build --release
+
+# 执行远程命令（daemon 自动启动）
+rhop exec web1 -- hostname
+
+# 交互模式（自动检测）
+rhop exec --pty host1 -- vim README.md
+
+# 文件复制
+rhop cp local.txt host1:/tmp/
+
+# 查看所有可达服务器
+rhop ls
 ```
 
-生成的二进制位于：
+## 架构概览
 
-- `target/debug/rhop`
-- `target/debug/rhopd`
+```
+rhop (CLI) ──Unix socket──▶ rhopd (Daemon) ──Jump Hosts──▶ End Target
+```
 
-## 运行模式
+- CLI 通过 gRPC over Unix socket 与本地 daemon 通信
+- Daemon 管理连接池、目标解析、命令审查
+- 三种 Jump Host 类型完全互换：direct、jumpserver、rhopd
 
-`rhopd` 默认前台运行，适合：
+详细架构设计见 [docs/architecture.md](docs/architecture.md)。
 
-- systemd
-- docker
-- 手工前台调试
-
-只有显式传入 `--daemon` 时，`rhopd` 才会自行转入后台运行。
-
-daemon 管理保护：
-
-- 由 `rhop` 拉起的 daemon 会标记为 `cli_spawned`
-- 由 systemd、docker 或手工 `rhopd` 启动的 daemon 会标记为 `external`
-- 只有 `cli_spawned` 的 daemon 允许执行 `daemon stop` 和 `daemon restart`
-- 可通过 `rhop status` 查看 `daemon_origin`、`cli_controllable` 和记录的 CLI 启动参数
-
-### systemd
-
-如果你想用 systemd 托管 `rhopd`：
-
-- 配置目录放在 `/etc/rhop`
-- 配置文件路径是 `/etc/rhop/config.toml`
-- 可直接使用仓库里的 unit 模板：
-  - [packaging/systemd/rhopd.service](packaging/systemd/rhopd.service)
-
-典型安装步骤：
+## 使用
 
 ```bash
-sudo install -d /etc/rhop
-sudo install -m 0644 config.example.toml /etc/rhop/config.toml
-sudo install -m 0755 target/release/rhopd /usr/local/bin/rhopd
-sudo install -m 0644 packaging/systemd/rhopd.service /etc/systemd/system/rhopd.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now rhopd
-```
+# 基本执行
+rhop exec <target> -- <command> [args...]
 
-systemd 应以前台方式运行 `rhopd`，不要在 unit 里传 `--daemon`。
+# PTY 模式（颜色输出、交互程序）
+rhop exec --pty <target> -- ls --color
 
-### Docker
+# 显式指定跳板路由
+rhop exec prod:web1 -- hostname
 
-仓库根目录提供了一个二阶段构建的 `Dockerfile`，最终镜像包含 `rhop` 和 `rhopd`，并保持较小体积。
+# Daemon 管理
+rhop status
+rhop daemon start --config ~/.rhop/config.toml
+rhop daemon restart
 
-构建镜像：
-
-```bash
-docker build -t rhopd:latest .
-```
-
-运行示例：
-
-```bash
-docker run --rm \
-  -p 2222:2222 \
-  -v /etc/rhop:/etc/rhop \
-  rhopd:latest
-```
-
-容器默认执行：
-
-```bash
-/usr/local/bin/rhopd --config /etc/rhop/config.toml --origin external
-```
-
-### Release
-
-使用 `v*` tag（例如 `v0.1.0`）推送到 GitHub 后，会自动触发 GitHub Actions：
-
-- 构建并发布 GHCR 多架构镜像：
-  - `linux/amd64`
-  - `linux/arm64`
-- 构建并发布 GitHub Release 二进制 tar.gz：
-  - `x86_64-unknown-linux-gnu`
-  - `aarch64-unknown-linux-gnu`
-  - `x86_64-apple-darwin`
-  - `aarch64-apple-darwin`
-
-## 工作方式
-
-1. `rhop exec` 接收目标和命令。
-2. `rhop` 通过本地 `gRPC over Unix socket` 连接 `rhopd`。
-3. 如果 `rhopd` 尚未运行，`rhop` 会自动以 `--daemon` 模式拉起它。
-4. daemon 根据第一个参数推导目标 IP。
-5. daemon 先检查 `server.toml`，支持按别名或 `host` 字段命中目标。
-6. 如果 `server.toml` 命中，则优先尝试该条目配置的直连认证。
-7. 如果 `server.toml` 未命中，或连接/认证失败，则按 `ssh.fallback` 继续尝试 `~/.ssh/config` 或 jumpserver。
-8. 如果配置了 `[[jump_hosts]]`，daemon 可通过对应的 jump host 到达目标。
-9. 同一逻辑目标有空闲连接时优先复用。
-10. 如果没有空闲连接，则在上限内新建连接。
-11. 如果启用了 review，daemon 会先做命令审查。
-12. 命令输出会实时流式返回到 CLI。
-
-## 通信方式
-
-前后端使用统一的 gRPC RPC：
-
-- local：`gRPC over Unix socket`
-- remote（rhopd jump host）：`gRPC over SSH subsystem (rhop-rpc)`
-
-- `Execute`：双向流 RPC
-- `Copy`：双向流 RPC
-- `Status`：普通 unary RPC
-
-`Execute` 流里：
-
-- CLI 先发送开始执行请求
-- daemon 回流 review、stdout、stderr、confirm、auth prompt、exit 等事件
-- 如果需要确认或输入 MFA，CLI 会在同一条流里回发对应消息
-
-## Jump Hosts
-
-Jump Host 是 daemon 到达远端目标的中间跳板。通过 `[[jump_hosts]]` 配置：
-
-```toml
-# 远程 rhopd daemon
-[[jump_hosts]]
-alias = "prod"
-kind = "rhopd"
-address = "rhop@prod-bastion.example.com:2222"
-identity_file = "~/.ssh/id_ed25519"
-known_hosts_path = "~/.rhop/known_hosts"
-
-# 交互式 jumpserver
-[[jump_hosts]]
-alias = "corp-jump"
-kind = "jumpserver"
-host = "jumpserver.example.com"
-port = 20221
-user = "user@example.com"
-identity_file = "~/.ssh/id_rsa"
-menu_prompt_contains = "Opt"
-mfa_prompt_contains = "MFA"
-shell_prompt_suffixes = ["$ ", "# "]
-```
-
-使用时可以通过 `<jump_alias>:<server_alias>` 显式指定路由：
-
-```bash
-rhop exec prod:webserver hostname
-```
-
-或者直接使用 server alias（如果在所有 source 中唯一）：
-
-```bash
-rhop exec webserver hostname
-```
-
-### 管理 rhopd Jump Hosts
-
-添加远程 rhopd：
-
-```bash
-rhop remote connect prod rhop@prod-bastion.example.com:2222
-```
-
-首次连接时会展示 SSH host key 指纹并等待确认。确认后会把主机记录写入 `~/.rhop/known_hosts`，并把 jump host 配置写入 `~/.rhop/config.toml`。
-
-查看已配置的 jump hosts：
-
-```bash
+# Jump Host 管理
+rhop remote connect prod rhop@bastion.example.com:2222
 rhop remote list
 ```
 
-移除一个 rhopd jump host：
+完整使用说明见 [docs/usage.md](docs/usage.md)。
 
-```bash
-rhop remote remove prod
-```
+## 配置
 
-## One By One：零配置首次运行
-
-这是最简单的路径，只依赖 `~/.ssh/config`。
-
-### 第 1 步：确认 `~/.ssh/config` 中有目标 IP 的直连配置
-
-示例：
-
-```sshconfig
-Host 192.0.2.163
-    HostName 192.0.2.163
-    Port 22
-    User wzy
-    IdentityFile ~/.ssh/id_rsa
-```
-
-关键点是：`rhop` 推导出的 IP 必须与 `Host` 名称匹配。
-
-### 第 2 步：构建项目
-
-```bash
-cargo build
-```
-
-### 第 2.5 步：可选，手工前台启动 daemon
-
-如果你想以前台方式运行 `rhopd`，例如用于 systemd、docker 或调试，可以单独启动：
-
-```bash
-./target/debug/rhopd
-```
-
-此时 `rhopd` 会保持在前台运行。
-
-### 第 3 步：执行远端命令
-
-```bash
-./target/debug/rhop exec foo-192-0-2-163 hostname
-```
-
-这里 `rhop` 会把 `foo-192-0-2-163` 推导成 `192.0.2.163`，然后按 `server.toml -> fallback` 的顺序解析目标；如果 daemon 没启动则自动启动，然后执行远端命令。
-
-### 第 4 步：查看 daemon 状态
-
-```bash
-./target/debug/rhop status
-```
-
-会显示：
-
-- socket 路径
-- 当前活跃执行数
-- 每个目标连接池的状态
-- 已配置的 jump hosts 及其状态
-
-### 第 5 步：在同一 IP 上再次执行命令
-
-```bash
-./target/debug/rhop exec foo-192-0-2-163 whoami
-```
-
-如果该 IP 已有空闲连接，则会直接复用。
-
-## One By One：使用配置文件运行
-
-程序不强制要求配置文件，但在你需要自定义行为时可以增加配置。
-
-默认配置路径：
-
-```text
-~/.rhop/config.toml
-```
-
-仓库中提供了一个完整但全部注释掉的示例：
-
-- [config.example.toml](config.example.toml)
-
-### 第 1 步：创建配置目录
-
-```bash
-mkdir -p ~/.rhop
-```
-
-### 第 2 步：复制示例配置
-
-```bash
-cp config.example.toml ~/.rhop/config.toml
-```
-
-### 第 3 步：只打开你需要的配置项
-
-最常见的是：
-
-- 配置 `server.toml` 机器清单
-- 调整 `ssh.pty`
-- 配置 `[[jump_hosts]]`（rhopd、jumpserver 或 direct）
-- 开启 review
-- 修改 socket 路径
-- 调整连接池上限和空闲超时
-
-### 第 3.5 步：可选，创建 `server.toml`
-
-默认路径：
-
-```text
-~/.rhop/server.toml
-```
-
-示例：
-
-```toml
-[defaults]
-identity_file = "~/.ssh/id_rsa"
-
-[servers.devbox]
-host = "192.0.2.163"
-user = "root"
-
-[servers.ops]
-host = "foo-192-0-2-163"
-user = "ops"
-identity_file = "~/.ssh/id_ed25519"
-
-[servers.db]
-host = "192.0.2.200"
-user = "dba"
-password = "REPLACE_ME"
-```
-
-规则：
-
-- 表键别名可直接命中，例如 `rhop exec devbox hostname`
-- 未命中表键时，会再用原始 target 和推导 IP 精确匹配 `host`
-- 单机认证优先级是 `password > identity_file > defaults.identity_file`
-
-### 第 3.6 步：可选，调整 `ssh.pty`
-
-在 `~/.rhop/config.toml` 中：
+程序无需配置文件即可运行。需要自定义时，创建 `~/.rhop/config.toml`：
 
 ```toml
 [ssh]
+server_config_path = "~/.rhop/server.toml"
+fallback = ["local", "prod"]
 pty = true
-```
 
-语义：
-
-- `pty = true`
-  - 直连命令更像手工 SSH，`ls` 等命令会正常输出颜色
-  - jumpserver 保持现有 PTY 交互与颜色表现
-- `pty = false`
-  - 直连命令按非 PTY 风格执行，颜色不输出
-  - jumpserver 不受该开关影响，仍然始终使用 PTY
-
-### 第 4 步：重启 daemon 使配置生效
-
-```bash
-./target/debug/rhop daemon restart
-```
-
-如果 daemon 还没有运行，那么第一次执行命令时会自动读取新配置。
-
-## One By One：连接远程 rhopd
-
-远程 rhopd 是一种 Jump Host，通过 `rhop remote connect` 添加：
-
-1. 在远端机器上开启 `server.remote.enable = true`
-2. 添加远程 rhopd jump host：
-
-```bash
-./target/debug/rhop remote connect prod rhop@example.com:2222
-```
-
-如果主机还不在 `~/.rhop/known_hosts` 中，CLI 会展示 SSH host key 的 SHA256 指纹并等待确认。确认后会把主机记录写入 `~/.rhop/known_hosts`，并把 jump host 配置写入 `~/.rhop/config.toml`。
-
-3. 之后可以通过该 jump host 执行命令：
-
-```bash
-./target/debug/rhop exec prod:webserver hostname
-```
-
-或者如果 server alias 在所有 source 中唯一，直接：
-
-```bash
-./target/debug/rhop exec webserver hostname
-```
-
-4. 查看已配置的 jump hosts：
-
-```bash
-./target/debug/rhop remote list
-```
-
-5. 移除一个 rhopd jump host：
-
-```bash
-./target/debug/rhop remote remove prod
-```
-
-## One By One：开启 jumpserver
-
-jumpserver 现在通过 `[[jump_hosts]]` 配置。只有当目标既不能通过 `server.toml` 成功直连，也不能通过 `~/.ssh/config` 成功直连时，才需要启用 jumpserver。
-
-### 第 1 步：在 `~/.rhop/config.toml` 中添加 jumpserver jump host
-
-```toml
 [[jump_hosts]]
-alias = "corp-jump"
-kind = "jumpserver"
-host = "bastion.example.com"
-port = 20221
-user = "user@example.com"
-identity_file = "~/.ssh/id_rsa"
-menu_prompt_contains = "Opt"
-mfa_prompt_contains = "MFA"
-shell_prompt_suffixes = ["$ ", "# "]
-
-[jump_hosts.mfa]
-totp_secret_base32 = "REPLACE_ME"
-digits = 6
-period = 30
-digest = "sha1"
+name = "prod"
+kind = "rhopd"
+address = "rhop@bastion.example.com:2222"
+identity_file = "~/.ssh/id_ed25519"
+known_hosts_path = "~/.rhop/known_hosts"
 ```
 
-### 第 2 步：重启 daemon 使配置生效
+完整配置示例见 [config.example.toml](config.example.toml)。
+
+## 部署
+
+### 本地使用
 
 ```bash
-./target/debug/rhop daemon restart
+cargo build --release
+# 二进制：target/release/rhop, target/release/rhopd
 ```
 
-### 第 3 步：执行一个未在 `~/.ssh/config` 中定义直连的目标
+### 远程 rhopd
 
 ```bash
-./target/debug/rhop exec foo-192-0-2-200 uname -a
+# 使用部署脚本
+.kiro/skills/rhopd-deploy-debug/scripts/deploy.sh root@your-server.com
 ```
 
-这时 daemon 会：
-
-- 连接 jumpserver
-- 在需要时自动提交 TOTP，或由 CLI 提示输入 MFA
-- 选择目标 IP
-- 保持 jumpserver 后面的连接可复用
-
-## One By One：开启命令审查
-
-命令审查默认关闭。
-
-### 第 1 步：设置 API key
-
-可以使用：
+### systemd / Docker
 
 ```bash
-export RHOP_REVIEW_API_KEY=...
+# systemd
+sudo install -m 0644 packaging/systemd/rhopd.service /etc/systemd/system/
+sudo systemctl enable --now rhopd
+
+# Docker
+docker build -t rhopd:latest .
+docker run --rm -p 2222:2222 -v /etc/rhop:/etc/rhop rhopd:latest
 ```
 
-或者：
+### GitHub Release
 
-```bash
-export OPENAI_API_KEY=...
-```
-
-### 第 2 步：在配置中开启 review
-
-```toml
-[review]
-enable = true
-```
-
-对于默认的 OpenAI 兼容调用路径，这样就已经够了。
-
-这些内容在代码中已有默认值：
-
-- endpoint
-- model
-- timeout
-- 简单命令本地快速白名单
-- prompts
-- 风险等级策略
-- 语义白名单
-
-### 第 3 步：重启 daemon 使配置生效
-
-```bash
-./target/debug/rhop daemon restart
-```
-
-### 第 4 步：执行命令
-
-```bash
-./target/debug/rhop exec foo-192-0-2-163 cat /etc/hosts
-```
-
-执行前你会先看到审查结果。
-
-如果策略把某个风险等级映射为 `confirm`，CLI 会在本地要求你二次确认。
-
-### 本地白名单与 AI 安审
-
-review 现在分两层：
-
-- 简单命令先走本地快速白名单
-- 复杂 shell / bash / python 脚本再走 LLM 语义安审
-
-本地白名单规则：
-
-- 如果规则里包含 `*`，按通配匹配完整命令
-- 如果规则里不包含 `*`，则必须精确匹配
-
-例如：
-
-- `ls`
-- `ls *`
-- `kubectl get *`
-
-而像下面这类命令会直接进入 AI 审查：
-
-- `bash -lc '...'`
-- `python -c '...'`
-- 含 `&&`、`||`、`;`、`$()` 的复杂命令
-
-## 连接池行为
-
-对于同一个 IP：
-
-- 有空闲连接就复用
-- 所有连接都忙时就新建连接
-- 达到单 IP 上限后，新请求进入等待
-- 空闲超过 `max_idle_time` 后自动关闭连接
-
-默认值：
-
-- `max_connections_per_ip = 10`
-- `max_idle_time = "10m"`
-
-## 常用命令
-
-执行远端命令：
-
-```bash
-./target/debug/rhop exec <target> <cmd> [arg...]
-```
-
-查看 daemon 和连接池状态：
-
-```bash
-./target/debug/rhop status
-```
-
-如果 `daemon_origin=external`，则 `daemon stop` 和 `daemon restart` 会被拒绝。
-
-查看所有 source 的服务器列表（本地 server.toml + 各 jump host）：
-
-```bash
-./target/debug/rhop server list
-```
-
-管理 rhopd jump hosts：
-
-```bash
-./target/debug/rhop remote connect <name> [user@]host[:port]
-./target/debug/rhop remote remove <name>
-./target/debug/rhop remote list
-```
-
-手动启动 daemon：
-
-```bash
-./target/debug/rhop daemon start
-```
-
-带显式参数启动 daemon：
-
-```bash
-./target/debug/rhop daemon start --config ~/.rhop/config.toml --log-level debug
-```
-
-停止 daemon：
-
-```bash
-./target/debug/rhop daemon stop
-```
-
-重启 daemon：
-
-```bash
-./target/debug/rhop daemon restart
-```
-
-`daemon restart` 会继承最近一次 CLI 拉起 daemon 时显式传入的 `--config` 和 `--log-level`。
-
-以前台方式运行 daemon：
-
-```bash
-./target/debug/rhopd
-```
-
-以后台方式运行 daemon：
-
-```bash
-./target/debug/rhopd --daemon
-```
-
-指定配置文件和日志级别：
-
-```bash
-./target/debug/rhopd -c ~/.rhop/config.toml --log-level debug
-```
-
-修改配置后重启 daemon：
-
-```bash
-./target/debug/rhop daemon restart
-```
-
-## 目标解析规则
-
-CLI 目标字符串按以下规则解析：
-
-1. `<jump_alias>:<server_alias>` — 显式指定 jump host 和 server alias
-2. `<server_alias>` — 在所有 source（local + jump hosts）中查找，唯一则命中，多个则报错并列出候选
-3. `<host_or_ip>` — 回退到 IP 推导 + `~/.ssh/config` 匹配
-
-IP 推导示例：
-
-```text
-foo-192-0-2-163 -> 192.0.2.163
-```
-
-解析顺序：
-
-1. 根据 CLI 第一个参数推导 IP
-2. 在 `server.toml` 中查找匹配的别名或 host
-3. 如果命中，则走对应认证方式
-4. 如果未命中，按 `ssh.fallback` 顺序尝试 `~/.ssh/config` 或 jumpserver
-5. 否则报错
-
-## 配置说明
-
-配置文件是可选的。
-
-代码中已经内置了这些默认值：
-
-- socket 路径
-- 日志默认输出到标准输出
-- 日志级别默认是 `info`
-- 如果配置了日志文件路径，修改该路径后需要重启 daemon 才会切换输出目标
-- SSH 超时
-- keepalive 间隔
-- 空闲连接回收周期
-- 单 IP 连接池大小
-- review prompt
-- review 风险策略
-- review endpoint 和 model
-
-因此推荐的使用方式是：
-
-1. 先无配置直接运行
-2. 确认需要偏离默认行为时，再增加配置
-
-## 当前限制
-
-- 直连模式要求推导出的 IP 能匹配 `~/.ssh/config` 中的 `Host`
-- jumpserver 模式依赖交互提示匹配
-- 直连模式暂不支持 `ProxyCommand`
-- review 目前使用 OpenAI 兼容的 `chat/completions` 风格接口
-- `tui_shell` 通过 rhopd jump host 暂不支持（返回 UnsupportedCapability）
+推送 `v*` tag 自动发布多平台二进制和 Docker 镜像。
 
 ## 开发
 
-格式化：
-
 ```bash
+# 构建
+cargo build
+
+# 测试
+cargo test
+
+# 格式化
 cargo fmt --all
 ```
 
-测试：
+## 文档
 
-```bash
-cargo test
-```
+- [架构文档](docs/architecture.md) — 系统设计、组件交互、数据流
+- [使用文档](docs/usage.md) — 安装、配置、命令参考、故障排查
+- [配置示例](config.example.toml) — 完整配置项说明
+- [服务器清单示例](server.example.toml) — server.toml 格式
+
+## License
+
+MIT
