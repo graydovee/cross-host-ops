@@ -46,8 +46,10 @@ impl JumpHost for JumpserverJumpHost {
         sender: &UnboundedSender<ServerEvent>,
         config: &AppConfig,
         pty: bool,
+        cols: u32,
+        rows: u32,
     ) -> Result<i32> {
-        self.inner.execute(argv, sender, config, pty).await
+        self.inner.execute(argv, sender, config, pty, cols, rows).await
     }
 
     async fn copy(&mut self, spec: &CopySpec, config: &AppConfig) -> Result<()> {

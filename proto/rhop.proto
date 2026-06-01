@@ -17,7 +17,18 @@ message ExecuteRequest {
     StartRequest start = 1;
     ConfirmRequest confirm = 2;
     AuthInputRequest auth_input = 3;
+    StdinData stdin_data = 4;
+    WindowResize window_resize = 5;
   }
+}
+
+message StdinData {
+  bytes data = 1;
+}
+
+message WindowResize {
+  uint32 cols = 1;
+  uint32 rows = 2;
 }
 
 message StartRequest {
@@ -27,6 +38,9 @@ message StartRequest {
   bool no_pty = 4;
   bool stdin = 5;
   uint64 timeout_ms = 6;
+  bool interactive = 7;
+  uint32 term_cols = 8;
+  uint32 term_rows = 9;
 }
 
 message ConfirmRequest {

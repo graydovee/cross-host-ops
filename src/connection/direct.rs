@@ -1,3 +1,4 @@
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -7,17 +8,18 @@ use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
 use russh_sftp::protocol::FileAttributes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{mpsc, oneshot};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::{AppConfig, DirectAuth};
 use crate::protocol::ServerEvent;
 
-use super::Connection;
+use super::{Connection, InteractiveSession};
 use super::shared::{
-    ClientHandler, PtyShell, apply_local_mode, authenticate_with_key, authenticate_with_password,
-    build_interactive_shell_command, build_remote_command, connect_handle,
+    ClientHandler, apply_local_mode, authenticate_with_key, authenticate_with_password,
+    build_remote_command, connect_handle,
     join_remote_path, local_mode, maybe_local_download_target, remote_mode,
-    remote_path_needs_expansion, request_default_pty, split_tilde_path,
+    remote_path_needs_expansion, split_tilde_path,
     upload_destination_for_directory,
 };
 use super::AuthPrompter;
@@ -62,36 +64,27 @@ impl Connection for DirectSshConnection {
         &mut self,
         argv: &[String],
         sender: &UnboundedSender<ServerEvent>,
-        config: &AppConfig,
+        _config: &AppConfig,
         pty: bool,
+        cols: u32,
+        rows: u32,
     ) -> Result<i32> {
-        let command = if pty {
-            build_interactive_shell_command(argv)
-        } else {
-            build_remote_command(argv)
-        };
-        if pty {
-            return self.execute_with_pty(&command, sender, config).await;
-        }
-        self.execute_without_pty(&command, sender).await
-    }
-
-    async fn copy(&mut self, spec: &CopySpec, config: &AppConfig) -> Result<()> {
-        match spec.direction {
-            CopyDirection::Upload => self.copy_upload(spec, config).await,
-            CopyDirection::Download => self.copy_download(spec, config).await,
-        }
-    }
-}
-
-impl DirectSshConnection {
-    async fn execute_without_pty(
-        &mut self,
-        command: &str,
-        sender: &UnboundedSender<ServerEvent>,
-    ) -> Result<i32> {
+        let command = build_remote_command(argv);
         let mut channel = self.handle.channel_open_session().await?;
-        channel.exec(true, command).await?;
+        if pty {
+            channel
+                .request_pty(
+                    true,
+                    "xterm-256color",
+                    cols,
+                    rows,
+                    0,
+                    0,
+                    &[],
+                )
+                .await?;
+        }
+        channel.exec(true, command.as_str()).await?;
         let mut exit_code = None;
         loop {
             let Some(message) = channel.wait().await else {
@@ -120,32 +113,81 @@ impl DirectSshConnection {
         Ok(exit_code.unwrap_or(255))
     }
 
-    async fn execute_with_pty(
+    async fn copy(&mut self, spec: &CopySpec, config: &AppConfig) -> Result<()> {
+        match spec.direction {
+            CopyDirection::Upload => self.copy_upload(spec, config).await,
+            CopyDirection::Download => self.copy_download(spec, config).await,
+        }
+    }
+
+    async fn execute_interactive(
         &mut self,
-        command: &str,
-        sender: &UnboundedSender<ServerEvent>,
-        config: &AppConfig,
-    ) -> Result<i32> {
-        let channel = self.handle.channel_open_session().await?;
-        request_default_pty(&channel).await?;
-        let mut shell = PtyShell::new(
-            channel,
-            vec!["$ ".to_string(), "# ".to_string()],
-            config.ssh.connect_timeout,
-        );
-        shell.request_shell().await?;
-        shell.wait_for_prompt().await?;
-        shell.clear_prompt_remainder();
-        shell.write_line("stty -echo").await?;
-        shell.wait_for_prompt().await?;
-        shell.clear_pending();
-        shell.clear_prompt_remainder();
-        let marker = shell.make_marker("__RHOP_EXEC__");
-        let wrapped = shell.wrap_shell_command(command, marker.as_ref());
-        shell.write_line(&wrapped).await?;
-        let (status, _) = shell.read_until_sentinel(marker.as_ref(), Some(sender)).await?;
-        shell.finish_roundtrip().await?;
-        Ok(status)
+        argv: &[String],
+        cols: u32,
+        rows: u32,
+        _config: &AppConfig,
+    ) -> Result<InteractiveSession> {
+        let mut channel = self.handle.channel_open_session().await?;
+
+        // Request PTY with caller-specified dimensions
+        channel
+            .request_pty(true, "xterm-256color", cols, rows, 0, 0, &[])
+            .await?;
+
+        // Execute command directly — no sentinel wrapping
+        let command = build_remote_command(argv);
+        channel.exec(true, command.as_str()).await?;
+
+        // Set up forwarding channels
+        let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(32);
+        let (resize_tx, mut resize_rx) = mpsc::channel::<(u32, u32)>(8);
+        let (stdout_tx, stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (exit_tx, exit_rx) = oneshot::channel::<i32>();
+
+        // Spawn channel I/O task
+        tokio::spawn(async move {
+            let mut exit_code: Option<i32> = None;
+            loop {
+                tokio::select! {
+                    // Write stdin to channel
+                    Some(data) = stdin_rx.recv() => {
+                        let _ = channel.data(Cursor::new(data)).await;
+                    }
+                    // Handle resize
+                    Some((cols, rows)) = resize_rx.recv() => {
+                        let _ = channel.window_change(cols, rows, 0, 0).await;
+                    }
+                    // Read channel messages
+                    msg = channel.wait() => {
+                        match msg {
+                            Some(ChannelMsg::Data { data }) => {
+                                if stdout_tx.send(data.to_vec()).is_err() {
+                                    break;
+                                }
+                            }
+                            Some(ChannelMsg::ExitStatus { exit_status }) => {
+                                exit_code = Some(exit_status as i32);
+                            }
+                            Some(ChannelMsg::ExitSignal { .. }) => {
+                                exit_code = Some(255);
+                            }
+                            Some(ChannelMsg::Eof) | None => {
+                                let _ = exit_tx.send(exit_code.unwrap_or(0));
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(InteractiveSession {
+            stdin_tx,
+            stdout_rx,
+            resize_tx,
+            exit_rx,
+        })
     }
 }
 

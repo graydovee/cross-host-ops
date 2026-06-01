@@ -2,6 +2,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -11,6 +12,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use hyper_util::rt::TokioIo;
 use tokio::io::AsyncReadExt;
 use tokio::net::UnixStream;
+use tokio::signal::unix::SignalKind;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
@@ -214,6 +216,66 @@ pub enum HostCommand {
     List,
 }
 
+/// Determine if the current execution should use interactive mode.
+/// Interactive mode requires: --pty flag, stdin is a TTY, stdout is a TTY.
+pub fn should_use_interactive_mode(pty: bool, stdin_is_tty: bool, stdout_is_tty: bool) -> bool {
+    pty && stdin_is_tty && stdout_is_tty
+}
+
+/// Get the current terminal size as (cols, rows).
+/// Falls back to (80, 24) if the terminal size cannot be determined.
+pub(crate) fn get_terminal_size() -> (u16, u16) {
+    terminal_size::terminal_size()
+        .map(|(w, h)| (w.0, h.0))
+        .unwrap_or((80, 24))
+}
+
+/// RAII guard that restores terminal to original mode on drop.
+pub struct RawModeGuard {
+    original_termios: libc::termios,
+    fd: RawFd,
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        // Restore original terminal settings unconditionally.
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original_termios);
+        }
+    }
+}
+
+/// Set the terminal to raw mode and return a guard that restores it on drop.
+///
+/// If raw mode setup fails (e.g., fd is not a terminal), returns an error
+/// so the caller can fall back to non-interactive mode.
+pub fn set_raw_mode(fd: RawFd) -> Result<RawModeGuard> {
+    unsafe {
+        let mut original_termios: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut original_termios) != 0 {
+            return Err(anyhow!(
+                "tcgetattr failed: {}",
+                io::Error::last_os_error()
+            ));
+        }
+
+        let mut raw = original_termios;
+        libc::cfmakeraw(&mut raw);
+
+        if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
+            return Err(anyhow!(
+                "tcsetattr failed: {}",
+                io::Error::last_os_error()
+            ));
+        }
+
+        Ok(RawModeGuard {
+            original_termios,
+            fd,
+        })
+    }
+}
+
 /// Print a deprecation warning to stderr guiding the user to the replacement command.
 fn emit_deprecation_warning(old_cmd: &str, new_cmd: &str) {
     eprintln!("warning: '{}' is deprecated; use '{}' instead", old_cmd, new_cmd);
@@ -405,6 +467,15 @@ fn detect_double_dash_separator(target: &str) -> bool {
 }
 
 async fn run_command(target: String, argv: Vec<String>, pty: bool, no_pty: bool, stdin: bool, timeout_ms: u64) -> Result<i32> {
+    // Check if we should use interactive mode (PTY + stdin is TTY + stdout is TTY).
+    let stdin_is_tty = io::stdin().is_terminal();
+    let stdout_is_tty = io::stdout().is_terminal();
+
+    if should_use_interactive_mode(pty, stdin_is_tty, stdout_is_tty) {
+        return run_interactive(target, argv, timeout_ms).await;
+    }
+
+    // Batch execution path: request_pty + exec without sentinel.
     let mut client = connect_data_client(ClientAccess::AutoStart).await?;
 
     let (tx, rx) = mpsc::channel(8);
@@ -416,6 +487,9 @@ async fn run_command(target: String, argv: Vec<String>, pty: bool, no_pty: bool,
             no_pty,
             stdin,
             timeout_ms,
+            interactive: false,
+            term_cols: 0,
+            term_rows: 0,
         })),
     })
     .await
@@ -512,6 +586,139 @@ async fn run_command(target: String, argv: Vec<String>, pty: bool, no_pty: bool,
     } else {
         Ok(cap_remote_exit_code(exit_code))
     }
+}
+
+/// Run a command in interactive PTY mode with raw terminal, bidirectional
+/// byte streaming, and SIGWINCH forwarding.
+pub(crate) async fn run_interactive(
+    target: String,
+    argv: Vec<String>,
+    timeout_ms: u64,
+) -> Result<i32> {
+    // Step 1: Get initial terminal size.
+    let (cols, rows) = get_terminal_size();
+
+    // Step 2: Connect to daemon and send StartRequest with interactive=true.
+    let mut client = connect_data_client(ClientAccess::AutoStart).await?;
+    let (tx, rx) = mpsc::channel(32);
+    tx.send(rpc::ExecuteRequest {
+        request: Some(rpc::execute_request::Request::Start(rpc::StartRequest {
+            target,
+            argv,
+            pty: true,
+            no_pty: false,
+            stdin: false,
+            timeout_ms,
+            interactive: true,
+            term_cols: cols as u32,
+            term_rows: rows as u32,
+        })),
+    })
+    .await
+    .map_err(|_| anyhow!("failed to send execute request"))?;
+
+    let response = client.execute(ReceiverStream::new(rx)).await?;
+    let mut stream = response.into_inner();
+
+    // Step 3: Set terminal to raw mode with RAII guard.
+    let _guard = set_raw_mode(libc::STDIN_FILENO)?;
+
+    // Step 4: Spawn stdin forwarding task (channel capacity 32 via tx clone).
+    let stdin_tx = tx.clone();
+    let stdin_task = tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        let mut stdin = tokio::io::stdin();
+        loop {
+            match stdin.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let msg = rpc::ExecuteRequest {
+                        request: Some(rpc::execute_request::Request::StdinData(
+                            rpc::StdinData {
+                                data: buf[..n].to_vec(),
+                            },
+                        )),
+                    };
+                    if stdin_tx.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Step 5: Spawn SIGWINCH handler (resize channel capacity 8 via bounded sender).
+    let resize_tx = tx.clone();
+    let sigwinch_task = tokio::spawn(async move {
+        let mut signal = match tokio::signal::unix::signal(SignalKind::window_change()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        while signal.recv().await.is_some() {
+            let (cols, rows) = get_terminal_size();
+            let msg = rpc::ExecuteRequest {
+                request: Some(rpc::execute_request::Request::WindowResize(
+                    rpc::WindowResize {
+                        cols: cols as u32,
+                        rows: rows as u32,
+                    },
+                )),
+            };
+            if resize_tx.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Step 6: Process response stream — write stdout directly, handle exit.
+    let mut exit_code = 1;
+    while let Some(message) = stream.message().await? {
+        match message
+            .event
+            .ok_or_else(|| anyhow!("execute stream returned empty event"))?
+        {
+            rpc::execute_response::Event::Stdout(chunk) => {
+                io::stdout().write_all(&chunk.data)?;
+                io::stdout().flush()?;
+            }
+            rpc::execute_response::Event::ExitStatus(status) => {
+                exit_code = status.code;
+                break;
+            }
+            rpc::execute_response::Event::Error(error) => {
+                eprintln!("error: {}", error.message);
+                stdin_task.abort();
+                sigwinch_task.abort();
+                return Ok(1);
+            }
+            rpc::execute_response::Event::AuthPrompt(prompt) => {
+                let value = prompt_for_auth_input(&prompt.message, prompt.secret)?;
+                tx.send(crate::protocol::execute_auth_input_request(prompt.prompt_id, value))
+                    .await
+                    .map_err(|_| anyhow!("failed to send auth input request"))?;
+            }
+            rpc::execute_response::Event::ConfirmRequired(confirm) => {
+                let allow = prompt_for_confirmation(&confirm.reason)?;
+                tx.send(rpc::ExecuteRequest {
+                    request: Some(rpc::execute_request::Request::Confirm(
+                        rpc::ConfirmRequest {
+                            execution_id: confirm.execution_id,
+                            allow,
+                        },
+                    )),
+                })
+                .await
+                .map_err(|_| anyhow!("failed to send confirmation request"))?;
+            }
+            _ => {}
+        }
+    }
+
+    // Step 7: Cleanup — abort tasks, guard drops automatically restoring terminal.
+    stdin_task.abort();
+    sigwinch_task.abort();
+    Ok(cap_remote_exit_code(exit_code))
 }
 
 async fn status() -> Result<i32> {

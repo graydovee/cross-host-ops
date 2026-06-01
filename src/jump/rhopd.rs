@@ -22,7 +22,7 @@ use crate::remote::{
 
 use super::auth::AuthPromptRouter;
 use super::error::UnsupportedCapability;
-use super::{JumpHost, JumpHostKind};
+use super::{InteractiveHandle, JumpHost, JumpHostKind};
 
 /// Owned SSH plumbing that backs the `rhop-rpc` byte stream.
 ///
@@ -350,6 +350,8 @@ impl JumpHost for RhopdJumpHost {
         sender: &UnboundedSender<ServerEvent>,
         config: &AppConfig,
         _pty: bool,
+        _cols: u32,
+        _rows: u32,
     ) -> Result<i32> {
         // Build the initial StartRequest and send it as the first message on
         // the Execute streaming RPC. We use an mpsc channel so we can send
@@ -611,6 +613,152 @@ impl JumpHost for RhopdJumpHost {
         Err(anyhow::anyhow!(
             "remote daemon closed copy stream without completion"
         ))
+    }
+
+    async fn exec_interactive(
+        &mut self,
+        argv: &[String],
+        cols: u32,
+        rows: u32,
+        _sender: &UnboundedSender<ServerEvent>,
+        config: &AppConfig,
+    ) -> Result<InteractiveHandle> {
+        // Send StartRequest with interactive=true to the remote daemon.
+        let start = rpc::ExecuteRequest {
+            request: Some(rpc::execute_request::Request::Start(rpc::StartRequest {
+                target: self.target_label.clone(),
+                argv: argv.to_vec(),
+                pty: true,
+                interactive: true,
+                term_cols: cols,
+                term_rows: rows,
+                ..Default::default()
+            })),
+        };
+
+        let (req_tx, req_rx) = mpsc::channel::<rpc::ExecuteRequest>(32);
+        req_tx.send(start).await.map_err(|_| {
+            anyhow::anyhow!("failed to send interactive start request into stream")
+        })?;
+
+        let request_stream = ReceiverStream::new(req_rx);
+        let mut response_stream = self
+            .client
+            .execute(request_stream)
+            .await?
+            .into_inner();
+
+        // Set up the InteractiveHandle channels.
+        let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(32);
+        let (resize_tx, mut resize_rx) = mpsc::channel::<(u32, u32)>(8);
+        let (stdout_tx, stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
+
+        let connect_timeout = config.ssh.connect_timeout;
+        let auth_router = self.auth_router.clone();
+
+        // Spawn a task that bridges the gRPC bidirectional stream to the
+        // InteractiveHandle channels.
+        tokio::spawn(async move {
+            let mut exit_code: Option<i32> = None;
+            loop {
+                tokio::select! {
+                    // Forward stdin bytes from the handle to the gRPC stream.
+                    Some(data) = stdin_rx.recv() => {
+                        let msg = rpc::ExecuteRequest {
+                            request: Some(rpc::execute_request::Request::StdinData(
+                                rpc::StdinData { data },
+                            )),
+                        };
+                        if req_tx.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Forward window resize from the handle to the gRPC stream.
+                    Some((cols, rows)) = resize_rx.recv() => {
+                        let msg = rpc::ExecuteRequest {
+                            request: Some(rpc::execute_request::Request::WindowResize(
+                                rpc::WindowResize { cols, rows },
+                            )),
+                        };
+                        if req_tx.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Read responses from the remote daemon.
+                    response = response_stream.message() => {
+                        match response {
+                            Ok(Some(msg)) => {
+                                if let Some(event) = msg.event {
+                                    match event {
+                                        rpc::execute_response::Event::Stdout(chunk) => {
+                                            if stdout_tx.send(chunk.data).is_err() {
+                                                break;
+                                            }
+                                        }
+                                        rpc::execute_response::Event::ExitStatus(status) => {
+                                            exit_code = Some(status.code);
+                                            break;
+                                        }
+                                        rpc::execute_response::Event::Error(err) => {
+                                            warn!(error = %err.message, "remote interactive error");
+                                            break;
+                                        }
+                                        rpc::execute_response::Event::AuthPrompt(prompt) => {
+                                            if let Some(router) = &auth_router {
+                                                let prompt_id = prompt.prompt_id.clone();
+                                                let auth_msg = AuthPromptMessage {
+                                                    prompt_id: prompt.prompt_id,
+                                                    target_label: prompt.target_label,
+                                                    kind: prompt.kind,
+                                                    secret: prompt.secret,
+                                                    message: prompt.message,
+                                                };
+                                                let ask_result = tokio::time::timeout(
+                                                    connect_timeout,
+                                                    router.ask(auth_msg),
+                                                ).await;
+                                                match ask_result {
+                                                    Ok(Ok(value)) => {
+                                                        let auth_input = rpc::ExecuteRequest {
+                                                            request: Some(
+                                                                rpc::execute_request::Request::AuthInput(
+                                                                    rpc::AuthInputRequest { prompt_id, value },
+                                                                ),
+                                                            ),
+                                                        };
+                                                        if req_tx.send(auth_input).await.is_err() {
+                                                            break;
+                                                        }
+                                                    }
+                                                    _ => break,
+                                                }
+                                            }
+                                        }
+                                        _ => {
+                                            // Info, ReviewResult, ConfirmRequired — ignore in
+                                            // interactive mode (handled before session starts).
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(None) | Err(_) => {
+                                // Stream closed.
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = exit_tx.send(exit_code.unwrap_or(255));
+        });
+
+        Ok(InteractiveHandle {
+            stdin_tx,
+            resize_tx,
+            stdout_rx,
+            exit_rx,
+        })
     }
 
     async fn tui_shell(&mut self, _config: &AppConfig) -> Result<()> {

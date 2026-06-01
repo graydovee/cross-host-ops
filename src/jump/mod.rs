@@ -18,12 +18,26 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::config::{AppConfig, ServerEntry};
 use crate::connection::CopySpec;
 use crate::protocol::ServerEvent;
 
 pub use error::UnsupportedCapability;
+
+/// Handle for driving an interactive session from the daemon's event loop.
+/// Same shape as `InteractiveSession` from the connection layer.
+pub struct InteractiveHandle {
+    /// Write stdin bytes to the remote process.
+    pub stdin_tx: mpsc::Sender<Vec<u8>>,
+    /// Send window resize events.
+    pub resize_tx: mpsc::Sender<(u32, u32)>,
+    /// Receive stdout bytes from the remote process.
+    pub stdout_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    /// Await the exit code.
+    pub exit_rx: oneshot::Receiver<i32>,
+}
 
 /// Identifies the concrete kind of a jump host for pool keying, diagnostics,
 /// and configuration dispatch.
@@ -57,6 +71,8 @@ pub trait JumpHost: Send {
         sender: &UnboundedSender<ServerEvent>,
         config: &AppConfig,
         pty: bool,
+        cols: u32,
+        rows: u32,
     ) -> Result<i32>;
 
     /// Required. Carry out the remote-side half of a copy. The local-side I/O
@@ -81,6 +97,24 @@ pub trait JumpHost: Send {
             kind: self.kind(),
             name: self.name().to_string(),
             method: "list_servers",
+        }
+        .into())
+    }
+
+    /// Optional. Open an interactive PTY session through this jump host.
+    /// Default returns an `UnsupportedCapability` error.
+    async fn exec_interactive(
+        &mut self,
+        _argv: &[String],
+        _cols: u32,
+        _rows: u32,
+        _sender: &UnboundedSender<ServerEvent>,
+        _config: &AppConfig,
+    ) -> Result<InteractiveHandle> {
+        Err(UnsupportedCapability {
+            kind: self.kind(),
+            name: self.name().to_string(),
+            method: "exec_interactive",
         }
         .into())
     }
@@ -113,6 +147,8 @@ mod tests {
             _sender: &UnboundedSender<ServerEvent>,
             _config: &AppConfig,
             _pty: bool,
+            _cols: u32,
+            _rows: u32,
         ) -> Result<i32> {
             Ok(0)
         }
@@ -147,7 +183,7 @@ mod tests {
 
     /// Strategy to generate method names from the set of optional trait methods.
     fn arb_method() -> impl Strategy<Value = &'static str> {
-        prop_oneof![Just("tui_shell"), Just("list_servers"),]
+        prop_oneof![Just("tui_shell"), Just("list_servers"), Just("exec_interactive"),]
     }
 
     proptest! {
@@ -155,7 +191,7 @@ mod tests {
 
         /// **Validates: Requirements 3.4, 3.6, 4.5, 16.3, 16.4**
         ///
-        /// For arbitrary alias strings and method names in {"tui_shell", "list_servers"},
+        /// For arbitrary alias strings and method names in {"tui_shell", "list_servers", "exec_interactive"},
         /// calling the default trait method on a synthesized JumpHost returns Err,
         /// the error downcasts to UnsupportedCapability, and its Display rendering
         /// contains the name, the textual JumpHostKind, and the method name.
@@ -176,12 +212,16 @@ mod tests {
                 let result = match method {
                     "tui_shell" => mock.tui_shell(&config).await.map(|_| ()),
                     "list_servers" => mock.list_servers(&config).await.map(|_| ()),
+                    "exec_interactive" => {
+                        let (sender, _rx) = tokio::sync::mpsc::unbounded_channel();
+                        mock.exec_interactive(&[], 80, 24, &sender, &config).await.map(|_| ())
+                    }
                     _ => unreachable!(),
                 };
 
                 // The result must be an error
                 let err = result.expect_err(
-                    "default tui_shell/list_servers should return Err"
+                    "default tui_shell/list_servers/exec_interactive should return Err"
                 );
 
                 // The error must downcast to UnsupportedCapability

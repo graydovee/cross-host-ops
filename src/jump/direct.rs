@@ -6,7 +6,7 @@ use crate::config::AppConfig;
 use crate::connection::{Connection, CopySpec, DirectSshConnection};
 use crate::protocol::ServerEvent;
 
-use super::{JumpHost, JumpHostKind};
+use super::{InteractiveHandle, JumpHost, JumpHostKind};
 
 /// A [`JumpHost`] wrapper around the existing [`DirectSshConnection`].
 ///
@@ -32,12 +32,31 @@ impl JumpHost for DirectJumpHost {
         sender: &UnboundedSender<ServerEvent>,
         config: &AppConfig,
         pty: bool,
+        cols: u32,
+        rows: u32,
     ) -> Result<i32> {
-        self.inner.execute(argv, sender, config, pty).await
+        self.inner.execute(argv, sender, config, pty, cols, rows).await
     }
 
     async fn copy(&mut self, spec: &CopySpec, config: &AppConfig) -> Result<()> {
         self.inner.copy(spec, config).await
+    }
+
+    async fn exec_interactive(
+        &mut self,
+        argv: &[String],
+        cols: u32,
+        rows: u32,
+        _sender: &UnboundedSender<ServerEvent>,
+        config: &AppConfig,
+    ) -> Result<InteractiveHandle> {
+        let session = self.inner.execute_interactive(argv, cols, rows, config).await?;
+        Ok(InteractiveHandle {
+            stdin_tx: session.stdin_tx,
+            resize_tx: session.resize_tx,
+            stdout_rx: session.stdout_rx,
+            exit_rx: session.exit_rx,
+        })
     }
 
     fn kind(&self) -> JumpHostKind {

@@ -9,7 +9,7 @@ use tracing::info;
 
 use crate::config::AppConfig;
 use crate::connection::{AuthPrompter, CopySpec};
-use crate::jump::{JumpHost, JumpHostKind};
+use crate::jump::{InteractiveHandle, JumpHost, JumpHostKind};
 use crate::jump::direct::DirectJumpHost;
 use crate::jump::factory::build_jump_host;
 use crate::jump::types::{EndTargetId, TargetRoute};
@@ -81,6 +81,8 @@ impl ConnectionPool {
         sender: UnboundedSender<ServerEvent>,
         auth_prompter: Arc<AuthPrompter>,
         pty: bool,
+        cols: u32,
+        rows: u32,
     ) -> Result<i32> {
         let target = targets
             .first()
@@ -97,7 +99,7 @@ impl ConnectionPool {
             let first_result = guard
                 .as_mut()
                 .expect("hop initialized")
-                .exec(&argv, &sender, &config, pty)
+                .exec(&argv, &sender, &config, pty, cols, rows)
                 .await;
             match first_result {
                 Ok(code) => Ok(code),
@@ -109,7 +111,7 @@ impl ConnectionPool {
                     guard
                         .as_mut()
                         .expect("hop reinitialized")
-                        .exec(&argv, &sender, &config, pty)
+                        .exec(&argv, &sender, &config, pty, cols, rows)
                         .await
                 }
                 Err(error) => Err(error),
@@ -154,6 +156,53 @@ impl ConnectionPool {
                         .as_mut()
                         .expect("hop reinitialized")
                         .copy(&spec, &config)
+                        .await
+                }
+                Err(error) => Err(error),
+            }
+        }
+        .await;
+        pool.release(slot.id);
+        result
+    }
+
+    pub async fn execute_interactive(
+        &self,
+        targets: Vec<TargetRoute>,
+        argv: Vec<String>,
+        cols: u32,
+        rows: u32,
+        sender: UnboundedSender<ServerEvent>,
+        auth_prompter: Arc<AuthPrompter>,
+    ) -> Result<InteractiveHandle> {
+        let target = targets
+            .first()
+            .ok_or_else(|| anyhow!("no resolved targets available"))?;
+        let pool = self.get_or_create_pool(target);
+        let key_display = pool_key_for_target(target).to_string();
+        let slot = pool.acquire(self.config.clone()).await?;
+        let result = async {
+            let mut guard = slot.hop.hop.lock().await;
+            if guard.is_none() {
+                *guard = Some(self.open_any_jump_host(&targets, auth_prompter.clone()).await?);
+            }
+            let config = self.config.read().await.clone();
+            let first_result = guard
+                .as_mut()
+                .expect("hop initialized")
+                .exec_interactive(&argv, cols, rows, &sender, &config)
+                .await;
+            match first_result {
+                Ok(handle) => Ok(handle),
+                Err(error) if classify_transport_error(&error) == ErrorClass::Transport => {
+                    info!(target = %key_display, error = %error, "reopening stale pooled connection");
+                    *guard = None;
+                    *guard = Some(self.open_any_jump_host(&targets, auth_prompter.clone()).await?);
+                    let config = self.config.read().await.clone();
+                    guard
+                        .as_mut()
+                        .expect("hop reinitialized")
+                        .exec_interactive(&argv, cols, rows, &sender, &config)
                         .await
                 }
                 Err(error) => Err(error),

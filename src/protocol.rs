@@ -17,6 +17,9 @@ pub struct ExecRequest {
     pub no_pty: bool,
     pub stdin: bool,
     pub timeout_ms: u64,
+    pub interactive: bool,
+    pub term_cols: u32,
+    pub term_rows: u32,
 }
 
 #[derive(Clone, Debug)]

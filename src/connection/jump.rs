@@ -376,6 +376,8 @@ impl Connection for JumpSshConnection {
         sender: &UnboundedSender<ServerEvent>,
         _config: &AppConfig,
         _pty: bool,
+        _cols: u32,
+        _rows: u32,
     ) -> Result<i32> {
         // Jump connections always use a PTY shell for the transport layer.
         // The `pty` parameter controls whether the *remote command* gets PTY

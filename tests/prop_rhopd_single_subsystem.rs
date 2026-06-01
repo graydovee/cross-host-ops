@@ -240,7 +240,7 @@ proptest! {
                     }
                     RpcOp::Execute { argv } => {
                         let (sender, _rx) = mpsc::unbounded_channel();
-                        let result = jump_host.exec(argv, &sender, &config, config.ssh.pty).await;
+                        let result = jump_host.exec(argv, &sender, &config, config.ssh.pty, 80, 24).await;
                         prop_assert!(
                             result.is_ok(),
                             "Execute #{} failed: {:?}",

@@ -587,6 +587,32 @@ async fn process_execute(
         bail!("argv must not be empty");
     }
 
+    // Dispatch to interactive execution path when requested.
+    if request.interactive {
+        // Validate: interactive requires pty == true, term_cols > 0, term_rows > 0
+        if !request.pty || request.no_pty {
+            send_execute_event(
+                sender,
+                ServerEvent::Error {
+                    message: "interactive mode requires pty (--pty) and is incompatible with --no-pty".to_string(),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+        if request.term_cols == 0 || request.term_rows == 0 {
+            send_execute_event(
+                sender,
+                ServerEvent::Error {
+                    message: "interactive mode requires term_cols > 0 and term_rows > 0".to_string(),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+        return process_interactive_execute(request, state, inbound, sender).await;
+    }
+
     let execution_id = Uuid::new_v4();
     let config = state.config.read().await.clone();
     let server_config = load_server_config(std::path::Path::new(&config.ssh.server_config_path))
@@ -711,7 +737,7 @@ async fn process_execute(
     let router = Arc::new(AuthPromptRouter::new(prompt_upstream_tx));
     let auth_prompter = make_auth_prompter(router.clone(), target.end_target.alias.clone());
     let exec_task = tokio::spawn(async move {
-        pool.execute(exec_targets, argv, tx, auth_prompter, pty).await
+        pool.execute(exec_targets, argv, tx, auth_prompter, pty, request.term_cols, request.term_rows).await
     });
     tokio::pin!(exec_task);
 
@@ -810,6 +836,238 @@ async fn process_execute(
                     send_execute_event(sender, event).await?;
                 }
                 info!(execution_id = %execution_id, code, "execution finished");
+                send_execute_event(sender, ServerEvent::ExitStatus { code }).await?;
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Process an interactive execute request.
+/// Unlike batch PTY mode, this directly pipes stdin/stdout without sentinels.
+/// Bidirectional forwarding: client stdin → remote, remote stdout → client,
+/// client resize → remote, remote exit → client.
+async fn process_interactive_execute(
+    request: ExecRequest,
+    state: &DaemonState,
+    inbound: &mut Streaming<rpc::ExecuteRequest>,
+    sender: &mpsc::Sender<Result<rpc::ExecuteResponse, Status>>,
+) -> Result<()> {
+    // Step 1: Resolve target and run review (same as batch mode)
+    let execution_id = Uuid::new_v4();
+    let config = state.config.read().await.clone();
+    let server_config = load_server_config(std::path::Path::new(&config.ssh.server_config_path))
+        .unwrap_or_default();
+    let resolver = Resolver::new(&config, &server_config, &config.jump_hosts);
+    let targets = resolver.resolve(&request.target)?;
+    let target = targets
+        .first()
+        .ok_or_else(|| anyhow!("no resolved target candidates"))?;
+    let shell_command = build_remote_command(&request.argv);
+
+    info!(
+        execution_id = %execution_id,
+        input = %request.target,
+        end_target = %target.end_target.alias,
+        hops = target.hops.len(),
+        interactive = true,
+        "resolved target (interactive)"
+    );
+
+    // Run review
+    let decision = match state
+        .reviewer
+        .review(&config.review, &target.end_target.alias, &request.argv, &shell_command)
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            warn!(
+                execution_id = %execution_id,
+                error = %format!("{error:#}"),
+                "review failed"
+            );
+            let action = config.review.failure_action;
+            let risk_level = crate::config::RiskLevel::Dangerous;
+            send_execute_event(
+                sender,
+                ServerEvent::ReviewResult {
+                    execution_id,
+                    risk_level,
+                    action,
+                    reason: format!("review failed: {error:#}"),
+                    matched_whitelist_reason: None,
+                },
+            )
+            .await?;
+            match action {
+                ReviewAction::Allow | ReviewAction::Warn => None,
+                ReviewAction::Confirm => {
+                    wait_for_confirmation(execution_id, inbound, sender, "review service failed")
+                        .await?;
+                    None
+                }
+                ReviewAction::Deny => {
+                    send_execute_event(
+                        sender,
+                        ServerEvent::Error {
+                            message: format!("review failed and policy is deny: {error:#}"),
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        }
+    };
+
+    if let Some(decision) = decision {
+        info!(
+            execution_id = %execution_id,
+            risk_level = %decision.risk_level,
+            action = %decision.action,
+            matched_whitelist_reason = decision.matched_whitelist_reason.as_deref().unwrap_or(""),
+            "review completed (interactive)"
+        );
+        send_execute_event(
+            sender,
+            ServerEvent::ReviewResult {
+                execution_id,
+                risk_level: decision.risk_level,
+                action: decision.action,
+                reason: decision.reason.clone(),
+                matched_whitelist_reason: decision.matched_whitelist_reason.clone(),
+            },
+        )
+        .await?;
+        match decision.action {
+            ReviewAction::Allow | ReviewAction::Warn => {}
+            ReviewAction::Confirm => {
+                debug!(execution_id = %execution_id, "waiting for confirmation (interactive)");
+                wait_for_confirmation(execution_id, inbound, sender, &decision.reason).await?;
+            }
+            ReviewAction::Deny => {
+                warn!(execution_id = %execution_id, "execution denied by review (interactive)");
+                send_execute_event(
+                    sender,
+                    ServerEvent::Error {
+                        message: format!("command denied: {}", decision.reason),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    }
+
+    // Step 2: Open interactive session through pool
+    let pool = state.pool.clone();
+    let (prompt_upstream_tx, mut prompt_upstream_rx) = mpsc::unbounded_channel();
+    let router = Arc::new(AuthPromptRouter::new(prompt_upstream_tx));
+    let auth_prompter = make_auth_prompter(router.clone(), target.end_target.alias.clone());
+
+    // Create an unbounded sender for the pool (used for status events during connection)
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+    let mut handle = pool
+        .execute_interactive(
+            targets.clone(),
+            request.argv.clone(),
+            request.term_cols,
+            request.term_rows,
+            event_tx,
+            auth_prompter,
+        )
+        .await?;
+
+    // Drain any connection-phase events (e.g. Info messages)
+    while let Ok(event) = event_rx.try_recv() {
+        send_execute_event(sender, event).await?;
+    }
+
+    info!(execution_id = %execution_id, "interactive session started");
+
+    // Step 3: Bidirectional forwarding loop
+    loop {
+        tokio::select! {
+            // Remote stdout → client
+            data = handle.stdout_rx.recv() => {
+                match data {
+                    Some(bytes) => {
+                        send_execute_event(sender, ServerEvent::Stdout { data: bytes }).await?;
+                    }
+                    None => {
+                        // stdout channel closed without exit code; send default
+                        debug!(execution_id = %execution_id, "stdout channel closed");
+                        break;
+                    }
+                }
+            }
+            // Client messages → remote
+            msg = inbound.message() => {
+                match msg {
+                    Ok(Some(message)) => {
+                        match message.request {
+                            Some(rpc::execute_request::Request::StdinData(stdin)) => {
+                                // Forward stdin bytes to remote
+                                if handle.stdin_tx.send(stdin.data).await.is_err() {
+                                    debug!(execution_id = %execution_id, "stdin_tx closed");
+                                    break;
+                                }
+                            }
+                            Some(rpc::execute_request::Request::WindowResize(resize)) => {
+                                // Forward window resize to remote
+                                if handle.resize_tx.send((resize.cols, resize.rows)).await.is_err() {
+                                    debug!(execution_id = %execution_id, "resize_tx closed");
+                                }
+                            }
+                            Some(rpc::execute_request::Request::AuthInput(input)) => {
+                                // Handle auth prompts during interactive session
+                                router.deliver_response(&input.prompt_id, input.value).await;
+                            }
+                            _ => {
+                                // Ignore other message types
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // Client disconnected — drop handle to close SSH channel
+                        // (remote process gets SIGHUP)
+                        debug!(execution_id = %execution_id, "client disconnected (interactive)");
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(execution_id = %execution_id, error = %e, "inbound stream error (interactive)");
+                        break;
+                    }
+                }
+            }
+            // Auth prompts from the connection layer
+            Some(prompt_msg) = prompt_upstream_rx.recv() => {
+                let prompt_id = prompt_msg.prompt_id.clone();
+                send_execute_event(
+                    sender,
+                    ServerEvent::AuthPrompt {
+                        prompt_id: prompt_msg.prompt_id,
+                        target_label: prompt_msg.target_label,
+                        kind: prompt_msg.kind,
+                        secret: prompt_msg.secret,
+                        message: prompt_msg.message,
+                    },
+                ).await?;
+                // Auth response will be delivered via the inbound message handler above
+                let _ = prompt_id; // prompt_id used for routing in the AuthInput arm
+            }
+            // Process exit
+            exit_result = &mut handle.exit_rx => {
+                let code = exit_result.unwrap_or(0);
+                info!(execution_id = %execution_id, code, "interactive session exited");
+                // Drain any remaining stdout
+                while let Ok(bytes) = handle.stdout_rx.try_recv() {
+                    send_execute_event(sender, ServerEvent::Stdout { data: bytes }).await?;
+                }
                 send_execute_event(sender, ServerEvent::ExitStatus { code }).await?;
                 break;
             }
@@ -964,6 +1222,9 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                     no_pty: start.no_pty,
                     stdin: start.stdin,
                     timeout_ms: start.timeout_ms,
+                    interactive: start.interactive,
+                    term_cols: start.term_cols,
+                    term_rows: start.term_rows,
                 };
                 process_execute(exec, &state, &mut inbound, &sender).await
             }

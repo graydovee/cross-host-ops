@@ -56,6 +56,9 @@ async fn bug_condition_timeout_enforcement() {
             no_pty: false,
             stdin: false,
             timeout_ms: 100,
+            interactive: false,
+            term_cols: 0,
+            term_rows: 0,
         })),
     };
 
@@ -127,6 +130,9 @@ async fn bug_condition_pty_flag_accepted() {
         no_pty: false,
         stdin: false,
         timeout_ms: 0,
+        interactive: false,
+        term_cols: 0,
+        term_rows: 0,
     };
 
     // Verify the field is set correctly (not silently dropped by proto3)
@@ -141,6 +147,9 @@ async fn bug_condition_pty_flag_accepted() {
         no_pty: true,
         stdin: false,
         timeout_ms: 0,
+        interactive: false,
+        term_cols: 0,
+        term_rows: 0,
     };
     assert!(start_req_no_pty.no_pty, "no_pty field should be true");
 }
@@ -166,6 +175,9 @@ async fn bug_condition_stdin_flag_accepted() {
         no_pty: false,
         stdin: true,
         timeout_ms: 0,
+        interactive: false,
+        term_cols: 0,
+        term_rows: 0,
     };
 
     assert!(start_req.stdin, "stdin field should be true");
@@ -222,6 +234,9 @@ proptest! {
             no_pty,
             stdin,
             timeout_ms,
+            interactive: false,
+            term_cols: 0,
+            term_rows: 0,
         };
 
         // Verify fields are preserved (not silently zeroed by proto3)
