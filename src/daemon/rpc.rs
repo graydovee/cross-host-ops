@@ -92,23 +92,25 @@ pub async fn process_copy(
 /// Process a list_servers request by iterating all gateways, merging results,
 /// and skipping gateways that return Unsupported errors.
 ///
-/// Returns a tuple of (server entries, source status) for building the RPC response.
+/// Returns a tuple of (rows with source tags, source status) for building the RPC response.
 pub async fn process_list_servers(
     state: &DaemonState,
-) -> (Vec<ServerEntry>, Vec<(ServerListSource, ServerListSourceStatus)>) {
-    let mut results: Vec<ServerEntry> = Vec::new();
+) -> (Vec<(ServerEntry, ServerListSource)>, Vec<(ServerListSource, ServerListSourceStatus)>) {
+    let mut results: Vec<(ServerEntry, ServerListSource)> = Vec::new();
     let mut source_status: Vec<(ServerListSource, ServerListSourceStatus)> = Vec::new();
 
     for (name, gateway) in &state.gateways {
         let source = if name == "local" {
             ServerListSource::Local
         } else {
-            ServerListSource::JumpHost(name.clone())
+            ServerListSource::Gateway(name.clone())
         };
 
         match gateway.list_servers().await {
             Ok(entries) => {
-                results.extend(entries);
+                for entry in entries {
+                    results.push((entry, source.clone()));
+                }
                 source_status.push((source, ServerListSourceStatus::Ok));
             }
             Err(e) if e.kind == ErrorKind::Unsupported => {

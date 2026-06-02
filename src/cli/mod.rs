@@ -20,7 +20,7 @@ use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
 use crate::config::{
-    AppConfig, ClientConfig, JumpHostConfig, JumpHostFields, RhopdJumpHostFields,
+    AppConfig, ClientConfig, GatewayConfig, RhopdGatewayConfig,
     default_config_path, expand_tilde, parse_duration, RESERVED_NAMES,
 };
 use crate::types::{CopyDirection, CopySpec, AddressDefaults, RemoteAddress, ExecPtyFlags, effective_pty_decision};
@@ -122,49 +122,11 @@ pub enum ArunCommand {
         #[command(subcommand)]
         command: HostCommand,
     },
-    #[command(about = "Manage remote daemon target selection", hide = true)]
-    Remote {
-        #[command(subcommand)]
-        command: RemoteCommand,
-    },
     #[command(about = "Manage the local daemon")]
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
     },
-    #[command(about = "Query configured servers", hide = true)]
-    Server {
-        #[command(subcommand)]
-        command: ServerCommand,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub enum RemoteCommand {
-    #[command(about = "Connect to a remote daemon and trust its host key if needed")]
-    Connect {
-        #[arg(value_name = "NAME", help = "Name for the remote jump host")]
-        name: String,
-        #[arg(value_name = "ADDRESS", help = "[user@]host[:port] of the remote daemon")]
-        address: String,
-        #[arg(long = "identity-file", value_name = "FILE")]
-        identity_file: Option<String>,
-        #[arg(long = "known-hosts", value_name = "FILE")]
-        known_hosts: Option<String>,
-        /// Trust the host key without prompting (TOFU mode).
-        #[arg(long = "accept-new-host-key", conflicts_with = "fingerprint")]
-        accept_new_host_key: bool,
-        /// Trust only if the host key's SHA256 fingerprint matches this value.
-        #[arg(long = "fingerprint", value_name = "SHA256", conflicts_with = "accept_new_host_key")]
-        fingerprint: Option<String>,
-    },
-    #[command(about = "Remove a rhopd jump host entry from the configuration")]
-    Remove {
-        #[arg(value_name = "NAME", help = "Name of the rhopd jump host to remove")]
-        name: String,
-    },
-    #[command(about = "List all configured jump hosts")]
-    List,
 }
 
 #[derive(Debug, Subcommand)]
@@ -180,16 +142,6 @@ pub enum DaemonCommand {
     Stop,
     #[command(about = "Restart the daemon")]
     Restart,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum ServerCommand {
-    #[command(about = "List configured servers from the daemon's active server.toml")]
-    List {
-        /// Re-fetch every Server_List_Source bypassing the in-memory cache.
-        #[arg(long, alias = "no-cache")]
-        refresh: bool,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -281,34 +233,6 @@ pub fn set_raw_mode(fd: RawFd) -> Result<RawModeGuard> {
     }
 }
 
-/// Print a deprecation warning to stderr guiding the user to the replacement command.
-fn emit_deprecation_warning(old_cmd: &str, new_cmd: &str) {
-    eprintln!("warning: '{}' is deprecated; use '{}' instead", old_cmd, new_cmd);
-}
-
-/// Convert a deprecated `RemoteCommand` variant into the equivalent `HostCommand`.
-fn remote_to_host(cmd: RemoteCommand) -> HostCommand {
-    match cmd {
-        RemoteCommand::Connect {
-            name,
-            address,
-            identity_file,
-            known_hosts,
-            accept_new_host_key,
-            fingerprint,
-        } => HostCommand::Add {
-            name,
-            address,
-            identity_file,
-            known_hosts,
-            accept_new_host_key,
-            fingerprint,
-        },
-        RemoteCommand::Remove { name } => HostCommand::Remove { name },
-        RemoteCommand::List => HostCommand::List,
-    }
-}
-
 pub async fn run_cli(cli: ArunCli) -> Result<i32> {
     match cli.command {
         ArunCommand::Exec { target, cmd, timeout, pty, no_pty, stdin, shell, no_shell } => {
@@ -392,21 +316,7 @@ pub async fn run_cli(cli: ArunCli) -> Result<i32> {
         ArunCommand::Status => status().await,
         ArunCommand::Ls { refresh } => list_servers(refresh).await,
         ArunCommand::Host { command } => run_host_command(command).await,
-        ArunCommand::Remote { command } => {
-            let (old_name, new_name) = match &command {
-                RemoteCommand::Connect { .. } => ("rhop remote connect", "rhop host add"),
-                RemoteCommand::Remove { .. } => ("rhop remote remove", "rhop host remove"),
-                RemoteCommand::List => ("rhop remote list", "rhop host list"),
-            };
-            emit_deprecation_warning(old_name, new_name);
-            run_host_command(remote_to_host(command)).await
-        }
         ArunCommand::Daemon { command } => run_daemon_command(command).await,
-        ArunCommand::Server { command } => {
-            emit_deprecation_warning("rhop server list", "rhop ls");
-            let ServerCommand::List { refresh } = command;
-            list_servers(refresh).await
-        }
     }
 }
 
@@ -420,10 +330,10 @@ pub fn print_version_json() {
             "exec",
             "cp",
             "status",
-            "server.list",
-            "remote.connect",
-            "remote.remove",
-            "remote.list",
+            "ls",
+            "host.add",
+            "host.remove",
+            "host.list",
             "daemon.start",
             "daemon.stop",
             "daemon.restart"
@@ -754,10 +664,10 @@ async fn status() -> Result<i32> {
         println!("  user: {}", response.remote_ssh_user);
     }
 
-    // Print jump hosts from the daemon's StatusResponse.
-    if !response.jump_hosts.is_empty() {
-        println!("jump_hosts:");
-        for jh in &response.jump_hosts {
+    // Print gateways from the daemon's StatusResponse.
+    if !response.gateways.is_empty() {
+        println!("gateways:");
+        for jh in &response.gateways {
             println!("  - name: {}", jh.name);
             println!("    kind: {}", jh.kind);
             println!("    address: {}", jh.address);
@@ -1224,18 +1134,16 @@ async fn remote_connect(
         return Ok(1);
     }
 
-    // --- Step 2: Validate <name> against existing jump host names ---
+    // --- Step 2: Validate <name> against existing gateway names ---
     // Load the daemon config to check for name collisions.
     let config_path = default_config_path();
     let config = AppConfig::load(Some(&config_path)).unwrap_or_default();
-    for entry in &config.jump_hosts {
-        if entry.name == name {
-            eprintln!(
-                "error: name '{}' is already used by a {} jump host",
-                name, entry.kind
-            );
-            return Ok(1);
-        }
+    if let Some(entry) = config.gateways.iter().find(|g| g.name() == name) {
+        eprintln!(
+            "error: name '{}' is already used by a {:?} gateway",
+            name, entry.gateway_kind()
+        );
+        return Ok(1);
     }
 
     // --- Step 3: Parse <address> via RemoteAddress::parse ---
@@ -1293,19 +1201,16 @@ async fn remote_connect(
     }
 
     // --- Step 5: Persist the new entry to the config file ---
-    let new_entry = JumpHostConfig {
+    let new_entry = GatewayConfig::Rhopd(RhopdGatewayConfig {
         name: name.clone(),
-        kind: GatewayKind::Rhopd,
-        fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
-            address: remote_addr.format(),
-            identity_file: identity_file.clone(),
-            known_hosts_path: known_hosts_path.clone(),
-        }),
-    };
+        address: remote_addr.format(),
+        identity_file: identity_file.clone(),
+        known_hosts_path: known_hosts_path.clone(),
+    });
 
     // Re-load config to persist (avoid stale state)
     let mut config = AppConfig::load(Some(&config_path)).unwrap_or_default();
-    config.jump_hosts.push(new_entry);
+    config.gateways.push(new_entry);
 
     // Write the updated config atomically
     let raw = toml::to_string_pretty(&config)
@@ -1330,27 +1235,27 @@ async fn remote_remove(name: String) -> Result<i32> {
     let config = AppConfig::load(Some(&config_path)).unwrap_or_default();
 
     // Find the entry with the given name
-    let entry = config.jump_hosts.iter().find(|e| e.name == name);
+    let entry = config.gateways.iter().find(|g| g.name() == name);
 
     match entry {
         None => {
             eprintln!(
-                "error: name '{}' not found in jump hosts configuration",
+                "error: name '{}' not found in gateways configuration",
                 name
             );
             Ok(1)
         }
-        Some(entry) if entry.kind != GatewayKind::Rhopd => {
+        Some(entry) if entry.gateway_kind() != GatewayKind::Rhopd => {
             eprintln!(
-                "error: name '{}' is a {} jump host; quick-remove only manages rhopd entries",
-                name, entry.kind
+                "error: name '{}' is a {:?} gateway; quick-remove only manages rhopd entries",
+                name, entry.gateway_kind()
             );
             Ok(1)
         }
         Some(_) => {
             // Remove the entry and persist
             let mut config = config;
-            config.jump_hosts.retain(|e| e.name != name);
+            config.gateways.retain(|g| g.name() != name);
 
             let raw = toml::to_string_pretty(&config)
                 .context("failed to serialize config")?;
@@ -1371,18 +1276,18 @@ fn remote_list() -> Result<i32> {
     let config_path = default_config_path();
     let config = AppConfig::load(Some(&config_path)).unwrap_or_default();
 
-    if config.jump_hosts.is_empty() {
+    if config.gateways.is_empty() {
         return Ok(0);
     }
 
     println!("{:<10}  {:<12}  {}", "NAME", "KIND", "ADDRESS");
-    for entry in &config.jump_hosts {
-        let address = match &entry.fields {
-            JumpHostFields::Rhopd(fields) => fields.address.clone(),
-            JumpHostFields::Jumpserver(fields) => format!("{}:{}", fields.host, fields.port),
-            JumpHostFields::Direct(fields) => format!("{}:{}", fields.host, fields.port),
+    for entry in &config.gateways {
+        let address = match entry {
+            GatewayConfig::Rhopd(c) => c.address.clone(),
+            GatewayConfig::Jumpserver(c) => format!("{}:{}", c.host, c.port),
+            GatewayConfig::Direct(c) => format!("{}:{}", c.host, c.port),
         };
-        println!("{:<10}  {:<12}  {}", entry.name, entry.kind, address);
+        println!("{:<10}  {:<12}  {}", entry.name(), entry.gateway_kind(), address);
     }
 
     Ok(0)

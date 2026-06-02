@@ -12,8 +12,6 @@ use home::home_dir;
 use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize};
 
-use crate::daemon::gateway::GatewayKind;
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -21,8 +19,6 @@ pub struct AppConfig {
     pub ssh: SshConfig,
     pub copy: CopyConfig,
     pub review: ReviewConfig,
-    #[serde(default)]
-    pub jump_hosts: Vec<JumpHostConfig>,
     #[serde(default)]
     pub gateways: Vec<GatewayConfig>,
 }
@@ -34,7 +30,6 @@ impl Default for AppConfig {
             ssh: SshConfig::default(),
             copy: CopyConfig::default(),
             review: ReviewConfig::default(),
-            jump_hosts: Vec::new(),
             gateways: Vec::new(),
         }
     }
@@ -68,19 +63,6 @@ impl AppConfig {
             expand_tilde(&self.server.remote.authorized_keys_path)?;
         self.ssh.ssh_config_path = expand_tilde(&self.ssh.ssh_config_path)?;
         self.ssh.server_config_path = expand_tilde(&self.ssh.server_config_path)?;
-
-        for jh in &mut self.jump_hosts {
-            match &mut jh.fields {
-                JumpHostFields::Jumpserver(f) => {
-                    f.identity_file = expand_tilde(&f.identity_file)?;
-                }
-                JumpHostFields::Rhopd(f) => {
-                    f.identity_file = expand_tilde(&f.identity_file)?;
-                    f.known_hosts_path = expand_tilde(&f.known_hosts_path)?;
-                }
-                JumpHostFields::Direct(_) => {}
-            }
-        }
 
         for gw in &mut self.gateways {
             match gw {
@@ -306,13 +288,13 @@ impl Default for MfaConfig {
 /// A single entry in the `ssh.fallback` list.
 ///
 /// - `"local"` deserializes to `FallbackEntry::Local` (resolve via ~/.ssh/config)
-/// - Any other string deserializes to `FallbackEntry::JumpHost(name)` (route through named jump host)
+/// - Any other string deserializes to `FallbackEntry::Gateway(name)` (route through named gateway)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FallbackEntry {
     /// Resolve via local ~/.ssh/config
     Local,
-    /// Route through the named jump host
-    JumpHost(String),
+    /// Route through the named gateway
+    Gateway(String),
 }
 
 impl<'de> Deserialize<'de> for FallbackEntry {
@@ -324,7 +306,7 @@ impl<'de> Deserialize<'de> for FallbackEntry {
         if s == "local" {
             Ok(FallbackEntry::Local)
         } else {
-            Ok(FallbackEntry::JumpHost(s))
+            Ok(FallbackEntry::Gateway(s))
         }
     }
 }
@@ -336,7 +318,7 @@ impl Serialize for FallbackEntry {
     {
         match self {
             FallbackEntry::Local => serializer.serialize_str("local"),
-            FallbackEntry::JumpHost(name) => serializer.serialize_str(name),
+            FallbackEntry::Gateway(name) => serializer.serialize_str(name),
         }
     }
 }
@@ -345,7 +327,7 @@ impl fmt::Display for FallbackEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             FallbackEntry::Local => write!(f, "local"),
-            FallbackEntry::JumpHost(name) => write!(f, "{}", name),
+            FallbackEntry::Gateway(name) => write!(f, "{}", name),
         }
     }
 }
@@ -965,87 +947,14 @@ fn glob_match_inner(pattern: &[char], text: &[char], pi: usize, ti: usize) -> bo
 }
 
 // ---------------------------------------------------------------------------
-// Jump host configuration types (task 7.1)
+// ---------------------------------------------------------------------------
+// Gateway configuration
 // ---------------------------------------------------------------------------
 
-/// Aliases that are reserved by the system and cannot be assigned to any
-/// Jump host names that are reserved by the system and cannot be assigned to any
-/// jump host entry. Currently only `"local"` is reserved (it names the
-/// local daemon's own server.toml source).
+/// Names reserved by the system that cannot be assigned to any gateway entry.
+/// Currently only `"local"` is reserved (it names the local daemon's own
+/// server.toml source).
 pub const RESERVED_NAMES: &[&str] = &["local"];
-
-/// Validation errors for the `[[jump_hosts]]` configuration section.
-#[derive(Debug, thiserror::Error)]
-pub enum JumpHostValidationError {
-    #[error("jump host name must not be empty")]
-    EmptyName,
-
-    #[error("jump host name '{name}' is reserved (reserved names: {reserved:?})")]
-    ReservedName {
-        name: String,
-        reserved: &'static [&'static str],
-    },
-
-    #[error("jump host name '{name}' is already used by a {existing_kind} jump host")]
-    NameCollision {
-        name: String,
-        existing_kind: GatewayKind,
-    },
-
-    #[error("jump host '{name}' has kind '{kind}' but fields do not match that kind")]
-    KindFieldsMismatch { name: String, kind: GatewayKind },
-}
-
-/// Validates the `[[jump_hosts]]` entries in the daemon configuration.
-///
-/// Checks:
-/// - name must not be empty
-/// - name must not be in `RESERVED_NAMES`
-/// - name must not duplicate any other entry's name (regardless of kind)
-/// - fields variant must match kind
-pub fn validate_jump_hosts(jump_hosts: &[JumpHostConfig]) -> Result<(), JumpHostValidationError> {
-    let mut seen: HashMap<&str, GatewayKind> = HashMap::new();
-
-    for entry in jump_hosts {
-        // Empty name check
-        if entry.name.is_empty() {
-            return Err(JumpHostValidationError::EmptyName);
-        }
-
-        // Reserved name check
-        if RESERVED_NAMES.contains(&entry.name.as_str()) {
-            return Err(JumpHostValidationError::ReservedName {
-                name: entry.name.clone(),
-                reserved: RESERVED_NAMES,
-            });
-        }
-
-        // Duplicate name check
-        if let Some(&existing_kind) = seen.get(entry.name.as_str()) {
-            return Err(JumpHostValidationError::NameCollision {
-                name: entry.name.clone(),
-                existing_kind,
-            });
-        }
-        seen.insert(&entry.name, entry.kind);
-
-        // Kind-fields mismatch check
-        let fields_match = match (&entry.kind, &entry.fields) {
-            (GatewayKind::Rhopd, JumpHostFields::Rhopd(_)) => true,
-            (GatewayKind::Jumpserver, JumpHostFields::Jumpserver(_)) => true,
-            (GatewayKind::Direct, JumpHostFields::Direct(_)) => true,
-            _ => false,
-        };
-        if !fields_match {
-            return Err(JumpHostValidationError::KindFieldsMismatch {
-                name: entry.name.clone(),
-                kind: entry.kind,
-            });
-        }
-    }
-
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // New gateway validation (task 2.2)
@@ -1141,14 +1050,14 @@ pub fn validate_gateways(gateways: &[GatewayConfig]) -> Result<(), GatewayValida
     Ok(())
 }
 
-/// Validates that all `ssh.fallback` entries of type `JumpHost(name)` reference
+/// Validates that all `ssh.fallback` entries of type `Gateway(name)` reference
 /// either `"local"` or a name present in the gateways list.
 pub fn validate_fallback_references(
     fallback: &[FallbackEntry],
     gateways: &[GatewayConfig],
 ) -> Result<()> {
     for entry in fallback {
-        if let FallbackEntry::JumpHost(name) = entry {
+        if let FallbackEntry::Gateway(name) = entry {
             // "local" is always valid as a fallback reference
             if name == "local" {
                 continue;
@@ -1182,7 +1091,7 @@ fn default_totp_period() -> u64 {
 // New gateway configuration types (task 2.1)
 // ---------------------------------------------------------------------------
 
-/// Tagged dispatch on `kind` field — replaces #[serde(untagged)] JumpHostFields.
+/// Tagged dispatch on `kind` field for gateway configuration.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GatewayConfig {
@@ -1255,84 +1164,13 @@ pub struct DirectGatewayConfig {
     pub password: Option<String>,
 }
 
-fn default_menu_prompt_contains() -> String {
-    "Opt".to_string()
-}
-
-fn default_mfa_prompt_contains() -> String {
-    "MFA".to_string()
-}
-
-fn default_shell_prompt_suffixes() -> Vec<String> {
-    vec!["$ ".to_string(), "# ".to_string()]
-}
-
-/// Configuration for a single jump host entry in `[[jump_hosts]]`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct JumpHostConfig {
-    #[serde(alias = "alias")]
-    pub name: String,
-    pub kind: GatewayKind,
-    #[serde(flatten)]
-    pub fields: JumpHostFields,
-}
-
-/// Kind-specific fields for a jump host, dispatched by `kind`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum JumpHostFields {
-    Rhopd(RhopdJumpHostFields),
-    Jumpserver(JumpserverJumpHostFields),
-    Direct(DirectJumpHostFields),
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RhopdJumpHostFields {
-    pub address: String,
-    #[serde(default)]
-    pub identity_file: String,
-    #[serde(default)]
-    pub known_hosts_path: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct JumpserverJumpHostFields {
-    pub host: String,
-    #[serde(default = "default_port")]
-    pub port: u16,
-    pub user: String,
-    #[serde(default)]
-    pub identity_file: String,
-    #[serde(default)]
-    pub pubkey_accepted_algorithms: Option<String>,
-    #[serde(default = "default_menu_prompt_contains")]
-    pub menu_prompt_contains: String,
-    #[serde(default = "default_mfa_prompt_contains")]
-    pub mfa_prompt_contains: String,
-    #[serde(default = "default_shell_prompt_suffixes")]
-    pub shell_prompt_suffixes: Vec<String>,
-    #[serde(default)]
-    pub mfa: MfaConfig,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DirectJumpHostFields {
-    pub host: String,
-    #[serde(default = "default_port")]
-    pub port: u16,
-    pub user: String,
-    pub auth: DirectAuth,
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        AppConfig, ClientConfig, DirectAuth, DirectJumpHostFields, FallbackEntry, JumpHostConfig,
-        JumpHostFields, JumpHostValidationError, JumpserverJumpHostFields, RhopdJumpHostFields,
+        AppConfig, ClientConfig, FallbackEntry,
         SshHostEntry, default_client_config_path, default_config_path, default_known_hosts_path,
-        glob_match, parse_duration, resolve_ssh_host, validate_jump_hosts, RESERVED_NAMES,
+        glob_match, parse_duration, resolve_ssh_host,
     };
-    use crate::daemon::gateway::GatewayKind;
     use proptest::prelude::*;
     use serde::{Deserialize, Serialize};
 
@@ -1396,246 +1234,8 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
-    // --- validate_jump_hosts tests ---
-
-    fn make_rhopd_entry(name: &str) -> JumpHostConfig {
-        JumpHostConfig {
-            name: name.to_string(),
-            kind: GatewayKind::Rhopd,
-            fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
-                address: "10.0.0.1:2222".to_string(),
-                identity_file: "/tmp/key".to_string(),
-                known_hosts_path: "/tmp/known_hosts".to_string(),
-            }),
-        }
-    }
-
-    fn make_jumpserver_entry(name: &str) -> JumpHostConfig {
-        JumpHostConfig {
-            name: name.to_string(),
-            kind: GatewayKind::Jumpserver,
-            fields: JumpHostFields::Jumpserver(JumpserverJumpHostFields {
-                host: "jump.example.com".to_string(),
-                port: 22,
-                user: "admin".to_string(),
-                identity_file: "/tmp/key".to_string(),
-                pubkey_accepted_algorithms: None,
-                menu_prompt_contains: "Opt".to_string(),
-                mfa_prompt_contains: "MFA".to_string(),
-                shell_prompt_suffixes: vec!["$ ".to_string(), "# ".to_string()],
-                mfa: super::MfaConfig::default(),
-            }),
-        }
-    }
-
-    fn make_direct_entry(name: &str) -> JumpHostConfig {
-        JumpHostConfig {
-            name: name.to_string(),
-            kind: GatewayKind::Direct,
-            fields: JumpHostFields::Direct(DirectJumpHostFields {
-                host: "10.0.0.2".to_string(),
-                port: 22,
-                user: "root".to_string(),
-                auth: DirectAuth::Password {
-                    password: "secret".to_string(),
-                },
-            }),
-        }
-    }
-
-    #[test]
-    fn validate_jump_hosts_accepts_valid_entries() {
-        let entries = vec![
-            make_rhopd_entry("prod"),
-            make_jumpserver_entry("staging"),
-            make_direct_entry("dev"),
-        ];
-        assert!(validate_jump_hosts(&entries).is_ok());
-    }
-
-    #[test]
-    fn validate_jump_hosts_accepts_empty_list() {
-        assert!(validate_jump_hosts(&[]).is_ok());
-    }
-
-    #[test]
-    fn validate_jump_hosts_rejects_empty_name() {
-        let entries = vec![make_rhopd_entry("")];
-        let err = validate_jump_hosts(&entries).unwrap_err();
-        assert!(matches!(err, JumpHostValidationError::EmptyName));
-        assert!(err.to_string().contains("must not be empty"));
-    }
-
-    #[test]
-    fn validate_jump_hosts_rejects_reserved_name() {
-        let entries = vec![make_rhopd_entry("local")];
-        let err = validate_jump_hosts(&entries).unwrap_err();
-        match &err {
-            JumpHostValidationError::ReservedName { name, reserved } => {
-                assert_eq!(name, "local");
-                assert_eq!(*reserved, RESERVED_NAMES);
-            }
-            other => panic!("expected ReservedName, got: {:?}", other),
-        }
-        assert!(err.to_string().contains("reserved"));
-    }
-
-    #[test]
-    fn validate_jump_hosts_rejects_duplicate_name_across_kinds() {
-        let entries = vec![make_rhopd_entry("shared"), make_jumpserver_entry("shared")];
-        let err = validate_jump_hosts(&entries).unwrap_err();
-        match &err {
-            JumpHostValidationError::NameCollision {
-                name,
-                existing_kind,
-            } => {
-                assert_eq!(name, "shared");
-                assert_eq!(*existing_kind, GatewayKind::Rhopd);
-            }
-            other => panic!("expected NameCollision, got: {:?}", other),
-        }
-        assert!(err.to_string().contains("already used"));
-    }
-
-    #[test]
-    fn validate_jump_hosts_rejects_kind_fields_mismatch() {
-        // kind is Rhopd but fields are Jumpserver
-        let entry = JumpHostConfig {
-            name: "bad".to_string(),
-            kind: GatewayKind::Rhopd,
-            fields: JumpHostFields::Jumpserver(JumpserverJumpHostFields {
-                host: "jump.example.com".to_string(),
-                port: 22,
-                user: "admin".to_string(),
-                identity_file: "/tmp/key".to_string(),
-                pubkey_accepted_algorithms: None,
-                menu_prompt_contains: "Opt".to_string(),
-                mfa_prompt_contains: "MFA".to_string(),
-                shell_prompt_suffixes: vec!["$ ".to_string(), "# ".to_string()],
-                mfa: super::MfaConfig::default(),
-            }),
-        };
-        let err = validate_jump_hosts(&[entry]).unwrap_err();
-        match &err {
-            JumpHostValidationError::KindFieldsMismatch { name, kind } => {
-                assert_eq!(name, "bad");
-                assert_eq!(*kind, GatewayKind::Rhopd);
-            }
-            other => panic!("expected KindFieldsMismatch, got: {:?}", other),
-        }
-        assert!(err.to_string().contains("do not match"));
-    }
-
     // -----------------------------------------------------------------------
-    // Property-based tests
-    // -----------------------------------------------------------------------
-
-    /// Strategy to generate a non-empty alphanumeric name string (1–20 chars).
-    fn arb_name_string() -> impl Strategy<Value = String> {
-        "[a-zA-Z0-9]{1,20}"
-    }
-
-    /// Strategy to generate a valid `JumpHostConfig` with `JumpHostFields::Rhopd`
-    /// and the given name.
-    fn arb_jump_host_config_with_name(name: String) -> JumpHostConfig {
-        JumpHostConfig {
-            name,
-            kind: GatewayKind::Rhopd,
-            fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
-                address: "10.0.0.1:2222".to_string(),
-                identity_file: "/tmp/key".to_string(),
-                known_hosts_path: "/tmp/known_hosts".to_string(),
-            }),
-        }
-    }
-
-    /// Strategy to generate a `Vec<JumpHostConfig>` of 0–5 entries with unique,
-    /// non-reserved names (used as a valid prefix before injecting a collision).
-    fn arb_valid_jump_host_vec() -> impl Strategy<Value = Vec<JumpHostConfig>> {
-        proptest::collection::hash_set(arb_name_string(), 0..=5)
-            .prop_filter("names must not be reserved", |names| {
-                names.iter().all(|a| !RESERVED_NAMES.contains(&a.as_str()))
-            })
-            .prop_map(|names| {
-                names
-                    .into_iter()
-                    .map(arb_jump_host_config_with_name)
-                    .collect::<Vec<_>>()
-            })
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig { cases: 100, .. ProptestConfig::default() })]
-
-        // Feature: remove-deprecated-jumpserver-config, Property 8: Name collision rejection
-        /// **Validates: Requirements 2.4**
-        ///
-        /// For any `Vec<JumpHostConfig>` containing two entries with equal `name`,
-        /// `validate_jump_hosts` returns `Err(NameCollision { .. })`.
-        #[test]
-        fn prop_name_collision_rejected(
-            prefix in arb_valid_jump_host_vec(),
-            dup_name in arb_name_string().prop_filter("not reserved", |a| {
-                !RESERVED_NAMES.contains(&a.as_str())
-            }),
-        ) {
-            // Build a config with two entries sharing the same name
-            let entry1 = arb_jump_host_config_with_name(dup_name.clone());
-            let entry2 = arb_jump_host_config_with_name(dup_name.clone());
-
-            // Filter out any prefix entry that already uses dup_name to avoid
-            // the collision being triggered by prefix vs entry1 instead of entry1 vs entry2
-            let mut entries: Vec<JumpHostConfig> = prefix
-                .into_iter()
-                .filter(|e| e.name != dup_name)
-                .collect();
-            entries.push(entry1);
-            entries.push(entry2);
-
-            let result = validate_jump_hosts(&entries);
-            prop_assert!(result.is_err(), "expected Err for duplicate name '{}'", dup_name);
-            match result.unwrap_err() {
-                JumpHostValidationError::NameCollision { name, .. } => {
-                    prop_assert_eq!(name, dup_name);
-                }
-                other => {
-                    prop_assert!(false, "expected NameCollision, got: {:?}", other);
-                }
-            }
-        }
-
-        // Feature: remove-deprecated-jumpserver-config, Property 7: Reserved name rejection
-        /// **Validates: Requirements 2.4, 3.3**
-        ///
-        /// For any `JumpHostConfig` with `name` in `RESERVED_NAMES`,
-        /// `validate_jump_hosts` returns `Err(ReservedName { .. })`.
-        #[test]
-        fn prop_reserved_name_rejected(
-            prefix in arb_valid_jump_host_vec(),
-        ) {
-            // Insert an entry with the reserved name "local"
-            let reserved_entry = arb_jump_host_config_with_name("local".to_string());
-
-            let mut entries = prefix;
-            entries.push(reserved_entry);
-
-            let result = validate_jump_hosts(&entries);
-            prop_assert!(result.is_err(), "expected Err for reserved name 'local'");
-            match result.unwrap_err() {
-                JumpHostValidationError::ReservedName { name, reserved } => {
-                    prop_assert_eq!(name, "local");
-                    prop_assert_eq!(reserved, RESERVED_NAMES);
-                }
-                other => {
-                    prop_assert!(false, "expected ReservedName, got: {:?}", other);
-                }
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Feature: remove-deprecated-jumpserver-config, Property 1: FallbackEntry serialization round-trip
-    // Feature: remove-deprecated-jumpserver-config, Property 2: Non-"local" strings deserialize as JumpHost
+    // FallbackEntry property-based tests
     // -----------------------------------------------------------------------
 
     /// Wrapper struct for TOML round-trip testing since TOML requires a top-level table.
@@ -1651,7 +1251,7 @@ mod tests {
             // Non-empty alphanumeric strings that are not "local"
             "[a-zA-Z][a-zA-Z0-9_-]{0,19}"
                 .prop_filter("must not be 'local'", |s| s != "local")
-                .prop_map(FallbackEntry::JumpHost),
+                .prop_map(FallbackEntry::Gateway),
         ]
     }
 
@@ -1682,18 +1282,18 @@ mod tests {
             prop_assert_eq!(deserialized.fallback, entries);
         }
 
-        // Feature: remove-deprecated-jumpserver-config, Property 2: Non-"local" strings deserialize as JumpHost
+        // Feature: config-and-legacy-cleanup, Property 2: Non-"local" strings deserialize as Gateway
         /// **Validates: Requirements 1.3, 1.7**
         ///
         /// For any non-empty string that is not "local", deserializing it as a
-        /// `FallbackEntry` produces `FallbackEntry::JumpHost(value)`.
+        /// `FallbackEntry` produces `FallbackEntry::Gateway(value)`.
         #[test]
-        fn prop_non_local_string_deserializes_as_jump_host(value in arb_non_local_string()) {
+        fn prop_non_local_string_deserializes_as_gateway(value in arb_non_local_string()) {
             // Wrap in a TOML table with a single-element array
             let toml_str = format!("fallback = [\"{}\"]", value);
             let deserialized: FallbackWrapper = toml::from_str(&toml_str).expect("deserialize from TOML");
             prop_assert_eq!(deserialized.fallback.len(), 1);
-            prop_assert_eq!(&deserialized.fallback[0], &FallbackEntry::JumpHost(value));
+            prop_assert_eq!(&deserialized.fallback[0], &FallbackEntry::Gateway(value));
         }
     }
 }

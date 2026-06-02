@@ -85,7 +85,7 @@ fn edge_15_5_explicit_jump_server_lookup() {
 }
 
 #[test]
-fn edge_15_5_explicit_unknown_jump_host_errors() {
+fn edge_15_5_explicit_unknown_gateway_errors() {
     let config = AppConfig::default();
     let server_config = ServerConfigFile {
         defaults: ServerDefaults {

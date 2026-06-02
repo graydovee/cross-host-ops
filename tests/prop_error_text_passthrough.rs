@@ -3,7 +3,7 @@
 // This property test verifies that the `list_servers` handler's error
 // conversion path preserves the upstream error's Display text byte-for-byte.
 // The conversion under test is:
-//   anyhow::Error (from build_jump_host) -> format!("{error}") -> ServerListSourceStatus::Error(msg)
+//   anyhow::Error (from build_gateway) -> format!("{error}") -> ServerListSourceStatus::Error(msg)
 //
 // For any arbitrary UTF-8 string `s` (length 0–1024), constructing
 // `anyhow!("{s}")` and formatting it with `format!("{}", error)` must yield
@@ -17,7 +17,7 @@ use rhop::protocol::ServerListSourceStatus;
 /// ```ignore
 /// Err(error) => {
 ///     prebuilt_status.push((
-///         ServerListSource::JumpHost(entry.name.clone()),
+///         ServerListSource::Gateway(entry.name.clone()),
 ///         ServerListSourceStatus::Error(format!("{error}")),
 ///     ));
 /// }

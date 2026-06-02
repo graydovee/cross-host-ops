@@ -3,7 +3,7 @@
 //! Feature: interactive-pty-passthrough
 //! Property 6: Backward Compatibility — Jumpserver Shell Navigation Preserved
 //!
-//! NOTE: This test originally tested the `JumpHost` trait architecture which
+//! NOTE: This test originally tested the `Gateway` trait architecture which
 //! was removed as part of the config-and-legacy-cleanup spec. The jumpserver
 //! shell navigation is now an internal implementation detail of
 //! `daemon::gateway::jumpserver::JumpserverGateway` and

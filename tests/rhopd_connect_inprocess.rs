@@ -1,6 +1,6 @@
 //! Integration tests: end-to-end connection path for rhopd gateway.
 //!
-//! NOTE: This test originally tested the `RhopdJumpHost` struct from the
+//! NOTE: This test originally tested the `RhopdGateway` struct from the
 //! deleted `src/jump/` module. That module was removed as part of the
 //! config-and-legacy-cleanup spec. The equivalent end-to-end connection
 //! behavior is now tested via the in-process RPC harness

@@ -23,8 +23,8 @@ pub struct CopySpec {
 pub enum ServerListSource {
     /// Entries from the local daemon's own server.toml.
     Local,
-    /// Entries from a configured jump host.
-    JumpHost(String), // the jump host alias
+    /// Entries from a configured gateway.
+    Gateway(String), // the gateway alias
 }
 
 // --- Address parsing (migrated from jump/address.rs) ---

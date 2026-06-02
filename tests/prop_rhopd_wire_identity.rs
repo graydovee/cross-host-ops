@@ -1,9 +1,9 @@
-//! Property-based test for wire-level identity of RhopdJumpHost::exec and
-//! RhopdJumpHost::list_servers.
+//! Property-based test for wire-level identity of RhopdGateway::exec and
+//! RhopdGateway::list_servers.
 //!
 //! Feature: rhopd-jumpserver-architecture, Property 11
 //!
-//! NOTE: This test originally tested the `RhopdJumpHost` struct from the
+//! NOTE: This test originally tested the `RhopdGateway` struct from the
 //! deleted `src/jump/` module. That module was removed as part of the
 //! config-and-legacy-cleanup spec. The equivalent wire-level behavior is now
 //! an implementation detail of `daemon::gateway::rhopd::RhopdGateway`.

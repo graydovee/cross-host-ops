@@ -229,20 +229,20 @@ pub fn copy_error_response(message: impl Into<String>) -> rpc::CopyResponse {
     }
 }
 
-// --- JumpHostStatus helpers ---
+// --- GatewayStatus helpers ---
 
-/// Domain representation of a jump host's status, including optional nested
+/// Domain representation of a gateway's status, including optional nested
 /// sub-status from a remote daemon.
 #[derive(Clone, Debug)]
-pub struct JumpHostStatus {
+pub struct GatewayStatus {
     pub name: String,
     pub kind: String,
     pub address: String,
     pub sub_status: Option<Box<rpc::StatusResponse>>,
 }
 
-pub fn jump_host_status_to_rpc(status: JumpHostStatus) -> rpc::JumpHostStatus {
-    rpc::JumpHostStatus {
+pub fn gateway_status_to_rpc(status: GatewayStatus) -> rpc::GatewayStatus {
+    rpc::GatewayStatus {
         name: status.name,
         kind: status.kind,
         address: status.address,
@@ -250,8 +250,8 @@ pub fn jump_host_status_to_rpc(status: JumpHostStatus) -> rpc::JumpHostStatus {
     }
 }
 
-pub fn jump_host_status_from_rpc(rpc_status: rpc::JumpHostStatus) -> JumpHostStatus {
-    JumpHostStatus {
+pub fn gateway_status_from_rpc(rpc_status: rpc::GatewayStatus) -> GatewayStatus {
+    GatewayStatus {
         name: rpc_status.name,
         kind: rpc_status.kind,
         address: rpc_status.address,
@@ -317,7 +317,7 @@ pub struct MergedServerList {
 pub fn server_list_source_to_string(source: &ServerListSource) -> String {
     match source {
         ServerListSource::Local => "local".to_string(),
-        ServerListSource::JumpHost(alias) => alias.clone(),
+        ServerListSource::Gateway(alias) => alias.clone(),
     }
 }
 
@@ -325,7 +325,7 @@ pub fn server_list_source_from_string(s: &str) -> ServerListSource {
     if s == "local" {
         ServerListSource::Local
     } else {
-        ServerListSource::JumpHost(s.to_string())
+        ServerListSource::Gateway(s.to_string())
     }
 }
 

@@ -40,7 +40,7 @@ use crate::config::{AppConfig, GatewayConfig, ReviewAction, default_config_path,
 use crate::logging::{init_logging, reopen_log_output};
 use crate::protocol::{self, ExecRequest, ServerEvent, rpc as proto_rpc};
 use self::ssh_server::remote_subsystem_name;
-use crate::types::{CopySpec, ServerListSource};
+use crate::types::CopySpec;
 
 use self::gateway::Gateway;
 use self::gateway::auth::AuthPrompter;
@@ -701,7 +701,7 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
         info!("status request");
         let config = self.state.config.read().await.clone();
         let socket_path = config.server.local.socket_path.clone();
-        let jump_hosts: Vec<proto_rpc::JumpHostStatus> = config
+        let gateways: Vec<proto_rpc::GatewayStatus> = config
             .gateways
             .iter()
             .map(|entry| {
@@ -710,7 +710,7 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                     GatewayConfig::Jumpserver(c) => (c.name.clone(), "jumpserver".to_string(), format!("{}:{}", c.host, c.port)),
                     GatewayConfig::Direct(c) => (c.name.clone(), "direct".to_string(), format!("{}:{}", c.host, c.port)),
                 };
-                proto_rpc::JumpHostStatus {
+                proto_rpc::GatewayStatus {
                     name,
                     kind,
                     address,
@@ -737,7 +737,7 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 .log_level
                 .clone()
                 .unwrap_or_default(),
-            jump_hosts,
+            gateways,
             remote_listening: config.server.remote.enable,
             remote_addr: if config.server.remote.enable {
                 config.server.remote.listen_addr.clone()
@@ -760,20 +760,20 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
         let config = self.state.config.read().await.clone();
         let path = PathBuf::from(&config.ssh.server_config_path);
 
-        let (entries, source_status) = rpc::process_list_servers(&self.state).await;
+        let (tagged_entries, source_status) = rpc::process_list_servers(&self.state).await;
 
-        // Convert entries to RPC format.
-        let servers: Vec<proto_rpc::ServerEntry> = entries
+        // Convert entries to RPC format (flat list without source).
+        let servers: Vec<proto_rpc::ServerEntry> = tagged_entries
             .iter()
-            .map(|entry| protocol::server_entry_to_rpc(entry.clone()))
+            .map(|(entry, _source)| protocol::server_entry_to_rpc(entry.clone()))
             .collect();
 
-        // Build merged RPC representation from entries + source_status.
-        let rows: Vec<crate::protocol::ServerListRow> = entries
+        // Build merged RPC representation with correct source tags.
+        let rows: Vec<crate::protocol::ServerListRow> = tagged_entries
             .into_iter()
-            .map(|entry| crate::protocol::ServerListRow {
+            .map(|(entry, source)| crate::protocol::ServerListRow {
                 server: entry,
-                source: ServerListSource::Local,
+                source,
             })
             .collect();
         let merged = crate::protocol::MergedServerList {
@@ -807,7 +807,7 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
     ) -> Result<Response<proto_rpc::UpdateConfigResponse>, Status> {
         let req = request.into_inner();
         match req.mutation_type.as_str() {
-            "add_jump_host" => {
+            "add_gateway" => {
                 let alias = req.name.trim().to_string();
                 if alias.is_empty() {
                     return Ok(Response::new(proto_rpc::UpdateConfigResponse {
@@ -877,14 +877,14 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                         Ok(Response::new(proto_rpc::UpdateConfigResponse {
                             success: false,
                             message: format!(
-                                "add_jump_host via RPC only supports kind 'rhopd', got '{}'",
+                                "add_gateway via RPC only supports kind 'rhopd', got '{}'",
                                 other
                             ),
                         }))
                     }
                 }
             }
-            "remove_jump_host" => {
+            "remove_gateway" => {
                 let alias = req.name.trim().to_string();
                 if alias.is_empty() {
                     return Ok(Response::new(proto_rpc::UpdateConfigResponse {
@@ -933,12 +933,12 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
         }
     }
 
-    async fn list_jump_hosts(
+    async fn list_gateways(
         &self,
-        _request: Request<proto_rpc::ListJumpHostsRequest>,
-    ) -> Result<Response<proto_rpc::ListJumpHostsResponse>, Status> {
+        _request: Request<proto_rpc::ListGatewaysRequest>,
+    ) -> Result<Response<proto_rpc::ListGatewaysResponse>, Status> {
         let config = self.state.config.read().await.clone();
-        let jump_hosts: Vec<proto_rpc::JumpHostStatus> = config
+        let gateways: Vec<proto_rpc::GatewayStatus> = config
             .gateways
             .iter()
             .map(|entry| {
@@ -947,7 +947,7 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                     GatewayConfig::Jumpserver(c) => (c.name.clone(), "jumpserver".to_string(), format!("{}:{}", c.host, c.port)),
                     GatewayConfig::Direct(c) => (c.name.clone(), "direct".to_string(), format!("{}:{}", c.host, c.port)),
                 };
-                proto_rpc::JumpHostStatus {
+                proto_rpc::GatewayStatus {
                     name,
                     kind,
                     address,
@@ -955,7 +955,7 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 }
             })
             .collect();
-        Ok(Response::new(proto_rpc::ListJumpHostsResponse { jump_hosts }))
+        Ok(Response::new(proto_rpc::ListGatewaysResponse { gateways }))
     }
 }
 

@@ -75,7 +75,7 @@ impl<'a> Resolver<'a> {
     /// Candidate ordering:
     /// 1. Server-config matches against the named source.
     /// 2. `ssh.fallback`-driven candidates in declared order.
-    /// 3. No implicit fan-out to all `rhopd` jump hosts.
+    /// 3. No implicit fan-out to all `rhopd` gateways.
     pub fn resolve(&self, input: &str) -> Result<Vec<Route>> {
         // Try explicit `<jump_name>:<server_alias>` form first.
         if let Some((jump_name, server_alias)) = parse_explicit_qualified(input) {
@@ -138,7 +138,7 @@ impl<'a> Resolver<'a> {
 
         // If we have a merged view, verify the server alias exists on this source.
         if !self.merged_rows.is_empty() {
-            let source = ServerListSource::JumpHost(jump_name.to_string());
+            let source = ServerListSource::Gateway(jump_name.to_string());
             let found = self
                 .merged_rows
                 .iter()
@@ -197,8 +197,8 @@ impl<'a> Resolver<'a> {
                         end_target: alias.to_string(),
                     }
                 }
-                ServerListSource::JumpHost(jump_alias) => {
-                    // Route through the named jump host — gateway_name = jump_host.name
+                ServerListSource::Gateway(jump_alias) => {
+                    // Route through the named gateway — gateway_name = jump_alias
                     Route {
                         gateway_name: jump_alias.clone(),
                         end_target: alias.to_string(),
@@ -213,7 +213,7 @@ impl<'a> Resolver<'a> {
             .iter()
             .map(|source| match source {
                 ServerListSource::Local => format!("local:{}", alias),
-                ServerListSource::JumpHost(jump_alias) => format!("{}:{}", jump_alias, alias),
+                ServerListSource::Gateway(jump_alias) => format!("{}:{}", jump_alias, alias),
             })
             .collect();
 
@@ -264,7 +264,7 @@ impl<'a> Resolver<'a> {
                         candidates.push(route);
                     }
                 }
-                FallbackEntry::JumpHost(name) => {
+                FallbackEntry::Gateway(name) => {
                     // Look up the named [[gateways]] entry
                     let gc = self
                         .gateways
@@ -480,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn resolver_explicit_jump_host() {
+    fn resolver_explicit_gateway() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![]);
         let gateways = vec![GatewayConfig::Rhopd(RhopdGatewayConfig {
@@ -499,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn resolver_explicit_unknown_jump_host() {
+    fn resolver_explicit_unknown_gateway() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![]);
         let gateways: Vec<GatewayConfig> = vec![];
@@ -543,7 +543,7 @@ mod tests {
     #[test]
     fn resolver_fallback_jumpserver_enabled() {
         let mut config = AppConfig::default();
-        config.ssh.fallback = vec![FallbackEntry::JumpHost("test-jump".to_string())];
+        config.ssh.fallback = vec![FallbackEntry::Gateway("test-jump".to_string())];
         config.ssh.server_config_path = "/tmp/nonexistent_server.toml".to_string();
         config.ssh.ssh_config_path = "/tmp/nonexistent_ssh_config".to_string();
 
@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn resolver_fallback_jumpserver_disabled() {
         let mut config = AppConfig::default();
-        config.ssh.fallback = vec![FallbackEntry::JumpHost("nonexistent-jump".to_string())];
+        config.ssh.fallback = vec![FallbackEntry::Gateway("nonexistent-jump".to_string())];
         config.ssh.server_config_path = "/tmp/nonexistent_server.toml".to_string();
         config.ssh.ssh_config_path = "/tmp/nonexistent_ssh_config".to_string();
 
@@ -603,7 +603,7 @@ mod tests {
     #[test]
     fn resolver_server_config_takes_priority_over_fallback() {
         let mut config = AppConfig::default();
-        config.ssh.fallback = vec![FallbackEntry::JumpHost("test-jump".to_string())];
+        config.ssh.fallback = vec![FallbackEntry::Gateway("test-jump".to_string())];
         config.ssh.server_config_path = "/tmp/nonexistent_server.toml".to_string();
         config.ssh.ssh_config_path = "/tmp/nonexistent_ssh_config".to_string();
 
@@ -678,7 +678,7 @@ mod tests {
                 },
             },
             ServerListRow {
-                source: ServerListSource::JumpHost("remote1".to_string()),
+                source: ServerListSource::Gateway("remote1".to_string()),
                 server: ServerEntry {
                     alias: "db01".to_string(),
                     host: "192.168.1.10".to_string(),
@@ -702,7 +702,7 @@ mod tests {
                 },
             },
             ServerListRow {
-                source: ServerListSource::JumpHost("remote1".to_string()),
+                source: ServerListSource::Gateway("remote1".to_string()),
                 server: ServerEntry {
                     alias: "shared".to_string(),
                     host: "192.168.1.5".to_string(),
@@ -789,7 +789,7 @@ mod tests {
     }
 
     #[test]
-    fn resolver_merged_view_explicit_jump_host_found() {
+    fn resolver_merged_view_explicit_gateway_found() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("web01", "10.0.0.1")]);
         let gateways = vec![GatewayConfig::Rhopd(RhopdGatewayConfig {
@@ -811,7 +811,7 @@ mod tests {
     }
 
     #[test]
-    fn resolver_merged_view_explicit_jump_host_not_found() {
+    fn resolver_merged_view_explicit_gateway_not_found() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("web01", "10.0.0.1")]);
         let gateways = vec![GatewayConfig::Rhopd(RhopdGatewayConfig {
@@ -852,7 +852,7 @@ mod tests {
     #[test]
     fn resolver_merged_view_bare_not_found_falls_through() {
         let mut config = AppConfig::default();
-        config.ssh.fallback = vec![FallbackEntry::JumpHost("test-jump".to_string())];
+        config.ssh.fallback = vec![FallbackEntry::Gateway("test-jump".to_string())];
         config.ssh.server_config_path = "/tmp/nonexistent_server.toml".to_string();
         config.ssh.ssh_config_path = "/tmp/nonexistent_ssh_config".to_string();
 

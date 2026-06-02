@@ -42,7 +42,7 @@ pub enum HarnessCopyDirection {
 /// - CLI → local daemon (over duplex)
 /// - local daemon → remote daemon (over duplex, for rhopd routes)
 ///
-/// The end target is a tempdir that the stub `JumpHost` performs filesystem
+/// The end target is a tempdir that the stub `Gateway` performs filesystem
 /// ops against directly.
 #[allow(dead_code)]
 pub struct TestHarness {
@@ -370,7 +370,7 @@ impl Drop for TestHarness {
     }
 }
 
-/// Proptest strategy that generates arbitrary `JumpHostKind` values.
+/// Proptest strategy that generates arbitrary `GatewayKind` values.
 /// Used by property tests P1–P4 to parameterize over route kinds.
 #[allow(dead_code)]
 pub fn route_kind_strategy() -> impl Strategy<Value = GatewayKind> {

@@ -5,7 +5,7 @@
 //! in tests, we verify that the gRPC protocol contracts hold through the
 //! gateway-based daemon.
 //!
-//! NOTE: This test originally used `RhopdJumpHost` from the deleted `src/jump/`
+//! NOTE: This test originally used `RhopdGateway` from the deleted `src/jump/`
 //! module. That module was removed as part of the config-and-legacy-cleanup spec.
 //! The equivalent protocol-level behavior is now tested through the in-process
 //! RPC harness which exercises the full gateway-based daemon.

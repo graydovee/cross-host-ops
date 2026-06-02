@@ -1,8 +1,8 @@
-//! Property test: exactly one rhop-rpc subsystem per RhopdJumpHost.
+//! Property test: exactly one rhop-rpc subsystem per RhopdGateway.
 //!
 //! Feature: rhopd-connect-and-server-list, Property 4
 //!
-//! NOTE: This test originally tested the `RhopdJumpHost` struct from the
+//! NOTE: This test originally tested the `RhopdGateway` struct from the
 //! deleted `src/jump/` module. That module was removed as part of the
 //! config-and-legacy-cleanup spec. The equivalent functionality (single
 //! connection per gateway) is now an implementation detail of

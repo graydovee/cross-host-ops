@@ -9,7 +9,7 @@ service RhopRpc {
   rpc ListServers(ServerListRequest) returns (ServerListResponse);
   rpc Shutdown(ShutdownRequest) returns (InfoResponse);
   rpc UpdateConfig(UpdateConfigRequest) returns (UpdateConfigResponse);
-  rpc ListJumpHosts(ListJumpHostsRequest) returns (ListJumpHostsResponse);
+  rpc ListGateways(ListGatewaysRequest) returns (ListGatewaysResponse);
 }
 
 message ExecuteRequest {
@@ -157,7 +157,7 @@ message StatusResponse {
   string cli_start_log_level = 8;
   reserved 9, 10, 11, 12;
   reserved "local_enabled", "remote_enabled", "remote_listen_addr", "remote_user";
-  repeated JumpHostStatus jump_hosts = 13;
+  repeated GatewayStatus gateways = 13;
   bool remote_listening = 14;
   string remote_addr = 15;
   string remote_ssh_user = 16;
@@ -185,7 +185,7 @@ message PoolStatus {
   uint64 queued = 5;
 }
 
-message JumpHostStatus {
+message GatewayStatus {
   string name = 1;
   string kind = 2;
   string address = 3;
@@ -222,8 +222,8 @@ message UpdateConfigResponse {
   string message = 2;
 }
 
-message ListJumpHostsRequest {}
+message ListGatewaysRequest {}
 
-message ListJumpHostsResponse {
-  repeated JumpHostStatus jump_hosts = 1;
+message ListGatewaysResponse {
+  repeated GatewayStatus gateways = 1;
 }
