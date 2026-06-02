@@ -21,6 +21,7 @@ pub struct ExecRequest {
     pub term_cols: u32,
     pub term_rows: u32,
     pub shell: String,
+    pub no_shell: bool,
 }
 
 #[derive(Clone, Debug)]

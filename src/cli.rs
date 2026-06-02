@@ -21,9 +21,9 @@ use tower::service_fn;
 
 use crate::config::{
     AppConfig, ClientConfig, JumpHostConfig, JumpHostFields, RhopdJumpHostFields,
-    default_config_path, expand_tilde, load_server_config, parse_duration, RESERVED_NAMES,
+    default_config_path, expand_tilde, parse_duration, RESERVED_NAMES,
 };
-use crate::connection::{CopyDirection, CopySpec, resolve_shell};
+use crate::connection::{CopyDirection, CopySpec};
 use crate::exit_codes::cap_remote_exit_code;
 use crate::jump::address::{AddressDefaults, RemoteAddress};
 use crate::jump::pty::{ExecPtyFlags, effective_pty_decision};
@@ -473,24 +473,16 @@ fn detect_double_dash_separator(target: &str) -> bool {
         .unwrap_or(false)
 }
 
-async fn run_command(target: String, argv: Vec<String>, pty: bool, no_pty: bool, stdin: bool, timeout_ms: u64, shell: Option<String>, no_shell: bool, config: &AppConfig) -> Result<i32> {
-    // Resolve shell wrapping: load server.toml, find matched entry, call resolve_shell.
-    let server_config = load_server_config(Path::new(&config.ssh.server_config_path))
-        .unwrap_or_default();
-    let server_shell: Option<&str> = server_config
-        .servers
-        .get(&target)
-        .and_then(|entry| entry.shell.as_deref());
-    let defaults_shell = &server_config.defaults.shell;
-    let resolved_shell = resolve_shell(shell.as_deref(), no_shell, server_shell, defaults_shell)
-        .unwrap_or_default();
+async fn run_command(target: String, argv: Vec<String>, pty: bool, no_pty: bool, stdin: bool, timeout_ms: u64, shell: Option<String>, no_shell: bool, _config: &AppConfig) -> Result<i32> {
+    // Pass raw CLI flags to daemon; daemon resolves effective shell from server.toml.
+    let cli_shell = shell.unwrap_or_default();
 
     // Check if we should use interactive mode (PTY + stdin is TTY + stdout is TTY).
     let stdin_is_tty = io::stdin().is_terminal();
     let stdout_is_tty = io::stdout().is_terminal();
 
     if should_use_interactive_mode(pty, stdin_is_tty, stdout_is_tty) {
-        return run_interactive(target, argv, timeout_ms, resolved_shell).await;
+        return run_interactive(target, argv, timeout_ms, cli_shell, no_shell).await;
     }
 
     // Batch execution path: request_pty + exec without sentinel.
@@ -508,7 +500,8 @@ async fn run_command(target: String, argv: Vec<String>, pty: bool, no_pty: bool,
             interactive: false,
             term_cols: 0,
             term_rows: 0,
-            shell: resolved_shell,
+            shell: cli_shell,
+            no_shell,
         })),
     })
     .await
@@ -614,6 +607,7 @@ pub(crate) async fn run_interactive(
     argv: Vec<String>,
     timeout_ms: u64,
     shell: String,
+    no_shell: bool,
 ) -> Result<i32> {
     // Step 1: Get initial terminal size.
     let (cols, rows) = get_terminal_size();
@@ -633,6 +627,7 @@ pub(crate) async fn run_interactive(
             term_cols: cols as u32,
             term_rows: rows as u32,
             shell,
+            no_shell,
         })),
     })
     .await

@@ -60,6 +60,7 @@ async fn bug_condition_timeout_enforcement() {
             term_cols: 0,
             term_rows: 0,
             shell: String::new(),
+            no_shell: false,
         })),
     };
 
@@ -135,6 +136,7 @@ async fn bug_condition_pty_flag_accepted() {
         term_cols: 0,
         term_rows: 0,
         shell: String::new(),
+            no_shell: false,
     };
 
     // Verify the field is set correctly (not silently dropped by proto3)
@@ -153,6 +155,7 @@ async fn bug_condition_pty_flag_accepted() {
         term_cols: 0,
         term_rows: 0,
         shell: String::new(),
+            no_shell: false,
     };
     assert!(start_req_no_pty.no_pty, "no_pty field should be true");
 }
@@ -182,6 +185,7 @@ async fn bug_condition_stdin_flag_accepted() {
         term_cols: 0,
         term_rows: 0,
         shell: String::new(),
+            no_shell: false,
     };
 
     assert!(start_req.stdin, "stdin field should be true");
@@ -242,6 +246,7 @@ proptest! {
             term_cols: 0,
             term_rows: 0,
             shell: String::new(),
+            no_shell: false,
         };
 
         // Verify fields are preserved (not silently zeroed by proto3)

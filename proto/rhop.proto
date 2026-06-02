@@ -41,7 +41,8 @@ message StartRequest {
   bool interactive = 7;
   uint32 term_cols = 8;
   uint32 term_rows = 9;
-  string shell = 10;  // shell name for wrapping (empty = no wrapping)
+  string shell = 10;   // --shell value; empty = not specified, daemon resolves from server.toml
+  bool no_shell = 11;  // --no-shell flag; true = disable wrapping regardless of config
 }
 
 message ConfirmRequest {
