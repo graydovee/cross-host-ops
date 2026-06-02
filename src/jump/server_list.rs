@@ -222,6 +222,7 @@ mod tests {
             _pty: bool,
             _cols: u32,
             _rows: u32,
+        _shell: &str,
         ) -> Result<i32> {
             Ok(0)
         }
@@ -258,6 +259,7 @@ mod tests {
             _pty: bool,
             _cols: u32,
             _rows: u32,
+        _shell: &str,
         ) -> Result<i32> {
             Ok(0)
         }
@@ -290,6 +292,7 @@ mod tests {
             _pty: bool,
             _cols: u32,
             _rows: u32,
+        _shell: &str,
         ) -> Result<i32> {
             Ok(0)
         }
@@ -322,12 +325,14 @@ mod tests {
                     user: user.to_string(),
                     identity_file: Some("/tmp/key".to_string()),
                     password: None,
+                    shell: None,
                 },
             );
         }
         ServerConfigFile {
             defaults: ServerDefaults {
                 identity_file: Some("/tmp/default_key".to_string()),
+                shell: String::new(),
             },
             servers,
         }
@@ -628,6 +633,7 @@ mod tests {
             _pty: bool,
             _cols: u32,
             _rows: u32,
+        _shell: &str,
         ) -> Result<i32> {
             Ok(0)
         }
@@ -737,12 +743,14 @@ mod tests {
                             user: entry.user.clone(),
                             identity_file: Some("/tmp/key".to_string()),
                             password: None,
+                            shell: None,
                         },
                     );
                 }
                 let server_config = ServerConfigFile {
                     defaults: ServerDefaults {
                         identity_file: Some("/tmp/default_key".to_string()),
+                        shell: String::new(),
                     },
                     servers: servers.clone(),
                 };

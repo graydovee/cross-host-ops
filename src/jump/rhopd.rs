@@ -352,6 +352,7 @@ impl JumpHost for RhopdJumpHost {
         _pty: bool,
         _cols: u32,
         _rows: u32,
+        _shell: &str,
     ) -> Result<i32> {
         // Build the initial StartRequest and send it as the first message on
         // the Execute streaming RPC. We use an mpsc channel so we can send
@@ -622,6 +623,7 @@ impl JumpHost for RhopdJumpHost {
         rows: u32,
         _sender: &UnboundedSender<ServerEvent>,
         config: &AppConfig,
+        _shell: &str,
     ) -> Result<InteractiveHandle> {
         // Send StartRequest with interactive=true to the remote daemon.
         let start = rpc::ExecuteRequest {

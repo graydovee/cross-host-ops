@@ -73,6 +73,7 @@ pub trait JumpHost: Send {
         pty: bool,
         cols: u32,
         rows: u32,
+        shell: &str,
     ) -> Result<i32>;
 
     /// Required. Carry out the remote-side half of a copy. The local-side I/O
@@ -110,6 +111,7 @@ pub trait JumpHost: Send {
         _rows: u32,
         _sender: &UnboundedSender<ServerEvent>,
         _config: &AppConfig,
+        _shell: &str,
     ) -> Result<InteractiveHandle> {
         Err(UnsupportedCapability {
             kind: self.kind(),
@@ -149,6 +151,7 @@ mod tests {
             _pty: bool,
             _cols: u32,
             _rows: u32,
+            _shell: &str,
         ) -> Result<i32> {
             Ok(0)
         }
@@ -214,7 +217,7 @@ mod tests {
                     "list_servers" => mock.list_servers(&config).await.map(|_| ()),
                     "exec_interactive" => {
                         let (sender, _rx) = tokio::sync::mpsc::unbounded_channel();
-                        mock.exec_interactive(&[], 80, 24, &sender, &config).await.map(|_| ())
+                        mock.exec_interactive(&[], 80, 24, &sender, &config, "").await.map(|_| ())
                     }
                     _ => unreachable!(),
                 };

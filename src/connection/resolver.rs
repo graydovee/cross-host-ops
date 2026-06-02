@@ -548,12 +548,14 @@ mod tests {
                     user: "testuser".to_string(),
                     identity_file: Some("/tmp/test_key".to_string()),
                     password: None,
+                    shell: None,
                 },
             );
         }
         ServerConfigFile {
             defaults: ServerDefaults {
                 identity_file: None,
+                shell: String::new(),
             },
             servers,
         }

@@ -176,6 +176,7 @@ proptest! {
             interactive: true,
             term_cols: cols,
             term_rows: rows,
+            shell: String::new(),
         };
 
         // Wrap in ExecuteRequest

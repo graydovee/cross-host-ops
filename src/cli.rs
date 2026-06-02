@@ -21,9 +21,9 @@ use tower::service_fn;
 
 use crate::config::{
     AppConfig, ClientConfig, JumpHostConfig, JumpHostFields, RhopdJumpHostFields,
-    default_config_path, expand_tilde, parse_duration, RESERVED_NAMES,
+    default_config_path, expand_tilde, load_server_config, parse_duration, RESERVED_NAMES,
 };
-use crate::connection::{CopyDirection, CopySpec};
+use crate::connection::{CopyDirection, CopySpec, resolve_shell};
 use crate::exit_codes::cap_remote_exit_code;
 use crate::jump::address::{AddressDefaults, RemoteAddress};
 use crate::jump::pty::{ExecPtyFlags, effective_pty_decision};
@@ -81,6 +81,13 @@ pub enum ArunCommand {
         /// Abort the operation after this duration (e.g. 30s, 2m).
         #[arg(long = "timeout", value_name = "DURATION")]
         timeout: Option<String>,
+        /// Wrap the remote command in a shell to source rc files.
+        /// Use --shell bash to wrap with bash, --no-shell to disable.
+        #[arg(long = "shell")]
+        shell: Option<String>,
+        /// Disable shell wrapping regardless of config.
+        #[arg(long = "no-shell", conflicts_with = "shell")]
+        no_shell: bool,
         /// Remote target name.
         #[arg(value_name = "TARGET")]
         target: String,
@@ -306,7 +313,7 @@ fn remote_to_host(cmd: RemoteCommand) -> HostCommand {
 
 pub async fn run_cli(cli: ArunCli) -> Result<i32> {
     match cli.command {
-        ArunCommand::Exec { target, cmd, timeout, pty, no_pty, stdin } => {
+        ArunCommand::Exec { target, cmd, timeout, pty, no_pty, stdin, shell, no_shell } => {
             // Validate --timeout if provided: parse and bounds-check (1–86400 seconds).
             let timeout_ms: u64 = if let Some(ref timeout_str) = timeout {
                 match parse_duration(timeout_str) {
@@ -356,7 +363,7 @@ pub async fn run_cli(cli: ArunCli) -> Result<i32> {
             let flags = ExecPtyFlags { force_pty: pty, force_no_pty: no_pty };
             let resolved_pty = effective_pty_decision(&flags, &config.ssh, stdout_is_tty);
 
-            run_command(target, argv, resolved_pty, no_pty, stdin, timeout_ms).await
+            run_command(target, argv, resolved_pty, no_pty, stdin, timeout_ms, shell, no_shell, &config).await
         }
         ArunCommand::Cp {
             recursive,
@@ -466,13 +473,24 @@ fn detect_double_dash_separator(target: &str) -> bool {
         .unwrap_or(false)
 }
 
-async fn run_command(target: String, argv: Vec<String>, pty: bool, no_pty: bool, stdin: bool, timeout_ms: u64) -> Result<i32> {
+async fn run_command(target: String, argv: Vec<String>, pty: bool, no_pty: bool, stdin: bool, timeout_ms: u64, shell: Option<String>, no_shell: bool, config: &AppConfig) -> Result<i32> {
+    // Resolve shell wrapping: load server.toml, find matched entry, call resolve_shell.
+    let server_config = load_server_config(Path::new(&config.ssh.server_config_path))
+        .unwrap_or_default();
+    let server_shell: Option<&str> = server_config
+        .servers
+        .get(&target)
+        .and_then(|entry| entry.shell.as_deref());
+    let defaults_shell = &server_config.defaults.shell;
+    let resolved_shell = resolve_shell(shell.as_deref(), no_shell, server_shell, defaults_shell)
+        .unwrap_or_default();
+
     // Check if we should use interactive mode (PTY + stdin is TTY + stdout is TTY).
     let stdin_is_tty = io::stdin().is_terminal();
     let stdout_is_tty = io::stdout().is_terminal();
 
     if should_use_interactive_mode(pty, stdin_is_tty, stdout_is_tty) {
-        return run_interactive(target, argv, timeout_ms).await;
+        return run_interactive(target, argv, timeout_ms, resolved_shell).await;
     }
 
     // Batch execution path: request_pty + exec without sentinel.
@@ -490,6 +508,7 @@ async fn run_command(target: String, argv: Vec<String>, pty: bool, no_pty: bool,
             interactive: false,
             term_cols: 0,
             term_rows: 0,
+            shell: resolved_shell,
         })),
     })
     .await
@@ -594,6 +613,7 @@ pub(crate) async fn run_interactive(
     target: String,
     argv: Vec<String>,
     timeout_ms: u64,
+    shell: String,
 ) -> Result<i32> {
     // Step 1: Get initial terminal size.
     let (cols, rows) = get_terminal_size();
@@ -612,6 +632,7 @@ pub(crate) async fn run_interactive(
             interactive: true,
             term_cols: cols as u32,
             term_rows: rows as u32,
+            shell,
         })),
     })
     .await

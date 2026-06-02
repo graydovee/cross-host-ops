@@ -34,8 +34,9 @@ impl JumpHost for DirectJumpHost {
         pty: bool,
         cols: u32,
         rows: u32,
+        shell: &str,
     ) -> Result<i32> {
-        self.inner.execute(argv, sender, config, pty, cols, rows).await
+        self.inner.execute(argv, sender, config, pty, cols, rows, shell).await
     }
 
     async fn copy(&mut self, spec: &CopySpec, config: &AppConfig) -> Result<()> {
@@ -49,8 +50,9 @@ impl JumpHost for DirectJumpHost {
         rows: u32,
         _sender: &UnboundedSender<ServerEvent>,
         config: &AppConfig,
+        shell: &str,
     ) -> Result<InteractiveHandle> {
-        let session = self.inner.execute_interactive(argv, cols, rows, config).await?;
+        let session = self.inner.execute_interactive(argv, cols, rows, config, shell).await?;
         Ok(InteractiveHandle {
             stdin_tx: session.stdin_tx,
             resize_tx: session.resize_tx,

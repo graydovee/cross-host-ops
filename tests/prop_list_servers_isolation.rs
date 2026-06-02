@@ -43,6 +43,7 @@ impl JumpHost for OkMockJumpHost {
         _pty: bool,
         _cols: u32,
         _rows: u32,
+        _shell: &str,
     ) -> Result<i32> {
         Ok(0)
     }
@@ -144,6 +145,7 @@ fn arb_local_entries() -> impl Strategy<Value = Vec<(String, ServerHostConfig)>>
                     user,
                     identity_file: Some("/tmp/key".to_string()),
                     password: None,
+                    shell: None,
                 }),
         ),
         0..=5,
@@ -231,6 +233,7 @@ proptest! {
             let server_config = ServerConfigFile {
                 defaults: ServerDefaults {
                     identity_file: Some("/tmp/default_key".to_string()),
+                    shell: String::new(),
                 },
                 servers: servers_map,
             };

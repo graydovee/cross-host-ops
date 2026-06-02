@@ -17,7 +17,7 @@ pub use direct::DirectSshConnection;
 pub use jump::JumpSshConnection;
 pub use resolver::{Resolver, derive_target_ip};
 pub use crate::config::JumpHostConfig;
-pub use shared::{build_remote_command, shell_quote};
+pub use shared::{build_final_command, build_remote_command, resolve_shell, shell_quote, wrap_in_shell};
 pub use types::{CopyDirection, CopySpec, DirectTarget};
 
 pub type AuthFuture = Pin<Box<dyn Future<Output = Result<String>> + Send>>;
@@ -54,6 +54,7 @@ pub trait Connection: Send {
         pty: bool,
         cols: u32,
         rows: u32,
+        shell: &str,
     ) -> Result<i32>;
 
     async fn copy(&mut self, spec: &CopySpec, config: &AppConfig) -> Result<()>;
@@ -69,6 +70,7 @@ pub trait Connection: Send {
         _cols: u32,
         _rows: u32,
         _config: &AppConfig,
+        _shell: &str,
     ) -> Result<InteractiveSession> {
         bail!("interactive execution is not supported for this connection type")
     }

@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::config::{AppConfig, ReviewAction, default_config_path, load_server_config, validate_jump_hosts};
 use crate::connection::CopySpec;
-use crate::connection::{AuthPrompter, AuthPromptRequest, build_remote_command, Resolver};
+use crate::connection::{AuthPrompter, AuthPromptRequest, build_final_command, Resolver};
 use crate::jump::auth::AuthPromptRouter;
 use crate::jump::factory::build_jump_host;
 use crate::jump::pty::{ExecPtyFlags, effective_pty_decision};
@@ -622,7 +622,7 @@ async fn process_execute(
     let target = targets
         .first()
         .ok_or_else(|| anyhow!("no resolved target candidates"))?;
-    let shell_command = build_remote_command(&request.argv);
+    let shell_command = build_final_command(&request.argv, &request.shell);
 
     info!(
         execution_id = %execution_id,
@@ -737,7 +737,7 @@ async fn process_execute(
     let router = Arc::new(AuthPromptRouter::new(prompt_upstream_tx));
     let auth_prompter = make_auth_prompter(router.clone(), target.end_target.alias.clone());
     let exec_task = tokio::spawn(async move {
-        pool.execute(exec_targets, argv, tx, auth_prompter, pty, request.term_cols, request.term_rows).await
+        pool.execute(exec_targets, argv, tx, auth_prompter, pty, request.term_cols, request.term_rows, request.shell).await
     });
     tokio::pin!(exec_task);
 
@@ -865,7 +865,7 @@ async fn process_interactive_execute(
     let target = targets
         .first()
         .ok_or_else(|| anyhow!("no resolved target candidates"))?;
-    let shell_command = build_remote_command(&request.argv);
+    let shell_command = build_final_command(&request.argv, &request.shell);
 
     info!(
         execution_id = %execution_id,
@@ -979,6 +979,7 @@ async fn process_interactive_execute(
             request.term_rows,
             event_tx,
             auth_prompter,
+            request.shell.clone(),
         )
         .await?;
 
@@ -1225,6 +1226,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                     interactive: start.interactive,
                     term_cols: start.term_cols,
                     term_rows: start.term_rows,
+                    shell: start.shell,
                 };
                 process_execute(exec, &state, &mut inbound, &sender).await
             }

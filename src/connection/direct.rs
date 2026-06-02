@@ -17,7 +17,7 @@ use crate::protocol::ServerEvent;
 use super::{Connection, InteractiveSession};
 use super::shared::{
     ClientHandler, apply_local_mode, authenticate_with_key, authenticate_with_password,
-    build_remote_command, connect_handle,
+    build_final_command, connect_handle,
     join_remote_path, local_mode, maybe_local_download_target, remote_mode,
     remote_path_needs_expansion, split_tilde_path,
     upload_destination_for_directory,
@@ -68,8 +68,9 @@ impl Connection for DirectSshConnection {
         pty: bool,
         cols: u32,
         rows: u32,
+        shell: &str,
     ) -> Result<i32> {
-        let command = build_remote_command(argv);
+        let command = build_final_command(argv, shell);
         let mut channel = self.handle.channel_open_session().await?;
         if pty {
             channel
@@ -126,6 +127,7 @@ impl Connection for DirectSshConnection {
         cols: u32,
         rows: u32,
         _config: &AppConfig,
+        shell: &str,
     ) -> Result<InteractiveSession> {
         let mut channel = self.handle.channel_open_session().await?;
 
@@ -135,7 +137,7 @@ impl Connection for DirectSshConnection {
             .await?;
 
         // Execute command directly — no sentinel wrapping
-        let command = build_remote_command(argv);
+        let command = build_final_command(argv, shell);
         channel.exec(true, command.as_str()).await?;
 
         // Set up forwarding channels

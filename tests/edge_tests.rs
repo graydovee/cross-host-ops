@@ -199,6 +199,7 @@ fn edge_15_5_explicit_jump_server_lookup() {
     let server_config = ServerConfigFile {
         defaults: ServerDefaults {
             identity_file: None,
+            shell: String::new(),
         },
         servers: HashMap::new(),
     };
@@ -230,6 +231,7 @@ fn edge_15_5_explicit_unknown_jump_host_errors() {
     let server_config = ServerConfigFile {
         defaults: ServerDefaults {
             identity_file: None,
+            shell: String::new(),
         },
         servers: HashMap::new(),
     };
@@ -260,11 +262,13 @@ fn edge_15_5_explicit_local_source_lookup() {
             user: "dbadmin".to_string(),
             identity_file: Some("/tmp/key".to_string()),
             password: None,
+            shell: None,
         },
     );
     let server_config = ServerConfigFile {
         defaults: ServerDefaults {
             identity_file: None,
+            shell: String::new(),
         },
         servers,
     };

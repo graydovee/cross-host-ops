@@ -60,6 +60,7 @@ impl JumpHost for MockJumpserverHost {
         _pty: bool,
         _cols: u32,
         _rows: u32,
+        _shell: &str,
     ) -> Result<i32> {
         // JumpserverJumpHost delegates to inner.execute() which uses
         // request_pty() + exec() — NOT sentinel wrapping.
@@ -132,7 +133,7 @@ proptest! {
             let (sender, _rx) = tokio::sync::mpsc::unbounded_channel();
             let mut host = MockJumpserverHost { name: name.clone() };
 
-            let result = host.exec_interactive(&argv, cols, rows, &sender, &config).await;
+            let result = host.exec_interactive(&argv, cols, rows, &sender, &config, "").await;
 
             // Must be an error
             let err = match result {
@@ -172,7 +173,7 @@ proptest! {
 
             // exec() should succeed — it delegates to inner.execute()
             // which uses request_pty() + exec() (no sentinel).
-            let result = host.exec(&argv, &sender, &config, true, 80, 24).await;
+            let result = host.exec(&argv, &sender, &config, true, 80, 24, "").await;
             prop_assert!(result.is_ok(), "exec should succeed (delegates to inner connection)");
 
             Ok(())

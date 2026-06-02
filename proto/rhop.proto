@@ -41,6 +41,7 @@ message StartRequest {
   bool interactive = 7;
   uint32 term_cols = 8;
   uint32 term_rows = 9;
+  string shell = 10;  // shell name for wrapping (empty = no wrapping)
 }
 
 message ConfirmRequest {

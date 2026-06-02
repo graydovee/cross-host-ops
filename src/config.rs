@@ -327,6 +327,7 @@ pub struct ServerConfigFile {
 #[serde(default)]
 pub struct ServerDefaults {
     pub identity_file: Option<String>,
+    pub shell: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -337,6 +338,7 @@ pub struct ServerHostConfig {
     pub user: String,
     pub identity_file: Option<String>,
     pub password: Option<String>,
+    pub shell: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

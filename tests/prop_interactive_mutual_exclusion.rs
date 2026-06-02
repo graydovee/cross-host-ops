@@ -54,6 +54,7 @@ proptest! {
             interactive,
             term_cols,
             term_rows,
+            shell: String::new(),
         };
 
         let result = validate_interactive_request(&req);
@@ -107,6 +108,7 @@ proptest! {
             interactive: true,
             term_cols,
             term_rows,
+            shell: String::new(),
         };
 
         let result = validate_interactive_request(&req);
@@ -143,6 +145,7 @@ proptest! {
             interactive: true,
             term_cols,
             term_rows,
+            shell: String::new(),
         };
 
         let result = validate_interactive_request(&req);
@@ -178,6 +181,7 @@ proptest! {
             interactive,
             term_cols,
             term_rows,
+            shell: String::new(),
         };
 
         let result = validate_interactive_request(&req);

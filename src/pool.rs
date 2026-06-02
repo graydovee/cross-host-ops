@@ -83,6 +83,7 @@ impl ConnectionPool {
         pty: bool,
         cols: u32,
         rows: u32,
+        shell: String,
     ) -> Result<i32> {
         let target = targets
             .first()
@@ -99,7 +100,7 @@ impl ConnectionPool {
             let first_result = guard
                 .as_mut()
                 .expect("hop initialized")
-                .exec(&argv, &sender, &config, pty, cols, rows)
+                .exec(&argv, &sender, &config, pty, cols, rows, &shell)
                 .await;
             match first_result {
                 Ok(code) => Ok(code),
@@ -111,7 +112,7 @@ impl ConnectionPool {
                     guard
                         .as_mut()
                         .expect("hop reinitialized")
-                        .exec(&argv, &sender, &config, pty, cols, rows)
+                        .exec(&argv, &sender, &config, pty, cols, rows, &shell)
                         .await
                 }
                 Err(error) => Err(error),
@@ -174,6 +175,7 @@ impl ConnectionPool {
         rows: u32,
         sender: UnboundedSender<ServerEvent>,
         auth_prompter: Arc<AuthPrompter>,
+        shell: String,
     ) -> Result<InteractiveHandle> {
         let target = targets
             .first()
@@ -190,7 +192,7 @@ impl ConnectionPool {
             let first_result = guard
                 .as_mut()
                 .expect("hop initialized")
-                .exec_interactive(&argv, cols, rows, &sender, &config)
+                .exec_interactive(&argv, cols, rows, &sender, &config, &shell)
                 .await;
             match first_result {
                 Ok(handle) => Ok(handle),
@@ -202,7 +204,7 @@ impl ConnectionPool {
                     guard
                         .as_mut()
                         .expect("hop reinitialized")
-                        .exec_interactive(&argv, cols, rows, &sender, &config)
+                        .exec_interactive(&argv, cols, rows, &sender, &config, &shell)
                         .await
                 }
                 Err(error) => Err(error),
