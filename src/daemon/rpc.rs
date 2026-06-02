@@ -6,12 +6,12 @@ use anyhow::{Result, anyhow};
 use tracing::warn;
 
 use crate::config::{ServerEntry, load_server_config};
-use crate::connection::CopySpec;
-use crate::jump::ServerListSource;
+use crate::types::CopySpec;
+use crate::types::ServerListSource;
 use crate::protocol::ServerListSourceStatus;
 
 use super::gateway::{ErrorKind, ExecRequest};
-use super::gateway_daemon::GatewayDaemonState;
+use super::DaemonState;
 use super::resolver::Resolver;
 
 /// Process an execute request by resolving routes and iterating candidates.
@@ -21,7 +21,7 @@ use super::resolver::Resolver;
 /// - Execution/Transport error → return immediately
 /// - All candidates fail → return the last error
 pub async fn process_execute(
-    state: &GatewayDaemonState,
+    state: &DaemonState,
     target: &str,
     request: &ExecRequest,
 ) -> Result<i32> {
@@ -29,7 +29,7 @@ pub async fn process_execute(
     let server_config =
         load_server_config(std::path::Path::new(&config.ssh.server_config_path))
             .unwrap_or_default();
-    let resolver = Resolver::new(&config, &server_config, &config.jump_hosts);
+    let resolver = Resolver::new(&config, &server_config, &config.gateways);
     let routes = resolver.resolve(target)?;
 
     let mut last_error: Option<anyhow::Error> = None;
@@ -57,7 +57,7 @@ pub async fn process_execute(
 ///
 /// Same multi-candidate fallback logic as process_execute.
 pub async fn process_copy(
-    state: &GatewayDaemonState,
+    state: &DaemonState,
     target: &str,
     spec: &CopySpec,
 ) -> Result<()> {
@@ -65,7 +65,7 @@ pub async fn process_copy(
     let server_config =
         load_server_config(std::path::Path::new(&config.ssh.server_config_path))
             .unwrap_or_default();
-    let resolver = Resolver::new(&config, &server_config, &config.jump_hosts);
+    let resolver = Resolver::new(&config, &server_config, &config.gateways);
     let routes = resolver.resolve(target)?;
 
     let mut last_error: Option<anyhow::Error> = None;
@@ -94,7 +94,7 @@ pub async fn process_copy(
 ///
 /// Returns a tuple of (server entries, source status) for building the RPC response.
 pub async fn process_list_servers(
-    state: &GatewayDaemonState,
+    state: &DaemonState,
 ) -> (Vec<ServerEntry>, Vec<(ServerListSource, ServerListSourceStatus)>) {
     let mut results: Vec<ServerEntry> = Vec::new();
     let mut source_status: Vec<(ServerListSource, ServerListSourceStatus)> = Vec::new();

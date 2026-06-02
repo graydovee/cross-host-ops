@@ -6,10 +6,10 @@ use std::path::Path;
 use anyhow::{Result, anyhow, bail};
 
 use crate::config::{
-    AppConfig, FallbackEntry, JumpHostConfig, ServerConfigFile,
+    AppConfig, FallbackEntry, GatewayConfig, ServerConfigFile,
     parse_ssh_config, resolve_server_entry, resolve_ssh_host,
 };
-use crate::jump::ServerListSource;
+use crate::types::ServerListSource;
 use crate::protocol::ServerListRow;
 
 use super::gateway::Route;
@@ -27,7 +27,7 @@ const LOCAL_SOURCE_ALIAS: &str = "local";
 pub struct Resolver<'a> {
     config: &'a AppConfig,
     server_config: &'a ServerConfigFile,
-    jump_hosts: &'a [JumpHostConfig],
+    gateways: &'a [GatewayConfig],
     /// Optional pre-computed merged server-list view from the aggregator.
     /// When provided, bare-alias resolution checks all sources for uniqueness
     /// and explicit `<jump_name>:<server_alias>` lookups verify the alias
@@ -39,12 +39,12 @@ impl<'a> Resolver<'a> {
     pub fn new(
         config: &'a AppConfig,
         server_config: &'a ServerConfigFile,
-        jump_hosts: &'a [JumpHostConfig],
+        gateways: &'a [GatewayConfig],
     ) -> Self {
         Self {
             config,
             server_config,
-            jump_hosts,
+            gateways,
             merged_rows: &[],
         }
     }
@@ -54,13 +54,13 @@ impl<'a> Resolver<'a> {
     pub fn with_merged_view(
         config: &'a AppConfig,
         server_config: &'a ServerConfigFile,
-        jump_hosts: &'a [JumpHostConfig],
+        gateways: &'a [GatewayConfig],
         merged_rows: &'a [ServerListRow],
     ) -> Self {
         Self {
             config,
             server_config,
-            jump_hosts,
+            gateways,
             merged_rows,
         }
     }
@@ -129,12 +129,12 @@ impl<'a> Resolver<'a> {
             );
         }
 
-        // Look up the jump host by name.
-        let jh = self
-            .jump_hosts
+        // Look up the gateway by name.
+        let gc = self
+            .gateways
             .iter()
-            .find(|jh| jh.name == jump_name)
-            .ok_or_else(|| anyhow!("jump host name '{}' not found", jump_name))?;
+            .find(|gc| gc.name() == jump_name)
+            .ok_or_else(|| anyhow!("gateway name '{}' not found", jump_name))?;
 
         // If we have a merged view, verify the server alias exists on this source.
         if !self.merged_rows.is_empty() {
@@ -145,16 +145,16 @@ impl<'a> Resolver<'a> {
                 .any(|row| row.source == source && row.server.alias == server_alias);
             if !found {
                 bail!(
-                    "server alias '{}' not found on jump host '{}'",
+                    "server alias '{}' not found on gateway '{}'",
                     server_alias,
                     jump_name
                 );
             }
         }
 
-        // Build a route through this jump host to the named server alias.
+        // Build a route through this gateway to the named server alias.
         let route = Route {
-            gateway_name: jh.name.clone(),
+            gateway_name: gc.name().to_string(),
             end_target: server_alias.to_string(),
         };
         Ok(vec![route])
@@ -265,17 +265,17 @@ impl<'a> Resolver<'a> {
                     }
                 }
                 FallbackEntry::JumpHost(name) => {
-                    // Look up the named [[jump_hosts]] entry
-                    let jh = self
-                        .jump_hosts
+                    // Look up the named [[gateways]] entry
+                    let gc = self
+                        .gateways
                         .iter()
-                        .find(|jh| jh.name == *name)
+                        .find(|gc| gc.name() == name.as_str())
                         .ok_or_else(|| anyhow!(
-                            "ssh.fallback references jump host '{}' which is not defined in [[jump_hosts]]",
+                            "ssh.fallback references gateway '{}' which is not defined in [[gateways]]",
                             name
                         ))?;
                     candidates.push(Route {
-                        gateway_name: jh.name.clone(),
+                        gateway_name: gc.name().to_string(),
                         end_target: input.to_string(),
                     });
                 }
@@ -381,10 +381,9 @@ pub fn derive_target_ip(input: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::{
-        AppConfig, FallbackEntry, JumpHostConfig, JumpHostFields, RhopdJumpHostFields,
-        JumpserverJumpHostFields, ServerConfigFile, ServerDefaults, ServerHostConfig,
+        AppConfig, FallbackEntry, GatewayConfig, RhopdGatewayConfig,
+        JumpserverGatewayConfig, ServerConfigFile, ServerDefaults, ServerHostConfig,
     };
-    use crate::jump::JumpHostKind;
     use std::collections::HashMap;
 
     #[test]
@@ -456,9 +455,9 @@ mod tests {
     fn resolver_explicit_local_found() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("web01", "10.0.0.1")]);
-        let jump_hosts: Vec<JumpHostConfig> = vec![];
+        let gateways: Vec<GatewayConfig> = vec![];
 
-        let resolver = Resolver::new(&config, &server_config, &jump_hosts);
+        let resolver = Resolver::new(&config, &server_config, &gateways);
         let routes = resolver.resolve("local:web01").unwrap();
 
         assert_eq!(routes.len(), 1);
@@ -470,9 +469,9 @@ mod tests {
     fn resolver_explicit_local_not_found() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("web01", "10.0.0.1")]);
-        let jump_hosts: Vec<JumpHostConfig> = vec![];
+        let gateways: Vec<GatewayConfig> = vec![];
 
-        let resolver = Resolver::new(&config, &server_config, &jump_hosts);
+        let resolver = Resolver::new(&config, &server_config, &gateways);
         let result = resolver.resolve("local:nonexistent");
 
         assert!(result.is_err());
@@ -484,17 +483,14 @@ mod tests {
     fn resolver_explicit_jump_host() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![]);
-        let jump_hosts = vec![JumpHostConfig {
+        let gateways = vec![GatewayConfig::Rhopd(RhopdGatewayConfig {
             name: "remote1".to_string(),
-            kind: JumpHostKind::Rhopd,
-            fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
-                address: "10.0.0.99:2222".to_string(),
-                identity_file: String::new(),
-                known_hosts_path: String::new(),
-            }),
-        }];
+            address: "10.0.0.99:2222".to_string(),
+            identity_file: String::new(),
+            known_hosts_path: String::new(),
+        })];
 
-        let resolver = Resolver::new(&config, &server_config, &jump_hosts);
+        let resolver = Resolver::new(&config, &server_config, &gateways);
         let routes = resolver.resolve("remote1:db01").unwrap();
 
         assert_eq!(routes.len(), 1);
@@ -506,9 +502,9 @@ mod tests {
     fn resolver_explicit_unknown_jump_host() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![]);
-        let jump_hosts: Vec<JumpHostConfig> = vec![];
+        let gateways: Vec<GatewayConfig> = vec![];
 
-        let resolver = Resolver::new(&config, &server_config, &jump_hosts);
+        let resolver = Resolver::new(&config, &server_config, &gateways);
         let result = resolver.resolve("unknown:db01");
 
         assert!(result.is_err());
@@ -520,9 +516,9 @@ mod tests {
     fn resolver_bare_alias_found_in_server_config() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("web01", "10.0.0.1")]);
-        let jump_hosts: Vec<JumpHostConfig> = vec![];
+        let gateways: Vec<GatewayConfig> = vec![];
 
-        let resolver = Resolver::new(&config, &server_config, &jump_hosts);
+        let resolver = Resolver::new(&config, &server_config, &gateways);
         let routes = resolver.resolve("web01").unwrap();
 
         assert_eq!(routes.len(), 1);
@@ -534,9 +530,9 @@ mod tests {
     fn resolver_bare_host_found_in_server_config() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("web01", "10.0.0.1")]);
-        let jump_hosts: Vec<JumpHostConfig> = vec![];
+        let gateways: Vec<GatewayConfig> = vec![];
 
-        let resolver = Resolver::new(&config, &server_config, &jump_hosts);
+        let resolver = Resolver::new(&config, &server_config, &gateways);
         let routes = resolver.resolve("10.0.0.1").unwrap();
 
         assert_eq!(routes.len(), 1);
@@ -552,23 +548,19 @@ mod tests {
         config.ssh.ssh_config_path = "/tmp/nonexistent_ssh_config".to_string();
 
         let server_config = ServerConfigFile::default();
-        let jump_hosts = vec![JumpHostConfig {
+        let gateways = vec![GatewayConfig::Jumpserver(JumpserverGatewayConfig {
             name: "test-jump".to_string(),
-            kind: JumpHostKind::Jumpserver,
-            fields: JumpHostFields::Jumpserver(JumpserverJumpHostFields {
-                host: "jump.example.com".to_string(),
-                port: 22,
-                user: "admin".to_string(),
-                identity_file: String::new(),
-                pubkey_accepted_algorithms: None,
-                menu_prompt_contains: "Opt".to_string(),
-                mfa_prompt_contains: "MFA".to_string(),
-                shell_prompt_suffixes: vec!["$ ".to_string(), "# ".to_string()],
-                mfa: crate::config::MfaConfig::default(),
-            }),
-        }];
+            host: "jump.example.com".to_string(),
+            port: 22,
+            user: "admin".to_string(),
+            identity_file: String::new(),
+            pubkey_accepted_algorithms: None,
+            totp_secret_base32: String::new(),
+            totp_digits: 6,
+            totp_period: 30,
+        })];
 
-        let resolver = Resolver::new(&config, &server_config, &jump_hosts);
+        let resolver = Resolver::new(&config, &server_config, &gateways);
         let routes = resolver.resolve("somehost").unwrap();
 
         assert_eq!(routes.len(), 1);
@@ -584,9 +576,9 @@ mod tests {
         config.ssh.ssh_config_path = "/tmp/nonexistent_ssh_config".to_string();
 
         let server_config = ServerConfigFile::default();
-        let jump_hosts: Vec<JumpHostConfig> = vec![];
+        let gateways: Vec<GatewayConfig> = vec![];
 
-        let resolver = Resolver::new(&config, &server_config, &jump_hosts);
+        let resolver = Resolver::new(&config, &server_config, &gateways);
         let result = resolver.resolve("somehost");
 
         assert!(result.is_err());
@@ -600,9 +592,9 @@ mod tests {
         config.ssh.ssh_config_path = "/tmp/nonexistent_ssh_config".to_string();
 
         let server_config = ServerConfigFile::default();
-        let jump_hosts: Vec<JumpHostConfig> = vec![];
+        let gateways: Vec<GatewayConfig> = vec![];
 
-        let resolver = Resolver::new(&config, &server_config, &jump_hosts);
+        let resolver = Resolver::new(&config, &server_config, &gateways);
         let result = resolver.resolve("somehost");
 
         assert!(result.is_err());
@@ -616,23 +608,19 @@ mod tests {
         config.ssh.ssh_config_path = "/tmp/nonexistent_ssh_config".to_string();
 
         let server_config = make_server_config_with(vec![("web01", "10.0.0.1")]);
-        let jump_hosts = vec![JumpHostConfig {
+        let gateways = vec![GatewayConfig::Jumpserver(JumpserverGatewayConfig {
             name: "test-jump".to_string(),
-            kind: JumpHostKind::Jumpserver,
-            fields: JumpHostFields::Jumpserver(JumpserverJumpHostFields {
-                host: "jump.example.com".to_string(),
-                port: 22,
-                user: "admin".to_string(),
-                identity_file: String::new(),
-                pubkey_accepted_algorithms: None,
-                menu_prompt_contains: "Opt".to_string(),
-                mfa_prompt_contains: "MFA".to_string(),
-                shell_prompt_suffixes: vec!["$ ".to_string(), "# ".to_string()],
-                mfa: crate::config::MfaConfig::default(),
-            }),
-        }];
+            host: "jump.example.com".to_string(),
+            port: 22,
+            user: "admin".to_string(),
+            identity_file: String::new(),
+            pubkey_accepted_algorithms: None,
+            totp_secret_base32: String::new(),
+            totp_digits: 6,
+            totp_period: 30,
+        })];
 
-        let resolver = Resolver::new(&config, &server_config, &jump_hosts);
+        let resolver = Resolver::new(&config, &server_config, &gateways);
         let routes = resolver.resolve("web01").unwrap();
 
         // Server config match should be returned, not the jumpserver fallback
@@ -645,9 +633,9 @@ mod tests {
     fn resolver_idempotent() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("web01", "10.0.0.1")]);
-        let jump_hosts: Vec<JumpHostConfig> = vec![];
+        let gateways: Vec<GatewayConfig> = vec![];
 
-        let resolver = Resolver::new(&config, &server_config, &jump_hosts);
+        let resolver = Resolver::new(&config, &server_config, &gateways);
         let routes1 = resolver.resolve("web01").unwrap();
         let routes2 = resolver.resolve("web01").unwrap();
 
@@ -662,9 +650,9 @@ mod tests {
     fn resolver_derived_ip_matches_server_host() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("web01", "192.0.2.163")]);
-        let jump_hosts: Vec<JumpHostConfig> = vec![];
+        let gateways: Vec<GatewayConfig> = vec![];
 
-        let resolver = Resolver::new(&config, &server_config, &jump_hosts);
+        let resolver = Resolver::new(&config, &server_config, &gateways);
         let routes = resolver.resolve("foo-192-0-2-163").unwrap();
 
         assert_eq!(routes.len(), 1);
@@ -732,19 +720,16 @@ mod tests {
     fn resolver_merged_view_bare_alias_unique() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("web01", "10.0.0.1")]);
-        let jump_hosts = vec![JumpHostConfig {
+        let gateways = vec![GatewayConfig::Rhopd(RhopdGatewayConfig {
             name: "remote1".to_string(),
-            kind: JumpHostKind::Rhopd,
-            fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
-                address: "10.0.0.99:2222".to_string(),
-                identity_file: String::new(),
-                known_hosts_path: String::new(),
-            }),
-        }];
+            address: "10.0.0.99:2222".to_string(),
+            identity_file: String::new(),
+            known_hosts_path: String::new(),
+        })];
         let merged_rows = make_merged_rows();
 
         let resolver =
-            Resolver::with_merged_view(&config, &server_config, &jump_hosts, &merged_rows);
+            Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
 
         // "db01" is unique (only in remote1)
         let routes = resolver.resolve("db01").unwrap();
@@ -757,19 +742,16 @@ mod tests {
     fn resolver_merged_view_bare_alias_unique_local() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("web01", "10.0.0.1")]);
-        let jump_hosts = vec![JumpHostConfig {
+        let gateways = vec![GatewayConfig::Rhopd(RhopdGatewayConfig {
             name: "remote1".to_string(),
-            kind: JumpHostKind::Rhopd,
-            fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
-                address: "10.0.0.99:2222".to_string(),
-                identity_file: String::new(),
-                known_hosts_path: String::new(),
-            }),
-        }];
+            address: "10.0.0.99:2222".to_string(),
+            identity_file: String::new(),
+            known_hosts_path: String::new(),
+        })];
         let merged_rows = make_merged_rows();
 
         let resolver =
-            Resolver::with_merged_view(&config, &server_config, &jump_hosts, &merged_rows);
+            Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
 
         // "web01" is unique (only in local)
         let routes = resolver.resolve("web01").unwrap();
@@ -782,19 +764,16 @@ mod tests {
     fn resolver_merged_view_bare_alias_ambiguous() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("shared", "10.0.0.5")]);
-        let jump_hosts = vec![JumpHostConfig {
+        let gateways = vec![GatewayConfig::Rhopd(RhopdGatewayConfig {
             name: "remote1".to_string(),
-            kind: JumpHostKind::Rhopd,
-            fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
-                address: "10.0.0.99:2222".to_string(),
-                identity_file: String::new(),
-                known_hosts_path: String::new(),
-            }),
-        }];
+            address: "10.0.0.99:2222".to_string(),
+            identity_file: String::new(),
+            known_hosts_path: String::new(),
+        })];
         let merged_rows = make_merged_rows();
 
         let resolver =
-            Resolver::with_merged_view(&config, &server_config, &jump_hosts, &merged_rows);
+            Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
 
         // "shared" exists in both local and remote1 — should be ambiguous
         let result = resolver.resolve("shared");
@@ -813,19 +792,16 @@ mod tests {
     fn resolver_merged_view_explicit_jump_host_found() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("web01", "10.0.0.1")]);
-        let jump_hosts = vec![JumpHostConfig {
+        let gateways = vec![GatewayConfig::Rhopd(RhopdGatewayConfig {
             name: "remote1".to_string(),
-            kind: JumpHostKind::Rhopd,
-            fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
-                address: "10.0.0.99:2222".to_string(),
-                identity_file: String::new(),
-                known_hosts_path: String::new(),
-            }),
-        }];
+            address: "10.0.0.99:2222".to_string(),
+            identity_file: String::new(),
+            known_hosts_path: String::new(),
+        })];
         let merged_rows = make_merged_rows();
 
         let resolver =
-            Resolver::with_merged_view(&config, &server_config, &jump_hosts, &merged_rows);
+            Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
 
         // Explicit "remote1:db01" should work
         let routes = resolver.resolve("remote1:db01").unwrap();
@@ -838,19 +814,16 @@ mod tests {
     fn resolver_merged_view_explicit_jump_host_not_found() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("web01", "10.0.0.1")]);
-        let jump_hosts = vec![JumpHostConfig {
+        let gateways = vec![GatewayConfig::Rhopd(RhopdGatewayConfig {
             name: "remote1".to_string(),
-            kind: JumpHostKind::Rhopd,
-            fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
-                address: "10.0.0.99:2222".to_string(),
-                identity_file: String::new(),
-                known_hosts_path: String::new(),
-            }),
-        }];
+            address: "10.0.0.99:2222".to_string(),
+            identity_file: String::new(),
+            known_hosts_path: String::new(),
+        })];
         let merged_rows = make_merged_rows();
 
         let resolver =
-            Resolver::with_merged_view(&config, &server_config, &jump_hosts, &merged_rows);
+            Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
 
         // Explicit "remote1:nonexistent" should fail
         let result = resolver.resolve("remote1:nonexistent");
@@ -863,11 +836,11 @@ mod tests {
     fn resolver_merged_view_explicit_local_found() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("web01", "10.0.0.1")]);
-        let jump_hosts: Vec<JumpHostConfig> = vec![];
+        let gateways: Vec<GatewayConfig> = vec![];
         let merged_rows = make_merged_rows();
 
         let resolver =
-            Resolver::with_merged_view(&config, &server_config, &jump_hosts, &merged_rows);
+            Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
 
         // Explicit "local:web01" should work
         let routes = resolver.resolve("local:web01").unwrap();
@@ -884,25 +857,21 @@ mod tests {
         config.ssh.ssh_config_path = "/tmp/nonexistent_ssh_config".to_string();
 
         let server_config = ServerConfigFile::default();
-        let jump_hosts = vec![JumpHostConfig {
+        let gateways = vec![GatewayConfig::Jumpserver(JumpserverGatewayConfig {
             name: "test-jump".to_string(),
-            kind: JumpHostKind::Jumpserver,
-            fields: JumpHostFields::Jumpserver(JumpserverJumpHostFields {
-                host: "jump.example.com".to_string(),
-                port: 22,
-                user: "admin".to_string(),
-                identity_file: String::new(),
-                pubkey_accepted_algorithms: None,
-                menu_prompt_contains: "Opt".to_string(),
-                mfa_prompt_contains: "MFA".to_string(),
-                shell_prompt_suffixes: vec!["$ ".to_string(), "# ".to_string()],
-                mfa: crate::config::MfaConfig::default(),
-            }),
-        }];
+            host: "jump.example.com".to_string(),
+            port: 22,
+            user: "admin".to_string(),
+            identity_file: String::new(),
+            pubkey_accepted_algorithms: None,
+            totp_secret_base32: String::new(),
+            totp_digits: 6,
+            totp_period: 30,
+        })];
         let merged_rows = make_merged_rows();
 
         let resolver =
-            Resolver::with_merged_view(&config, &server_config, &jump_hosts, &merged_rows);
+            Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
 
         // "unknown_host" is not in the merged view — should fall through to fallback
         let routes = resolver.resolve("unknown_host").unwrap();

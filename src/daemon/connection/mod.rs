@@ -10,7 +10,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::connection::CopySpec;
+use crate::types::CopySpec;
 use crate::protocol::ServerEvent;
 
 // ---------------------------------------------------------------------------

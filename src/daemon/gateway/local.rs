@@ -17,7 +17,7 @@ use crate::config::{
     AppConfig, DirectAuth, ServerEntry, list_server_entries, load_server_config,
     resolve_server_entry,
 };
-use crate::connection::types::CopySpec;
+use crate::types::CopySpec;
 
 use super::auth::AuthPrompter;
 use super::{
@@ -375,7 +375,7 @@ impl Gateway for LocalGateway {
     }
 
     fn kind(&self) -> GatewayKind {
-        GatewayKind::Local
+        GatewayKind::Direct
     }
 
     fn name(&self) -> &str {

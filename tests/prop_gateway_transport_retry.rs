@@ -15,7 +15,7 @@ use proptest::prelude::*;
 use tokio::sync::mpsc;
 
 use rhop::config::ServerEntry;
-use rhop::connection::CopySpec;
+use rhop::types::CopySpec;
 use rhop::daemon::gateway::{
     ErrorKind, ExecRequest, Gateway, GatewayError, GatewayKind, InteractiveHandle,
     InteractiveRequest,
@@ -149,7 +149,7 @@ impl Gateway for RetryMockGateway {
     }
 
     fn kind(&self) -> GatewayKind {
-        GatewayKind::Local
+        GatewayKind::Direct
     }
 
     fn name(&self) -> &str {

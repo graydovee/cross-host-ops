@@ -23,15 +23,13 @@ use crate::config::{
     AppConfig, ClientConfig, JumpHostConfig, JumpHostFields, RhopdJumpHostFields,
     default_config_path, expand_tilde, parse_duration, RESERVED_NAMES,
 };
-use crate::connection::{CopyDirection, CopySpec};
+use crate::types::{CopyDirection, CopySpec, AddressDefaults, RemoteAddress, ExecPtyFlags, effective_pty_decision};
 use crate::exit_codes::cap_remote_exit_code;
-use crate::jump::address::{AddressDefaults, RemoteAddress};
-use crate::jump::pty::{ExecPtyFlags, effective_pty_decision};
-use crate::jump::JumpHostKind;
+use crate::daemon::gateway::GatewayKind;
 use crate::protocol::rpc;
-use crate::remote::{
-    KnownHostState, fetch_remote_host_key, inspect_known_host, load_client_config,
-    normalize_remote_paths, parse_remote_target,
+use crate::daemon::gateway::auth::{
+    KnownHostState, fetch_remote_host_key, inspect_known_host,
+    normalize_paths as normalize_remote_paths, parse_remote_target, trust_known_host,
 };
 
 /// Output format for CLI responses.
@@ -1045,12 +1043,12 @@ enum ClientAccess {
 async fn connect_data_client(
     access: ClientAccess,
 ) -> Result<rpc::rhop_rpc_client::RhopRpcClient<Channel>> {
-    let client_config = load_client_config()?;
+    let client_config = ClientConfig::load()?;
     connect_local_data_client(&client_config, access).await
 }
 
 async fn connect_local_copy_client() -> Result<rpc::rhop_rpc_client::RhopRpcClient<Channel>> {
-    let client_config = load_client_config()?;
+    let client_config = ClientConfig::load()?;
     connect_local_data_client(&client_config, ClientAccess::AutoStart).await
 }
 
@@ -1183,7 +1181,7 @@ fn daemon_path() -> Result<PathBuf> {
 }
 
 fn local_socket_path() -> Result<PathBuf> {
-    let client_config = load_client_config()?;
+    let client_config = ClientConfig::load()?;
     Ok(PathBuf::from(client_config.local.socket_path))
 }
 
@@ -1255,11 +1253,11 @@ async fn remote_connect(
 
     // --- Step 4: SSH host-key trust flow ---
     let (identity_file, known_hosts_path) =
-        normalize_remote_paths(identity_file_override, known_hosts_override)?;
+        normalize_remote_paths(identity_file_override.as_deref(), known_hosts_override.as_deref())?;
 
     let target = parse_remote_target(&remote_addr.format())?;
     let public_key = fetch_remote_host_key(&target, &identity_file).await?;
-    let state = inspect_known_host(&target, &public_key, &std::path::PathBuf::from(&known_hosts_path));
+    let state = inspect_known_host(&target.host, target.port, &public_key, &std::path::PathBuf::from(&known_hosts_path));
     match state {
         KnownHostState::Known => {}
         KnownHostState::Unknown {
@@ -1274,8 +1272,9 @@ async fn remote_connect(
             if !prompt_for_confirmation("trust this host key and continue")? {
                 bail!("host key not trusted");
             }
-            crate::remote::trust_known_host(
-                &target,
+            trust_known_host(
+                &target.host,
+                target.port,
                 &public_key,
                 &std::path::PathBuf::from(&known_hosts_path),
             )?;
@@ -1296,7 +1295,7 @@ async fn remote_connect(
     // --- Step 5: Persist the new entry to the config file ---
     let new_entry = JumpHostConfig {
         name: name.clone(),
-        kind: JumpHostKind::Rhopd,
+        kind: GatewayKind::Rhopd,
         fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
             address: remote_addr.format(),
             identity_file: identity_file.clone(),
@@ -1341,7 +1340,7 @@ async fn remote_remove(name: String) -> Result<i32> {
             );
             Ok(1)
         }
-        Some(entry) if entry.kind != JumpHostKind::Rhopd => {
+        Some(entry) if entry.kind != GatewayKind::Rhopd => {
             eprintln!(
                 "error: name '{}' is a {} jump host; quick-remove only manages rhopd entries",
                 name, entry.kind

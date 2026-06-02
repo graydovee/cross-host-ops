@@ -26,6 +26,117 @@ use crate::config::{AppConfig, MfaConfig, default_known_hosts_path, expand_tilde
 type HmacSha1 = Hmac<Sha1>;
 
 // ---------------------------------------------------------------------------
+// Remote target parsing
+// ---------------------------------------------------------------------------
+
+const DEFAULT_REMOTE_PORT: u16 = 2222;
+const DEFAULT_REMOTE_USER: &str = "rhop";
+
+/// A parsed remote target (user@host:port).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteTarget {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+}
+
+impl RemoteTarget {
+    pub fn address(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+}
+
+/// Parse a remote target string of the form `[user@]host[:port]`.
+/// Defaults to user "rhop" and port 2222 when not specified.
+pub fn parse_remote_target(input: &str) -> Result<RemoteTarget> {
+    if input.trim().is_empty() {
+        bail!("remote target must not be empty");
+    }
+
+    let (user, host_port) = match input.rsplit_once('@') {
+        Some((user, host_port)) if !user.is_empty() => (user.to_string(), host_port),
+        _ => (DEFAULT_REMOTE_USER.to_string(), input),
+    };
+
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && !port.is_empty() => {
+            let port = port
+                .parse::<u16>()
+                .with_context(|| format!("invalid remote port in target {}", input))?;
+            (host.to_string(), port)
+        }
+        _ => (host_port.to_string(), DEFAULT_REMOTE_PORT),
+    };
+
+    if host.trim().is_empty() {
+        bail!("remote host must not be empty");
+    }
+
+    Ok(RemoteTarget { host, port, user })
+}
+
+/// Connect to a remote target and retrieve its host key.
+/// Used by the CLI trust flow when adding new rhopd hosts.
+pub async fn fetch_remote_host_key(target: &RemoteTarget, identity_file: &str) -> Result<ssh_key::PublicKey> {
+    use std::sync::Mutex;
+
+    struct HostKeyCapture {
+        seen: Mutex<Option<ssh_key::PublicKey>>,
+    }
+
+    struct CaptureHandler {
+        capture: Arc<HostKeyCapture>,
+    }
+
+    impl client::Handler for CaptureHandler {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            server_public_key: &ssh_key::PublicKey,
+        ) -> Result<bool, Self::Error> {
+            let mut seen = self.capture.seen.lock().expect("host key mutex poisoned");
+            *seen = Some(server_public_key.clone());
+            // Accept all keys — we capture and verify externally.
+            Ok(true)
+        }
+    }
+
+    let capture = Arc::new(HostKeyCapture {
+        seen: Mutex::new(None),
+    });
+    let handler = CaptureHandler {
+        capture: capture.clone(),
+    };
+    let client_config = Arc::new(client::Config::default());
+    let mut handle = client::connect(client_config, (target.host.as_str(), target.port), handler)
+        .await
+        .with_context(|| format!("failed to connect to {}", target.address()))?;
+
+    // Authenticate to complete handshake
+    let key = load_secret_key(identity_file, None)
+        .with_context(|| format!("failed to load key {}", identity_file))?;
+    let hash_alg = handle.best_supported_rsa_hash().await?.flatten();
+    let _auth = handle
+        .authenticate_publickey(
+            &target.user,
+            PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg),
+        )
+        .await?;
+
+    let host_key = capture
+        .seen
+        .lock()
+        .expect("host key mutex poisoned")
+        .clone()
+        .ok_or_else(|| anyhow!("server did not present a host key"))?;
+    let _ = handle
+        .disconnect(russh::Disconnect::ByApplication, "done", "en")
+        .await;
+    Ok(host_key)
+}
+
+// ---------------------------------------------------------------------------
 // AuthPrompter type alias and AuthPrompt struct
 // ---------------------------------------------------------------------------
 

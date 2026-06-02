@@ -11,10 +11,11 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, RwLock};
 
-use crate::config::{JumpHostConfig, JumpHostFields, ServerEntry};
-use crate::connection::CopySpec;
+use crate::config::{GatewayConfig, ServerEntry};
+use crate::types::CopySpec;
 use crate::protocol::ServerEvent;
 
 use self::auth::AuthPrompter;
@@ -62,11 +63,22 @@ pub trait Gateway: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// Identifies the concrete type of a Gateway.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GatewayKind {
-    Local,
     Rhopd,
     Jumpserver,
+    Direct,
+}
+
+impl std::fmt::Display for GatewayKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GatewayKind::Direct => write!(f, "direct"),
+            GatewayKind::Jumpserver => write!(f, "jumpserver"),
+            GatewayKind::Rhopd => write!(f, "rhopd"),
+        }
+    }
 }
 
 /// A resolved route from the Resolver: which gateway to use and what
@@ -219,12 +231,12 @@ pub fn is_resolution_error(error: &anyhow::Error) -> bool {
 
 /// Construct all Gateways from the loaded configuration.
 /// Always creates one LocalGateway named "local".
-/// Creates one RhopdGateway or JumpserverGateway per `[[jump_hosts]]` entry.
+/// Creates one RhopdGateway or JumpserverGateway per `[[gateways]]` entry.
 /// No network connections are established during construction.
 pub fn build_gateways(
     config: Arc<RwLock<crate::config::AppConfig>>,
     server_config_path: &str,
-    jump_hosts: &[JumpHostConfig],
+    gateways_config: &[GatewayConfig],
     auth_prompter: Arc<AuthPrompter>,
 ) -> HashMap<String, Arc<dyn Gateway>> {
     let mut gateways: HashMap<String, Arc<dyn Gateway>> = HashMap::new();
@@ -256,28 +268,28 @@ pub fn build_gateways(
         )),
     );
 
-    // Create one gateway per jump_hosts entry.
-    for jh in jump_hosts {
-        let gateway: Arc<dyn Gateway> = match &jh.fields {
-            JumpHostFields::Rhopd(fields) => Arc::new(RhopdGateway::new(
-                jh.name.clone(),
-                fields.address.clone(),
-                fields.identity_file.clone(),
-                fields.known_hosts_path.clone(),
+    // Create one gateway per gateways_config entry.
+    for gc in gateways_config {
+        let gateway: Arc<dyn Gateway> = match gc {
+            GatewayConfig::Rhopd(c) => Arc::new(RhopdGateway::new(
+                c.name.clone(),
+                c.address.clone(),
+                c.identity_file.clone(),
+                c.known_hosts_path.clone(),
                 auth_prompter.clone(),
             )),
-            JumpHostFields::Jumpserver(fields) => Arc::new(JumpserverGateway::new(
-                jh.name.clone(),
+            GatewayConfig::Jumpserver(c) => Arc::new(JumpserverGateway::new(
+                c.name.clone(),
                 config.clone(),
-                fields.clone(),
+                c.clone(),
                 auth_prompter.clone(),
             )),
-            JumpHostFields::Direct(_fields) => {
-                // Direct jump hosts are treated as a LocalGateway with their own name.
+            GatewayConfig::Direct(c) => {
+                // Direct gateways are treated as a LocalGateway with their own name.
                 // They use the same server.toml resolution as "local" but route
                 // through the named gateway for resolver distinction.
                 Arc::new(LocalGateway::new(
-                    jh.name.clone(),
+                    c.name.clone(),
                     config.clone(),
                     server_config_path.to_string(),
                     auth_prompter.clone(),
@@ -286,7 +298,7 @@ pub fn build_gateways(
                 ))
             }
         };
-        gateways.insert(jh.name.clone(), gateway);
+        gateways.insert(gc.name().to_string(), gateway);
     }
 
     gateways

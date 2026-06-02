@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use proptest::prelude::*;
 
 use rhop::config::{DirectAuth, ServerEntry};
-use rhop::connection::CopySpec;
+use rhop::types::CopySpec;
 use rhop::daemon::gateway::{
     ErrorKind, ExecRequest, Gateway, GatewayError, GatewayKind, InteractiveHandle,
     InteractiveRequest,
@@ -55,7 +55,7 @@ impl Gateway for OkGateway {
     }
 
     fn kind(&self) -> GatewayKind {
-        GatewayKind::Local
+        GatewayKind::Direct
     }
 
     fn name(&self) -> &str {

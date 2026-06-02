@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
 use crate::config::{AppConfig, DirectAuth};
-use crate::connection::types::{CopyDirection, CopySpec};
+use crate::types::{CopyDirection, CopySpec};
 use crate::protocol::ServerEvent;
 
 use super::shared::build_final_command;

@@ -12,7 +12,7 @@
 
 use proptest::prelude::*;
 
-use rhop::connection::wrap_in_shell;
+use rhop::daemon::connection::shared::wrap_in_shell;
 
 /// Strategy to generate a random command string of 0–200 chars including
 /// single quotes, backslashes, spaces, and other special characters.

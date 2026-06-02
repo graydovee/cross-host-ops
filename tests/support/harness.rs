@@ -13,7 +13,7 @@ use proptest::prelude::*;
 
 use rhop::config::{AppConfig, DirectAuth, ServerEntry};
 use rhop::daemon::test_support::make_test_rpc_service;
-use rhop::jump::JumpHostKind;
+use rhop::daemon::gateway::GatewayKind;
 use rhop::protocol::rpc;
 use rhop::protocol::rpc::rhop_rpc_client::RhopRpcClient;
 
@@ -278,14 +278,14 @@ impl TestHarness {
     /// - `Rhopd` → `"<rhopd_alias>:<end_alias>"` (explicit jump-host qualification)
     pub fn target_for(
         &self,
-        route_kind: JumpHostKind,
+        route_kind: GatewayKind,
         end_alias: &str,
         _remote_path: &str,
     ) -> String {
         match route_kind {
-            JumpHostKind::Direct => end_alias.to_string(),
-            JumpHostKind::Jumpserver => end_alias.to_string(),
-            JumpHostKind::Rhopd => format!("rhopd:{}", end_alias),
+            GatewayKind::Direct => end_alias.to_string(),
+            GatewayKind::Jumpserver => end_alias.to_string(),
+            GatewayKind::Rhopd => format!("rhopd:{}", end_alias),
         }
     }
 
@@ -373,11 +373,11 @@ impl Drop for TestHarness {
 /// Proptest strategy that generates arbitrary `JumpHostKind` values.
 /// Used by property tests P1–P4 to parameterize over route kinds.
 #[allow(dead_code)]
-pub fn route_kind_strategy() -> impl Strategy<Value = JumpHostKind> {
+pub fn route_kind_strategy() -> impl Strategy<Value = GatewayKind> {
     prop_oneof![
-        Just(JumpHostKind::Direct),
-        Just(JumpHostKind::Jumpserver),
-        Just(JumpHostKind::Rhopd),
+        Just(GatewayKind::Direct),
+        Just(GatewayKind::Jumpserver),
+        Just(GatewayKind::Rhopd),
     ]
 }
 

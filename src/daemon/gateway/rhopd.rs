@@ -15,11 +15,11 @@ use tower::service_fn;
 use tracing::{debug, info};
 
 use crate::config::ServerEntry;
-use crate::connection::CopySpec;
+use crate::types::CopySpec;
 use crate::protocol::rpc;
-use crate::remote::{parse_remote_target, remote_subsystem_name};
+use crate::daemon::ssh_server::remote_subsystem_name;
 
-use super::auth::{normalize_paths, AuthPrompter, ClientHandler};
+use super::auth::{normalize_paths, parse_remote_target, AuthPrompter, ClientHandler};
 use super::{
     ExecRequest, Gateway, GatewayError, GatewayKind, InteractiveHandle, InteractiveRequest,
     is_transport_error,

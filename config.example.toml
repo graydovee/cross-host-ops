@@ -6,7 +6,7 @@
 # - remote daemon listener disabled
 # - target resolution: derive IP from the first CLI argument
 # - direct SSH only: the derived IP must match a Host entry in ~/.ssh/config
-# - jump hosts: none configured
+# - gateways: none configured
 # - command review: disabled by default
 #
 # Copy only the sections you need into ~/.rhop/config.toml.
@@ -34,7 +34,7 @@
 #
 # Fallback resolution order. Each entry is either:
 #   "local"       — resolve via local ~/.ssh/config
-#   "<name>"      — route through the named [[jump_hosts]] entry
+#   "<name>"      — route through the named [[gateways]] entry
 # Default: ["local"]
 # fallback = ["local", "corp-jump"]
 # pty = true
@@ -46,49 +46,44 @@
 # [copy]
 # preserve_mode = true
 
-# --- Jump Hosts ---
+# --- Gateways ---
 #
-# Jump hosts define how the local daemon reaches end targets that are not
-# directly reachable via ~/.ssh/config. Each entry has a unique name, a kind,
-# and kind-specific fields. The name is used in target resolution:
+# Gateways define how the local daemon reaches end targets that are not
+# directly reachable via ~/.ssh/config. Each entry has a unique name and a
+# `kind` field that selects the gateway type. The name is used in target
+# resolution:
 #   rhop exec <name>:<server_alias> <cmd>
 #
 # Supported kinds: "rhopd", "jumpserver", "direct"
 
-# Example: an interactive jumpserver with MFA
-# [[jump_hosts]]
-# name = "corp-jump"
+# Example: an interactive jumpserver with TOTP MFA
+# [[gateways]]
 # kind = "jumpserver"
+# name = "corp-jump"
 # host = "bastion.example.com"
 # port = 20221
 # user = "user@example.com"
 # identity_file = "~/.ssh/id_rsa"
-# menu_prompt_contains = "Opt"
-# mfa_prompt_contains = "MFA"
-# shell_prompt_suffixes = ["$ ", "# "]
-# [jump_hosts.mfa]
 # totp_secret_base32 = "REPLACE_ME"
-# digits = 6
-# period = 30
-# digest = "sha1"
+# totp_digits = 6
+# totp_period = 30
 
 # Example: a remote rhopd daemon reachable over SSH
-# [[jump_hosts]]
-# name = "prod"
+# [[gateways]]
 # kind = "rhopd"
+# name = "prod"
 # address = "rhop@prod-bastion.example.com:2222"
 # identity_file = "~/.ssh/id_ed25519"
 # known_hosts_path = "~/.rhop/known_hosts"
 
 # Example: a named direct SSH entry (useful for explicit routing)
-# [[jump_hosts]]
-# name = "lab"
+# [[gateways]]
 # kind = "direct"
+# name = "lab"
 # host = "10.0.1.50"
 # port = 22
 # user = "admin"
-# [jump_hosts.auth]
-# key = { identity_file = "~/.ssh/id_rsa" }
+# identity_file = "~/.ssh/id_rsa"
 
 # Enable this only when you want LLM command review before execution.
 # If api_key is omitted, rhop will try RHOP_REVIEW_API_KEY first, then OPENAI_API_KEY.

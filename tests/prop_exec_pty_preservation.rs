@@ -20,7 +20,7 @@ mod support;
 use proptest::prelude::*;
 
 use rhop::config::SshConfig;
-use rhop::jump::pty::{ExecPtyFlags, effective_pty_decision};
+use rhop::types::{ExecPtyFlags, effective_pty_decision};
 use rhop::protocol::rpc;
 
 use support::in_process_rpc::InProcessRpcHarness;

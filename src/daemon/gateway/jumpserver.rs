@@ -12,9 +12,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
-use crate::config::{AppConfig, JumpserverJumpHostFields, ServerEntry};
-use crate::connection::resolver::derive_target_ip;
-use crate::connection::types::CopySpec;
+use crate::config::{AppConfig, JumpserverGatewayConfig, MfaConfig, ServerEntry};
+use crate::daemon::resolver::derive_target_ip;
+use crate::types::CopySpec;
 
 use super::auth::{
     AuthPrompt, AuthPrompter, ClientHandler, authenticate_with_key, connect_handle,
@@ -31,13 +31,24 @@ use crate::daemon::connection::{
 };
 
 // ---------------------------------------------------------------------------
+// Hardcoded prompt detection constants
+// ---------------------------------------------------------------------------
+
+/// Hardcoded prompt detection strings for jumpserver interactive shells.
+/// These values are specific to the jumpserver protocol and do not vary
+/// between deployments — only the auth credentials differ.
+const MENU_PROMPT_CONTAINS: &str = "Opt";
+const MFA_PROMPT_CONTAINS: &str = "MFA";
+const SHELL_PROMPT_SUFFIXES: &[&str] = &["$ ", "# "];
+
+// ---------------------------------------------------------------------------
 // JumpserverGateway
 // ---------------------------------------------------------------------------
 
 pub struct JumpserverGateway {
     gateway_name: String,
     config: Arc<RwLock<AppConfig>>,
-    fields: JumpserverJumpHostFields,
+    fields: JumpserverGatewayConfig,
     auth_prompter: Arc<AuthPrompter>,
     /// Single PTY shell session (lazily connected, serial access).
     shell: AsyncMutex<Option<ShellState>>,
@@ -58,7 +69,7 @@ impl JumpserverGateway {
     pub fn new(
         gateway_name: String,
         config: Arc<RwLock<AppConfig>>,
-        fields: JumpserverJumpHostFields,
+        fields: JumpserverGatewayConfig,
         auth_prompter: Arc<AuthPrompter>,
     ) -> Self {
         Self {
@@ -97,14 +108,22 @@ impl JumpserverGateway {
         let app_config = self.config.read().await.clone();
         let mut handle = connect_handle(&self.fields.host, self.fields.port, &app_config).await?;
 
+        // Build MfaConfig from flat gateway config fields.
+        let mfa_config = MfaConfig {
+            totp_secret_base32: self.fields.totp_secret_base32.clone(),
+            digits: self.fields.totp_digits,
+            period: self.fields.totp_period,
+            ..MfaConfig::default()
+        };
+
         // Authenticate with key, handling MFA via TOTP or AuthPrompter.
-        let mfa = if self.fields.mfa.totp_secret_base32.is_empty() {
+        let mfa = if mfa_config.totp_secret_base32.is_empty() {
             None
         } else {
-            Some(&self.fields.mfa)
+            Some(&mfa_config)
         };
         let auth_prompter: Option<&AuthPrompter> =
-            if self.fields.mfa.totp_secret_base32.is_empty() {
+            if mfa_config.totp_secret_base32.is_empty() {
                 Some(self.auth_prompter.as_ref())
             } else {
                 // Auto-TOTP: no need for auth prompter during keyboard-interactive
@@ -127,7 +146,7 @@ impl JumpserverGateway {
 
         let mut shell = PtyShell::new(
             channel,
-            self.fields.shell_prompt_suffixes.clone(),
+            SHELL_PROMPT_SUFFIXES.iter().map(|s| s.to_string()).collect(),
             app_config.ssh.connect_timeout,
         );
         shell.request_shell().await?;
@@ -153,9 +172,15 @@ impl JumpserverGateway {
             let text = shell.pending_text();
 
             // Check for MFA prompt
-            if !mfa_sent && text.contains(&self.fields.mfa_prompt_contains) {
-                let code = if !self.fields.mfa.totp_secret_base32.is_empty() {
-                    super::auth::generate_totp(&self.fields.mfa)?
+            if !mfa_sent && text.contains(MFA_PROMPT_CONTAINS) {
+                let code = if !self.fields.totp_secret_base32.is_empty() {
+                    let mfa_config = MfaConfig {
+                        totp_secret_base32: self.fields.totp_secret_base32.clone(),
+                        digits: self.fields.totp_digits,
+                        period: self.fields.totp_period,
+                        ..MfaConfig::default()
+                    };
+                    super::auth::generate_totp(&mfa_config)?
                 } else {
                     (self.auth_prompter)(AuthPrompt {
                         gateway_name: self.gateway_name.clone(),

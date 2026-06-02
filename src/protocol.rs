@@ -2,8 +2,7 @@ use anyhow::{Result, anyhow};
 use uuid::Uuid;
 
 use crate::config::{ReviewAction, RiskLevel, ServerEntry};
-use crate::connection::{CopyDirection, CopySpec};
-use crate::jump::ServerListSource;
+use crate::types::{CopyDirection, CopySpec, ServerListSource};
 
 pub mod rpc {
     tonic::include_proto!("rhop.rpc");

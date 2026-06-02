@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use proptest::prelude::*;
 
-use rhop::config::{AppConfig, JumpserverJumpHostFields, MfaConfig};
+use rhop::config::{AppConfig, JumpserverGatewayConfig, MfaConfig};
 use rhop::daemon::gateway::auth::{AuthPrompt, AuthPrompter};
 use rhop::daemon::gateway::jumpserver::JumpserverGateway;
 use rhop::daemon::gateway::{ErrorKind, Gateway};
@@ -80,46 +80,43 @@ fn arb_mfa_config() -> impl Strategy<Value = MfaConfig> {
     ]
 }
 
-/// Strategy for generating random shell prompt suffixes.
+/// Strategy for generating random shell prompt suffixes (kept for reference).
+#[allow(dead_code)]
 fn arb_shell_prompt_suffixes() -> impl Strategy<Value = Vec<String>> {
     prop::collection::vec("[#$>]{1,3}", 1..=4)
 }
 
-/// Strategy for generating a random JumpserverJumpHostFields.
-fn arb_jumpserver_fields() -> impl Strategy<Value = JumpserverJumpHostFields> {
+/// Strategy for generating a random JumpserverGatewayConfig.
+fn arb_jumpserver_fields() -> impl Strategy<Value = JumpserverGatewayConfig> {
     (
+        arb_gateway_name(),
         arb_host(),
         1u16..=65535u16,
         arb_user(),
         arb_identity_file(),
         prop::option::of("[a-z+,-]{5,30}"),
-        "[a-z]{2,10}".prop_map(|s| format!("{}]", s)), // menu_prompt_contains
-        "[a-z ]{3,15}",                                  // mfa_prompt_contains
-        arb_shell_prompt_suffixes(),
         arb_mfa_config(),
     )
         .prop_map(
             |(
+                name,
                 host,
                 port,
                 user,
                 identity_file,
                 pubkey_accepted_algorithms,
-                menu_prompt_contains,
-                mfa_prompt_contains,
-                shell_prompt_suffixes,
                 mfa,
             )| {
-                JumpserverJumpHostFields {
+                JumpserverGatewayConfig {
+                    name,
                     host,
                     port,
                     user,
                     identity_file,
                     pubkey_accepted_algorithms,
-                    menu_prompt_contains,
-                    mfa_prompt_contains,
-                    shell_prompt_suffixes,
-                    mfa,
+                    totp_secret_base32: mfa.totp_secret_base32,
+                    totp_digits: mfa.digits,
+                    totp_period: mfa.period,
                 }
             },
         )
@@ -144,13 +141,14 @@ proptest! {
     /// returns immediately without I/O.
     #[test]
     fn prop_jumpserver_list_servers_returns_unsupported(
-        gateway_name in arb_gateway_name(),
         fields in arb_jumpserver_fields()
     ) {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             // Build a minimal AppConfig
             let config = Arc::new(tokio::sync::RwLock::new(AppConfig::default()));
+
+            let gateway_name = fields.name.clone();
 
             // Construct JumpserverGateway with a panic auth prompter.
             // If any network I/O or auth were attempted, this would panic.

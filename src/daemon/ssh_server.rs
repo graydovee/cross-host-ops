@@ -17,9 +17,20 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tonic::transport::server::Connected;
 
-use crate::remote::remote_subsystem_name;
-
 use super::DaemonState;
+
+// ---------------------------------------------------------------------------
+// Subsystem name constant
+// ---------------------------------------------------------------------------
+
+const REMOTE_SUBSYSTEM_NAME: &str = "rhop-rpc";
+
+/// Returns the SSH subsystem name used for rhop gRPC-over-SSH connections.
+pub(crate) fn remote_subsystem_name() -> &'static str {
+    REMOTE_SUBSYSTEM_NAME
+}
+
+// Note: DaemonState is now the gateway-based state struct from super (daemon/mod.rs).
 
 // ---------------------------------------------------------------------------
 // Types

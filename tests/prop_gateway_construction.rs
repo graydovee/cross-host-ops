@@ -2,7 +2,7 @@
 //!
 //! Feature: gateway-refactor, Property 1: Gateway construction is I/O-free
 //!
-//! For any valid configuration (AppConfig with any combination of jump_hosts
+//! For any valid configuration (AppConfig with any combination of gateway
 //! entries), constructing all Gateways via `build_gateways` SHALL complete
 //! without establishing any network connection (no TCP connect, no SSH
 //! handshake, no gRPC dial).
@@ -14,12 +14,10 @@ use std::sync::Arc;
 use proptest::prelude::*;
 
 use rhop::config::{
-    AppConfig, DirectAuth, DirectJumpHostFields, JumpHostConfig, JumpHostFields,
-    JumpserverJumpHostFields, MfaConfig, RhopdJumpHostFields,
+    AppConfig, GatewayConfig, RhopdGatewayConfig, JumpserverGatewayConfig, DirectGatewayConfig,
 };
 use rhop::daemon::gateway::auth::{AuthPrompt, AuthPrompter};
 use rhop::daemon::gateway::build_gateways;
-use rhop::jump::JumpHostKind;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -35,7 +33,7 @@ fn panic_auth_prompter() -> Arc<AuthPrompter> {
 }
 
 // ---------------------------------------------------------------------------
-// Strategies for generating random JumpHostConfig entries
+// Strategies for generating random GatewayConfig entries
 // ---------------------------------------------------------------------------
 
 /// Strategy for generating a unique gateway name (lowercase alpha + digits, 1-12 chars).
@@ -73,95 +71,71 @@ fn arb_file_path() -> impl Strategy<Value = String> {
     ]
 }
 
-/// Strategy for generating a random MfaConfig.
-fn arb_mfa_config() -> impl Strategy<Value = MfaConfig> {
-    prop_oneof![
-        // No MFA (empty secret)
-        Just(MfaConfig {
-            totp_secret_base32: String::new(),
-            digits: 6,
-            period: 30,
-            digest: "sha1".to_string(),
-        }),
-        // With MFA secret
-        "[A-Z2-7]{16,32}".prop_map(|secret| MfaConfig {
-            totp_secret_base32: secret,
-            digits: 6,
-            period: 30,
-            digest: "sha1".to_string(),
-        }),
-    ]
-}
-
-/// Strategy for generating a Rhopd JumpHostConfig.
-fn arb_rhopd_jump_host(name: String) -> impl Strategy<Value = JumpHostConfig> {
+/// Strategy for generating a Rhopd GatewayConfig.
+fn arb_rhopd_gateway(name: String) -> impl Strategy<Value = GatewayConfig> {
     (arb_address(), arb_file_path(), arb_file_path()).prop_map(
-        move |(address, identity_file, known_hosts_path)| JumpHostConfig {
-            name: name.clone(),
-            kind: JumpHostKind::Rhopd,
-            fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
+        move |(address, identity_file, known_hosts_path)| {
+            GatewayConfig::Rhopd(RhopdGatewayConfig {
+                name: name.clone(),
                 address,
                 identity_file,
                 known_hosts_path,
-            }),
+            })
         },
     )
 }
 
-/// Strategy for generating a Jumpserver JumpHostConfig.
-fn arb_jumpserver_jump_host(name: String) -> impl Strategy<Value = JumpHostConfig> {
+/// Strategy for generating a Jumpserver GatewayConfig.
+fn arb_jumpserver_gateway(name: String) -> impl Strategy<Value = GatewayConfig> {
     (
         arb_host(),
         1u16..=65535u16,
         arb_user(),
         arb_file_path(),
-        arb_mfa_config(),
     )
-        .prop_map(move |(host, port, user, identity_file, mfa)| JumpHostConfig {
-            name: name.clone(),
-            kind: JumpHostKind::Jumpserver,
-            fields: JumpHostFields::Jumpserver(JumpserverJumpHostFields {
+        .prop_map(move |(host, port, user, identity_file)| {
+            GatewayConfig::Jumpserver(JumpserverGatewayConfig {
+                name: name.clone(),
                 host,
                 port,
                 user,
                 identity_file,
                 pubkey_accepted_algorithms: None,
-                menu_prompt_contains: "Opt".to_string(),
-                mfa_prompt_contains: "MFA".to_string(),
-                shell_prompt_suffixes: vec!["$ ".to_string(), "# ".to_string()],
-                mfa,
-            }),
+                totp_secret_base32: String::new(),
+                totp_digits: 6,
+                totp_period: 30,
+            })
         })
 }
 
-/// Strategy for generating a Direct JumpHostConfig.
-fn arb_direct_jump_host(name: String) -> impl Strategy<Value = JumpHostConfig> {
+/// Strategy for generating a Direct GatewayConfig.
+fn arb_direct_gateway(name: String) -> impl Strategy<Value = GatewayConfig> {
     (arb_host(), 1u16..=65535u16, arb_user(), arb_file_path()).prop_map(
-        move |(host, port, user, identity_file)| JumpHostConfig {
-            name: name.clone(),
-            kind: JumpHostKind::Direct,
-            fields: JumpHostFields::Direct(DirectJumpHostFields {
+        move |(host, port, user, identity_file)| {
+            GatewayConfig::Direct(DirectGatewayConfig {
+                name: name.clone(),
                 host,
                 port,
                 user,
-                auth: DirectAuth::Key { identity_file },
-            }),
+                identity_file,
+                password: None,
+            })
         },
     )
 }
 
-/// Strategy for generating a single JumpHostConfig of any variant.
-fn arb_jump_host_config(name: String) -> impl Strategy<Value = JumpHostConfig> {
+/// Strategy for generating a single GatewayConfig of any variant.
+fn arb_gateway_config(name: String) -> impl Strategy<Value = GatewayConfig> {
     prop_oneof![
-        arb_rhopd_jump_host(name.clone()),
-        arb_jumpserver_jump_host(name.clone()),
-        arb_direct_jump_host(name),
+        arb_rhopd_gateway(name.clone()),
+        arb_jumpserver_gateway(name.clone()),
+        arb_direct_gateway(name),
     ]
 }
 
-/// Strategy for generating a Vec of 0-5 JumpHostConfig entries with unique names.
+/// Strategy for generating a Vec of 0-5 GatewayConfig entries with unique names.
 /// Names are guaranteed unique and not "local" (reserved).
-fn arb_jump_hosts_vec() -> impl Strategy<Value = Vec<JumpHostConfig>> {
+fn arb_gateways_vec() -> impl Strategy<Value = Vec<GatewayConfig>> {
     proptest::collection::hash_set(arb_gateway_name(), 0..=5)
         .prop_filter("names must not be 'local'", |names| {
             names.iter().all(|n| n != "local")
@@ -169,7 +143,7 @@ fn arb_jump_hosts_vec() -> impl Strategy<Value = Vec<JumpHostConfig>> {
         .prop_flat_map(|names| {
             let strategies: Vec<_> = names
                 .into_iter()
-                .map(|name| arb_jump_host_config(name).boxed())
+                .map(|name| arb_gateway_config(name).boxed())
                 .collect();
             strategies
         })
@@ -184,30 +158,30 @@ proptest! {
 
     /// **Validates: Requirements 6.1, 10.5**
     ///
-    /// For any valid configuration (0-5 jump_hosts of any kind), constructing
+    /// For any valid configuration (0-5 gateways of any kind), constructing
     /// all Gateways via `build_gateways` SHALL complete without establishing
     /// any network connection.
     ///
     /// Verification:
     /// - The AuthPrompter panics if called (no auth attempt during construction)
-    /// - All jump host addresses are random/unreachable, so any real connection
+    /// - All gateway addresses are random/unreachable, so any real connection
     ///   would fail or timeout — but the test completes instantly because
     ///   construction is I/O-free
-    /// - The returned HashMap has the correct number of entries: 1 (local) + N (jump_hosts)
+    /// - The returned HashMap has the correct number of entries: 1 (local) + N (gateways)
     #[test]
     fn prop_gateway_construction_is_io_free(
-        jump_hosts in arb_jump_hosts_vec()
+        gateways_config in arb_gateways_vec()
     ) {
         let config = Arc::new(tokio::sync::RwLock::new(AppConfig::default()));
         let auth_prompter = panic_auth_prompter();
 
-        let expected_count = 1 + jump_hosts.len(); // 1 for "local" + 1 per jump_host
+        let expected_count = 1 + gateways_config.len(); // 1 for "local" + 1 per gateway
 
         // This must complete instantly without panic (no I/O, no auth).
         let gateways = build_gateways(
             config,
             "/tmp/nonexistent_server.toml",
-            &jump_hosts,
+            &gateways_config,
             auth_prompter,
         );
 
@@ -215,9 +189,9 @@ proptest! {
         prop_assert_eq!(
             gateways.len(),
             expected_count,
-            "expected {} gateways (1 local + {} jump_hosts), got {}",
+            "expected {} gateways (1 local + {} configured), got {}",
             expected_count,
-            jump_hosts.len(),
+            gateways_config.len(),
             gateways.len()
         );
 
@@ -227,12 +201,12 @@ proptest! {
             "gateways map must contain the 'local' key"
         );
 
-        // Verify each jump_host name is present as a gateway.
-        for jh in &jump_hosts {
+        // Verify each gateway name is present.
+        for gc in &gateways_config {
             prop_assert!(
-                gateways.contains_key(&jh.name),
+                gateways.contains_key(gc.name()),
                 "gateways map must contain key '{}'",
-                jh.name
+                gc.name()
             );
         }
     }

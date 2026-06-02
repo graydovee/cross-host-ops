@@ -8,7 +8,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tracing::warn;
 
-use crate::connection::CopySpec;
+use crate::types::{CopyDirection, CopySpec};
 use crate::protocol::{rpc, ServerEvent};
 
 use super::{Connection, ExecRequest, InteractiveHandle, InteractiveRequest};
@@ -146,8 +146,8 @@ impl Connection for RhopdConnection {
         // Build CopyStartRequest with local_path intentionally set to "" for
         // rhopd hops — the remote daemon must not touch local paths.
         let direction = match spec.direction {
-            crate::connection::CopyDirection::Upload => rpc::CopyDirection::Upload as i32,
-            crate::connection::CopyDirection::Download => rpc::CopyDirection::Download as i32,
+            CopyDirection::Upload => rpc::CopyDirection::Upload as i32,
+            CopyDirection::Download => rpc::CopyDirection::Download as i32,
         };
 
         let start = rpc::CopyRequest {

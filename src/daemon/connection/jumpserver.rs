@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::connection::types::{CopyDirection, CopySpec};
+use crate::types::{CopyDirection, CopySpec};
 use crate::protocol::ServerEvent;
 
 use super::shared::{build_interactive_shell_command, PtyShell};

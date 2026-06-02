@@ -20,9 +20,8 @@ use rhop::config::MfaConfig;
 use rhop::daemon::gateway::auth::{generate_totp, AuthPrompt, AuthPrompter};
 use rhop::daemon::gateway::build_gateways;
 use rhop::config::{
-    AppConfig, JumpHostConfig, JumpHostFields, JumpserverJumpHostFields, RhopdJumpHostFields,
+    AppConfig, GatewayConfig, RhopdGatewayConfig, JumpserverGatewayConfig,
 };
-use rhop::jump::JumpHostKind;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -96,63 +95,58 @@ fn arb_address() -> impl Strategy<Value = String> {
     (arb_host(), 1u16..=65535u16).prop_map(|(host, port)| format!("{}:{}", host, port))
 }
 
-/// Strategy for generating a JumpserverGateway config with TOTP configured.
-fn arb_jumpserver_with_totp(name: String) -> impl Strategy<Value = JumpHostConfig> {
+/// Strategy for generating a Jumpserver GatewayConfig with TOTP configured.
+fn arb_jumpserver_with_totp(name: String) -> impl Strategy<Value = GatewayConfig> {
     (
         arb_host(),
         1u16..=65535u16,
         arb_user(),
         arb_file_path(),
-        arb_mfa_config_with_totp(),
+        arb_valid_base32_secret(),
     )
-        .prop_map(move |(host, port, user, identity_file, mfa)| JumpHostConfig {
-            name: name.clone(),
-            kind: JumpHostKind::Jumpserver,
-            fields: JumpHostFields::Jumpserver(JumpserverJumpHostFields {
+        .prop_map(move |(host, port, user, identity_file, totp_secret)| {
+            GatewayConfig::Jumpserver(JumpserverGatewayConfig {
+                name: name.clone(),
                 host,
                 port,
                 user,
                 identity_file,
                 pubkey_accepted_algorithms: None,
-                menu_prompt_contains: "Opt".to_string(),
-                mfa_prompt_contains: "MFA".to_string(),
-                shell_prompt_suffixes: vec!["$ ".to_string(), "# ".to_string()],
-                mfa,
-            }),
+                totp_secret_base32: totp_secret,
+                totp_digits: 6,
+                totp_period: 30,
+            })
         })
 }
 
-/// Strategy for generating a JumpserverGateway config without TOTP (empty secret).
-fn arb_jumpserver_without_totp(name: String) -> impl Strategy<Value = JumpHostConfig> {
+/// Strategy for generating a Jumpserver GatewayConfig without TOTP (empty secret).
+fn arb_jumpserver_without_totp(name: String) -> impl Strategy<Value = GatewayConfig> {
     (arb_host(), 1u16..=65535u16, arb_user(), arb_file_path())
-        .prop_map(move |(host, port, user, identity_file)| JumpHostConfig {
-            name: name.clone(),
-            kind: JumpHostKind::Jumpserver,
-            fields: JumpHostFields::Jumpserver(JumpserverJumpHostFields {
+        .prop_map(move |(host, port, user, identity_file)| {
+            GatewayConfig::Jumpserver(JumpserverGatewayConfig {
+                name: name.clone(),
                 host,
                 port,
                 user,
                 identity_file,
                 pubkey_accepted_algorithms: None,
-                menu_prompt_contains: "Opt".to_string(),
-                mfa_prompt_contains: "MFA".to_string(),
-                shell_prompt_suffixes: vec!["$ ".to_string(), "# ".to_string()],
-                mfa: MfaConfig::default(),
-            }),
+                totp_secret_base32: String::new(),
+                totp_digits: 6,
+                totp_period: 30,
+            })
         })
 }
 
-/// Strategy for generating a Rhopd JumpHostConfig (always has key credential).
-fn arb_rhopd_with_key(name: String) -> impl Strategy<Value = JumpHostConfig> {
+/// Strategy for generating a Rhopd GatewayConfig (always has key credential).
+fn arb_rhopd_with_key(name: String) -> impl Strategy<Value = GatewayConfig> {
     (arb_address(), arb_file_path(), arb_file_path()).prop_map(
-        move |(address, identity_file, known_hosts_path)| JumpHostConfig {
-            name: name.clone(),
-            kind: JumpHostKind::Rhopd,
-            fields: JumpHostFields::Rhopd(RhopdJumpHostFields {
+        move |(address, identity_file, known_hosts_path)| {
+            GatewayConfig::Rhopd(RhopdGatewayConfig {
+                name: name.clone(),
                 address,
                 identity_file,
                 known_hosts_path,
-            }),
+            })
         },
     )
 }
@@ -224,7 +218,7 @@ proptest! {
     /// never invokes the AuthPrompter when credentials are available.
     #[test]
     fn prop_credentials_present_no_prompter_during_construction(
-        jump_host in arb_gateway_name().prop_flat_map(|n| {
+        gateway in arb_gateway_name().prop_flat_map(|n| {
             prop_oneof![
                 arb_rhopd_with_key(n.clone()),
                 arb_jumpserver_with_totp(n),
@@ -239,15 +233,15 @@ proptest! {
         let gateways = build_gateways(
             config,
             "/tmp/nonexistent_server.toml",
-            &[jump_host.clone()],
+            &[gateway.clone()],
             auth_prompter,
         );
 
         // Verify the gateway was constructed successfully.
         prop_assert!(
-            gateways.contains_key(&jump_host.name),
+            gateways.contains_key(gateway.name()),
             "gateway '{}' should be present in the map",
-            jump_host.name
+            gateway.name()
         );
     }
 
@@ -263,22 +257,29 @@ proptest! {
     /// the AuthPrompter unnecessary for MFA.
     #[test]
     fn prop_totp_configured_no_prompter_needed_for_mfa(
-        jump_host in arb_gateway_name().prop_flat_map(arb_jumpserver_with_totp)
+        gateway in arb_gateway_name().prop_flat_map(arb_jumpserver_with_totp)
     ) {
-        // Extract the MFA config from the JumpserverGateway configuration
-        let mfa = match &jump_host.fields {
-            JumpHostFields::Jumpserver(fields) => &fields.mfa,
+        // Extract the TOTP secret from the JumpserverGateway configuration
+        let totp_secret = match &gateway {
+            GatewayConfig::Jumpserver(c) => &c.totp_secret_base32,
             _ => unreachable!("strategy always produces Jumpserver"),
         };
 
         // When totp_secret_base32 is configured, generate_totp should succeed
         // without any external callback.
         prop_assert!(
-            !mfa.totp_secret_base32.is_empty(),
+            !totp_secret.is_empty(),
             "totp_secret_base32 should be non-empty for this test"
         );
 
-        let code = generate_totp(mfa);
+        let mfa = MfaConfig {
+            totp_secret_base32: totp_secret.clone(),
+            digits: 6,
+            period: 30,
+            digest: "sha1".to_string(),
+        };
+
+        let code = generate_totp(&mfa);
         prop_assert!(
             code.is_ok(),
             "auto-TOTP generation should succeed without AuthPrompter: {:?}",
@@ -302,42 +303,39 @@ proptest! {
     /// AuthPrompter path would be exercised for MFA in this case.
     #[test]
     fn prop_no_totp_secret_means_prompter_needed(
-        jump_host in arb_gateway_name().prop_flat_map(arb_jumpserver_without_totp)
+        gateway in arb_gateway_name().prop_flat_map(arb_jumpserver_without_totp)
     ) {
-        let mfa = match &jump_host.fields {
-            JumpHostFields::Jumpserver(fields) => &fields.mfa,
+        let totp_secret = match &gateway {
+            GatewayConfig::Jumpserver(c) => &c.totp_secret_base32,
             _ => unreachable!("strategy always produces Jumpserver"),
         };
 
         // With empty totp_secret_base32, auto-TOTP cannot work.
         prop_assert!(
-            mfa.totp_secret_base32.is_empty(),
+            totp_secret.is_empty(),
             "totp_secret_base32 should be empty for this test"
         );
 
+        let mfa = MfaConfig {
+            totp_secret_base32: totp_secret.clone(),
+            digits: 6,
+            period: 30,
+            digest: "sha1".to_string(),
+        };
+
         // generate_totp with empty secret will fail (invalid base32)
-        let result = generate_totp(mfa);
+        let result = generate_totp(&mfa);
         // Either it fails (invalid base32 decode of empty string)
         // or the code path would need the AuthPrompter.
-        // The actual JumpserverGateway code checks: if totp_secret_base32 is empty,
-        // pass auth_prompter to authenticate_with_key (see establish_shell()).
-        // This confirms the decision logic: empty TOTP → prompter is injected.
-
-        // The important assertion: with empty base32, generate_totp either fails
-        // or produces empty output — confirming the gateway MUST use AuthPrompter instead.
+        // The important assertion: with empty base32, the gateway MUST use AuthPrompter.
         if result.is_ok() {
             // If somehow the empty string decodes as valid base32 (zero-length secret),
-            // the HMAC would still succeed, but in practice the JumpserverGateway
-            // explicitly checks `totp_secret_base32.is_empty()` and uses the prompter.
-            // The gateway code path is:
-            //   if self.fields.mfa.totp_secret_base32.is_empty() → use auth_prompter
-            // So regardless of generate_totp's behavior on empty input, the gateway
-            // will use the AuthPrompter.
+            // the gateway still explicitly checks `totp_secret_base32.is_empty()` and
+            // uses the prompter.
         }
 
-        // The real verification: the gateway decision logic (in establish_shell) uses
-        // `is_empty()` check, so with empty totp_secret_base32, auth_prompter IS injected.
-        // We verify this is consistent: the gateway field is indeed empty.
-        prop_assert!(mfa.totp_secret_base32.is_empty());
+        // The real verification: the gateway decision logic uses `is_empty()` check,
+        // so with empty totp_secret_base32, auth_prompter IS injected.
+        prop_assert!(totp_secret.is_empty());
     }
 }

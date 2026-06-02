@@ -5,7 +5,7 @@
 
 use proptest::prelude::*;
 
-use rhop::connection::{build_final_command, build_remote_command};
+use rhop::daemon::connection::shared::{build_final_command, build_remote_command};
 
 // ---------------------------------------------------------------------------
 // Strategies

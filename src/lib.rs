@@ -18,12 +18,9 @@
 
 pub mod cli;
 pub mod config;
-pub mod connection;
 pub mod daemon;
 pub mod exit_codes;
-pub mod jump;
 pub mod logging;
 pub mod output;
-pub mod pool;
 pub mod protocol;
-pub mod remote;
+pub mod types;
