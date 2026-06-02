@@ -27,4 +27,3 @@ pub mod output;
 pub mod pool;
 pub mod protocol;
 pub mod remote;
-pub mod review;

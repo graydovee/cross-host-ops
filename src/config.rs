@@ -65,6 +65,19 @@ impl AppConfig {
             expand_tilde(&self.server.remote.authorized_keys_path)?;
         self.ssh.ssh_config_path = expand_tilde(&self.ssh.ssh_config_path)?;
         self.ssh.server_config_path = expand_tilde(&self.ssh.server_config_path)?;
+
+        for jh in &mut self.jump_hosts {
+            match &mut jh.fields {
+                JumpHostFields::Jumpserver(f) => {
+                    f.identity_file = expand_tilde(&f.identity_file)?;
+                }
+                JumpHostFields::Rhopd(f) => {
+                    f.identity_file = expand_tilde(&f.identity_file)?;
+                    f.known_hosts_path = expand_tilde(&f.known_hosts_path)?;
+                }
+                JumpHostFields::Direct(_) => {}
+            }
+        }
         Ok(())
     }
 

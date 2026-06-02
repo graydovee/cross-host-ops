@@ -1,3 +1,16 @@
+#[allow(dead_code)]
+pub mod connection;
+#[allow(dead_code)]
+pub mod gateway;
+#[allow(dead_code)]
+pub mod resolver;
+#[allow(dead_code)]
+pub mod review;
+#[allow(dead_code)]
+pub mod rpc;
+#[allow(dead_code)]
+pub mod ssh_server;
+
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -33,9 +46,9 @@ use crate::jump::server_list::ServerListAggregator;
 use crate::jump::{JumpHost, ServerListSource};
 use crate::logging::{init_logging, reopen_log_output};
 use crate::pool::ConnectionPool;
-use crate::protocol::{self, AuthPromptMessage, ExecRequest, ServerEvent, ServerListSourceStatus, rpc};
+use crate::protocol::{self, AuthPromptMessage, ExecRequest, ServerEvent, ServerListSourceStatus, rpc as proto_rpc};
 use crate::remote::remote_subsystem_name;
-use crate::review::CommandReviewer;
+use self::review::CommandReviewer;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DaemonOrigin {
@@ -462,7 +475,7 @@ pub async fn run_with_overrides(
 
     let incoming = ReceiverStream::new(receiver_map_incoming(incoming_rx));
     Server::builder()
-        .add_service(rpc::rhop_rpc_server::RhopRpcServer::new(RhopRpcService {
+        .add_service(proto_rpc::rhop_rpc_server::RhopRpcServer::new(RhopRpcService {
             state,
         }))
         .serve_with_incoming_shutdown(incoming, async move {
@@ -580,8 +593,8 @@ fn is_authorized_key(path: &Path, candidate: &ssh_key::PublicKey) -> Result<bool
 async fn process_execute(
     request: ExecRequest,
     state: &DaemonState,
-    inbound: &mut Streaming<rpc::ExecuteRequest>,
-    sender: &mpsc::Sender<Result<rpc::ExecuteResponse, Status>>,
+    inbound: &mut Streaming<proto_rpc::ExecuteRequest>,
+    sender: &mpsc::Sender<Result<proto_rpc::ExecuteResponse, Status>>,
 ) -> Result<()> {
     if request.argv.is_empty() {
         bail!("argv must not be empty");
@@ -793,7 +806,7 @@ async fn process_execute(
                 match msg {
                     Ok(Some(message)) => {
                         match message.request {
-                            Some(rpc::execute_request::Request::AuthInput(input))
+                            Some(proto_rpc::execute_request::Request::AuthInput(input))
                                 if input.prompt_id == "__stdin__" =>
                             {
                                 // Stdin data forwarding: the client sends stdin
@@ -862,8 +875,8 @@ async fn process_execute(
 async fn process_interactive_execute(
     request: ExecRequest,
     state: &DaemonState,
-    inbound: &mut Streaming<rpc::ExecuteRequest>,
-    sender: &mpsc::Sender<Result<rpc::ExecuteResponse, Status>>,
+    inbound: &mut Streaming<proto_rpc::ExecuteRequest>,
+    sender: &mpsc::Sender<Result<proto_rpc::ExecuteResponse, Status>>,
 ) -> Result<()> {
     // Step 1: Resolve target and run review (same as batch mode)
     let execution_id = Uuid::new_v4();
@@ -1031,20 +1044,20 @@ async fn process_interactive_execute(
                 match msg {
                     Ok(Some(message)) => {
                         match message.request {
-                            Some(rpc::execute_request::Request::StdinData(stdin)) => {
+                            Some(proto_rpc::execute_request::Request::StdinData(stdin)) => {
                                 // Forward stdin bytes to remote
                                 if handle.stdin_tx.send(stdin.data).await.is_err() {
                                     debug!(execution_id = %execution_id, "stdin_tx closed");
                                     break;
                                 }
                             }
-                            Some(rpc::execute_request::Request::WindowResize(resize)) => {
+                            Some(proto_rpc::execute_request::Request::WindowResize(resize)) => {
                                 // Forward window resize to remote
                                 if handle.resize_tx.send((resize.cols, resize.rows)).await.is_err() {
                                     debug!(execution_id = %execution_id, "resize_tx closed");
                                 }
                             }
-                            Some(rpc::execute_request::Request::AuthInput(input)) => {
+                            Some(proto_rpc::execute_request::Request::AuthInput(input)) => {
                                 // Handle auth prompts during interactive session
                                 router.deliver_response(&input.prompt_id, input.value).await;
                             }
@@ -1133,8 +1146,8 @@ fn make_auth_prompter(
 
 async fn wait_for_confirmation(
     execution_id: Uuid,
-    inbound: &mut Streaming<rpc::ExecuteRequest>,
-    sender: &mpsc::Sender<Result<rpc::ExecuteResponse, Status>>,
+    inbound: &mut Streaming<proto_rpc::ExecuteRequest>,
+    sender: &mpsc::Sender<Result<proto_rpc::ExecuteResponse, Status>>,
     reason: &str,
 ) -> Result<()> {
     send_execute_event(
@@ -1151,7 +1164,7 @@ async fn wait_for_confirmation(
     };
 
     match message.request {
-        Some(rpc::execute_request::Request::Confirm(confirm)) => {
+        Some(proto_rpc::execute_request::Request::Confirm(confirm)) => {
             let response_id = protocol::parse_execution_id(&confirm.execution_id)?;
             if response_id == execution_id && confirm.allow {
                 Ok(())
@@ -1164,7 +1177,7 @@ async fn wait_for_confirmation(
 }
 
 async fn send_execute_event(
-    sender: &mpsc::Sender<Result<rpc::ExecuteResponse, Status>>,
+    sender: &mpsc::Sender<Result<proto_rpc::ExecuteResponse, Status>>,
     event: ServerEvent,
 ) -> Result<()> {
     sender
@@ -1175,7 +1188,7 @@ async fn send_execute_event(
 }
 
 async fn wait_for_auth_input_execute(
-    inbound: &mut Streaming<rpc::ExecuteRequest>,
+    inbound: &mut Streaming<proto_rpc::ExecuteRequest>,
     prompt_id: &str,
     wants_stdin: bool,
 ) -> Result<String> {
@@ -1184,21 +1197,21 @@ async fn wait_for_auth_input_execute(
             bail!("client disconnected before auth input");
         };
         match message.request {
-            Some(rpc::execute_request::Request::AuthInput(input)) if input.prompt_id == prompt_id => {
+            Some(proto_rpc::execute_request::Request::AuthInput(input)) if input.prompt_id == prompt_id => {
                 return Ok(input.value);
             }
-            Some(rpc::execute_request::Request::AuthInput(input)) if wants_stdin && input.prompt_id == "__stdin__" => {
+            Some(proto_rpc::execute_request::Request::AuthInput(input)) if wants_stdin && input.prompt_id == "__stdin__" => {
                 // Skip stdin data messages while waiting for auth input
                 continue;
             }
-            Some(rpc::execute_request::Request::Confirm(_)) => continue,
+            Some(proto_rpc::execute_request::Request::Confirm(_)) => continue,
             _ => bail!("unexpected request while awaiting auth input"),
         }
     }
 }
 
 async fn wait_for_auth_input_copy(
-    inbound: &mut Streaming<rpc::CopyRequest>,
+    inbound: &mut Streaming<proto_rpc::CopyRequest>,
     prompt_id: &str,
 ) -> Result<String> {
     loop {
@@ -1206,7 +1219,7 @@ async fn wait_for_auth_input_copy(
             bail!("client disconnected before auth input");
         };
         match message.request {
-            Some(rpc::copy_request::Request::AuthInput(input)) if input.prompt_id == prompt_id => {
+            Some(proto_rpc::copy_request::Request::AuthInput(input)) if input.prompt_id == prompt_id => {
                 return Ok(input.value);
             }
             _ => bail!("unexpected request while awaiting copy auth input"),
@@ -1215,13 +1228,13 @@ async fn wait_for_auth_input_copy(
 }
 
 #[tonic::async_trait]
-impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
-    type ExecuteStream = ReceiverStream<Result<rpc::ExecuteResponse, Status>>;
-    type CopyStream = ReceiverStream<Result<rpc::CopyResponse, Status>>;
+impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
+    type ExecuteStream = ReceiverStream<Result<proto_rpc::ExecuteResponse, Status>>;
+    type CopyStream = ReceiverStream<Result<proto_rpc::CopyResponse, Status>>;
 
     async fn execute(
         &self,
-        request: Request<Streaming<rpc::ExecuteRequest>>,
+        request: Request<Streaming<proto_rpc::ExecuteRequest>>,
     ) -> Result<Response<Self::ExecuteStream>, Status> {
         info!("accepted execute stream");
         let mut inbound = request.into_inner();
@@ -1233,7 +1246,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 let Some(first) = inbound.message().await? else {
                     bail!("client disconnected before start request");
                 };
-                let Some(rpc::execute_request::Request::Start(start)) = first.request else {
+                let Some(proto_rpc::execute_request::Request::Start(start)) = first.request else {
                     bail!("first execute stream message must be start");
                 };
                 let exec = ExecRequest {
@@ -1266,7 +1279,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
 
     async fn copy(
         &self,
-        request: Request<Streaming<rpc::CopyRequest>>,
+        request: Request<Streaming<proto_rpc::CopyRequest>>,
     ) -> Result<Response<Self::CopyStream>, Status> {
         let is_remote = request
             .extensions()
@@ -1282,7 +1295,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 let Some(first) = inbound.message().await? else {
                     bail!("client disconnected before copy start request");
                 };
-                let Some(rpc::copy_request::Request::Start(start)) = first.request else {
+                let Some(proto_rpc::copy_request::Request::Start(start)) = first.request else {
                     bail!("first copy stream message must be start");
                 };
 
@@ -1385,14 +1398,14 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
 
     async fn status(
         &self,
-        _request: Request<rpc::StatusRequest>,
-    ) -> Result<Response<rpc::StatusResponse>, Status> {
+        _request: Request<proto_rpc::StatusRequest>,
+    ) -> Result<Response<proto_rpc::StatusResponse>, Status> {
         info!("status request");
         let config = self.state.config.read().await.clone();
         let socket_path = config.server.local.socket_path.clone();
         let pools = self.state.pool.status();
         let active_executions = pools.iter().map(|entry| entry.busy).sum::<usize>() as u64;
-        let jump_hosts: Vec<rpc::JumpHostStatus> = config
+        let jump_hosts: Vec<proto_rpc::JumpHostStatus> = config
             .jump_hosts
             .iter()
             .map(|entry| {
@@ -1405,7 +1418,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                         format!("{}:{}", fields.host, fields.port)
                     }
                 };
-                rpc::JumpHostStatus {
+                proto_rpc::JumpHostStatus {
                     name: entry.name.clone(),
                     kind: entry.kind.to_string(),
                     address,
@@ -1413,7 +1426,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 }
             })
             .collect();
-        let response = rpc::StatusResponse {
+        let response = proto_rpc::StatusResponse {
             daemon_running: true,
             local_socket_path: socket_path,
             active_executions,
@@ -1453,8 +1466,8 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
 
     async fn list_servers(
         &self,
-        _request: Request<rpc::ServerListRequest>,
-    ) -> Result<Response<rpc::ServerListResponse>, Status> {
+        _request: Request<proto_rpc::ServerListRequest>,
+    ) -> Result<Response<proto_rpc::ServerListResponse>, Status> {
         let config = self.state.config.read().await.clone();
         let path = PathBuf::from(&config.ssh.server_config_path);
         let server_config = load_server_config(&path)
@@ -1499,7 +1512,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
         merged.source_status.extend(prebuilt_status);
 
         // Populate the legacy `servers` field for backward compatibility.
-        let servers: Vec<rpc::ServerEntry> = merged
+        let servers: Vec<proto_rpc::ServerEntry> = merged
             .rows
             .iter()
             .map(|row| protocol::server_entry_to_rpc(row.server.clone()))
@@ -1508,7 +1521,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
         // Convert the MergedServerList to its RPC representation.
         let merged_rpc = protocol::merged_server_list_to_rpc(merged);
 
-        Ok(Response::new(rpc::ServerListResponse {
+        Ok(Response::new(proto_rpc::ServerListResponse {
             server_config_path: path.display().to_string(),
             servers,
             merged: Some(merged_rpc),
@@ -1517,32 +1530,32 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
 
     async fn shutdown(
         &self,
-        _request: Request<rpc::ShutdownRequest>,
-    ) -> Result<Response<rpc::InfoResponse>, Status> {
+        _request: Request<proto_rpc::ShutdownRequest>,
+    ) -> Result<Response<proto_rpc::InfoResponse>, Status> {
         shutdown_daemon(&self.state)
             .await
             .map_err(|error| Status::internal(error.to_string()))?;
-        Ok(Response::new(rpc::InfoResponse {
+        Ok(Response::new(proto_rpc::InfoResponse {
             message: "daemon shutting down".to_string(),
         }))
     }
 
     async fn update_config(
         &self,
-        request: Request<rpc::UpdateConfigRequest>,
-    ) -> Result<Response<rpc::UpdateConfigResponse>, Status> {
+        request: Request<proto_rpc::UpdateConfigRequest>,
+    ) -> Result<Response<proto_rpc::UpdateConfigResponse>, Status> {
         let req = request.into_inner();
         match req.mutation_type.as_str() {
             "add_jump_host" => {
                 let alias = req.name.trim().to_string();
                 if alias.is_empty() {
-                    return Ok(Response::new(rpc::UpdateConfigResponse {
+                    return Ok(Response::new(proto_rpc::UpdateConfigResponse {
                         success: false,
                         message: "name must not be empty".to_string(),
                     }));
                 }
                 if crate::config::RESERVED_NAMES.contains(&alias.as_str()) {
-                    return Ok(Response::new(rpc::UpdateConfigResponse {
+                    return Ok(Response::new(proto_rpc::UpdateConfigResponse {
                         success: false,
                         message: format!(
                             "name '{}' is reserved (reserved names: {:?})",
@@ -1555,7 +1568,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 {
                     let config = self.state.config.read().await;
                     if let Some(existing) = config.jump_hosts.iter().find(|e| e.name == alias) {
-                        return Ok(Response::new(rpc::UpdateConfigResponse {
+                        return Ok(Response::new(proto_rpc::UpdateConfigResponse {
                             success: false,
                             message: format!(
                                 "name '{}' is already used by a {} jump host",
@@ -1571,7 +1584,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                     "jumpserver" => crate::jump::JumpHostKind::Jumpserver,
                     "direct" => crate::jump::JumpHostKind::Direct,
                     other => {
-                        return Ok(Response::new(rpc::UpdateConfigResponse {
+                        return Ok(Response::new(proto_rpc::UpdateConfigResponse {
                             success: false,
                             message: format!("unknown jump host kind: '{}'", other),
                         }));
@@ -1590,7 +1603,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                             })
                         }
                         _ => {
-                            return Ok(Response::new(rpc::UpdateConfigResponse {
+                            return Ok(Response::new(proto_rpc::UpdateConfigResponse {
                                 success: false,
                                 message: format!(
                                     "add_jump_host via RPC only supports kind 'rhopd', got '{}'",
@@ -1610,7 +1623,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                     // Rollback the in-memory change
                     let mut config = self.state.config.write().await;
                     config.jump_hosts.retain(|e| e.name != alias);
-                    return Ok(Response::new(rpc::UpdateConfigResponse {
+                    return Ok(Response::new(proto_rpc::UpdateConfigResponse {
                         success: false,
                         message: format!("failed to write config: {}", e),
                     }));
@@ -1620,7 +1633,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 self.state.reload_jump_hosts().await;
 
                 info!(name = %alias, "added jump host via UpdateConfig");
-                Ok(Response::new(rpc::UpdateConfigResponse {
+                Ok(Response::new(proto_rpc::UpdateConfigResponse {
                     success: true,
                     message: format!("jump host '{}' added successfully", alias),
                 }))
@@ -1628,7 +1641,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
             "remove_jump_host" => {
                 let alias = req.name.trim().to_string();
                 if alias.is_empty() {
-                    return Ok(Response::new(rpc::UpdateConfigResponse {
+                    return Ok(Response::new(proto_rpc::UpdateConfigResponse {
                         success: false,
                         message: "name must not be empty".to_string(),
                     }));
@@ -1643,7 +1656,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 };
 
                 if !removed {
-                    return Ok(Response::new(rpc::UpdateConfigResponse {
+                    return Ok(Response::new(proto_rpc::UpdateConfigResponse {
                         success: false,
                         message: format!("jump host '{}' not found", alias),
                     }));
@@ -1652,7 +1665,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 if let Err(e) = atomic_write_config(&self.state).await {
                     // Reload from disk to restore consistency
                     self.state.reload_jump_hosts().await;
-                    return Ok(Response::new(rpc::UpdateConfigResponse {
+                    return Ok(Response::new(proto_rpc::UpdateConfigResponse {
                         success: false,
                         message: format!("failed to write config: {}", e),
                     }));
@@ -1662,12 +1675,12 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 self.state.reload_jump_hosts().await;
 
                 info!(name = %alias, "removed jump host via UpdateConfig");
-                Ok(Response::new(rpc::UpdateConfigResponse {
+                Ok(Response::new(proto_rpc::UpdateConfigResponse {
                     success: true,
                     message: format!("jump host '{}' removed successfully", alias),
                 }))
             }
-            other => Ok(Response::new(rpc::UpdateConfigResponse {
+            other => Ok(Response::new(proto_rpc::UpdateConfigResponse {
                 success: false,
                 message: format!("unknown mutation_type: '{}'", other),
             })),
@@ -1676,10 +1689,10 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
 
     async fn list_jump_hosts(
         &self,
-        _request: Request<rpc::ListJumpHostsRequest>,
-    ) -> Result<Response<rpc::ListJumpHostsResponse>, Status> {
+        _request: Request<proto_rpc::ListJumpHostsRequest>,
+    ) -> Result<Response<proto_rpc::ListJumpHostsResponse>, Status> {
         let config = self.state.config.read().await.clone();
-        let jump_hosts: Vec<rpc::JumpHostStatus> = config
+        let jump_hosts: Vec<proto_rpc::JumpHostStatus> = config
             .jump_hosts
             .iter()
             .map(|entry| {
@@ -1692,7 +1705,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                         format!("{}:{}", fields.host, fields.port)
                     }
                 };
-                rpc::JumpHostStatus {
+                proto_rpc::JumpHostStatus {
                     name: entry.name.clone(),
                     kind: entry.kind.to_string(),
                     address,
@@ -1700,7 +1713,7 @@ impl rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 }
             })
             .collect();
-        Ok(Response::new(rpc::ListJumpHostsResponse { jump_hosts }))
+        Ok(Response::new(proto_rpc::ListJumpHostsResponse { jump_hosts }))
     }
 }
 
@@ -1749,7 +1762,7 @@ pub mod test_support {
     pub fn make_test_rpc_service(
         config: AppConfig,
         config_path: PathBuf,
-    ) -> rpc::rhop_rpc_server::RhopRpcServer<impl rpc::rhop_rpc_server::RhopRpc> {
+    ) -> proto_rpc::rhop_rpc_server::RhopRpcServer<impl proto_rpc::rhop_rpc_server::RhopRpc> {
         let config = Arc::new(RwLock::new(config));
         let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
         let state = DaemonState {
@@ -1761,7 +1774,7 @@ pub mod test_support {
             origin: DaemonOrigin::External,
             cli_start_options: CliStartOptions::default(),
         };
-        rpc::rhop_rpc_server::RhopRpcServer::new(RhopRpcService { state })
+        proto_rpc::rhop_rpc_server::RhopRpcServer::new(RhopRpcService { state })
     }
 }
 
@@ -1891,5 +1904,245 @@ known_hosts_path = "/tmp/kh"
         let config = state.config.read().await;
         assert_eq!(config.jump_hosts.len(), 1);
         assert_eq!(config.jump_hosts[0].name, "keep-me");
+    }
+}
+
+// ===========================================================================
+// New Gateway-based DaemonState (gateway-refactor)
+// Added alongside existing code; will replace old DaemonState incrementally.
+// ===========================================================================
+
+#[allow(dead_code)]
+mod gateway_daemon {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use anyhow::{Result, anyhow};
+    use tokio::sync::{RwLock, mpsc};
+    use tokio::time::sleep;
+    use tracing::{debug, info, warn};
+
+    use crate::config::{AppConfig, default_config_path, validate_jump_hosts};
+    use crate::logging::{init_logging, reopen_log_output};
+
+    use super::gateway::{self, Gateway};
+    use super::gateway::auth::AuthPrompter;
+    use super::review::CommandReviewer;
+    use super::{CliStartOptions, DaemonOrigin};
+
+    /// The default interval for the idle connection reaper (seconds).
+    const DEFAULT_REAPER_INTERVAL_SECS: u64 = 60;
+
+    /// New DaemonState that holds gateways directly instead of a ConnectionPool.
+    /// Each gateway manages its own connections internally.
+    #[derive(Clone)]
+    pub struct GatewayDaemonState {
+        pub config_path: PathBuf,
+        pub config: Arc<RwLock<AppConfig>>,
+        /// All gateways, keyed by name. "local" is always present.
+        pub gateways: HashMap<String, Arc<dyn Gateway>>,
+        pub reviewer: CommandReviewer,
+        pub shutdown_tx: mpsc::Sender<()>,
+        pub origin: DaemonOrigin,
+        pub cli_start_options: CliStartOptions,
+    }
+
+    impl GatewayDaemonState {
+        /// Reload the jump-hosts configuration from disk and rebuild gateways.
+        ///
+        /// Re-reads the config file, validates jump_hosts, and on success
+        /// swaps the active config. Note: gateways are NOT rebuilt here —
+        /// a full restart is needed for gateway topology changes.
+        pub async fn reload_jump_hosts(&self) {
+            let new_config = match AppConfig::load(Some(&self.config_path)) {
+                Ok(cfg) => cfg,
+                Err(error) => {
+                    warn!(
+                        error = %format!("{error:#}"),
+                        config_path = %self.config_path.display(),
+                        "failed to read config during jump-hosts reload; keeping prior config"
+                    );
+                    return;
+                }
+            };
+
+            if let Err(error) = validate_jump_hosts(&new_config.jump_hosts) {
+                warn!(
+                    error = %format!("{error}"),
+                    config_path = %self.config_path.display(),
+                    "jump-hosts validation failed during reload; keeping prior config"
+                );
+                return;
+            }
+
+            let mut config = self.config.write().await;
+            config.jump_hosts = new_config.jump_hosts;
+            info!(
+                config_path = %self.config_path.display(),
+                "jump-hosts reloaded successfully"
+            );
+        }
+    }
+
+    /// Build a `GatewayDaemonState` from configuration.
+    ///
+    /// Steps:
+    /// 1. Load config from disk
+    /// 2. Construct all gateways via `build_gateways()` (no I/O)
+    /// 3. Create shutdown channel
+    /// 4. Return the assembled state
+    pub fn build_daemon_state(
+        config_path: Option<PathBuf>,
+        origin: DaemonOrigin,
+        cli_start_options: CliStartOptions,
+        auth_prompter: Arc<AuthPrompter>,
+    ) -> Result<(GatewayDaemonState, mpsc::Receiver<()>)> {
+        let config_path = config_path.unwrap_or_else(default_config_path);
+        let loaded = AppConfig::load(Some(&config_path))?;
+        let config = Arc::new(RwLock::new(loaded.clone()));
+
+        // Build all gateways from config (no network connections established).
+        let gateways = gateway::build_gateways(
+            config.clone(),
+            &loaded.ssh.server_config_path,
+            &loaded.jump_hosts,
+            auth_prompter,
+        );
+
+        let reviewer = CommandReviewer::new()?;
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+
+        let state = GatewayDaemonState {
+            config_path,
+            config,
+            gateways,
+            reviewer,
+            shutdown_tx,
+            origin,
+            cli_start_options,
+        };
+
+        Ok((state, shutdown_rx))
+    }
+
+    /// Spawn the idle reaper task that periodically calls `prune_idle()` on all gateways.
+    ///
+    /// Returns the JoinHandle so the caller can abort it on shutdown if needed.
+    pub fn spawn_idle_reaper(
+        state: GatewayDaemonState,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let interval = {
+                    let config = state.config.read().await;
+                    config.server.reaper_interval
+                };
+                // Use configured interval, fallback to default if zero/unset.
+                let wait = if interval.as_secs() == 0 && interval.subsec_nanos() == 0 {
+                    Duration::from_secs(DEFAULT_REAPER_INTERVAL_SECS)
+                } else {
+                    interval
+                };
+                sleep(wait).await;
+
+                for (name, gw) in &state.gateways {
+                    gw.prune_idle().await;
+                    debug!(gateway = %name, "idle reaper pruned gateway");
+                }
+            }
+        })
+    }
+
+    /// Initiate graceful shutdown by sending on the shutdown channel.
+    pub async fn shutdown(state: &GatewayDaemonState) -> Result<()> {
+        if !state.origin.cli_controllable() {
+            return Err(anyhow!("daemon is externally managed and cannot be stopped/restarted by CLI"));
+        }
+        let _ = state.shutdown_tx.send(()).await;
+        Ok(())
+    }
+
+    /// Full daemon startup using the new gateway architecture.
+    ///
+    /// This function:
+    /// 1. Loads configuration
+    /// 2. Builds gateways (no I/O)
+    /// 3. Starts listeners (Unix socket, remote SSH)
+    /// 4. Spawns the idle reaper
+    /// 5. Runs the gRPC server until shutdown
+    ///
+    /// Note: This is the new entrypoint that will eventually replace `super::run()`.
+    /// Currently not wired into the binary — will be connected in subsequent tasks.
+    pub async fn run_gateway_daemon(
+        config_path: Option<PathBuf>,
+        log_level_override: Option<String>,
+        origin: DaemonOrigin,
+        cli_start_options: CliStartOptions,
+        auth_prompter: Arc<AuthPrompter>,
+    ) -> Result<()> {
+        let config_path_resolved = config_path.unwrap_or_else(default_config_path);
+        let mut loaded = AppConfig::load(Some(&config_path_resolved))?;
+        if let Some(level) = log_level_override {
+            loaded.server.log_level = level;
+        }
+        let _log_guard = init_logging(loaded.server.log_path.clone(), &loaded.server.log_level)?;
+        info!(config_path = %config_path_resolved.display(), "starting rhopd (gateway architecture)");
+
+        let config = Arc::new(RwLock::new(loaded.clone()));
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
+
+        // Build all gateways from config (no network connections established).
+        let gateways = gateway::build_gateways(
+            config.clone(),
+            &loaded.ssh.server_config_path,
+            &loaded.jump_hosts,
+            auth_prompter,
+        );
+
+        let reviewer = CommandReviewer::new()?;
+
+        let state = GatewayDaemonState {
+            config_path: config_path_resolved,
+            config: config.clone(),
+            gateways,
+            reviewer,
+            shutdown_tx,
+            origin,
+            cli_start_options,
+        };
+
+        // Spawn idle reaper.
+        let reaper_handle = spawn_idle_reaper(state.clone());
+
+        // Spawn SIGHUP handler for config reload + log reopen.
+        #[cfg(unix)]
+        {
+            let sighup_state = state.clone();
+            tokio::spawn(async move {
+                use tokio::signal::unix::{SignalKind, signal};
+                let Ok(mut sighup) = signal(SignalKind::hangup()) else {
+                    return;
+                };
+                while sighup.recv().await.is_some() {
+                    match reopen_log_output() {
+                        Ok(()) => info!("reopened log output after SIGHUP"),
+                        Err(error) => warn!(error = %format!("{error:#}"), "failed to reopen log output after SIGHUP"),
+                    }
+                    sighup_state.reload_jump_hosts().await;
+                }
+            });
+        }
+
+        // Wait for shutdown signal.
+        info!("gateway daemon running, waiting for shutdown signal");
+        let _ = shutdown_rx.recv().await;
+
+        // Graceful shutdown: abort the reaper and allow in-flight requests to drain.
+        reaper_handle.abort();
+        info!("gateway daemon shutting down");
+
+        Ok(())
     }
 }
