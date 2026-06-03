@@ -640,11 +640,28 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                     .find_gateway(&route.gateway_name)
                     .ok_or_else(|| anyhow!("gateway '{}' not found", route.gateway_name))?;
 
-                // When the copy routes through an rhopd gateway, the daemon acts as
-                // a relay: file data travels on the gRPC streams rather than through
-                // local files. We inject relay channels into the spec so that
-                // RhopdConnection::copy can read/write them instead of local files.
-                if gateway.kind() == gateway::GatewayKind::Rhopd {
+                // When copy data arrives over an rhop-rpc subsystem, the remote
+                // daemon materializes it into a temp file before handing off to
+                // local SFTP. When the next hop is another rhopd gateway, the
+                // daemon relays data directly over channels.
+                let mut remote_temp_path: Option<PathBuf> = None;
+                let mut download_relay_task: Option<tokio::task::JoinHandle<()>> = None;
+                if is_remote {
+                    use crate::types::CopyDirection;
+                    match spec.direction {
+                        CopyDirection::Upload => {
+                            let temp_path = remote_copy_temp_path("upload");
+                            receive_copy_upload_to_temp(&mut inbound, &temp_path).await?;
+                            spec.local_path = temp_path.display().to_string();
+                            remote_temp_path = Some(temp_path);
+                        }
+                        CopyDirection::Download => {
+                            let temp_path = remote_copy_temp_path("download");
+                            spec.local_path = temp_path.display().to_string();
+                            remote_temp_path = Some(temp_path);
+                        }
+                    }
+                } else if gateway.kind() == gateway::GatewayKind::Rhopd {
                     use crate::types::CopyDirection;
                     match spec.direction {
                         CopyDirection::Upload => {
@@ -690,7 +707,7 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                             spec.relay_download_tx = Some(download_tx);
 
                             let sender_clone = sender.clone();
-                            tokio::spawn(async move {
+                            let relay_task = tokio::spawn(async move {
                                 while let Some((data, eof)) = download_rx.recv().await {
                                     let chunk_response = proto_rpc::CopyResponse {
                                         event: Some(proto_rpc::copy_response::Event::DataChunk(
@@ -705,6 +722,7 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                                     }
                                 }
                             });
+                            download_relay_task = Some(relay_task);
                         }
                     }
                 }
@@ -717,6 +735,7 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 };
                 tokio::pin!(copy_timeout);
 
+                let copy_direction = spec.direction.clone();
                 let copy_task = {
                     let gw = gateway.clone();
                     let end_target = route.end_target.clone();
@@ -735,6 +754,9 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                         } => {
                             warn!(timeout_ms, "copy timed out");
                             copy_task.abort();
+                            if let Some(ref temp_path) = remote_temp_path {
+                                let _ = fs::remove_file(temp_path).await;
+                            }
                             sender
                                 .send(Ok(protocol::copy_error_response("copy timed out (exit code 124)")))
                                 .await
@@ -742,11 +764,27 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                             break;
                         }
                         result = &mut copy_task => {
-                            result?.map_err(|e| anyhow!("{}", e))?;
+                            result?.map_err(|e| {
+                                if let Some(ref temp_path) = remote_temp_path {
+                                    let _ = std::fs::remove_file(temp_path);
+                                }
+                                anyhow!("{}", e)
+                            })?;
+                            if is_remote && copy_direction == crate::types::CopyDirection::Download {
+                                if let Some(ref temp_path) = remote_temp_path {
+                                    send_copy_download_from_temp(&sender, temp_path).await?;
+                                }
+                            }
+                            if let Some(relay_task) = download_relay_task.take() {
+                                let _ = relay_task.await;
+                            }
                             sender
                                 .send(Ok(protocol::copy_complete_response(String::new())))
                                 .await
                                 .map_err(|_| anyhow!("copy client stream closed"))?;
+                            if let Some(ref temp_path) = remote_temp_path {
+                                let _ = fs::remove_file(temp_path).await;
+                            }
                             break;
                         }
                     }
@@ -1199,6 +1237,9 @@ async fn process_execute(
         cols: request.term_cols,
         rows: request.term_rows,
         shell: request.shell.clone(),
+        no_shell: request.no_shell,
+        timeout_ms: request.timeout_ms,
+        stdin: request.stdin,
         stdin_rx: std::sync::Mutex::new(stdin_rx),
     };
 
@@ -1509,6 +1550,87 @@ async fn process_interactive_execute(
             }
         }
     }
+
+    Ok(())
+}
+
+fn remote_copy_temp_path(prefix: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("rhop_{}_{}", prefix, Uuid::new_v4()))
+}
+
+async fn receive_copy_upload_to_temp(
+    inbound: &mut Streaming<proto_rpc::CopyRequest>,
+    temp_path: &Path,
+) -> Result<()> {
+    if let Some(parent) = temp_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    let mut file = fs::File::create(temp_path).await?;
+
+    loop {
+        let Some(message) = inbound.message().await? else {
+            bail!("copy upload stream closed before EOF");
+        };
+        match message.request {
+            Some(proto_rpc::copy_request::Request::DataChunk(chunk)) => {
+                if !chunk.data.is_empty() {
+                    use tokio::io::AsyncWriteExt as _;
+                    file.write_all(&chunk.data).await?;
+                }
+                if chunk.eof {
+                    use tokio::io::AsyncWriteExt as _;
+                    file.flush().await?;
+                    break;
+                }
+            }
+            Some(proto_rpc::copy_request::Request::AuthInput(_)) => {}
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+async fn send_copy_download_from_temp(
+    sender: &mpsc::Sender<Result<proto_rpc::CopyResponse, Status>>,
+    temp_path: &Path,
+) -> Result<()> {
+    const CHUNK_SIZE: usize = 64 * 1024;
+    let mut file = fs::File::open(temp_path).await?;
+    let mut buf = vec![0u8; CHUNK_SIZE];
+
+    loop {
+        let n = {
+            use tokio::io::AsyncReadExt as _;
+            file.read(&mut buf).await?
+        };
+        if n == 0 {
+            break;
+        }
+        sender
+            .send(Ok(proto_rpc::CopyResponse {
+                event: Some(proto_rpc::copy_response::Event::DataChunk(
+                    proto_rpc::CopyDataChunk {
+                        data: buf[..n].to_vec(),
+                        eof: false,
+                    },
+                )),
+            }))
+            .await
+            .map_err(|_| anyhow!("copy client stream closed"))?;
+    }
+
+    sender
+        .send(Ok(proto_rpc::CopyResponse {
+            event: Some(proto_rpc::copy_response::Event::DataChunk(
+                proto_rpc::CopyDataChunk {
+                    data: Vec::new(),
+                    eof: true,
+                },
+            )),
+        }))
+        .await
+        .map_err(|_| anyhow!("copy client stream closed"))?;
 
     Ok(())
 }

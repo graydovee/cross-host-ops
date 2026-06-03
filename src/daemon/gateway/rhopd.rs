@@ -299,6 +299,9 @@ impl Gateway for RhopdGateway {
             cols: request.cols,
             rows: request.rows,
             shell: request.shell.clone(),
+            no_shell: request.no_shell,
+            timeout_ms: request.timeout_ms,
+            stdin: request.stdin,
             stdin_rx,
         };
 

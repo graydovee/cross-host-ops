@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use hyper_util::rt::TokioIo;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::signal::unix::SignalKind;
 use tokio::sync::mpsc;
@@ -734,13 +734,28 @@ async fn status() -> Result<i32> {
 
 async fn run_copy(recursive: bool, source: String, dest: String, timeout_ms: u64) -> Result<i32> {
     let (target, spec) = parse_copy_operands(recursive, &source, &dest)?;
+    let config = AppConfig::load(None).unwrap_or_default();
+    let stream_file_data = is_rhopd_target(&target, &config);
     let mut client = connect_local_copy_client().await?;
     let (tx, rx) = mpsc::channel(8);
-    tx.send(crate::protocol::copy_spec_to_rpc(target, spec, timeout_ms))
+    tx.send(crate::protocol::copy_spec_to_rpc(target, spec.clone(), timeout_ms))
         .await
         .map_err(|_| anyhow!("failed to send copy start request"))?;
+
+    let upload_file = if stream_file_data && spec.direction == CopyDirection::Upload {
+        Some(tokio::fs::File::open(&spec.local_path).await.with_context(|| {
+            format!("failed to open upload source {}", spec.local_path)
+        })?)
+    } else {
+        None
+    };
+
     let response = client.copy(ReceiverStream::new(rx)).await?;
+    if let Some(file) = upload_file {
+        spawn_copy_upload_stream(tx.clone(), file);
+    }
     let mut stream = response.into_inner();
+    let mut download_file: Option<tokio::fs::File> = None;
     while let Some(message) = stream.message().await? {
         match message
             .event
@@ -767,13 +782,88 @@ async fn run_copy(recursive: bool, source: String, dest: String, timeout_ms: u64
                     println!("{}", info.message);
                 }
             }
-            rpc::copy_response::Event::DataChunk(_chunk) => {
-                // Download data streaming is not yet implemented in the CLI
-                // path; handled in a future task.
+            rpc::copy_response::Event::DataChunk(chunk) => {
+                if stream_file_data && spec.direction == CopyDirection::Download {
+                    write_copy_download_chunk(&mut download_file, &spec.local_path, chunk).await?;
+                }
             }
         }
     }
     Ok(0)
+}
+
+fn is_rhopd_target(target: &str, config: &AppConfig) -> bool {
+    let gateway_name = target.split_once(':').map_or(target, |(prefix, _)| prefix);
+    config.gateways.iter().any(|gateway| {
+        gateway.name() == gateway_name && matches!(gateway.gateway_kind(), GatewayKind::Rhopd)
+    })
+}
+
+fn spawn_copy_upload_stream(tx: mpsc::Sender<rpc::CopyRequest>, mut file: tokio::fs::File) {
+    tokio::spawn(async move {
+        const CHUNK_SIZE: usize = 64 * 1024;
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        loop {
+            let n = match file.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(error) => {
+                    tracing::warn!(error = %error, "failed to read copy upload source");
+                    return;
+                }
+            };
+            let msg = rpc::CopyRequest {
+                request: Some(rpc::copy_request::Request::DataChunk(
+                    rpc::CopyDataChunk {
+                        data: buf[..n].to_vec(),
+                        eof: false,
+                    },
+                )),
+            };
+            if tx.send(msg).await.is_err() {
+                return;
+            }
+        }
+        let eof = rpc::CopyRequest {
+            request: Some(rpc::copy_request::Request::DataChunk(
+                rpc::CopyDataChunk {
+                    data: Vec::new(),
+                    eof: true,
+                },
+            )),
+        };
+        let _ = tx.send(eof).await;
+    });
+}
+
+async fn write_copy_download_chunk(
+    download_file: &mut Option<tokio::fs::File>,
+    local_path: &str,
+    chunk: rpc::CopyDataChunk,
+) -> Result<()> {
+    if download_file.is_none() {
+        let path = Path::new(local_path);
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+        }
+        *download_file = Some(tokio::fs::File::create(path).await?);
+    }
+
+    if !chunk.data.is_empty() {
+        if let Some(file) = download_file.as_mut() {
+            file.write_all(&chunk.data).await?;
+        }
+    }
+
+    if chunk.eof {
+        if let Some(mut file) = download_file.take() {
+            file.flush().await?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Dispatch a HostCommand to the appropriate handler function.
@@ -1410,7 +1500,9 @@ fn parse_copy_operands(recursive: bool, source: &str, dest: &str) -> Result<(Str
 }
 
 fn parse_remote_spec(value: &str) -> Option<(String, String)> {
-    let (target, path) = value.split_once(':')?;
+    let colon_pos = value.rfind(':')?;
+    let target = &value[..colon_pos];
+    let path = &value[colon_pos + 1..];
     if target.is_empty()
         || path.is_empty()
         || target.contains('/')
@@ -1463,6 +1555,22 @@ mod tests {
             Just("-".to_string()),
             Just("---".to_string()),
         ]
+    }
+
+    #[test]
+    fn parse_remote_spec_supports_rhopd_qualified_targets() {
+        assert_eq!(
+            parse_remote_spec("ali-rhopd:host1:/tmp/x"),
+            Some(("ali-rhopd:host1".to_string(), "/tmp/x".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_remote_spec_keeps_single_hop_behavior() {
+        assert_eq!(
+            parse_remote_spec("host1:/tmp/x"),
+            Some(("host1".to_string(), "/tmp/x".to_string()))
+        );
     }
 
     proptest! {

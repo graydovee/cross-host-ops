@@ -53,8 +53,14 @@ impl Connection for RhopdConnection {
                 target: self.target_label.clone(),
                 argv: request.argv.clone(),
                 pty: request.pty,
+                no_pty: !request.pty,
+                stdin: stdin_rx.is_some(),
+                timeout_ms: request.timeout_ms,
+                interactive: false,
                 term_cols: request.cols,
                 term_rows: request.rows,
+                shell: request.shell.clone(),
+                no_shell: request.no_shell,
                 ..Default::default()
             })),
         };
@@ -734,6 +740,9 @@ mod tests {
             cols: 80,
             rows: 24,
             shell: String::new(),
+            no_shell: false,
+            timeout_ms: 0,
+            stdin: false,
             stdin_rx: None,
         }
     }
@@ -762,6 +771,9 @@ mod tests {
             cols: 80,
             rows: 24,
             shell: String::new(),
+            no_shell: false,
+            timeout_ms: 0,
+            stdin: true,
             stdin_rx: Some(stdin_rx),
         };
         (req, event_rx)
@@ -818,6 +830,20 @@ mod tests {
                     )
                 });
                 prop_assert!(has_start, "mock server should receive StartRequest");
+
+                let start_has_stdin = received_msgs.iter().any(|m| {
+                    if let Some(crate::protocol::rpc::execute_request::Request::Start(start)) =
+                        &m.request
+                    {
+                        start.stdin
+                    } else {
+                        false
+                    }
+                });
+                prop_assert!(
+                    start_has_stdin,
+                    "StartRequest must set stdin=true when stdin_rx is present"
+                );
 
                 // StdinData must be present and carry the exact payload.
                 let stdin_received = received_msgs.iter().any(|m| {

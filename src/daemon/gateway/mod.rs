@@ -98,6 +98,9 @@ pub struct ExecRequest {
     pub cols: u32,
     pub rows: u32,
     pub shell: String,
+    pub no_shell: bool,
+    pub timeout_ms: u64,
+    pub stdin: bool,
     /// Optional stdin receiver for forwarding stdin data to the remote process.
     /// Created by process_execute when the client requests stdin forwarding.
     /// Wrapped in Mutex<Option<...>> so the gateway can take ownership from `&self`.

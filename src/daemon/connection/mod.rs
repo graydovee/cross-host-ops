@@ -32,6 +32,9 @@ pub(super) struct ExecRequest {
     pub cols: u32,
     pub rows: u32,
     pub shell: String,
+    pub no_shell: bool,
+    pub timeout_ms: u64,
+    pub stdin: bool,
     /// Optional stdin receiver. When Some, the connection implementation SHALL
     /// read from this channel and forward bytes to the remote process.
     /// When None, behavior is identical to the pre-fix implementation.
