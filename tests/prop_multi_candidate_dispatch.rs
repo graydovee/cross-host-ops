@@ -12,15 +12,16 @@
 //! - When a Gateway returns an Execution error, the Daemon SHALL return
 //!   immediately without trying further candidates
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use proptest::prelude::*;
 use tokio::sync::mpsc;
 
-use rhop::config::ServerEntry;
+use std::collections::HashMap;
+
 use rhop::types::CopySpec;
+use rhop::protocol::ServerListRow;
 use rhop::daemon::gateway::{
     ErrorKind, ExecRequest, Gateway, GatewayError, GatewayKind, InteractiveHandle,
     InteractiveRequest, Route,
@@ -103,7 +104,7 @@ impl Gateway for MockGateway {
         unimplemented!("not needed for this test")
     }
 
-    async fn list_servers(&self) -> Result<Vec<ServerEntry>, GatewayError> {
+    async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError> {
         unimplemented!("not needed for this test")
     }
 
@@ -125,14 +126,16 @@ impl Gateway for MockGateway {
 /// Simulates the daemon's multi-candidate dispatch loop as specified in the
 /// design document.
 async fn dispatch_exec(
-    gateways: &HashMap<String, Arc<dyn Gateway>>,
+    gateways: &[(String, Arc<dyn Gateway>)],
     routes: &[Route],
     request: &ExecRequest,
 ) -> Result<i32, GatewayError> {
     let mut last_error = None;
     for route in routes {
         let gateway = gateways
-            .get(&route.gateway_name)
+            .iter()
+            .find(|(n, _)| n == &route.gateway_name)
+            .map(|(_, gw)| gw)
             .expect("gateway not found in test setup");
 
         match gateway.exec(&route.end_target, request).await {
@@ -190,8 +193,8 @@ fn arb_route_list() -> impl Strategy<Value = Vec<(Route, MockResult)>> {
 fn build_test_setup(
     route_results: &[(Route, MockResult)],
     call_log: Arc<Mutex<Vec<String>>>,
-) -> (HashMap<String, Arc<dyn Gateway>>, Vec<Route>) {
-    let mut gateways: HashMap<String, Arc<dyn Gateway>> = HashMap::new();
+) -> (Vec<(String, Arc<dyn Gateway>)>, Vec<Route>) {
+    let mut gateways: Vec<(String, Arc<dyn Gateway>)> = Vec::new();
     let mut routes = Vec::new();
 
     // Group results by gateway_name
@@ -207,7 +210,7 @@ fn build_test_setup(
     // Build mock gateways
     for (name, results) in gateway_results {
         let gw = MockGateway::new(&name, results, call_log.clone());
-        gateways.insert(name, Arc::new(gw));
+        gateways.push((name, Arc::new(gw)));
     }
 
     (gateways, routes)

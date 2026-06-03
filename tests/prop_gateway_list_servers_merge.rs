@@ -9,14 +9,14 @@
 //!
 //! **Validates: Requirements 10.3**
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use proptest::prelude::*;
 
 use rhop::config::{DirectAuth, ServerEntry};
-use rhop::types::CopySpec;
+use rhop::protocol::ServerListRow;
+use rhop::types::{CopySpec, ServerListSource};
 use rhop::daemon::gateway::{
     ErrorKind, ExecRequest, Gateway, GatewayError, GatewayKind, InteractiveHandle,
     InteractiveRequest,
@@ -26,7 +26,7 @@ use rhop::daemon::gateway::{
 // Mock Gateway implementations
 // ---------------------------------------------------------------------------
 
-/// A mock gateway that returns Ok with a list of server entries.
+/// A mock gateway that returns Ok with a list of ServerListRow entries.
 struct OkGateway {
     gateway_name: String,
     entries: Vec<ServerEntry>,
@@ -50,8 +50,16 @@ impl Gateway for OkGateway {
         unimplemented!("not needed for this test")
     }
 
-    async fn list_servers(&self) -> Result<Vec<ServerEntry>, GatewayError> {
-        Ok(self.entries.clone())
+    async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError> {
+        let rows = self
+            .entries
+            .iter()
+            .map(|entry| ServerListRow {
+                source: ServerListSource::Gateway(self.gateway_name.clone()),
+                server: entry.clone(),
+            })
+            .collect();
+        Ok(rows)
     }
 
     fn kind(&self) -> GatewayKind {
@@ -88,7 +96,7 @@ impl Gateway for UnsupportedGateway {
         unimplemented!("not needed for this test")
     }
 
-    async fn list_servers(&self) -> Result<Vec<ServerEntry>, GatewayError> {
+    async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError> {
         Err(GatewayError::unsupported(anyhow::anyhow!(
             "list_servers not supported by gateway '{}'",
             self.gateway_name
@@ -111,13 +119,14 @@ impl Gateway for UnsupportedGateway {
 // ---------------------------------------------------------------------------
 
 /// Simulates the daemon's list_servers merge logic as specified in the design.
+/// Iterates the Vec in order, preserving gateway declaration ordering.
 async fn merge_list_servers(
-    gateways: &HashMap<String, Arc<dyn Gateway>>,
-) -> Vec<ServerEntry> {
+    gateways: &[(String, Arc<dyn Gateway>)],
+) -> Vec<ServerListRow> {
     let mut results = Vec::new();
-    for gateway in gateways.values() {
+    for (_name, gateway) in gateways {
         match gateway.list_servers().await {
-            Ok(entries) => results.extend(entries),
+            Ok(rows) => results.extend(rows),
             Err(e) if e.kind == ErrorKind::Unsupported => continue,
             Err(_e) => continue,
         }
@@ -201,13 +210,13 @@ fn arb_gateway_set() -> impl Strategy<Value = Vec<(String, GatewayBehavior)>> {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: build gateways map from test data.
+// Helper: build gateways Vec from test data.
 // ---------------------------------------------------------------------------
 
 fn build_gateways(
     gateway_set: &[(String, GatewayBehavior)],
-) -> HashMap<String, Arc<dyn Gateway>> {
-    let mut gateways: HashMap<String, Arc<dyn Gateway>> = HashMap::new();
+) -> Vec<(String, Arc<dyn Gateway>)> {
+    let mut gateways: Vec<(String, Arc<dyn Gateway>)> = Vec::new();
 
     for (name, behavior) in gateway_set {
         let gw: Arc<dyn Gateway> = match behavior {
@@ -219,7 +228,7 @@ fn build_gateways(
                 gateway_name: name.clone(),
             }),
         };
-        gateways.insert(name.clone(), gw);
+        gateways.push((name.clone(), gw));
     }
 
     gateways
@@ -251,10 +260,12 @@ proptest! {
             let result = merge_list_servers(&gateways).await;
 
             // Compute expected: union of all entries from Ok gateways
-            let mut expected: Vec<ServerEntry> = Vec::new();
+            let mut expected_aliases: Vec<String> = Vec::new();
             for (_name, behavior) in &gateway_set {
                 if let GatewayBehavior::ReturnsEntries(entries) = behavior {
-                    expected.extend(entries.clone());
+                    for entry in entries {
+                        expected_aliases.push(entry.alias.clone());
+                    }
                 }
                 // Unsupported gateways contribute nothing
             }
@@ -262,34 +273,32 @@ proptest! {
             // PROPERTY: result count matches expected count
             prop_assert_eq!(
                 result.len(),
-                expected.len(),
+                expected_aliases.len(),
                 "Merge result count ({}) does not match expected ({}). \
                  Unsupported gateways should contribute zero entries.",
                 result.len(),
-                expected.len()
+                expected_aliases.len()
             );
 
             // PROPERTY: result contains exactly the expected entries (by alias)
-            // Sort both by alias for comparison since HashMap iteration order
-            // is non-deterministic.
-            let mut result_aliases: Vec<String> =
-                result.iter().map(|e| e.alias.clone()).collect();
-            result_aliases.sort();
-
-            let mut expected_aliases: Vec<String> =
-                expected.iter().map(|e| e.alias.clone()).collect();
-            expected_aliases.sort();
+            // Because we use Vec (ordered), the aliases should appear in the
+            // same order as the gateway_set declaration order.
+            let result_aliases: Vec<String> =
+                result.iter().map(|row| row.server.alias.clone()).collect();
 
             prop_assert_eq!(
                 &result_aliases,
                 &expected_aliases,
-                "Merged aliases do not match expected aliases from successful gateways"
+                "Merged aliases do not match expected aliases from successful gateways (order matters)"
             );
 
-            // PROPERTY: no entries from unsupported gateways appear
-            // (This is implicitly verified by count equality above, but let's
-            // also verify that the merge never fails — it always returns a Vec.)
-            // The fact that we got here without panic/error confirms no failure.
+            // PROPERTY: each row has a proper source tag
+            for row in &result {
+                match &row.source {
+                    ServerListSource::Gateway(_) => {},
+                    other => prop_assert!(false, "Expected Gateway source, got {:?}", other),
+                }
+            }
 
             Ok(())
         })?;

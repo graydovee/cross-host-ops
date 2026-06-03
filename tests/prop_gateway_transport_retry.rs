@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use proptest::prelude::*;
 use tokio::sync::mpsc;
 
-use rhop::config::ServerEntry;
+use rhop::protocol::ServerListRow;
 use rhop::types::CopySpec;
 use rhop::daemon::gateway::{
     ErrorKind, ExecRequest, Gateway, GatewayError, GatewayKind, InteractiveHandle,
@@ -144,7 +144,7 @@ impl Gateway for RetryMockGateway {
         unimplemented!("not needed for this test")
     }
 
-    async fn list_servers(&self) -> Result<Vec<ServerEntry>, GatewayError> {
+    async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError> {
         unimplemented!("not needed for this test")
     }
 

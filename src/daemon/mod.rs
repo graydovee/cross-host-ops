@@ -86,8 +86,8 @@ pub struct CliStartOptions {
 pub struct DaemonState {
     pub config_path: PathBuf,
     pub config: Arc<RwLock<AppConfig>>,
-    /// All gateways, keyed by name. "local" is always present.
-    pub gateways: HashMap<String, Arc<dyn Gateway>>,
+    /// All gateways, ordered by config declaration. "local" is always first.
+    pub gateways: Vec<(String, Arc<dyn Gateway>)>,
     pub reviewer: CommandReviewer,
     pub shutdown_tx: mpsc::Sender<()>,
     pub origin: DaemonOrigin,
@@ -132,6 +132,11 @@ impl DaemonState {
             config_path = %self.config_path.display(),
             "gateways reloaded successfully"
         );
+    }
+
+    /// Find a gateway by name in the ordered list.
+    pub fn find_gateway(&self, name: &str) -> Option<&Arc<dyn Gateway>> {
+        self.gateways.iter().find(|(n, _)| n == name).map(|(_, gw)| gw)
     }
 }
 
@@ -632,8 +637,7 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 );
 
                 let gateway = state
-                    .gateways
-                    .get(&route.gateway_name)
+                    .find_gateway(&route.gateway_name)
                     .ok_or_else(|| anyhow!("gateway '{}' not found", route.gateway_name))?;
 
                 // If timeout is specified, create a deadline future.
@@ -1107,8 +1111,7 @@ async fn process_execute(
 
     // Execute via gateway
     let gateway = state
-        .gateways
-        .get(&route.gateway_name)
+        .find_gateway(&route.gateway_name)
         .ok_or_else(|| anyhow!("gateway '{}' not found", route.gateway_name))?;
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -1295,8 +1298,7 @@ async fn process_interactive_execute(
 
     // Open interactive session via gateway
     let gateway = state
-        .gateways
-        .get(&route.gateway_name)
+        .find_gateway(&route.gateway_name)
         .ok_or_else(|| anyhow!("gateway '{}' not found", route.gateway_name))?;
 
     let (event_tx, mut _event_rx) = mpsc::unbounded_channel();

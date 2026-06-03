@@ -14,10 +14,11 @@ use tokio::sync::RwLock;
 use tracing::debug;
 
 use crate::config::{
-    AppConfig, DirectAuth, ServerEntry, list_server_entries, load_server_config,
+    AppConfig, DirectAuth, list_server_entries, load_server_config,
     resolve_server_entry,
 };
-use crate::types::CopySpec;
+use crate::protocol::ServerListRow;
+use crate::types::{CopySpec, ServerListSource};
 
 use super::auth::AuthPrompter;
 use super::{
@@ -367,11 +368,16 @@ impl Gateway for LocalGateway {
         })
     }
 
-    async fn list_servers(&self) -> Result<Vec<ServerEntry>, GatewayError> {
+    async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError> {
         let path = Path::new(&self.server_config_path);
-        list_server_entries(path).map_err(|e| {
+        let entries = list_server_entries(path).map_err(|e| {
             GatewayError::resolution(anyhow!("failed to list servers: {}", e))
-        })
+        })?;
+        let rows = entries.into_iter().map(|server| ServerListRow {
+            source: ServerListSource::Local,
+            server,
+        }).collect();
+        Ok(rows)
     }
 
     fn kind(&self) -> GatewayKind {

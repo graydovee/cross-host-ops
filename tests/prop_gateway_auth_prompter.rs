@@ -239,7 +239,7 @@ proptest! {
 
         // Verify the gateway was constructed successfully.
         prop_assert!(
-            gateways.contains_key(gateway.name()),
+            gateways.iter().any(|(n, _)| n == gateway.name()),
             "gateway '{}' should be present in the map",
             gateway.name()
         );

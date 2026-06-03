@@ -6,7 +6,7 @@ pub mod jumpserver;
 pub mod local;
 pub mod rhopd;
 
-use std::collections::HashMap;
+
 use std::fmt;
 use std::sync::Arc;
 
@@ -14,9 +14,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, RwLock};
 
-use crate::config::{GatewayConfig, ServerEntry};
+use crate::config::GatewayConfig;
 use crate::types::CopySpec;
-use crate::protocol::ServerEvent;
+use crate::protocol::{ServerEvent, ServerListRow};
 
 use self::auth::AuthPrompter;
 use self::jumpserver::JumpserverGateway;
@@ -46,7 +46,7 @@ pub trait Gateway: Send + Sync {
     ) -> Result<InteractiveHandle, GatewayError>;
 
     /// List servers reachable through this gateway.
-    async fn list_servers(&self) -> Result<Vec<ServerEntry>, GatewayError>;
+    async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError>;
 
     /// The concrete kind of this gateway.
     fn kind(&self) -> GatewayKind;
@@ -238,8 +238,8 @@ pub fn build_gateways(
     server_config_path: &str,
     gateways_config: &[GatewayConfig],
     auth_prompter: Arc<AuthPrompter>,
-) -> HashMap<String, Arc<dyn Gateway>> {
-    let mut gateways: HashMap<String, Arc<dyn Gateway>> = HashMap::new();
+) -> Vec<(String, Arc<dyn Gateway>)> {
+    let mut gateways: Vec<(String, Arc<dyn Gateway>)> = Vec::new();
 
     // Read max_connections_per_ip and max_idle_time from a blocking snapshot.
     // These are read at construction time and won't change until daemon restart.
@@ -255,8 +255,8 @@ pub fn build_gateways(
         }
     };
 
-    // Always create the "local" gateway.
-    gateways.insert(
+    // Always create the "local" gateway first.
+    gateways.push((
         "local".to_string(),
         Arc::new(LocalGateway::new(
             "local".to_string(),
@@ -266,9 +266,9 @@ pub fn build_gateways(
             max_connections_per_address,
             max_idle_time,
         )),
-    );
+    ));
 
-    // Create one gateway per gateways_config entry.
+    // Create one gateway per gateways_config entry, preserving declaration order.
     for gc in gateways_config {
         let gateway: Arc<dyn Gateway> = match gc {
             GatewayConfig::Rhopd(c) => Arc::new(RhopdGateway::new(
@@ -298,7 +298,7 @@ pub fn build_gateways(
                 ))
             }
         };
-        gateways.insert(gc.name().to_string(), gateway);
+        gateways.push((gc.name().to_string(), gateway));
     }
 
     gateways

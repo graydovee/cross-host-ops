@@ -332,34 +332,35 @@ impl<'a> Resolver<'a> {
     }
 }
 
-/// Parse an input string as `<jump_name>:<server_alias>`.
-/// Returns `None` if the input does not contain exactly one colon that is not
-/// at the start or end, or if either part is empty.
+/// Parse an input string as `<gateway_name>:<end_target>`.
+/// Splits on the FIRST colon only, so multi-colon targets like
+/// `"ali-rhopd:sub-gw:server1"` parse as gateway="ali-rhopd", end_target="sub-gw:server1".
+/// Returns `None` if there is no colon, if either part is empty, or if the
+/// part after the first colon is purely numeric (port-like, e.g. "host:22").
 fn parse_explicit_qualified(input: &str) -> Option<(&str, &str)> {
-    // Avoid matching bare IPv6 addresses or port-like patterns.
-    // A valid explicit form has exactly one colon with non-empty parts on both sides.
+    // Split on the first colon only.
     let colon_pos = input.find(':')?;
-    let jump_name = &input[..colon_pos];
-    let server_alias = &input[colon_pos + 1..];
+    let gateway_name = &input[..colon_pos];
+    let end_target = &input[colon_pos + 1..];
 
     // Both parts must be non-empty.
-    if jump_name.is_empty() || server_alias.is_empty() {
+    if gateway_name.is_empty() || end_target.is_empty() {
         return None;
     }
 
-    // If the part after the colon is purely numeric, treat it as a port (e.g.
-    // "host:22") rather than an explicit qualification.
-    if server_alias.chars().all(|c| c.is_ascii_digit()) {
+    // Reject if end_target starts with ':' (e.g. IPv6 "fe80::1" splits to
+    // gateway="fe80", end_target=":1" — the leading colon signals IPv6).
+    if end_target.starts_with(':') {
         return None;
     }
 
-    // If there are multiple colons, this might be an IPv6 address — don't treat
-    // it as explicit qualification.
-    if input.matches(':').count() > 1 {
+    // If the part after the first colon is purely numeric, treat it as a port
+    // (e.g. "host:22") rather than an explicit qualification.
+    if end_target.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
 
-    Some((jump_name, server_alias))
+    Some((gateway_name, end_target))
 }
 
 /// Derive an IP address from a hostname suffix pattern like "foo-192-0-2-163".
@@ -425,6 +426,22 @@ mod tests {
     #[test]
     fn parse_explicit_qualified_rejects_no_colon() {
         assert_eq!(parse_explicit_qualified("bareserver"), None);
+    }
+
+    #[test]
+    fn parse_explicit_qualified_multi_colon_two_levels() {
+        assert_eq!(
+            parse_explicit_qualified("ali-rhopd:sub-gw:server1"),
+            Some(("ali-rhopd", "sub-gw:server1"))
+        );
+    }
+
+    #[test]
+    fn parse_explicit_qualified_multi_colon_three_levels() {
+        assert_eq!(
+            parse_explicit_qualified("gw:sub:deep:server1"),
+            Some(("gw", "sub:deep:server1"))
+        );
     }
 
     fn make_server_config_with(entries: Vec<(&str, &str)>) -> ServerConfigFile {

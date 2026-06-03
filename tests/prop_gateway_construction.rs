@@ -167,7 +167,7 @@ proptest! {
     /// - All gateway addresses are random/unreachable, so any real connection
     ///   would fail or timeout — but the test completes instantly because
     ///   construction is I/O-free
-    /// - The returned HashMap has the correct number of entries: 1 (local) + N (gateways)
+    /// - The returned Vec has the correct number of entries: 1 (local) + N (gateways)
     #[test]
     fn prop_gateway_construction_is_io_free(
         gateways_config in arb_gateways_vec()
@@ -197,14 +197,14 @@ proptest! {
 
         // Verify "local" gateway is always present.
         prop_assert!(
-            gateways.contains_key("local"),
+            gateways.iter().any(|(n, _)| n == "local"),
             "gateways map must contain the 'local' key"
         );
 
         // Verify each gateway name is present.
         for gc in &gateways_config {
             prop_assert!(
-                gateways.contains_key(gc.name()),
+                gateways.iter().any(|(n, _)| n == gc.name()),
                 "gateways map must contain key '{}'",
                 gc.name()
             );

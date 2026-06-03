@@ -19,6 +19,7 @@ use rhop::config::AppConfig;
 use rhop::daemon::gateway::auth::{AuthPrompt, AuthPrompter};
 use rhop::daemon::gateway::local::LocalGateway;
 use rhop::daemon::gateway::Gateway;
+use rhop::types::ServerListSource;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -150,16 +151,26 @@ proptest! {
             let result = gateway.list_servers().await;
 
             // Verify the result is Ok
-            let server_entries = result.expect("list_servers should succeed for valid config");
+            let server_rows = result.expect("list_servers should succeed for valid config");
 
             // Verify the count matches
             prop_assert_eq!(
-                server_entries.len(),
+                server_rows.len(),
                 entries.len(),
                 "entry count mismatch: got {} but expected {}",
-                server_entries.len(),
+                server_rows.len(),
                 entries.len()
             );
+
+            // Property 6: All rows from LocalGateway must have source == Local
+            for row in &server_rows {
+                prop_assert_eq!(
+                    &row.source,
+                    &ServerListSource::Local,
+                    "LocalGateway row should have source == Local, got {:?}",
+                    row.source
+                );
+            }
 
             // Build expected set of (alias, host, port, user) tuples
             let mut expected: Vec<(String, String, u16, String)> = entries
@@ -168,10 +179,10 @@ proptest! {
                 .collect();
             expected.sort();
 
-            // Build actual set from the returned entries
-            let mut actual: Vec<(String, String, u16, String)> = server_entries
+            // Build actual set from the returned rows (unwrap row.server)
+            let mut actual: Vec<(String, String, u16, String)> = server_rows
                 .iter()
-                .map(|e| (e.alias.clone(), e.host.clone(), e.port, e.user.clone()))
+                .map(|row| (row.server.alias.clone(), row.server.host.clone(), row.server.port, row.server.user.clone()))
                 .collect();
             actual.sort();
 

@@ -14,9 +14,10 @@ use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 use tracing::{debug, info};
 
-use crate::config::ServerEntry;
 use crate::types::CopySpec;
-use crate::protocol::rpc;
+use crate::types::ServerListSource;
+use crate::protocol::{self, rpc, ServerListRow};
+use crate::daemon::rpc::prefix_source;
 use crate::daemon::ssh_server::remote_subsystem_name;
 
 use super::auth::{normalize_paths, parse_remote_target, AuthPrompter, ClientHandler};
@@ -402,44 +403,38 @@ impl Gateway for RhopdGateway {
         })
     }
 
-    async fn list_servers(&self) -> Result<Vec<ServerEntry>, GatewayError> {
+    async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError> {
         let mut client = self.ensure_client().await?;
 
         let response = client
             .list_servers(rpc::ServerListRequest {})
             .await
             .map_err(|e| {
-                // On transport error from list_servers, discard the client.
-                // We can't call discard_client() here directly (borrow issues),
-                // so we classify and handle below.
                 GatewayError::transport(anyhow!("list_servers RPC failed: {}", e))
             })?
             .into_inner();
 
-        let entries = response
-            .servers
-            .into_iter()
-            .map(|s| {
-                let auth = if s.auth_kind == "password" {
-                    crate::config::DirectAuth::Password {
-                        password: String::new(),
-                    }
-                } else {
-                    crate::config::DirectAuth::Key {
-                        identity_file: String::new(),
-                    }
-                };
-                ServerEntry {
-                    alias: s.alias,
-                    host: s.host,
-                    port: s.port as u16,
-                    user: s.user,
-                    auth,
-                }
-            })
-            .collect();
+        // Prefer merged.rows if available and non-empty
+        if let Some(ref merged) = response.merged {
+            if !merged.rows.is_empty() {
+                let rows = merged.rows.iter().filter_map(|rpc_row| {
+                    let server = protocol::server_entry_from_rpc(rpc_row.server.clone()?);
+                    let source = prefix_source(&self.gateway_name, &rpc_row.source);
+                    Some(ServerListRow { source, server })
+                }).collect();
+                return Ok(rows);
+            }
+        }
 
-        Ok(entries)
+        // Fallback: use flat servers field, treat as source="local"
+        let rows = response.servers.into_iter().map(|s| {
+            let server = protocol::server_entry_from_rpc(s);
+            ServerListRow {
+                source: ServerListSource::Gateway(self.gateway_name.clone()),
+                server,
+            }
+        }).collect();
+        Ok(rows)
     }
 
     fn kind(&self) -> GatewayKind {

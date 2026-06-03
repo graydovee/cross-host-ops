@@ -12,8 +12,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
-use crate::config::{AppConfig, JumpserverGatewayConfig, MfaConfig, ServerEntry};
+use crate::config::{AppConfig, JumpserverGatewayConfig, MfaConfig};
 use crate::daemon::resolver::derive_target_ip;
+use crate::protocol::ServerListRow;
 use crate::types::CopySpec;
 
 use super::auth::{
@@ -419,7 +420,7 @@ impl Gateway for JumpserverGateway {
         })
     }
 
-    async fn list_servers(&self) -> Result<Vec<ServerEntry>, GatewayError> {
+    async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError> {
         Err(GatewayError::unsupported(anyhow!(
             "jumpserver gateway '{}' does not support list_servers",
             self.gateway_name

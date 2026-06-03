@@ -10,9 +10,23 @@ use crate::types::CopySpec;
 use crate::types::ServerListSource;
 use crate::protocol::ServerListSourceStatus;
 
+
 use super::gateway::{ErrorKind, ExecRequest};
 use super::DaemonState;
 use super::resolver::Resolver;
+
+/// Apply path prefix logic to a remote source string.
+///
+/// Rules:
+/// - remote_source == "local" || remote_source.is_empty() → ServerListSource::Gateway(gateway_name)
+/// - otherwise → ServerListSource::Gateway(format!("{}:{}", gateway_name, remote_source))
+pub fn prefix_source(gateway_name: &str, remote_source: &str) -> ServerListSource {
+    if remote_source == "local" || remote_source.is_empty() {
+        ServerListSource::Gateway(gateway_name.to_string())
+    } else {
+        ServerListSource::Gateway(format!("{}:{}", gateway_name, remote_source))
+    }
+}
 
 /// Process an execute request by resolving routes and iterating candidates.
 ///
@@ -36,8 +50,7 @@ pub async fn process_execute(
 
     for route in &routes {
         let gateway = state
-            .gateways
-            .get(&route.gateway_name)
+            .find_gateway(&route.gateway_name)
             .ok_or_else(|| anyhow!("gateway '{}' not found", route.gateway_name))?;
 
         match gateway.exec(&route.end_target, request).await {
@@ -72,8 +85,7 @@ pub async fn process_copy(
 
     for route in &routes {
         let gateway = state
-            .gateways
-            .get(&route.gateway_name)
+            .find_gateway(&route.gateway_name)
             .ok_or_else(|| anyhow!("gateway '{}' not found", route.gateway_name))?;
 
         match gateway.copy(&route.end_target, spec).await {
@@ -99,32 +111,37 @@ pub async fn process_list_servers(
     let mut results: Vec<(ServerEntry, ServerListSource)> = Vec::new();
     let mut source_status: Vec<(ServerListSource, ServerListSourceStatus)> = Vec::new();
 
+    // Iterate in Vec order (config declaration order)
     for (name, gateway) in &state.gateways {
-        let source = if name == "local" {
-            ServerListSource::Local
-        } else {
-            ServerListSource::Gateway(name.clone())
-        };
-
         match gateway.list_servers().await {
-            Ok(entries) => {
-                for entry in entries {
-                    results.push((entry, source.clone()));
+            Ok(rows) => {
+                let source_tag = if name == "local" {
+                    ServerListSource::Local
+                } else {
+                    ServerListSource::Gateway(name.clone())
+                };
+                for row in rows {
+                    // Use source directly from the row (gateway already tagged it)
+                    results.push((row.server, row.source));
                 }
-                source_status.push((source, ServerListSourceStatus::Ok));
+                source_status.push((source_tag, ServerListSourceStatus::Ok));
             }
             Err(e) if e.kind == ErrorKind::Unsupported => {
-                source_status.push((source, ServerListSourceStatus::Unsupported));
-                continue;
+                let source_tag = if name == "local" {
+                    ServerListSource::Local
+                } else {
+                    ServerListSource::Gateway(name.clone())
+                };
+                source_status.push((source_tag, ServerListSourceStatus::Unsupported));
             }
             Err(e) => {
-                warn!(
-                    gateway = name.as_str(),
-                    error = %e,
-                    "list_servers failed"
-                );
-                source_status.push((source, ServerListSourceStatus::Error(e.to_string())));
-                continue;
+                let source_tag = if name == "local" {
+                    ServerListSource::Local
+                } else {
+                    ServerListSource::Gateway(name.clone())
+                };
+                warn!(gateway = name.as_str(), error = %e, "list_servers failed");
+                source_status.push((source_tag, ServerListSourceStatus::Error(e.to_string())));
             }
         }
     }
