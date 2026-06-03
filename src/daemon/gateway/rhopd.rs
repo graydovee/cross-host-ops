@@ -287,17 +287,23 @@ impl Gateway for RhopdGateway {
 
         // Create a RhopdConnection and delegate exec to it.
         let mut conn = RhopdConnection::new(client, target.to_string());
-        let conn_request = ConnExecRequest {
+
+        // Take stdin_rx from the gateway request (consuming it so the channel
+        // is owned by the connection layer for forwarding).
+        let stdin_rx = request.stdin_rx.lock().ok().and_then(|mut g| g.take());
+
+        let mut conn_request = ConnExecRequest {
             argv: request.argv.clone(),
             sender: request.sender.clone(),
             pty: request.pty,
             cols: request.cols,
             rows: request.rows,
             shell: request.shell.clone(),
+            stdin_rx,
         };
 
         // First attempt
-        let result = conn.exec(&conn_request).await;
+        let result = conn.exec(&mut conn_request).await;
 
         match result {
             Ok(exit_code) => Ok(exit_code),
@@ -313,7 +319,7 @@ impl Gateway for RhopdGateway {
 
                 let new_client = self.ensure_client().await?;
                 let mut retry_conn = RhopdConnection::new(new_client, target.to_string());
-                let retry_result = retry_conn.exec(&conn_request).await;
+                let retry_result = retry_conn.exec(&mut conn_request).await;
 
                 match retry_result {
                     Ok(exit_code) => Ok(exit_code),
@@ -332,13 +338,13 @@ impl Gateway for RhopdGateway {
         }
     }
 
-    async fn copy(&self, target: &str, spec: &CopySpec) -> Result<(), GatewayError> {
+    async fn copy(&self, target: &str, spec: CopySpec) -> Result<(), GatewayError> {
         let client = self.ensure_client().await?;
 
         let mut conn = RhopdConnection::new(client, target.to_string());
 
         // First attempt
-        let result = conn.copy(spec).await;
+        let result = conn.copy(spec.clone()).await;
 
         match result {
             Ok(()) => Ok(()),
@@ -353,6 +359,8 @@ impl Gateway for RhopdGateway {
 
                 let new_client = self.ensure_client().await?;
                 let mut retry_conn = RhopdConnection::new(new_client, target.to_string());
+                // Note: relay channels are dropped on clone, so retry is only
+                // effective for non-relay copies (where channels were None).
                 let retry_result = retry_conn.copy(spec).await;
 
                 match retry_result {

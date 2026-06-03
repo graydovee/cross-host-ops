@@ -247,13 +247,18 @@ impl JumpserverGateway {
         target: &str,
         request: &ExecRequest,
     ) -> Result<i32, GatewayError> {
-        let conn_request = ConnExecRequest {
+        // Take stdin_rx from the gateway request (consuming it so the channel
+        // is owned by the connection layer for forwarding).
+        let stdin_rx = request.stdin_rx.lock().ok().and_then(|mut g| g.take());
+
+        let mut conn_request = ConnExecRequest {
             argv: request.argv.clone(),
             sender: request.sender.clone(),
             pty: request.pty,
             cols: request.cols,
             rows: request.rows,
             shell: request.shell.clone(),
+            stdin_rx,
         };
 
         // First attempt
@@ -262,7 +267,7 @@ impl JumpserverGateway {
             self.ensure_shell(&mut shell_guard).await?;
 
             let result = self
-                .navigate_and_exec(&mut shell_guard, target, &conn_request)
+                .navigate_and_exec(&mut shell_guard, target, &mut conn_request)
                 .await;
 
             match &result {
@@ -296,7 +301,7 @@ impl JumpserverGateway {
         self.ensure_shell(&mut shell_guard).await?;
 
         let result = self
-            .navigate_and_exec(&mut shell_guard, target, &conn_request)
+            .navigate_and_exec(&mut shell_guard, target, &mut conn_request)
             .await;
         self.touch();
 
@@ -318,7 +323,7 @@ impl JumpserverGateway {
         &self,
         shell_guard: &mut Option<ShellState>,
         target: &str,
-        conn_request: &ConnExecRequest,
+        conn_request: &mut ConnExecRequest,
     ) -> Result<i32> {
         let state = shell_guard.as_mut().unwrap();
         self.navigate_to_target(&mut state.shell, target).await?;
@@ -342,7 +347,7 @@ impl Gateway for JumpserverGateway {
         self.exec_with_retry(target, request).await
     }
 
-    async fn copy(&self, target: &str, spec: &CopySpec) -> Result<(), GatewayError> {
+    async fn copy(&self, target: &str, spec: CopySpec) -> Result<(), GatewayError> {
         let mut shell_guard = self.shell.lock().await;
         self.ensure_shell(&mut shell_guard).await?;
         let state = shell_guard.as_mut().unwrap();

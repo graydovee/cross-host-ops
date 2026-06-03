@@ -616,7 +616,7 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                     bail!("Copy requests received over rhop-rpc must not specify local_path");
                 }
 
-                let (target_input, spec, timeout_ms): (String, CopySpec, u64) = protocol::copy_spec_from_rpc(start)?;
+                let (target_input, mut spec, timeout_ms): (String, CopySpec, u64) = protocol::copy_spec_from_rpc(start)?;
                 let config = state.config.read().await.clone();
                 let server_config = load_server_config(std::path::Path::new(&config.ssh.server_config_path))
                     .unwrap_or_default();
@@ -640,6 +640,75 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                     .find_gateway(&route.gateway_name)
                     .ok_or_else(|| anyhow!("gateway '{}' not found", route.gateway_name))?;
 
+                // When the copy routes through an rhopd gateway, the daemon acts as
+                // a relay: file data travels on the gRPC streams rather than through
+                // local files. We inject relay channels into the spec so that
+                // RhopdConnection::copy can read/write them instead of local files.
+                if gateway.kind() == gateway::GatewayKind::Rhopd {
+                    use crate::types::CopyDirection;
+                    match spec.direction {
+                        CopyDirection::Upload => {
+                            // Upload relay: spawn a task to forward CopyDataChunk messages
+                            // from the client gRPC inbound stream into a channel, which
+                            // RhopdConnection::copy will read instead of a local file.
+                            let (upload_tx, upload_rx) = mpsc::channel::<(Vec<u8>, bool)>(16);
+                            spec.relay_upload_rx = Some(upload_rx);
+
+                            tokio::spawn(async move {
+                                loop {
+                                    match inbound.message().await {
+                                        Ok(Some(msg)) => {
+                                            match msg.request {
+                                                Some(proto_rpc::copy_request::Request::DataChunk(chunk)) => {
+                                                    let eof = chunk.eof;
+                                                    if upload_tx.send((chunk.data, eof)).await.is_err() {
+                                                        break;
+                                                    }
+                                                    if eof {
+                                                        break;
+                                                    }
+                                                }
+                                                Some(proto_rpc::copy_request::Request::AuthInput(_)) => {
+                                                    // Auth input not handled in relay mode; skip.
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        Ok(None) | Err(_) => {
+                                            // Client disconnected; the channel drop signals EOF.
+                                            break;
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        CopyDirection::Download => {
+                            // Download relay: RhopdConnection::copy sends data chunks to this
+                            // channel; we forward them as CopyDataChunk events on the gRPC
+                            // response stream back to the client.
+                            let (download_tx, mut download_rx) = mpsc::channel::<(Vec<u8>, bool)>(16);
+                            spec.relay_download_tx = Some(download_tx);
+
+                            let sender_clone = sender.clone();
+                            tokio::spawn(async move {
+                                while let Some((data, eof)) = download_rx.recv().await {
+                                    let chunk_response = proto_rpc::CopyResponse {
+                                        event: Some(proto_rpc::copy_response::Event::DataChunk(
+                                            proto_rpc::CopyDataChunk { data, eof },
+                                        )),
+                                    };
+                                    if sender_clone.send(Ok(chunk_response)).await.is_err() {
+                                        break;
+                                    }
+                                    if eof {
+                                        break;
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+
                 // If timeout is specified, create a deadline future.
                 let copy_timeout = if timeout_ms > 0 {
                     Some(tokio::time::sleep(Duration::from_millis(timeout_ms)))
@@ -651,8 +720,7 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 let copy_task = {
                     let gw = gateway.clone();
                     let end_target = route.end_target.clone();
-                    let spec = spec.clone();
-                    tokio::spawn(async move { gw.copy(&end_target, &spec).await })
+                    tokio::spawn(async move { gw.copy(&end_target, spec).await })
                 };
                 tokio::pin!(copy_task);
 

@@ -36,7 +36,7 @@ pub trait Gateway: Send + Sync {
     async fn exec(&self, target: &str, request: &ExecRequest) -> Result<i32, GatewayError>;
 
     /// Copy files to/from the specified end target.
-    async fn copy(&self, target: &str, spec: &CopySpec) -> Result<(), GatewayError>;
+    async fn copy(&self, target: &str, spec: CopySpec) -> Result<(), GatewayError>;
 
     /// Open an interactive PTY session to the specified end target.
     async fn exec_interactive(

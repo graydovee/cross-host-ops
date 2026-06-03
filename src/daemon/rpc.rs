@@ -72,7 +72,7 @@ pub async fn process_execute(
 pub async fn process_copy(
     state: &DaemonState,
     target: &str,
-    spec: &CopySpec,
+    spec: CopySpec,
 ) -> Result<()> {
     let config = state.config.read().await.clone();
     let server_config =
@@ -88,7 +88,7 @@ pub async fn process_copy(
             .find_gateway(&route.gateway_name)
             .ok_or_else(|| anyhow!("gateway '{}' not found", route.gateway_name))?;
 
-        match gateway.copy(&route.end_target, spec).await {
+        match gateway.copy(&route.end_target, spec.clone()).await {
             Ok(()) => return Ok(()),
             Err(e) if e.kind == ErrorKind::Resolution => {
                 last_error = Some(e.into());

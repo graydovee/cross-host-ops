@@ -88,7 +88,7 @@ impl DirectConnection {
 
 #[async_trait::async_trait]
 impl Connection for DirectConnection {
-    async fn exec(&mut self, request: &ExecRequest) -> Result<i32> {
+    async fn exec(&mut self, request: &mut ExecRequest) -> Result<i32> {
         let command = build_final_command(&request.argv, &request.shell);
         let mut channel = self.handle.channel_open_session().await?;
         if request.pty {
@@ -98,38 +98,71 @@ impl Connection for DirectConnection {
         }
         channel.exec(true, command.as_str()).await?;
 
+        // Take ownership of the stdin receiver so we can forward bytes to the
+        // SSH channel. When None, behavior is identical to the original loop.
+        let mut stdin_rx = request.stdin_rx.take();
+
         let mut exit_code = None;
+        let mut stdin_done = stdin_rx.is_none(); // true means no stdin branch to service
         loop {
-            let Some(message) = channel.wait().await else {
-                break;
-            };
-            match message {
-                ChannelMsg::Data { data } => {
-                    let _ = request.sender.send(ServerEvent::Stdout {
-                        data: data.to_vec(),
-                    });
+            tokio::select! {
+                // Read from stdin_rx and forward to the SSH channel.
+                // This branch is only active when stdin_rx is Some and not yet exhausted.
+                stdin_result = async {
+                    if stdin_done {
+                        // Park this branch permanently — return pending to disable it.
+                        std::future::pending::<Option<Vec<u8>>>().await
+                    } else {
+                        // Safety: stdin_rx is Some when stdin_done is false.
+                        stdin_rx.as_mut().unwrap().recv().await
+                    }
+                } => {
+                    match stdin_result {
+                        Some(data) => {
+                            // Forward stdin chunk to the remote process via the SSH channel.
+                            channel.data(Cursor::new(data)).await?;
+                        }
+                        None => {
+                            // Stdin sender has been dropped — signal EOF to the remote process.
+                            channel.eof().await?;
+                            stdin_done = true;
+                        }
+                    }
                 }
-                ChannelMsg::ExtendedData { data, .. } => {
-                    let _ = request.sender.send(ServerEvent::Stderr {
-                        data: data.to_vec(),
-                    });
+                // Read messages from the SSH channel (stdout, stderr, exit status).
+                msg = channel.wait() => {
+                    let Some(message) = msg else {
+                        break;
+                    };
+                    match message {
+                        ChannelMsg::Data { data } => {
+                            let _ = request.sender.send(ServerEvent::Stdout {
+                                data: data.to_vec(),
+                            });
+                        }
+                        ChannelMsg::ExtendedData { data, .. } => {
+                            let _ = request.sender.send(ServerEvent::Stderr {
+                                data: data.to_vec(),
+                            });
+                        }
+                        ChannelMsg::ExitStatus { exit_status } => {
+                            exit_code = Some(exit_status as i32);
+                        }
+                        ChannelMsg::ExitSignal { .. } => {
+                            exit_code = Some(255);
+                        }
+                        _ => {}
+                    }
                 }
-                ChannelMsg::ExitStatus { exit_status } => {
-                    exit_code = Some(exit_status as i32);
-                }
-                ChannelMsg::ExitSignal { .. } => {
-                    exit_code = Some(255);
-                }
-                _ => {}
             }
         }
         Ok(exit_code.unwrap_or(255))
     }
 
-    async fn copy(&mut self, spec: &CopySpec) -> Result<()> {
+    async fn copy(&mut self, spec: CopySpec) -> Result<()> {
         match spec.direction {
-            CopyDirection::Upload => self.copy_upload(spec).await,
-            CopyDirection::Download => self.copy_download(spec).await,
+            CopyDirection::Upload => self.copy_upload(&spec).await,
+            CopyDirection::Download => self.copy_download(&spec).await,
         }
     }
 

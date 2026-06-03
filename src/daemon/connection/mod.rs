@@ -20,7 +20,11 @@ use crate::protocol::ServerEvent;
 // ---------------------------------------------------------------------------
 
 /// Request payload for exec operations (Connection-level).
-#[derive(Clone, Debug)]
+///
+/// NOTE: `stdin_rx` is not Clone because `mpsc::Receiver` is not Clone.
+/// The `Connection` trait takes `&mut self`, so the connection can take
+/// ownership of `stdin_rx` by calling `Option::take()`.
+#[derive(Debug)]
 pub(super) struct ExecRequest {
     pub argv: Vec<String>,
     pub sender: mpsc::UnboundedSender<ServerEvent>,
@@ -28,6 +32,10 @@ pub(super) struct ExecRequest {
     pub cols: u32,
     pub rows: u32,
     pub shell: String,
+    /// Optional stdin receiver. When Some, the connection implementation SHALL
+    /// read from this channel and forward bytes to the remote process.
+    /// When None, behavior is identical to the pre-fix implementation.
+    pub stdin_rx: Option<mpsc::Receiver<Vec<u8>>>,
 }
 
 /// Request payload for interactive PTY sessions (Connection-level).
@@ -57,10 +65,17 @@ pub(super) struct InteractiveHandle {
 #[async_trait]
 pub(super) trait Connection: Send {
     /// Execute a command on the connected end target.
-    async fn exec(&mut self, request: &ExecRequest) -> Result<i32>;
+    ///
+    /// Takes `&mut ExecRequest` so that implementations can call
+    /// `request.stdin_rx.take()` to move the receiver out for forwarding.
+    async fn exec(&mut self, request: &mut ExecRequest) -> Result<i32>;
 
     /// Copy files to/from the connected end target.
-    async fn copy(&mut self, spec: &CopySpec) -> Result<()>;
+    ///
+    /// Takes owned `CopySpec` so that implementations can take relay channels
+    /// (`relay_upload_rx`, `relay_download_tx`) out of it without needing
+    /// `&mut self` style awkwardness.
+    async fn copy(&mut self, spec: CopySpec) -> Result<()>;
 
     /// Open an interactive PTY session.
     async fn exec_interactive(&mut self, request: &InteractiveRequest) -> Result<InteractiveHandle>;

@@ -61,10 +61,18 @@ enum CopyDirection {
   COPY_DIRECTION_DOWNLOAD = 2;
 }
 
+// CopyDataChunk streams file content between client and daemon for rhopd-routed copies.
+// Used on both the request stream (upload) and response stream (download).
+message CopyDataChunk {
+  bytes data = 1;
+  bool eof = 2;
+}
+
 message CopyRequest {
   oneof request {
     CopyStartRequest start = 1;
     AuthInputRequest auth_input = 2;
+    CopyDataChunk data_chunk = 3;
   }
 }
 
@@ -96,6 +104,7 @@ message CopyResponse {
     ErrorResponse error = 2;
     AuthPrompt auth_prompt = 3;
     CopyComplete complete = 4;
+    CopyDataChunk data_chunk = 5;
   }
 }
 

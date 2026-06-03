@@ -65,6 +65,8 @@ pub fn copy_spec_from_rpc(request: rpc::CopyStartRequest) -> Result<(String, Cop
             local_path: request.local_path,
             remote_path: request.remote_path,
             recursive: request.recursive,
+            relay_upload_rx: None,
+            relay_download_tx: None,
         },
         request.timeout_ms,
     ))

@@ -734,6 +734,10 @@ async fn run_copy(recursive: bool, source: String, dest: String, timeout_ms: u64
                     println!("{}", info.message);
                 }
             }
+            rpc::copy_response::Event::DataChunk(_chunk) => {
+                // Download data streaming is not yet implemented in the CLI
+                // path; handled in a future task.
+            }
         }
     }
     Ok(0)
@@ -1352,6 +1356,8 @@ fn parse_copy_operands(recursive: bool, source: &str, dest: &str) -> Result<(Str
                 local_path: expand_tilde(dest)?,
                 remote_path,
                 recursive,
+                relay_upload_rx: None,
+                relay_download_tx: None,
             },
         )),
         (None, Some((target, remote_path))) => Ok((
@@ -1361,6 +1367,8 @@ fn parse_copy_operands(recursive: bool, source: &str, dest: &str) -> Result<(Str
                 local_path: expand_tilde(source)?,
                 remote_path,
                 recursive,
+                relay_upload_rx: None,
+                relay_download_tx: None,
             },
         )),
         (Some(_), Some(_)) => bail!("copy supports exactly one remote operand"),

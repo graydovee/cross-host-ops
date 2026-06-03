@@ -217,7 +217,7 @@ impl JumpserverConnection {
 
 #[async_trait::async_trait]
 impl Connection for JumpserverConnection {
-    async fn exec(&mut self, request: &ExecRequest) -> Result<i32> {
+    async fn exec(&mut self, request: &mut ExecRequest) -> Result<i32> {
         // Jumpserver connections always operate through an interactive PTY shell.
         // Build the command using interactive shell formatting (first word unquoted
         // for alias expansion).
@@ -226,10 +226,10 @@ impl Connection for JumpserverConnection {
             .await
     }
 
-    async fn copy(&mut self, spec: &CopySpec) -> Result<()> {
+    async fn copy(&mut self, spec: CopySpec) -> Result<()> {
         match spec.direction {
-            CopyDirection::Upload => self.copy_upload(spec).await,
-            CopyDirection::Download => self.copy_download(spec).await,
+            CopyDirection::Upload => self.copy_upload(&spec).await,
+            CopyDirection::Download => self.copy_download(&spec).await,
         }
     }
 
@@ -451,16 +451,16 @@ impl<'a> BorrowedJumpserverConnection<'a> {
 
 #[async_trait::async_trait]
 impl Connection for BorrowedJumpserverConnection<'_> {
-    async fn exec(&mut self, request: &ExecRequest) -> Result<i32> {
+    async fn exec(&mut self, request: &mut ExecRequest) -> Result<i32> {
         let command = build_interactive_shell_command(&request.argv);
         self.run_shell_command_stream(&command, &request.sender, EXEC_SENTINEL_PREFIX)
             .await
     }
 
-    async fn copy(&mut self, spec: &CopySpec) -> Result<()> {
+    async fn copy(&mut self, spec: CopySpec) -> Result<()> {
         match spec.direction {
-            CopyDirection::Upload => self.copy_upload(spec).await,
-            CopyDirection::Download => self.copy_download(spec).await,
+            CopyDirection::Upload => self.copy_upload(&spec).await,
+            CopyDirection::Download => self.copy_download(&spec).await,
         }
     }
 

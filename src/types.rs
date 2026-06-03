@@ -10,12 +10,57 @@ pub enum CopyDirection {
 }
 
 /// Specification for a single file copy operation.
-#[derive(Clone, Debug)]
+///
+/// The `relay_upload_rx` and `relay_download_tx` fields are used when the
+/// daemon acts as a relay for rhopd-routed copies. In this mode, file data
+/// does not live on the daemon's local disk — it travels on gRPC streams.
+///
+/// - `relay_upload_rx`: When `Some`, the connection reads upload chunks from
+///   this channel instead of reading from `local_path`.
+/// - `relay_download_tx`: When `Some`, the connection sends download chunks
+///   to this channel instead of writing to `local_path`.
+///
+/// Both fields are `None` for direct (non-relay) copy operations, preserving
+/// the original SFTP file-based behavior.
 pub struct CopySpec {
     pub direction: CopyDirection,
     pub local_path: String,
     pub remote_path: String,
     pub recursive: bool,
+    /// Upload relay: receive (data, eof) tuples from the daemon's gRPC inbound stream.
+    /// When Some, replaces local file reading for upload operations.
+    pub relay_upload_rx: Option<tokio::sync::mpsc::Receiver<(Vec<u8>, bool)>>,
+    /// Download relay: send (data, eof) tuples to the daemon's gRPC response sender.
+    /// When Some, replaces local file writing for download operations.
+    pub relay_download_tx: Option<tokio::sync::mpsc::Sender<(Vec<u8>, bool)>>,
+}
+
+impl Clone for CopySpec {
+    fn clone(&self) -> Self {
+        // relay channels are not clonable; cloning drops them (used only in retry paths
+        // before channels are populated, so this is safe in practice).
+        Self {
+            direction: self.direction.clone(),
+            local_path: self.local_path.clone(),
+            remote_path: self.remote_path.clone(),
+            recursive: self.recursive,
+            relay_upload_rx: None,
+            relay_download_tx: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for CopySpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CopySpec")
+            .field("direction", &self.direction)
+            .field("local_path", &self.local_path)
+            .field("remote_path", &self.remote_path)
+            .field("recursive", &self.recursive)
+            .field("relay_upload_rx", &self.relay_upload_rx.is_some())
+            .field("relay_download_tx", &self.relay_download_tx.is_some())
+            .finish()
+    }
 }
 
 /// Identifies the source of server-list entries.

@@ -221,20 +221,25 @@ impl Gateway for LocalGateway {
         let key = Self::pool_key(&resolved.host, resolved.port);
         let pooled = self.get_connection(&resolved).await?;
 
+        // Take stdin_rx from the gateway request (consuming it so the channel
+        // is owned by the connection layer for forwarding).
+        let stdin_rx = request.stdin_rx.lock().ok().and_then(|mut g| g.take());
+
         // Build the connection-level request
-        let conn_request = ConnExecRequest {
+        let mut conn_request = ConnExecRequest {
             argv: request.argv.clone(),
             sender: request.sender.clone(),
             pty: request.pty,
             cols: request.cols,
             rows: request.rows,
             shell: request.shell.clone(),
+            stdin_rx,
         };
 
         // First attempt
         let result = {
             let mut conn = pooled.conn.lock().await;
-            conn.exec(&conn_request).await
+            conn.exec(&mut conn_request).await
         };
 
         match result {
@@ -259,7 +264,7 @@ impl Gateway for LocalGateway {
 
                 let retry_result = {
                     let mut conn = retry_pooled.conn.lock().await;
-                    conn.exec(&conn_request).await
+                    conn.exec(&mut conn_request).await
                 };
 
                 match retry_result {
@@ -280,7 +285,7 @@ impl Gateway for LocalGateway {
         }
     }
 
-    async fn copy(&self, target: &str, spec: &CopySpec) -> Result<(), GatewayError> {
+    async fn copy(&self, target: &str, spec: CopySpec) -> Result<(), GatewayError> {
         let resolved = self.resolve_target(target)?;
         let key = Self::pool_key(&resolved.host, resolved.port);
         let pooled = self.get_connection(&resolved).await?;
@@ -288,7 +293,7 @@ impl Gateway for LocalGateway {
         // First attempt
         let result = {
             let mut conn = pooled.conn.lock().await;
-            conn.copy(spec).await
+            conn.copy(spec.clone()).await
         };
 
         match result {
@@ -312,6 +317,8 @@ impl Gateway for LocalGateway {
 
                 let retry_result = {
                     let mut conn = retry_pooled.conn.lock().await;
+                    // Note: relay channels from the original spec are dropped on clone;
+                    // retry only makes sense for non-relay (direct SFTP) copies.
                     conn.copy(spec).await
                 };
 

@@ -38,7 +38,7 @@ impl Gateway for MockGateway {
         unimplemented!("not needed for this test")
     }
 
-    async fn copy(&self, _target: &str, _spec: &CopySpec) -> Result<(), GatewayError> {
+    async fn copy(&self, _target: &str, _spec: CopySpec) -> Result<(), GatewayError> {
         unimplemented!("not needed for this test")
     }
 
