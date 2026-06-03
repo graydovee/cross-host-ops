@@ -64,37 +64,84 @@ impl Connection for RhopdConnection {
             anyhow::anyhow!("failed to send start request into stream")
         })?;
 
-        if let Some(mut rx) = stdin_rx {
-            // Spawn a stdin relay task that keeps req_tx alive until stdin is
-            // exhausted. When the sender side closes, rx.recv() returns None
-            // and we drop req_tx, signaling EOF (stream close) to the remote daemon.
-            tokio::spawn(async move {
-                while let Some(data) = rx.recv().await {
-                    let msg = rpc::ExecuteRequest {
-                        request: Some(rpc::execute_request::Request::StdinData(
-                            rpc::StdinData { data },
-                        )),
-                    };
-                    if req_tx.send(msg).await.is_err() {
-                        // Remote end closed the stream; stop forwarding.
-                        break;
-                    }
-                }
-                // req_tx is dropped here, closing the gRPC request stream
-                // and signaling EOF to the remote daemon process.
-            });
-        } else {
-            // No stdin — drop req_tx immediately to close the request stream,
-            // preserving the original pre-fix behavior.
-            drop(req_tx);
-        }
-
+        // Build the request stream and start the bidirectional RPC FIRST,
+        // so that tonic begins consuming the stream and forwarding messages
+        // (including any subsequent StdinData chunks the relay task will
+        // produce).  Only after the RPC is established do we spawn the
+        // stdin relay task — otherwise the relay can finish (and drop req_tx)
+        // before tonic has a chance to set up the HTTP/2 stream, which on
+        // SSH-tunneled gRPC has been observed to drop buffered messages.
         let request_stream = ReceiverStream::new(req_rx);
         let mut response_stream = self
             .client
             .execute(request_stream)
             .await?
             .into_inner();
+
+        // Hold a clone of req_tx for the duration of the RPC so the request
+        // stream stays open even after the relay task finishes.  This is
+        // essential because EOF is now signaled via an explicit empty
+        // StdinData message rather than by closing the stream — and closing
+        // the stream prematurely (over an SSH-tunneled gRPC connection) has
+        // been observed to drop in-flight DATA frames on the receiving end.
+        let _req_tx_keepalive = req_tx.clone();
+
+        if let Some(mut rx) = stdin_rx {
+            // Spawn a stdin relay task that forwards stdin bytes upstream
+            // and emits an explicit empty-StdinData EOF sentinel when the
+            // local source closes.  After emitting the sentinel, the relay
+            // drops its sender — but the keepalive clone above keeps the
+            // request stream open so the remote can still send responses.
+            tokio::spawn(async move {
+                tracing::info!("rhopd-relay: started");
+                let mut sent_bytes = 0usize;
+                let mut sent_chunks = 0usize;
+                while let Some(data) = rx.recv().await {
+                    if data.is_empty() {
+                        // Upstream EOF sentinel passed through verbatim.
+                        let msg = rpc::ExecuteRequest {
+                            request: Some(rpc::execute_request::Request::StdinData(
+                                rpc::StdinData { data: Vec::new() },
+                            )),
+                        };
+                        match req_tx.send(msg).await {
+                            Ok(_) => tracing::info!(sent_chunks, sent_bytes, "rhopd-relay: forwarded explicit EOF sentinel"),
+                            Err(_) => tracing::info!(sent_chunks, sent_bytes, "rhopd-relay: failed to forward EOF sentinel"),
+                        }
+                        break;
+                    }
+                    sent_bytes += data.len();
+                    sent_chunks += 1;
+                    let len = data.len();
+                    let msg = rpc::ExecuteRequest {
+                        request: Some(rpc::execute_request::Request::StdinData(
+                            rpc::StdinData { data },
+                        )),
+                    };
+                    match req_tx.send(msg).await {
+                        Ok(_) => tracing::info!(len, sent_chunks, "rhopd-relay: forwarded StdinData"),
+                        Err(_) => {
+                            tracing::info!(sent_chunks, sent_bytes, "rhopd-relay: send failed, stopping");
+                            return;
+                        }
+                    }
+                }
+                // If we reached here without seeing an explicit empty sentinel
+                // (i.e. rx was dropped without sending one), still emit one so
+                // the remote daemon can stop waiting for stdin.
+                tracing::info!(sent_chunks, sent_bytes, "rhopd-relay: rx exhausted without sentinel, emitting fallback EOF");
+                let eof = rpc::ExecuteRequest {
+                    request: Some(rpc::execute_request::Request::StdinData(
+                        rpc::StdinData { data: Vec::new() },
+                    )),
+                };
+                let _ = req_tx.send(eof).await;
+                // req_tx (the relay clone) drops here.  The keepalive clone
+                // outside this task keeps the stream open until the RPC ends.
+            });
+        }
+        // Note: we no longer drop req_tx in the no-stdin branch.  The
+        // keepalive clone keeps the stream open for the duration of the RPC.
 
         let mut exit_code: Option<i32> = None;
 

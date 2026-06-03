@@ -419,16 +419,32 @@ async fn run_command(target: String, argv: Vec<String>, resolved_tty: bool, reso
 
     // If stdin forwarding is requested, spawn a task that reads from tokio stdin
     // and sends data on the bidirectional stream.
-    if resolved_stdin {
+    //
+    // EOF semantics: instead of relying on closing the gRPC request stream
+    // (which is unreliable across SSH-tunneled gRPC hops), we send an
+    // EXPLICIT zero-length StdinData message as an EOF sentinel.  Daemons
+    // along the path interpret an empty StdinData payload as "no more stdin"
+    // and propagate it downstream.  We then keep the sender alive for the
+    // remainder of the call so the bidirectional stream stays healthy.
+    let response_tx = if resolved_stdin {
         let stdin_tx = tx.clone();
         tokio::spawn(async move {
             let mut tokio_stdin = tokio::io::stdin();
             let mut buf = [0u8; 4096];
             loop {
                 match tokio_stdin.read(&mut buf).await {
-                    Ok(0) => break, // EOF
+                    Ok(0) => {
+                        // Local stdin EOF: send explicit empty StdinData as
+                        // an EOF sentinel rather than just dropping the sender.
+                        let eof_msg = rpc::ExecuteRequest {
+                            request: Some(rpc::execute_request::Request::StdinData(
+                                rpc::StdinData { data: Vec::new() },
+                            )),
+                        };
+                        let _ = stdin_tx.send(eof_msg).await;
+                        break;
+                    }
                     Ok(n) => {
-                        // Send raw stdin bytes via StdinData message.
                         let msg = rpc::ExecuteRequest {
                             request: Some(rpc::execute_request::Request::StdinData(
                                 rpc::StdinData {
@@ -443,8 +459,15 @@ async fn run_command(target: String, argv: Vec<String>, resolved_tty: bool, reso
                     Err(_) => break,
                 }
             }
+            // stdin_tx (the clone) drops here.  The MAIN tx returned in
+            // `response_tx` keeps the request channel open for the rest of
+            // the call so confirm/auth replies can still be sent if needed
+            // and so the gRPC stream stays open until ExitStatus arrives.
         });
-    }
+        Some(tx)
+    } else {
+        Some(tx)
+    };
 
     let response = client.execute(ReceiverStream::new(rx)).await?;
     let mut stream = response.into_inner();
@@ -466,7 +489,12 @@ async fn run_command(target: String, argv: Vec<String>, resolved_tty: bool, reso
             rpc::execute_response::Event::ReviewResult(_result) => {}
             rpc::execute_response::Event::ConfirmRequired(confirm) => {
                 let allow = prompt_for_confirmation(&confirm.reason)?;
-                tx.send(rpc::ExecuteRequest {
+                let Some(ref response_tx) = response_tx else {
+                    return Err(anyhow!(
+                        "received ConfirmRequired but no response channel available"
+                    ));
+                };
+                response_tx.send(rpc::ExecuteRequest {
                     request: Some(rpc::execute_request::Request::Confirm(
                         rpc::ConfirmRequest {
                             execution_id: confirm.execution_id,
@@ -479,7 +507,12 @@ async fn run_command(target: String, argv: Vec<String>, resolved_tty: bool, reso
             }
             rpc::execute_response::Event::AuthPrompt(prompt) => {
                 let value = prompt_for_auth_input(&prompt.message, prompt.secret)?;
-                tx.send(crate::protocol::execute_auth_input_request(prompt.prompt_id, value))
+                let Some(ref response_tx) = response_tx else {
+                    return Err(anyhow!(
+                        "received AuthPrompt but no response channel available"
+                    ));
+                };
+                response_tx.send(crate::protocol::execute_auth_input_request(prompt.prompt_id, value))
                     .await
                     .map_err(|_| anyhow!("failed to send auth input request"))?;
             }

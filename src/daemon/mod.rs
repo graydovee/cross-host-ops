@@ -1219,21 +1219,37 @@ async fn process_execute(
     };
     tokio::pin!(timeout_deadline);
 
+    // Track whether the client's inbound stream has closed.  Once it has,
+    // `inbound.message()` returns `Ok(None)` immediately on every poll, which
+    // would otherwise turn the select! loop into a tight busy-loop spamming
+    // logs and starving the exec_task from making progress.
+    let mut inbound_closed = false;
+
     loop {
         tokio::select! {
             Some(event) = event_rx.recv() => {
                 send_execute_event(sender, event).await?;
             }
-            // Handle inbound client messages (StdinData forwarding)
-            msg = inbound.message() => {
+            // Handle inbound client messages (StdinData forwarding).  Disabled
+            // once the stream has closed to avoid a busy-loop on Ok(None).
+            msg = inbound.message(), if !inbound_closed => {
                 match msg {
                     Ok(Some(message)) => {
                         match message.request {
                             Some(proto_rpc::execute_request::Request::StdinData(stdin_data)) => {
                                 if stdin_enabled {
-                                    if let Some(ref tx) = stdin_tx {
+                                    if stdin_data.data.is_empty() {
+                                        // Explicit EOF sentinel: drop stdin sender
+                                        // to signal EOF to the gateway/connection layer.
+                                        // We do NOT close the inbound branch — keep
+                                        // the bidirectional stream alive so the remote
+                                        // can still send stdout/stderr/ExitStatus.
+                                        info!(execution_id = %execution_id, "received explicit stdin EOF sentinel");
+                                        stdin_tx.take();
+                                    } else if let Some(ref tx) = stdin_tx {
                                         // Forward stdin bytes to gateway; ignore send errors
                                         // (channel may be closed if process exited).
+                                        info!(execution_id = %execution_id, bytes = stdin_data.data.len(), "forwarding stdin to gateway");
                                         let _ = tx.send(stdin_data.data).await;
                                     }
                                 }
@@ -1245,12 +1261,20 @@ async fn process_execute(
                         }
                     }
                     Ok(None) => {
-                        debug!(execution_id = %execution_id, "client disconnected");
+                        debug!(execution_id = %execution_id, "client inbound stream closed");
                         // Drop the stdin sender to signal EOF to the gateway.
                         stdin_tx.take();
+                        // Disable this select branch — without this guard, the
+                        // closed stream would yield Ok(None) immediately on
+                        // every poll and the loop would burn CPU and disk I/O.
+                        inbound_closed = true;
                     }
                     Err(e) => {
                         debug!(execution_id = %execution_id, error = %e, "inbound stream error");
+                        // Treat transport errors the same as a clean close so
+                        // we don't spin on a permanently failed stream.
+                        stdin_tx.take();
+                        inbound_closed = true;
                     }
                 }
             }
