@@ -40,14 +40,19 @@ proptest! {
     /// For arbitrary argv, verify that the Execute RPC returns a response
     /// stream (either error or exit status) without hanging. This confirms
     /// the daemon's gateway-based architecture correctly handles exec requests.
+    ///
+    /// NOTE: Uses a short timeout because the stub target (127.0.0.1:22) has
+    /// no real SSH server in tests. The important invariant is that the daemon
+    /// always produces a terminal response (error or exit status).
     #[test]
     fn prop_exec_always_returns_response(argv in arb_argv()) {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut harness = InProcessRpcHarness::new().await;
 
-            // Execute against the stub target
-            let events = harness.execute("stub-target", &argv.iter().map(|s| s.as_str()).collect::<Vec<_>>()).await;
+            // Execute against the stub target with a timeout to prevent hangs
+            // in environments without a local SSH server.
+            let events = harness.execute_with_timeout("stub-target", &argv.iter().map(|s| s.as_str()).collect::<Vec<_>>(), 2000).await;
 
             // The daemon must always produce at least one response event
             // (either an exit status or an error).

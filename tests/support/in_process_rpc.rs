@@ -130,10 +130,23 @@ impl InProcessRpcHarness {
         target: &str,
         argv: &[&str],
     ) -> Vec<rpc::ExecuteResponse> {
+        self.execute_with_timeout(target, argv, 0).await
+    }
+
+    /// Call `Execute` on the remote daemon with the given target, argv, and
+    /// an optional timeout (in milliseconds, 0 = no timeout).
+    /// Returns the collected response events.
+    pub async fn execute_with_timeout(
+        &mut self,
+        target: &str,
+        argv: &[&str],
+        timeout_ms: u64,
+    ) -> Vec<rpc::ExecuteResponse> {
         let start_request = rpc::ExecuteRequest {
             request: Some(rpc::execute_request::Request::Start(rpc::StartRequest {
                 target: target.to_string(),
                 argv: argv.iter().map(|s| s.to_string()).collect(),
+                timeout_ms,
                 ..Default::default()
             })),
         };

@@ -1115,6 +1115,15 @@ async fn process_execute(
         .ok_or_else(|| anyhow!("gateway '{}' not found", route.gateway_name))?;
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+    // Create stdin forwarding channel when the client requests stdin.
+    let (mut stdin_tx, stdin_rx) = if request.stdin {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(32);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
     let gw_request = gateway::ExecRequest {
         argv: request.argv.clone(),
         sender: event_tx,
@@ -1122,9 +1131,11 @@ async fn process_execute(
         cols: request.term_cols,
         rows: request.term_rows,
         shell: request.shell.clone(),
+        stdin_rx: std::sync::Mutex::new(stdin_rx),
     };
 
     let timeout_ms = request.timeout_ms;
+    let stdin_enabled = request.stdin;
     let gw = gateway.clone();
     let end_target = route.end_target.clone();
     let exec_task = tokio::spawn(async move {
@@ -1144,6 +1155,36 @@ async fn process_execute(
         tokio::select! {
             Some(event) = event_rx.recv() => {
                 send_execute_event(sender, event).await?;
+            }
+            // Handle inbound client messages (StdinData forwarding)
+            msg = inbound.message() => {
+                match msg {
+                    Ok(Some(message)) => {
+                        match message.request {
+                            Some(proto_rpc::execute_request::Request::StdinData(stdin_data)) => {
+                                if stdin_enabled {
+                                    if let Some(ref tx) = stdin_tx {
+                                        // Forward stdin bytes to gateway; ignore send errors
+                                        // (channel may be closed if process exited).
+                                        let _ = tx.send(stdin_data.data).await;
+                                    }
+                                }
+                                // When stdin is not enabled, silently ignore StdinData messages.
+                            }
+                            _ => {
+                                // Ignore other message types in non-interactive mode.
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        debug!(execution_id = %execution_id, "client disconnected");
+                        // Drop the stdin sender to signal EOF to the gateway.
+                        stdin_tx.take();
+                    }
+                    Err(e) => {
+                        debug!(execution_id = %execution_id, error = %e, "inbound stream error");
+                    }
+                }
             }
             // Timeout enforcement: abort execution with exit code 124
             _ = async {

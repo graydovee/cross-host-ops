@@ -23,7 +23,7 @@ use crate::config::{
     AppConfig, ClientConfig, GatewayConfig, RhopdGatewayConfig,
     default_config_path, expand_tilde, parse_duration, RESERVED_NAMES,
 };
-use crate::types::{CopyDirection, CopySpec, AddressDefaults, RemoteAddress, ExecPtyFlags, effective_pty_decision};
+use crate::types::{CopyDirection, CopySpec, AddressDefaults, RemoteAddress, ExecTtyFlags, ExecStdinFlags, effective_tty_decision, effective_stdin_decision, should_use_interactive_mode};
 use crate::exit_codes::cap_remote_exit_code;
 use crate::daemon::gateway::GatewayKind;
 use crate::protocol::rpc;
@@ -67,15 +67,18 @@ pub enum ArunCommand {
         trailing_var_arg = true,
     )]
     Exec {
-        /// Allocate a PTY for the remote command.
-        #[arg(long = "pty", conflicts_with = "no_pty")]
-        pty: bool,
-        /// Do not allocate a PTY for the remote command.
-        #[arg(long = "no-pty")]
-        no_pty: bool,
+        /// Allocate a TTY for the remote command.
+        #[arg(short = 't', long = "tty", conflicts_with = "no_tty")]
+        tty: bool,
+        /// Do not allocate a TTY for the remote command.
+        #[arg(long = "no-tty")]
+        no_tty: bool,
         /// Forward local stdin to the remote command's stdin.
-        #[arg(long = "stdin")]
+        #[arg(short = 'i', long = "stdin", conflicts_with = "no_stdin")]
         stdin: bool,
+        /// Do not forward stdin (overrides config default).
+        #[arg(long = "no-stdin")]
+        no_stdin: bool,
         /// Abort the operation after this duration (e.g. 30s, 2m).
         #[arg(long = "timeout", value_name = "DURATION")]
         timeout: Option<String>,
@@ -173,11 +176,8 @@ pub enum HostCommand {
     List,
 }
 
-/// Determine if the current execution should use interactive mode.
-/// Interactive mode requires: --pty flag, stdin is a TTY, stdout is a TTY.
-pub fn should_use_interactive_mode(pty: bool, stdin_is_tty: bool, stdout_is_tty: bool) -> bool {
-    pty && stdin_is_tty && stdout_is_tty
-}
+// Interactive mode detection is now provided by crate::types::should_use_interactive_mode
+// (4-argument version: resolved_tty, resolved_stdin, stdin_is_tty, stdout_is_tty).
 
 /// Get the current terminal size as (cols, rows).
 /// Falls back to (80, 24) if the terminal size cannot be determined.
@@ -235,7 +235,7 @@ pub fn set_raw_mode(fd: RawFd) -> Result<RawModeGuard> {
 
 pub async fn run_cli(cli: ArunCli) -> Result<i32> {
     match cli.command {
-        ArunCommand::Exec { target, cmd, timeout, pty, no_pty, stdin, shell, no_shell } => {
+        ArunCommand::Exec { target, cmd, timeout, tty, no_tty, stdin, no_stdin, shell, no_shell } => {
             // Validate --timeout if provided: parse and bounds-check (1–86400 seconds).
             let timeout_ms: u64 = if let Some(ref timeout_str) = timeout {
                 match parse_duration(timeout_str) {
@@ -279,13 +279,15 @@ pub async fn run_cli(cli: ArunCli) -> Result<i32> {
                 cmd
             };
 
-            // Resolve PTY decision using effective_pty_decision.
+            // Resolve TTY and stdin decisions using the new decision functions.
             let stdout_is_tty = std::io::stdout().is_terminal();
             let config = AppConfig::load(None).unwrap_or_default();
-            let flags = ExecPtyFlags { force_pty: pty, force_no_pty: no_pty };
-            let resolved_pty = effective_pty_decision(&flags, &config.ssh, stdout_is_tty);
+            let tty_flags = ExecTtyFlags { force_tty: tty, force_no_tty: no_tty };
+            let stdin_flags = ExecStdinFlags { force_stdin: stdin, force_no_stdin: no_stdin };
+            let resolved_tty = effective_tty_decision(&tty_flags, &config.ssh, stdout_is_tty);
+            let resolved_stdin = effective_stdin_decision(&stdin_flags, &config.ssh);
 
-            run_command(target, argv, resolved_pty, no_pty, stdin, timeout_ms, shell, no_shell, &config).await
+            run_command(target, argv, resolved_tty, resolved_stdin, timeout_ms, shell, no_shell, &config).await
         }
         ArunCommand::Cp {
             recursive,
@@ -365,7 +367,7 @@ fn detect_double_dash_separator(target: &str) -> bool {
         None => return false,
     };
 
-    // Find the target position after "exec" (skip options like --pty, --timeout, etc.)
+    // Find the target position after "exec" (skip options like --tty, --timeout, etc.)
     let target_pos = match raw_args[exec_pos + 1..]
         .iter()
         .position(|a| a == target_os)
@@ -381,15 +383,15 @@ fn detect_double_dash_separator(target: &str) -> bool {
         .unwrap_or(false)
 }
 
-async fn run_command(target: String, argv: Vec<String>, pty: bool, no_pty: bool, stdin: bool, timeout_ms: u64, shell: Option<String>, no_shell: bool, _config: &AppConfig) -> Result<i32> {
+async fn run_command(target: String, argv: Vec<String>, resolved_tty: bool, resolved_stdin: bool, timeout_ms: u64, shell: Option<String>, no_shell: bool, _config: &AppConfig) -> Result<i32> {
     // Pass raw CLI flags to daemon; daemon resolves effective shell from server.toml.
     let cli_shell = shell.unwrap_or_default();
 
-    // Check if we should use interactive mode (PTY + stdin is TTY + stdout is TTY).
+    // Check if we should use interactive mode (all 4 conditions must be true).
     let stdin_is_tty = io::stdin().is_terminal();
     let stdout_is_tty = io::stdout().is_terminal();
 
-    if should_use_interactive_mode(pty, stdin_is_tty, stdout_is_tty) {
+    if should_use_interactive_mode(resolved_tty, resolved_stdin, stdin_is_tty, stdout_is_tty) {
         return run_interactive(target, argv, timeout_ms, cli_shell, no_shell).await;
     }
 
@@ -401,9 +403,9 @@ async fn run_command(target: String, argv: Vec<String>, pty: bool, no_pty: bool,
         request: Some(rpc::execute_request::Request::Start(rpc::StartRequest {
             target,
             argv,
-            pty,
-            no_pty,
-            stdin,
+            pty: resolved_tty,
+            no_pty: !resolved_tty,
+            stdin: resolved_stdin,
             timeout_ms,
             interactive: false,
             term_cols: 0,
@@ -417,7 +419,7 @@ async fn run_command(target: String, argv: Vec<String>, pty: bool, no_pty: bool,
 
     // If stdin forwarding is requested, spawn a task that reads from tokio stdin
     // and sends data on the bidirectional stream.
-    if stdin {
+    if resolved_stdin {
         let stdin_tx = tx.clone();
         tokio::spawn(async move {
             let mut tokio_stdin = tokio::io::stdin();
@@ -426,14 +428,11 @@ async fn run_command(target: String, argv: Vec<String>, pty: bool, no_pty: bool,
                 match tokio_stdin.read(&mut buf).await {
                     Ok(0) => break, // EOF
                     Ok(n) => {
-                        let data = buf[..n].to_vec();
-                        // Send stdin data as a raw message. The daemon will
-                        // recognize this as stdin input on the execute stream.
+                        // Send raw stdin bytes via StdinData message.
                         let msg = rpc::ExecuteRequest {
-                            request: Some(rpc::execute_request::Request::AuthInput(
-                                rpc::AuthInputRequest {
-                                    prompt_id: "__stdin__".to_string(),
-                                    value: String::from_utf8_lossy(&data).to_string(),
+                            request: Some(rpc::execute_request::Request::StdinData(
+                                rpc::StdinData {
+                                    data: buf[..n].to_vec(),
                                 },
                             )),
                         };
@@ -1392,21 +1391,21 @@ mod tests {
     // Feature: rhopd-jumpserver-architecture, Property 16: Argv pass-through transparency
     //
     // For any TARGET T and any Vec<String> argv V (including elements that look like
-    // rhop flags such as --non-interactive, --pty, --output, --), parsing
+    // rhop flags such as --non-interactive, --tty, --output, --), parsing
     // `rhop exec <target> -- <argv>...` produces the exact same argv in the parsed struct.
     //
     // Validates: Requirements 17.1, 17.2, 17.4
 
     /// Strategy that generates arbitrary argv elements, including ones that look like
-    /// rhop flags (--output, --non-interactive, --pty, --no-pty, --stdin, --timeout, --).
+    /// rhop flags (--output, --non-interactive, --tty, --no-tty, --stdin, --timeout, --).
     fn argv_element_strategy() -> impl Strategy<Value = String> {
         prop_oneof![
             // Plain words
             "[a-zA-Z0-9_./]{1,20}",
             // Flags that look like rhop's own flags
             Just("--non-interactive".to_string()),
-            Just("--pty".to_string()),
-            Just("--no-pty".to_string()),
+            Just("--tty".to_string()),
+            Just("--no-tty".to_string()),
             Just("--stdin".to_string()),
             Just("--output".to_string()),
             Just("--output=json".to_string()),

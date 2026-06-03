@@ -90,7 +90,7 @@ pub struct Route {
 }
 
 /// Request payload for exec operations.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ExecRequest {
     pub argv: Vec<String>,
     pub sender: mpsc::UnboundedSender<ServerEvent>,
@@ -98,6 +98,10 @@ pub struct ExecRequest {
     pub cols: u32,
     pub rows: u32,
     pub shell: String,
+    /// Optional stdin receiver for forwarding stdin data to the remote process.
+    /// Created by process_execute when the client requests stdin forwarding.
+    /// Wrapped in Mutex<Option<...>> so the gateway can take ownership from `&self`.
+    pub stdin_rx: std::sync::Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
 }
 
 /// Request payload for interactive PTY sessions.

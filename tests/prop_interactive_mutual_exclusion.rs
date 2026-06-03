@@ -11,7 +11,7 @@
 
 use proptest::prelude::*;
 
-use rhop::cli::should_use_interactive_mode;
+use rhop::types::should_use_interactive_mode;
 use rhop::protocol::ExecRequest;
 
 /// Simulate the daemon's validation logic for an ExecRequest.
@@ -167,19 +167,20 @@ proptest! {
     #[test]
     fn prop_interactive_mode_detection_implies_valid_request(
         pty in any::<bool>(),
+        resolved_stdin in any::<bool>(),
         stdin_is_tty in any::<bool>(),
         stdout_is_tty in any::<bool>(),
         term_cols in 1u32..=300,
         term_rows in 1u32..=200,
     ) {
-        let interactive = should_use_interactive_mode(pty, stdin_is_tty, stdout_is_tty);
+        let interactive = should_use_interactive_mode(pty, resolved_stdin, stdin_is_tty, stdout_is_tty);
 
         let req = ExecRequest {
             target: "test".to_string(),
             argv: vec!["cmd".to_string()],
             pty,
             no_pty: false,
-            stdin: false,
+            stdin: resolved_stdin,
             timeout_ms: 0,
             interactive,
             term_cols,

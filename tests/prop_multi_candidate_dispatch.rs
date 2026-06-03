@@ -225,6 +225,7 @@ fn make_exec_request() -> ExecRequest {
         cols: 80,
         rows: 24,
         shell: String::new(),
+        stdin_rx: std::sync::Mutex::new(None),
     }
 }
 

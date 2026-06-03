@@ -105,43 +105,87 @@ impl RemoteAddress {
     }
 }
 
-// --- PTY decision logic (migrated from jump/pty.rs) ---
+// --- TTY / stdin decision logic ---
 
 use crate::config::SshConfig;
 
-/// Flags derived from the CLI's `--pty` / `--no-pty` arguments.
+/// Flags derived from the CLI's --tty / --no-tty arguments.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ExecPtyFlags {
-    /// `--pty` was passed.
-    pub force_pty: bool,
-    /// `--no-pty` was passed.
-    pub force_no_pty: bool,
+pub struct ExecTtyFlags {
+    /// --tty or -t was passed.
+    pub force_tty: bool,
+    /// --no-tty was passed.
+    pub force_no_tty: bool,
 }
 
-/// Compute the effective PTY decision.
+/// Flags derived from the CLI's --stdin / --no-stdin arguments.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExecStdinFlags {
+    /// --stdin or -i was passed.
+    pub force_stdin: bool,
+    /// --no-stdin was passed.
+    pub force_no_stdin: bool,
+}
+
+/// Compute the effective TTY decision.
 ///
 /// Priority (each step short-circuits):
-/// 1. `--no-pty` → false
-/// 2. `--pty` → true
-/// 3. `auto_pty_detect && !stdout_is_tty` → false
-/// 4. Otherwise → `ssh.pty`
+/// 1. --no-tty → false
+/// 2. --tty → true
+/// 3. auto_tty_detect && !stdout_is_tty → false
+/// 4. Otherwise → ssh_config.tty
 ///
-/// Note: `(force_pty=true, force_no_pty=true)` is unreachable because clap's
+/// Note: (force_tty=true, force_no_tty=true) is unreachable because clap's
 /// `conflicts_with` rejects it at parse time. If somehow both are true,
-/// `force_no_pty` wins (it is checked first).
-pub fn effective_pty_decision(
-    flags: &ExecPtyFlags,
+/// force_no_tty wins (it is checked first).
+pub fn effective_tty_decision(
+    flags: &ExecTtyFlags,
     ssh_config: &SshConfig,
     stdout_is_tty: bool,
 ) -> bool {
-    if flags.force_no_pty {
+    if flags.force_no_tty {
         return false;
     }
-    if flags.force_pty {
+    if flags.force_tty {
         return true;
     }
-    if ssh_config.auto_pty_detect && !stdout_is_tty {
+    if ssh_config.auto_tty_detect && !stdout_is_tty {
         return false;
     }
-    ssh_config.pty
+    ssh_config.tty
+}
+
+/// Compute the effective stdin decision.
+///
+/// Priority (each step short-circuits):
+/// 1. --no-stdin → false
+/// 2. --stdin → true
+/// 3. Otherwise → ssh_config.stdin
+pub fn effective_stdin_decision(
+    flags: &ExecStdinFlags,
+    ssh_config: &SshConfig,
+) -> bool {
+    if flags.force_no_stdin {
+        return false;
+    }
+    if flags.force_stdin {
+        return true;
+    }
+    ssh_config.stdin
+}
+
+/// Determine if the current execution should enter full interactive mode.
+///
+/// Interactive mode requires ALL of:
+/// - tty allocation is enabled (resolved_tty = true)
+/// - stdin forwarding is enabled (resolved_stdin = true)
+/// - stdin is a TTY device
+/// - stdout is a TTY device
+pub fn should_use_interactive_mode(
+    resolved_tty: bool,
+    resolved_stdin: bool,
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+) -> bool {
+    resolved_tty && resolved_stdin && stdin_is_tty && stdout_is_tty
 }

@@ -1,15 +1,11 @@
-//! Property-based test: Stdin Byte Preservation
+// Feature: exec-stdin-tty-refactor, Property 2: StdinData byte fidelity (Round-Trip)
+// Validates: Requirements 1.2
 //!
-//! Feature: interactive-pty-passthrough
-//! Property 2: Stdin Byte Preservation
+//! Property-based test: StdinData byte preservation (round-trip).
 //!
-//! For any sequence of raw bytes (including non-UTF8, null bytes, control
-//! characters, and all 256 possible byte values) written to stdin, the bytes
-//! forwarded through the StdinData gRPC message to the remote SSH channel are
-//! identical in content and order — no encoding transformation, no loss, no
-//! reordering.
-//!
-//! **Validates: Requirements 5.1, 5.2, 7.2**
+//! For any arbitrary byte sequence (including non-UTF-8, null bytes, and
+//! control characters), wrapping it in a StdinData message and serializing/
+//! deserializing via prost SHALL preserve the exact bytes in content and order.
 
 use proptest::prelude::*;
 
@@ -17,10 +13,10 @@ use prost::Message;
 use rhop::protocol::rpc;
 
 // ---------------------------------------------------------------------------
-// Property 2: Stdin Byte Preservation — arbitrary byte sequences
+// Property 2: StdinData byte fidelity (Round-Trip) — arbitrary byte sequences
 // ---------------------------------------------------------------------------
 
-/// **Validates: Requirements 5.1, 5.2, 7.2**
+/// **Validates: Requirements 1.2**
 ///
 /// For any arbitrary byte sequence, wrapping it in a StdinData message and
 /// round-tripping through prost serialization/deserialization preserves the
@@ -92,10 +88,10 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
-// Property 2: Stdin Byte Preservation — all 256 byte values
+// Property 2: StdinData byte fidelity (Round-Trip) — all 256 byte values
 // ---------------------------------------------------------------------------
 
-/// **Validates: Requirements 5.1, 5.2, 7.2**
+/// **Validates: Requirements 1.2**
 ///
 /// A sequence containing all 256 possible byte values (0x00..=0xFF) is
 /// preserved exactly through StdinData serialization round-trip.
@@ -117,10 +113,10 @@ fn stdin_data_all_256_byte_values() {
 }
 
 // ---------------------------------------------------------------------------
-// Property 2: Stdin Byte Preservation — null bytes
+// Property 2: StdinData byte fidelity (Round-Trip) — null bytes
 // ---------------------------------------------------------------------------
 
-/// **Validates: Requirements 5.1, 7.2**
+/// **Validates: Requirements 1.2**
 ///
 /// Sequences consisting entirely of null bytes are preserved.
 #[test]
@@ -141,10 +137,10 @@ fn stdin_data_null_bytes() {
 }
 
 // ---------------------------------------------------------------------------
-// Property 2: Stdin Byte Preservation — non-UTF8 sequences
+// Property 2: StdinData byte fidelity (Round-Trip) — non-UTF8 sequences
 // ---------------------------------------------------------------------------
 
-/// **Validates: Requirements 5.1, 7.2**
+/// **Validates: Requirements 1.2**
 ///
 /// Non-UTF8 byte sequences (invalid UTF-8 continuations) are preserved.
 #[test]
@@ -166,10 +162,10 @@ fn stdin_data_non_utf8_sequences() {
 }
 
 // ---------------------------------------------------------------------------
-// Property 2: Stdin Byte Preservation — empty bytes
+// Property 2: StdinData byte fidelity (Round-Trip) — empty bytes
 // ---------------------------------------------------------------------------
 
-/// **Validates: Requirements 5.1, 7.2**
+/// **Validates: Requirements 1.2**
 ///
 /// An empty byte sequence is preserved (no phantom bytes introduced).
 #[test]
@@ -190,10 +186,10 @@ fn stdin_data_empty_bytes() {
 }
 
 // ---------------------------------------------------------------------------
-// Property 2: Stdin Byte Preservation — single byte values
+// Property 2: StdinData byte fidelity (Round-Trip) — single byte values
 // ---------------------------------------------------------------------------
 
-/// **Validates: Requirements 5.1, 7.2**
+/// **Validates: Requirements 1.2**
 ///
 /// Each individual byte value (0x00..=0xFF) is preserved when sent alone.
 proptest! {
@@ -221,10 +217,10 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
-// Property 2: Stdin Byte Preservation — ordering preserved across chunks
+// Property 2: StdinData byte fidelity (Round-Trip) — ordering preserved across chunks
 // ---------------------------------------------------------------------------
 
-/// **Validates: Requirements 5.1, 5.2, 7.2**
+/// **Validates: Requirements 1.2**
 ///
 /// When multiple StdinData messages are sent in sequence, each message
 /// independently preserves its bytes, ensuring overall ordering is maintained.

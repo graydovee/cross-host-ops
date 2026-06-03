@@ -37,7 +37,9 @@
 #   "<name>"      — route through the named [[gateways]] entry
 # Default: ["local"]
 # fallback = ["local", "corp-jump"]
-# pty = true
+# tty = true
+# stdin = false
+# auto_tty_detect = true
 # connect_timeout = "10s"
 # keepalive_interval = "30s"
 # max_idle_time = "10m"

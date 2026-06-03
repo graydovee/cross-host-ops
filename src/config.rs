@@ -222,8 +222,12 @@ pub struct SshConfig {
     pub ssh_config_path: String,
     pub server_config_path: String,
     pub fallback: Vec<FallbackEntry>,
-    pub pty: bool,
-    pub auto_pty_detect: bool,
+    /// When true, allocate PTY by default unless --no-tty overrides.
+    pub tty: bool,
+    /// When true, forward stdin by default unless --no-stdin overrides.
+    pub stdin: bool,
+    /// When true, auto-detect TTY based on stdout. If stdout is not a TTY, disable TTY.
+    pub auto_tty_detect: bool,
     #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]
     pub connect_timeout: Duration,
     #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]
@@ -239,8 +243,9 @@ impl Default for SshConfig {
             ssh_config_path: "~/.ssh/config".to_string(),
             server_config_path: "~/.rhop/server.toml".to_string(),
             fallback: vec![FallbackEntry::Local],
-            pty: true,
-            auto_pty_detect: true,
+            tty: true,
+            stdin: false,
+            auto_tty_detect: true,
             connect_timeout: Duration::from_secs(10),
             keepalive_interval: Duration::from_secs(30),
             max_idle_time: Duration::from_secs(600),
