@@ -1,6 +1,6 @@
 //! Property-based test for NDJSON output validity.
 //!
-//! Feature: rhopd-jumpserver-architecture, Property 14: NDJSON output is a valid stream
+//! Feature: xhod-jumpserver-architecture, Property 14: NDJSON output is a valid stream
 //!
 //! For any arbitrary CliEvent value, JsonSink produces valid JSON that:
 //! 1. Parses as a single JSON object
@@ -12,7 +12,7 @@
 use proptest::prelude::*;
 use serde_json::Value;
 
-use rhop::output::CliEvent;
+use xho::output::CliEvent;
 
 /// Strategy to generate arbitrary CliEvent values.
 fn arb_cli_event() -> impl Strategy<Value = CliEvent> {
@@ -64,7 +64,7 @@ proptest! {
 
     /// Property 14: For any arbitrary CliEvent, serializing it to JSON produces
     /// a valid JSON object with an "event" discriminator field.
-    // Feature: rhopd-jumpserver-architecture, Property 14: NDJSON output is a valid stream
+    // Feature: xhod-jumpserver-architecture, Property 14: NDJSON output is a valid stream
     #[test]
     fn ndjson_output_is_valid_json(event in arb_cli_event()) {
         // Serialize the event to a JSON string (same as JsonSink does internally)

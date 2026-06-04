@@ -3,7 +3,7 @@
 
 use proptest::prelude::*;
 
-use rhop::types::should_use_interactive_mode;
+use xho::types::should_use_interactive_mode;
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: 100, .. ProptestConfig::default() })]

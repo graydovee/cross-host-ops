@@ -9,7 +9,7 @@
 cargo build --release
 ```
 
-生成二进制：`target/release/rhop` 和 `target/release/rhopd`
+生成二进制：`target/release/xho` 和 `target/release/xhod`
 
 ### 从 GitHub Release 下载
 
@@ -22,8 +22,8 @@ cargo build --release
 ### Docker
 
 ```bash
-docker build -t rhopd:latest .
-docker run --rm -p 2222:2222 -v /etc/rhop:/etc/rhop rhopd:latest
+docker build -t xhod:latest .
+docker run --rm -p 2222:2222 -v /etc/xho:/etc/xho xhod:latest
 ```
 
 ## 快速开始
@@ -34,12 +34,12 @@ docker run --rm -p 2222:2222 -v /etc/rhop:/etc/rhop rhopd:latest
 
 ```bash
 # daemon 会自动启动
-rhop exec 192.0.2.163 hostname
+xho exec 192.0.2.163 hostname
 ```
 
 ### 使用 server.toml
 
-创建 `~/.rhop/server.toml`：
+创建 `~/.xho/server.toml`：
 
 ```toml
 [defaults]
@@ -58,7 +58,7 @@ password = "secret"
 然后按别名执行：
 
 ```bash
-rhop exec web1 -- uname -a
+xho exec web1 -- uname -a
 ```
 
 ## 命令参考
@@ -67,22 +67,22 @@ rhop exec web1 -- uname -a
 
 ```bash
 # 基本用法
-rhop exec <target> -- <command> [args...]
+xho exec <target> -- <command> [args...]
 
 # 分配 PTY（颜色输出、交互程序）
-rhop exec --pty <target> -- vim README.md
+xho exec --pty <target> -- vim README.md
 
 # 禁用 PTY
-rhop exec --no-pty <target> -- cat /etc/hosts
+xho exec --no-pty <target> -- cat /etc/hosts
 
 # 转发 stdin
-rhop exec --stdin <target> -- bash < script.sh
+xho exec --stdin <target> -- bash < script.sh
 
 # 设置超时
-rhop exec --timeout 30s <target> -- long-running-task
+xho exec --timeout 30s <target> -- long-running-task
 
 # 显式指定 jump host
-rhop exec ali-rhopd:web1 -- hostname
+xho exec remote-xhod:web1 -- hostname
 ```
 
 ### 交互模式
@@ -94,9 +94,9 @@ rhop exec ali-rhopd:web1 -- hostname
 
 ```bash
 # 自动进入交互模式
-rhop exec --pty host1 -- vim README.md
-rhop exec --pty host1 -- htop
-rhop exec --pty host1 -- bash
+xho exec --pty host1 -- vim README.md
+xho exec --pty host1 -- htop
+xho exec --pty host1 -- bash
 ```
 
 交互模式特性：
@@ -109,83 +109,83 @@ rhop exec --pty host1 -- bash
 
 ```bash
 # 上传
-rhop cp local.txt host1:/tmp/
+xho cp local.txt host1:/tmp/
 
 # 下载
-rhop cp host1:/etc/hosts ./hosts
+xho cp host1:/etc/hosts ./hosts
 
 # 递归复制目录
-rhop cp -r ./project host1:/opt/
+xho cp -r ./project host1:/opt/
 ```
 
 ### 服务器列表
 
 ```bash
 # 列出所有可达服务器（本地 + 各 jump host）
-rhop ls
+xho ls
 
 # 强制刷新缓存
-rhop ls --refresh
+xho ls --refresh
 ```
 
 ### Daemon 管理
 
 ```bash
 # 查看状态
-rhop status
+xho status
 
 # 手动启动
-rhop daemon start
-rhop daemon start --config ~/.rhop/config.toml --log-level debug
+xho daemon start
+xho daemon start --config ~/.xho/config.toml --log-level debug
 
 # 停止
-rhop daemon stop
+xho daemon stop
 
 # 重启（继承上次启动参数）
-rhop daemon restart
+xho daemon restart
 ```
 
 ### Jump Host 管理
 
 ```bash
-# 添加 rhopd jump host
-rhop remote connect prod rhop@bastion.example.com:2222
+# 添加 xhod jump host
+xho host add prod xho@bastion.example.com:2222
 
 # 添加时指定 identity file
-rhop remote connect prod rhop@bastion.example.com:2222 --identity-file ~/.ssh/id_ed25519
+xho host add prod xho@bastion.example.com:2222 --identity-file ~/.ssh/id_ed25519
 
 # 列出已配置的 jump hosts
-rhop remote list
+xho host list
 
 # 移除
-rhop remote remove prod
+xho host remove prod
 ```
 
 ## 配置
 
 ### 配置文件位置
 
-- 主配置：`~/.rhop/config.toml`
-- 服务器清单：`~/.rhop/server.toml`（路径可在主配置中修改）
-- 已知主机：`~/.rhop/known_hosts`
+- 主配置：`~/.xho/config.toml`
+- 服务器清单：`~/.xho/server.toml`（路径可在主配置中修改）
+- 已知主机：`~/.xho/known_hosts`
 
 ### 主配置 (`config.toml`)
 
 ```toml
 [server]
-log_path = "/var/log/rhopd.log"
+log_path = "/var/log/xhod.log"
 log_level = "info"
 
 [server.remote]
 enable = true
 listen_addr = "0.0.0.0:2222"
-user = "rhop"
-host_key_path = "~/.rhop/host_key"
-authorized_keys_path = "~/.rhop/authorized_keys"
+user = "xho"
+host_key_path = "~/.xho/host_key"
+authorized_keys_path = "~/.xho/authorized_keys"
 
 [ssh]
-server_config_path = "~/.rhop/server.toml"
-fallback = ["local", "prod-rhopd"]
+server_config_path = "~/.xho/server.toml"
+fallback = ["local", "prod-xhod"]
 pty = true
 connect_timeout = "10s"
 keepalive_interval = "30s"
@@ -193,28 +193,23 @@ max_idle_time = "10m"
 max_connections_per_ip = 10
 
 # Jump Hosts
-[[jump_hosts]]
-name = "prod-rhopd"
-kind = "rhopd"
-address = "rhop@bastion.example.com:2222"
+[[gateways]]
+name = "prod-xhod"
+kind = "xhod"
+address = "xho@bastion.example.com:2222"
 identity_file = "~/.ssh/id_ed25519"
-known_hosts_path = "~/.rhop/known_hosts"
+known_hosts_path = "~/.xho/known_hosts"
 
-[[jump_hosts]]
+[[gateways]]
 name = "corp-jump"
 kind = "jumpserver"
 host = "jumpserver.example.com"
 port = 20221
 user = "user@example.com"
 identity_file = "~/.ssh/id_rsa"
-menu_prompt_contains = "Opt"
-mfa_prompt_contains = "MFA"
-shell_prompt_suffixes = ["$ ", "# "]
-[jump_hosts.mfa]
 totp_secret_base32 = "YOUR_SECRET"
-digits = 6
-period = 30
-digest = "sha1"
+totp_digits = 6
+totp_period = 30
 
 # 命令审查（可选）
 [review]
@@ -278,44 +273,44 @@ bar-192-168-1-1  →  192.168.1.1
 
 ```toml
 [ssh]
-fallback = ["local", "prod-rhopd", "corp-jump"]
+fallback = ["local", "prod-xhod", "corp-jump"]
 ```
 
 - `"local"` — 尝试 `~/.ssh/config` 直连
 - `"<name>"` — 通过对应的 jump host 路由
 
-## 部署 rhopd 到远程服务器
+## 部署 xhod 到远程服务器
 
 ### 服务端配置
 
 1. 部署二进制到服务器
-2. 创建配置 `~/.rhop/config.toml`：
+2. 创建配置 `~/.xho/config.toml`：
 
 ```toml
 [server.remote]
 enable = true
 listen_addr = "0.0.0.0:2222"
-user = "rhop"
-host_key_path = "~/.rhop/host_key"
-authorized_keys_path = "~/.rhop/authorized_keys"
+user = "xho"
+host_key_path = "~/.xho/host_key"
+authorized_keys_path = "~/.xho/authorized_keys"
 
 [ssh]
-server_config_path = "~/.rhop/server.toml"
+server_config_path = "~/.xho/server.toml"
 ```
 
-3. 将客户端公钥添加到 `~/.rhop/authorized_keys`
-4. 创建 `~/.rhop/server.toml` 定义可达目标
-5. 启动：`rhop daemon start --config ~/.rhop/config.toml`
+3. 将客户端公钥添加到 `~/.xho/authorized_keys`
+4. 创建 `~/.xho/server.toml` 定义可达目标
+5. 启动：`xho daemon start --config ~/.xho/config.toml`
 
 ### 客户端配置
 
 ```toml
-[[jump_hosts]]
+[[gateways]]
 name = "prod"
-kind = "rhopd"
-address = "rhop@your-server.com:2222"
+kind = "xhod"
+address = "xho@your-server.com:2222"
 identity_file = "~/.ssh/id_ed25519"
-known_hosts_path = "~/.rhop/known_hosts"
+known_hosts_path = "~/.xho/known_hosts"
 
 [ssh]
 fallback = ["local", "prod"]
@@ -324,7 +319,8 @@ fallback = ["local", "prod"]
 ### 使用部署脚本
 
 ```bash
-.kiro/skills/rhopd-deploy-debug/scripts/deploy.sh root@your-server.com
+cargo build --release --bin xhod
+scp target/release/xhod root@your-server.com:/usr/local/bin/xhod
 ```
 
 ## 运行模式
@@ -334,22 +330,22 @@ fallback = ["local", "prod"]
 执行命令时 daemon 自动启动，无需手动管理：
 
 ```bash
-rhop exec web1 -- hostname  # daemon 不存在时自动拉起
+xho exec web1 -- hostname  # daemon 不存在时自动拉起
 ```
 
 ### systemd
 
 ```bash
-sudo install -m 0644 packaging/systemd/rhopd.service /etc/systemd/system/
-sudo systemctl enable --now rhopd
+sudo install -m 0644 packaging/systemd/xhod.service /etc/systemd/system/
+sudo systemctl enable --now xhod
 ```
 
-systemd 模式下 daemon 标记为 `external`，`rhop daemon stop` 会被拒绝。
+systemd 模式下 daemon 标记为 `external`，`xho daemon stop` 会被拒绝。
 
 ### Docker
 
 ```bash
-docker run --rm -p 2222:2222 -v /etc/rhop:/etc/rhop rhopd:latest
+docker run --rm -p 2222:2222 -v /etc/xho:/etc/xho xhod:latest
 ```
 
 ## 连接池
@@ -376,7 +372,7 @@ docker run --rm -p 2222:2222 -v /etc/rhop:/etc/rhop rhopd:latest
 enable = true
 ```
 
-API key 通过环境变量提供：`RHOP_REVIEW_API_KEY` 或 `OPENAI_API_KEY`
+API key 通过环境变量提供：`XHO_REVIEW_API_KEY` 或 `OPENAI_API_KEY`
 
 ### 两层过滤
 
@@ -407,26 +403,26 @@ dangerous = "deny"   # 拒绝
 
 ```bash
 # 检查是否已有进程
-ps aux | grep rhopd
+ps aux | grep xhod
 
 # 检查 socket
-ls -la ~/.rhop/rhopd.sock
+ls -la ~/.xho/xhod.sock
 
 # 查看日志
-tail -50 ~/.rhop/rhopd.log
+tail -50 ~/.xho/xhod.log
 ```
 
 ### 连接失败
 
 ```bash
 # 查看 daemon 状态和连接池
-rhop status
+xho status
 
 # 检查目标解析
-rhop exec --no-pty <target> -- echo ok
+xho exec --no-pty <target> -- echo ok
 
 # 检查远程 daemon
-ssh root@server "/root/rhop/rhop status"
+ssh root@server "/root/xho/xho status"
 ```
 
 ### 交互模式问题

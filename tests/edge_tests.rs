@@ -6,11 +6,11 @@
 
 use std::collections::HashMap;
 
-use rhop::config::{
-    AppConfig, GatewayConfig, GatewayValidationError, RhopdGatewayConfig,
+use xho::config::{
+    AppConfig, GatewayConfig, GatewayValidationError, XhodGatewayConfig,
     ServerConfigFile, ServerDefaults, ServerHostConfig, RESERVED_NAMES, validate_gateways,
 };
-use rhop::daemon::resolver::Resolver;
+use xho::daemon::resolver::Resolver;
 
 // ---------------------------------------------------------------------------
 // 14.2: Reserved alias rejection
@@ -19,7 +19,7 @@ use rhop::daemon::resolver::Resolver;
 
 #[test]
 fn edge_14_2_reserved_alias_local_rejected() {
-    let gateways = vec![GatewayConfig::Rhopd(RhopdGatewayConfig {
+    let gateways = vec![GatewayConfig::Xhod(XhodGatewayConfig {
         name: "local".to_string(),
         address: "10.0.0.1:2222".to_string(),
         identity_file: String::new(),
@@ -67,7 +67,7 @@ fn edge_15_5_explicit_jump_server_lookup() {
         },
         servers: HashMap::new(),
     };
-    let gateways = vec![GatewayConfig::Rhopd(RhopdGatewayConfig {
+    let gateways = vec![GatewayConfig::Xhod(XhodGatewayConfig {
         name: "prod-jump".to_string(),
         address: "10.0.0.99:2222".to_string(),
         identity_file: String::new(),

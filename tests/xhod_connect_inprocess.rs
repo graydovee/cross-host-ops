@@ -1,6 +1,6 @@
-//! Integration tests: end-to-end connection path for rhopd gateway.
+//! Integration tests: end-to-end connection path for xhod gateway.
 //!
-//! NOTE: This test originally tested the `RhopdGateway` struct from the
+//! NOTE: This test originally tested the `XhodGateway` struct from the
 //! deleted `src/jump/` module. That module was removed as part of the
 //! config-and-legacy-cleanup spec. The equivalent end-to-end connection
 //! behavior is now tested via the in-process RPC harness
@@ -37,7 +37,7 @@ async fn connect_exec_nonexistent_target_errors() {
 
     // Should get an error event (target not found)
     let has_error = events.iter().any(|e| {
-        if let Some(rhop::protocol::rpc::execute_response::Event::Error(err)) = &e.event {
+        if let Some(xho::protocol::rpc::execute_response::Event::Error(err)) = &e.event {
             !err.message.is_empty()
         } else {
             false

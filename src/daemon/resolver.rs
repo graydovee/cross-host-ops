@@ -75,7 +75,7 @@ impl<'a> Resolver<'a> {
     /// Candidate ordering:
     /// 1. Server-config matches against the named source.
     /// 2. `ssh.fallback`-driven candidates in declared order.
-    /// 3. No implicit fan-out to all `rhopd` gateways.
+    /// 3. No implicit fan-out to all `xhod` gateways.
     pub fn resolve(&self, input: &str) -> Result<Vec<Route>> {
         // Try explicit `<jump_name>:<server_alias>` form first.
         if let Some((jump_name, server_alias)) = parse_explicit_qualified(input) {
@@ -334,7 +334,7 @@ impl<'a> Resolver<'a> {
 
 /// Parse an input string as `<gateway_name>:<end_target>`.
 /// Splits on the FIRST colon only, so multi-colon targets like
-/// `"ali-rhopd:sub-gw:server1"` parse as gateway="ali-rhopd", end_target="sub-gw:server1".
+/// `"remote-xhod:sub-gw:server1"` parse as gateway="remote-xhod", end_target="sub-gw:server1".
 /// Returns `None` if there is no colon, if either part is empty, or if the
 /// part after the first colon is purely numeric (port-like, e.g. "host:22").
 fn parse_explicit_qualified(input: &str) -> Option<(&str, &str)> {
@@ -382,7 +382,7 @@ pub fn derive_target_ip(input: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::{
-        AppConfig, FallbackEntry, GatewayConfig, RhopdGatewayConfig,
+        AppConfig, FallbackEntry, GatewayConfig, XhodGatewayConfig,
         JumpserverGatewayConfig, ServerConfigFile, ServerDefaults, ServerHostConfig,
     };
     use std::collections::HashMap;
@@ -431,8 +431,8 @@ mod tests {
     #[test]
     fn parse_explicit_qualified_multi_colon_two_levels() {
         assert_eq!(
-            parse_explicit_qualified("ali-rhopd:sub-gw:server1"),
-            Some(("ali-rhopd", "sub-gw:server1"))
+            parse_explicit_qualified("remote-xhod:sub-gw:server1"),
+            Some(("remote-xhod", "sub-gw:server1"))
         );
     }
 
@@ -500,7 +500,7 @@ mod tests {
     fn resolver_explicit_gateway() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![]);
-        let gateways = vec![GatewayConfig::Rhopd(RhopdGatewayConfig {
+        let gateways = vec![GatewayConfig::Xhod(XhodGatewayConfig {
             name: "remote1".to_string(),
             address: "10.0.0.99:2222".to_string(),
             identity_file: String::new(),
@@ -737,7 +737,7 @@ mod tests {
     fn resolver_merged_view_bare_alias_unique() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("web01", "10.0.0.1")]);
-        let gateways = vec![GatewayConfig::Rhopd(RhopdGatewayConfig {
+        let gateways = vec![GatewayConfig::Xhod(XhodGatewayConfig {
             name: "remote1".to_string(),
             address: "10.0.0.99:2222".to_string(),
             identity_file: String::new(),
@@ -759,7 +759,7 @@ mod tests {
     fn resolver_merged_view_bare_alias_unique_local() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("web01", "10.0.0.1")]);
-        let gateways = vec![GatewayConfig::Rhopd(RhopdGatewayConfig {
+        let gateways = vec![GatewayConfig::Xhod(XhodGatewayConfig {
             name: "remote1".to_string(),
             address: "10.0.0.99:2222".to_string(),
             identity_file: String::new(),
@@ -781,7 +781,7 @@ mod tests {
     fn resolver_merged_view_bare_alias_ambiguous() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("shared", "10.0.0.5")]);
-        let gateways = vec![GatewayConfig::Rhopd(RhopdGatewayConfig {
+        let gateways = vec![GatewayConfig::Xhod(XhodGatewayConfig {
             name: "remote1".to_string(),
             address: "10.0.0.99:2222".to_string(),
             identity_file: String::new(),
@@ -809,7 +809,7 @@ mod tests {
     fn resolver_merged_view_explicit_gateway_found() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("web01", "10.0.0.1")]);
-        let gateways = vec![GatewayConfig::Rhopd(RhopdGatewayConfig {
+        let gateways = vec![GatewayConfig::Xhod(XhodGatewayConfig {
             name: "remote1".to_string(),
             address: "10.0.0.99:2222".to_string(),
             identity_file: String::new(),
@@ -831,7 +831,7 @@ mod tests {
     fn resolver_merged_view_explicit_gateway_not_found() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("web01", "10.0.0.1")]);
-        let gateways = vec![GatewayConfig::Rhopd(RhopdGatewayConfig {
+        let gateways = vec![GatewayConfig::Xhod(XhodGatewayConfig {
             name: "remote1".to_string(),
             address: "10.0.0.99:2222".to_string(),
             identity_file: String::new(),

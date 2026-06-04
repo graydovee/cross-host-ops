@@ -7,7 +7,7 @@
 use clap::Parser;
 use proptest::prelude::*;
 
-use rhop::cli::{ArunCli, ArunCommand};
+use xho::cli::{ArunCli, ArunCommand};
 
 // ---------------------------------------------------------------------------
 // Proptest strategies
@@ -49,7 +49,7 @@ proptest! {
     ) {
         // Build command line with combined `-it` flag
         let mut args_combined: Vec<String> = vec![
-            "rhop".to_string(),
+            "xho".to_string(),
             "exec".to_string(),
             "-it".to_string(),
             target.clone(),
@@ -94,7 +94,7 @@ proptest! {
 
         // Build command line with separate `-i -t` flags
         let mut args_separate: Vec<String> = vec![
-            "rhop".to_string(),
+            "xho".to_string(),
             "exec".to_string(),
             "-i".to_string(),
             "-t".to_string(),

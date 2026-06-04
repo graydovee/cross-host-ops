@@ -14,7 +14,7 @@
 
 use proptest::prelude::*;
 
-use rhop::daemon::connection::shared::{build_remote_command, shell_quote};
+use xho::daemon::connection::shared::{build_remote_command, shell_quote};
 
 // ---------------------------------------------------------------------------
 // Strategy: generate arbitrary command argument vectors

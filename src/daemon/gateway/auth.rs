@@ -30,7 +30,7 @@ type HmacSha1 = Hmac<Sha1>;
 // ---------------------------------------------------------------------------
 
 const DEFAULT_REMOTE_PORT: u16 = 2222;
-const DEFAULT_REMOTE_USER: &str = "rhop";
+const DEFAULT_REMOTE_USER: &str = "xho";
 
 /// A parsed remote target (user@host:port).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,7 +47,7 @@ impl RemoteTarget {
 }
 
 /// Parse a remote target string of the form `[user@]host[:port]`.
-/// Defaults to user "rhop" and port 2222 when not specified.
+/// Defaults to user "xho" and port 2222 when not specified.
 pub fn parse_remote_target(input: &str) -> Result<RemoteTarget> {
     if input.trim().is_empty() {
         bail!("remote target must not be empty");
@@ -76,7 +76,7 @@ pub fn parse_remote_target(input: &str) -> Result<RemoteTarget> {
 }
 
 /// Connect to a remote target and retrieve its host key.
-/// Used by the CLI trust flow when adding new rhopd hosts.
+/// Used by the CLI trust flow when adding new xhod hosts.
 pub async fn fetch_remote_host_key(target: &RemoteTarget, identity_file: &str) -> Result<ssh_key::PublicKey> {
     use std::sync::Mutex;
 
@@ -214,7 +214,7 @@ pub fn trust_known_host(
 }
 
 /// Normalize identity_file and known_hosts_path, expanding ~ to the user's home.
-/// Falls back to `~/.ssh/id_ed25519` and the default rhop known_hosts path.
+/// Falls back to `~/.ssh/id_ed25519` and the default xho known_hosts path.
 pub fn normalize_paths(
     identity_file: Option<&str>,
     known_hosts_path: Option<&str>,

@@ -5,7 +5,7 @@ use crate::config::{ReviewAction, RiskLevel, ServerEntry};
 use crate::types::{CopyDirection, CopySpec, ServerListSource};
 
 pub mod rpc {
-    tonic::include_proto!("rhop.rpc");
+    tonic::include_proto!("xho.rpc");
 }
 
 #[derive(Clone, Debug)]

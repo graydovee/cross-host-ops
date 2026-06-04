@@ -16,11 +16,11 @@ use std::sync::Arc;
 
 use proptest::prelude::*;
 
-use rhop::config::MfaConfig;
-use rhop::daemon::gateway::auth::{generate_totp, AuthPrompt, AuthPrompter};
-use rhop::daemon::gateway::build_gateways;
-use rhop::config::{
-    AppConfig, GatewayConfig, RhopdGatewayConfig, JumpserverGatewayConfig,
+use xho::config::MfaConfig;
+use xho::daemon::gateway::auth::{generate_totp, AuthPrompt, AuthPrompter};
+use xho::daemon::gateway::build_gateways;
+use xho::config::{
+    AppConfig, GatewayConfig, XhodGatewayConfig, JumpserverGatewayConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -137,11 +137,11 @@ fn arb_jumpserver_without_totp(name: String) -> impl Strategy<Value = GatewayCon
         })
 }
 
-/// Strategy for generating a Rhopd GatewayConfig (always has key credential).
-fn arb_rhopd_with_key(name: String) -> impl Strategy<Value = GatewayConfig> {
+/// Strategy for generating a Xhod GatewayConfig (always has key credential).
+fn arb_xhod_with_key(name: String) -> impl Strategy<Value = GatewayConfig> {
     (arb_address(), arb_file_path(), arb_file_path()).prop_map(
         move |(address, identity_file, known_hosts_path)| {
-            GatewayConfig::Rhopd(RhopdGatewayConfig {
+            GatewayConfig::Xhod(XhodGatewayConfig {
                 name: name.clone(),
                 address,
                 identity_file,
@@ -220,7 +220,7 @@ proptest! {
     fn prop_credentials_present_no_prompter_during_construction(
         gateway in arb_gateway_name().prop_flat_map(|n| {
             prop_oneof![
-                arb_rhopd_with_key(n.clone()),
+                arb_xhod_with_key(n.clone()),
                 arb_jumpserver_with_totp(n),
             ]
         }),

@@ -13,11 +13,11 @@ use std::sync::Arc;
 
 use proptest::prelude::*;
 
-use rhop::config::{
-    AppConfig, GatewayConfig, RhopdGatewayConfig, JumpserverGatewayConfig, DirectGatewayConfig,
+use xho::config::{
+    AppConfig, GatewayConfig, XhodGatewayConfig, JumpserverGatewayConfig, DirectGatewayConfig,
 };
-use rhop::daemon::gateway::auth::{AuthPrompt, AuthPrompter};
-use rhop::daemon::gateway::build_gateways;
+use xho::daemon::gateway::auth::{AuthPrompt, AuthPrompter};
+use xho::daemon::gateway::build_gateways;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -71,11 +71,11 @@ fn arb_file_path() -> impl Strategy<Value = String> {
     ]
 }
 
-/// Strategy for generating a Rhopd GatewayConfig.
-fn arb_rhopd_gateway(name: String) -> impl Strategy<Value = GatewayConfig> {
+/// Strategy for generating a Xhod GatewayConfig.
+fn arb_xhod_gateway(name: String) -> impl Strategy<Value = GatewayConfig> {
     (arb_address(), arb_file_path(), arb_file_path()).prop_map(
         move |(address, identity_file, known_hosts_path)| {
-            GatewayConfig::Rhopd(RhopdGatewayConfig {
+            GatewayConfig::Xhod(XhodGatewayConfig {
                 name: name.clone(),
                 address,
                 identity_file,
@@ -127,7 +127,7 @@ fn arb_direct_gateway(name: String) -> impl Strategy<Value = GatewayConfig> {
 /// Strategy for generating a single GatewayConfig of any variant.
 fn arb_gateway_config(name: String) -> impl Strategy<Value = GatewayConfig> {
     prop_oneof![
-        arb_rhopd_gateway(name.clone()),
+        arb_xhod_gateway(name.clone()),
         arb_jumpserver_gateway(name.clone()),
         arb_direct_gateway(name),
     ]

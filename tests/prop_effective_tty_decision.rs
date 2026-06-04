@@ -12,8 +12,8 @@
 
 use proptest::prelude::*;
 
-use rhop::config::SshConfig;
-use rhop::types::{ExecTtyFlags, effective_tty_decision};
+use xho::config::SshConfig;
+use xho::types::{ExecTtyFlags, effective_tty_decision};
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: 100, .. ProptestConfig::default() })]

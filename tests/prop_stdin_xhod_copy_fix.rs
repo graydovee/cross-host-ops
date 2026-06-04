@@ -1,5 +1,5 @@
 //! Integration-level property tests for bug condition:
-//!   Stdin and Rhopd Copy Data Forwarding Hang.
+//!   Stdin and Xhod Copy Data Forwarding Hang.
 //!
 //! **Validates: Requirements 1.1, 1.2, 1.3, 1.4, 3.1, 3.2, 3.3, 3.4, 3.5, 3.6**
 //!
@@ -10,7 +10,7 @@
 //! ### Bug Condition Tests (Property 1, Task 1)
 //! Confirms the two bugs on unfixed code:
 //! 1. Stdin forwarding hang (Requirements 1.1, 1.2)
-//! 2. Rhopd copy data hang (Requirements 1.3, 1.4)
+//! 2. Xhod copy data hang (Requirements 1.3, 1.4)
 //!
 //! ### Preservation Tests (Property 2, Task 2)
 //! Verifies baseline behavior is intact on UNFIXED code (Requirements 3.1–3.6):
@@ -19,9 +19,9 @@
 //! - ServerEvent forwarding path is intact at the gateway-daemon layer
 //!
 //! ## Core unit tests (lower level)
-//! The deeper property tests that directly exercise `RhopdConnection` internals
+//! The deeper property tests that directly exercise `XhodConnection` internals
 //! (stdout/stderr/event forwarding, interactive handle) are in:
-//!   `src/daemon/connection/rhopd.rs` (cfg(test) module)
+//!   `src/daemon/connection/xhod.rs` (cfg(test) module)
 //! Those tests have access to `pub(super)` types.
 //!
 //! ## Integration tests here
@@ -31,7 +31,7 @@
 mod support;
 
 use proptest::prelude::*;
-use rhop::protocol::rpc;
+use xho::protocol::rpc;
 use support::in_process_rpc::InProcessRpcHarness;
 
 // ---------------------------------------------------------------------------
@@ -140,8 +140,8 @@ proptest! {
 // They verify baseline behavior is intact on UNFIXED code.
 // **EXPECTED OUTCOME: ALL PASS on unfixed code.**
 //
-// Note: Deeper RhopdConnection-level preservation tests (stdout/stderr/event
-// forwarding, interactive handle) live in src/daemon/connection/rhopd.rs
+// Note: Deeper XhodConnection-level preservation tests (stdout/stderr/event
+// forwarding, interactive handle) live in src/daemon/connection/xhod.rs
 // cfg(test) because they require access to pub(super) types.
 //
 // **Validates: Requirements 3.1, 3.5**

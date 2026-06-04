@@ -125,29 +125,29 @@ impl Gateway for LocalGateway {
 }
 ```
 
-### RhopdGateway
+### XhodGateway
 
-通过 SSH subsystem 连接远程 rhopd daemon。
+通过 SSH subsystem 连接远程 xhod daemon。
 
 ```rust
-pub struct RhopdGateway {
+pub struct XhodGateway {
     name: String,
-    config: RhopdGatewayConfig,    // address, identity_file, known_hosts
+    config: XhodGatewayConfig,    // address, identity_file, known_hosts
     /// 单个 gRPC client 连接（复用，远程 daemon 管理并发）
-    client: AsyncMutex<Option<RhopdClient>>,
+    client: AsyncMutex<Option<XhodClient>>,
 }
 ```
 
 **连接池策略**：
-- 只维护一个到远程 rhopd 的 SSH subsystem 连接
+- 只维护一个到远程 xhod 的 SSH subsystem 连接
 - 所有请求复用同一个 gRPC client
-- 远程 rhopd 自己管理到 end target 的并发连接
+- 远程 xhod 自己管理到 end target 的并发连接
 - 断线时惰性重连
 
 **list_servers**：通过 gRPC `ListServers` RPC 查询远程 daemon。
 
 ```rust
-impl Gateway for RhopdGateway {
+impl Gateway for XhodGateway {
     async fn exec(&self, target: &str, request: &ExecRequest) -> Result<i32> {
         let client = self.ensure_client().await?;
         // Send StartRequest with target via gRPC Execute stream
@@ -221,17 +221,17 @@ impl Connection for DirectConnection {
 }
 ```
 
-### RhopdConnection
+### XhodConnection
 
-一个 gRPC Execute stream，由 RhopdGateway 创建。
+一个 gRPC Execute stream，由 XhodGateway 创建。
 
 ```rust
-pub struct RhopdConnection {
-    client: RhopdClient,
+pub struct XhodConnection {
+    client: XhodClient,
     target: String,
 }
 
-impl Connection for RhopdConnection {
+impl Connection for XhodConnection {
     async fn exec(&mut self, request: &ExecRequest) -> Result<i32> {
         // Start Execute streaming RPC with target + argv
     }
@@ -304,7 +304,7 @@ async fn process_list_servers(state: &DaemonState) -> MergedServerList {
 | Gateway | 池结构 | 复用策略 | list_servers |
 |---------|--------|----------|-------------|
 | LocalGateway | `HashMap<host:port, Vec<SshHandle>>` | 相同地址复用，不同地址新建 | 读配置文件，零连接 |
-| RhopdGateway | 单个 `RhopdClient` | 所有请求复用同一连接，远程 daemon 管并发 | gRPC RPC，惰性连接 |
+| XhodGateway | 单个 `XhodClient` | 所有请求复用同一连接，远程 daemon 管并发 | gRPC RPC，惰性连接 |
 | JumpserverGateway | 单个 `PtyShell` | 串行复用（有状态 shell） | 不支持，零成本返回 |
 
 ## 层次关系图
@@ -321,10 +321,10 @@ Daemon
   │   │   ├─ exec("host1", req) → acquire DirectConnection → conn.exec()
   │   │   └─ pools: { "203.0.113.10:22": [SshHandle, SshHandle, ...] }
   │   │
-  │   ├─ RhopdGateway("ali-rhopd")
+  │   ├─ XhodGateway("remote-xhod")
   │   │   ├─ list_servers() → ensure_client → gRPC ListServers
   │   │   ├─ exec("host2", req) → ensure_client → gRPC Execute
-  │   │   └─ client: Option<RhopdClient>  (惰性，共享)
+  │   │   └─ client: Option<XhodClient>  (惰性，共享)
   │   │
   │   └─ JumpserverGateway("corp-jump")
   │       ├─ list_servers() → Err(UnsupportedCapability)  (不连接)
@@ -344,13 +344,13 @@ src/
 ├── gateway/
 │   ├── mod.rs           # Gateway trait + GatewayKind + Route
 │   ├── local.rs         # LocalGateway (直连 SSH + 连接池)
-│   ├── rhopd.rs         # RhopdGateway (SSH subsystem + gRPC)
+│   ├── xhod.rs         # XhodGateway (SSH subsystem + gRPC)
 │   ├── jumpserver.rs    # JumpserverGateway (PTY shell)
 │   └── error.rs         # UnsupportedCapability, ErrorClass
 ├── connection/
 │   ├── mod.rs           # Connection trait
 │   ├── direct.rs        # DirectConnection (SSH channel 操作)
-│   ├── rhopd.rs         # RhopdConnection (gRPC stream 操作)
+│   ├── xhod.rs         # XhodConnection (gRPC stream 操作)
 │   ├── jumpserver.rs    # JumpserverConnection (PTY 操作)
 │   └── shared.rs        # shell_quote, build_command, wrap_in_shell
 ├── resolver.rs          # 目标解析 (target → Vec<Route>)
@@ -366,7 +366,7 @@ src/
 
 2. **Connection 是 Gateway 的私有实现** — 不 pub，不暴露给 daemon。Gateway 内部用 Connection trait 来抽象具体操作，方便测试和替换。
 
-3. **每种 Gateway 自己的池策略** — LocalGateway 按地址分池（多连接），RhopdGateway 共享单连接，JumpserverGateway 单 shell。不需要统一的 Pool 组件。
+3. **每种 Gateway 自己的池策略** — LocalGateway 按地址分池（多连接），XhodGateway 共享单连接，JumpserverGateway 单 shell。不需要统一的 Pool 组件。
 
 4. **外部 Pool 消失** — 当前的 `ConnectionPool` 被各 Gateway 内部替代。Daemon 直接持有 `HashMap<String, Arc<dyn Gateway>>`。
 
@@ -494,30 +494,30 @@ async fn new_shell(&self) -> Result<PtyShell> {
 }
 ```
 
-**RhopdGateway**：
+**XhodGateway**：
 
 ```rust
-async fn new_client(&self) -> Result<RhopdClient> {
+async fn new_client(&self) -> Result<XhodClient> {
     let handle = ssh_connect(&self.config.host, self.config.port).await?;
 
-    // SSH auth — rhopd 通常用 key，但也支持 password
+    // SSH auth — xhod 通常用 key，但也支持 password
     match &self.config.auth {
-        Auth::Key(path) => authenticate_with_key(&handle, "rhop", path).await?,
-        Auth::Password(pw) => authenticate_with_password(&handle, "rhop", pw).await?,
+        Auth::Key(path) => authenticate_with_key(&handle, "xho", path).await?,
+        Auth::Password(pw) => authenticate_with_password(&handle, "xho", pw).await?,
         Auth::None => {
             let pw = (self.prompter)(AuthPrompt {
                 gateway_name: self.name.clone(),
-                message: "Password for rhop: ".to_string(),
+                message: "Password for xho: ".to_string(),
                 secret: true,
             }).await?;
-            authenticate_with_password(&handle, "rhop", &pw).await?;
+            authenticate_with_password(&handle, "xho", &pw).await?;
         }
     }
 
     // Open subsystem → gRPC
     let channel = handle.channel_open_session().await?;
-    channel.request_subsystem(true, "rhop-rpc").await?;
-    RhopdClient::from_channel(channel).await
+    channel.request_subsystem(true, "xho-rpc").await?;
+    XhodClient::from_channel(channel).await
 }
 ```
 

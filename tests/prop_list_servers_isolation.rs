@@ -1,6 +1,6 @@
 //! Property test: list_servers handler is per-source isolated and order-preserving
 //!
-//! Feature: rhopd-connect-and-server-list, Property 5
+//! Feature: xhod-connect-and-server-list, Property 5
 //!
 //! NOTE: This test originally tested the `Gateway` trait + `ServerListAggregator`
 //! architecture which was removed as part of the config-and-legacy-cleanup spec.

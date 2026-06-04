@@ -1,5 +1,5 @@
-// RhopdConnection implementation.
-// Wraps a gRPC client that communicates with a remote rhopd daemon and
+// XhodConnection implementation.
+// Wraps a gRPC client that communicates with a remote xhod daemon and
 // implements the Connection trait for exec/copy/exec_interactive operations.
 
 use anyhow::Result;
@@ -14,22 +14,22 @@ use crate::protocol::{rpc, ServerEvent};
 use super::{Connection, ExecRequest, InteractiveHandle, InteractiveRequest};
 
 // ---------------------------------------------------------------------------
-// RhopdConnection
+// XhodConnection
 // ---------------------------------------------------------------------------
 
-/// A connection to an end target via a remote rhopd daemon's gRPC interface.
-/// The gRPC client is shared with the owning RhopdGateway; this struct holds
+/// A connection to an end target via a remote xhod daemon's gRPC interface.
+/// The gRPC client is shared with the owning XhodGateway; this struct holds
 /// a clone of the client plus the target label to route requests to.
-pub(crate) struct RhopdConnection {
-    client: rpc::rhop_rpc_client::RhopRpcClient<Channel>,
+pub(crate) struct XhodConnection {
+    client: rpc::xho_rpc_client::XhoRpcClient<Channel>,
     /// The end-target server alias sent as the `target` field in RPCs.
     target_label: String,
 }
 
-impl RhopdConnection {
-    /// Create a new RhopdConnection from a pre-connected gRPC client.
+impl XhodConnection {
+    /// Create a new XhodConnection from a pre-connected gRPC client.
     pub(crate) fn new(
-        client: rpc::rhop_rpc_client::RhopRpcClient<Channel>,
+        client: rpc::xho_rpc_client::XhoRpcClient<Channel>,
         target_label: String,
     ) -> Self {
         Self {
@@ -40,7 +40,7 @@ impl RhopdConnection {
 }
 
 #[async_trait::async_trait]
-impl Connection for RhopdConnection {
+impl Connection for XhodConnection {
     async fn exec(&mut self, request: &mut ExecRequest) -> Result<i32> {
         // Take the optional stdin receiver before building the request.
         // This moves stdin_rx out so we can decide whether to spawn a relay task.
@@ -99,7 +99,7 @@ impl Connection for RhopdConnection {
             // drops its sender — but the keepalive clone above keeps the
             // request stream open so the remote can still send responses.
             tokio::spawn(async move {
-                tracing::info!("rhopd-relay: started");
+                tracing::info!("xhod-relay: started");
                 let mut sent_bytes = 0usize;
                 let mut sent_chunks = 0usize;
                 while let Some(data) = rx.recv().await {
@@ -111,8 +111,8 @@ impl Connection for RhopdConnection {
                             )),
                         };
                         match req_tx.send(msg).await {
-                            Ok(_) => tracing::info!(sent_chunks, sent_bytes, "rhopd-relay: forwarded explicit EOF sentinel"),
-                            Err(_) => tracing::info!(sent_chunks, sent_bytes, "rhopd-relay: failed to forward EOF sentinel"),
+                            Ok(_) => tracing::info!(sent_chunks, sent_bytes, "xhod-relay: forwarded explicit EOF sentinel"),
+                            Err(_) => tracing::info!(sent_chunks, sent_bytes, "xhod-relay: failed to forward EOF sentinel"),
                         }
                         break;
                     }
@@ -125,9 +125,9 @@ impl Connection for RhopdConnection {
                         )),
                     };
                     match req_tx.send(msg).await {
-                        Ok(_) => tracing::info!(len, sent_chunks, "rhopd-relay: forwarded StdinData"),
+                        Ok(_) => tracing::info!(len, sent_chunks, "xhod-relay: forwarded StdinData"),
                         Err(_) => {
-                            tracing::info!(sent_chunks, sent_bytes, "rhopd-relay: send failed, stopping");
+                            tracing::info!(sent_chunks, sent_bytes, "xhod-relay: send failed, stopping");
                             return;
                         }
                     }
@@ -135,7 +135,7 @@ impl Connection for RhopdConnection {
                 // If we reached here without seeing an explicit empty sentinel
                 // (i.e. rx was dropped without sending one), still emit one so
                 // the remote daemon can stop waiting for stdin.
-                tracing::info!(sent_chunks, sent_bytes, "rhopd-relay: rx exhausted without sentinel, emitting fallback EOF");
+                tracing::info!(sent_chunks, sent_bytes, "xhod-relay: rx exhausted without sentinel, emitting fallback EOF");
                 let eof = rpc::ExecuteRequest {
                     request: Some(rpc::execute_request::Request::StdinData(
                         rpc::StdinData { data: Vec::new() },
@@ -226,7 +226,7 @@ impl Connection for RhopdConnection {
 
     async fn copy(&mut self, mut spec: CopySpec) -> Result<()> {
         // Build CopyStartRequest with local_path intentionally set to "" for
-        // rhopd hops — the remote daemon must not touch local paths on this side.
+        // xhod hops — the remote daemon must not touch local paths on this side.
         let direction = match spec.direction {
             CopyDirection::Upload => rpc::CopyDirection::Upload as i32,
             CopyDirection::Download => rpc::CopyDirection::Download as i32,
@@ -235,7 +235,7 @@ impl Connection for RhopdConnection {
         let start = rpc::CopyRequest {
             request: Some(rpc::copy_request::Request::Start(rpc::CopyStartRequest {
                 target: self.target_label.clone(),
-                local_path: String::new(), // intentionally empty for rhopd hops
+                local_path: String::new(), // intentionally empty for xhod hops
                 remote_path: spec.remote_path.clone(),
                 recursive: spec.recursive,
                 direction,
@@ -346,7 +346,7 @@ impl Connection for RhopdConnection {
                     rpc::copy_response::Event::AuthPrompt(_prompt) => {
                         // Auth prompts at the Connection level cannot be
                         // responded to without a request channel back into the
-                        // stream. The owning RhopdGateway handles auth at a
+                        // stream. The owning XhodGateway handles auth at a
                         // higher level. If we reach here, we silently skip.
                     }
                     rpc::copy_response::Event::DataChunk(chunk) => {
@@ -532,7 +532,7 @@ impl Connection for RhopdConnection {
         // A tonic Channel remains usable as long as it hasn't been explicitly
         // dropped. The channel internally handles reconnection for HTTP/2
         // connections. We assume the connection is alive if we still hold the
-        // client. The owning RhopdGateway detects transport errors during
+        // client. The owning XhodGateway detects transport errors during
         // operations and discards the connection when needed.
         true
     }
@@ -563,7 +563,7 @@ mod tests {
     /// Recorded messages from one Execute RPC invocation.
     #[derive(Default)]
     struct ExecMessageLog {
-        /// All messages received from the RhopdConnection client request stream.
+        /// All messages received from the XhodConnection client request stream.
         messages: Vec<crate::protocol::rpc::ExecuteRequest>,
     }
 
@@ -571,13 +571,13 @@ mod tests {
     type SharedExecLog = Arc<AsyncMutex<ExecMessageLog>>;
 
     /// A minimal mock gRPC server implementation that logs all received messages.
-    struct MockRhopServer {
+    struct MockXhoServer {
         exec_log: SharedExecLog,
         copy_messages_tx: tokio::sync::mpsc::UnboundedSender<crate::protocol::rpc::CopyRequest>,
     }
 
     #[tonic::async_trait]
-    impl crate::protocol::rpc::rhop_rpc_server::RhopRpc for MockRhopServer {
+    impl crate::protocol::rpc::xho_rpc_server::XhoRpc for MockXhoServer {
         type ExecuteStream = ReceiverStream<Result<crate::protocol::rpc::ExecuteResponse, Status>>;
         type CopyStream = ReceiverStream<Result<crate::protocol::rpc::CopyResponse, Status>>;
 
@@ -611,7 +611,7 @@ mod tests {
                         _ => break,
                     }
                 }
-                // Send exit status so the RhopdConnection caller can complete.
+                // Send exit status so the XhodConnection caller can complete.
                 let _ = resp_tx.send(Ok(crate::protocol::rpc::ExecuteResponse {
                     event: Some(crate::protocol::rpc::execute_response::Event::ExitStatus(
                         crate::protocol::rpc::ExitStatus { code: 42 },
@@ -643,7 +643,7 @@ mod tests {
                         _ => break,
                     }
                 }
-                // Send completion so RhopdConnection copy() returns.
+                // Send completion so XhodConnection copy() returns.
                 let _ = resp_tx.send(Ok(crate::protocol::rpc::CopyResponse {
                     event: Some(crate::protocol::rpc::copy_response::Event::Complete(
                         crate::protocol::rpc::CopyComplete { message: String::new() },
@@ -687,14 +687,14 @@ mod tests {
     const DUPLEX_BUF: usize = 256 * 1024;
 
     async fn start_mock_server() -> (
-        crate::protocol::rpc::rhop_rpc_client::RhopRpcClient<Channel>,
+        crate::protocol::rpc::xho_rpc_client::XhoRpcClient<Channel>,
         SharedExecLog,
         tokio::sync::mpsc::UnboundedReceiver<crate::protocol::rpc::CopyRequest>,
     ) {
         let exec_log: SharedExecLog = Arc::new(AsyncMutex::new(ExecMessageLog::default()));
         let (copy_tx, copy_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let server = MockRhopServer {
+        let server = MockXhoServer {
             exec_log: exec_log.clone(),
             copy_messages_tx: copy_tx,
         };
@@ -704,7 +704,7 @@ mod tests {
         tokio::spawn(async move {
             Server::builder()
                 .add_service(
-                    crate::protocol::rpc::rhop_rpc_server::RhopRpcServer::new(server),
+                    crate::protocol::rpc::xho_rpc_server::XhoRpcServer::new(server),
                 )
                 .serve_with_incoming(tokio_stream::once(
                     Ok::<_, std::io::Error>(server_io),
@@ -722,7 +722,7 @@ mod tests {
             .await
             .expect("failed to connect test client");
 
-        let client = crate::protocol::rpc::rhop_rpc_client::RhopRpcClient::new(channel);
+        let client = crate::protocol::rpc::xho_rpc_client::XhoRpcClient::new(channel);
         (client, exec_log, copy_rx)
     }
 
@@ -780,7 +780,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Property 1 Bug Condition: RhopdConnection::exec must forward stdin
+    // Property 1 Bug Condition: XhodConnection::exec must forward stdin
     // -----------------------------------------------------------------------
 
     proptest! {
@@ -788,11 +788,11 @@ mod tests {
 
         /// **Validates: Requirements 1.2, 2.2**
         ///
-        /// Expected Behavior: RhopdConnection::exec forwards stdin bytes as
+        /// Expected Behavior: XhodConnection::exec forwards stdin bytes as
         /// StdinData gRPC messages.
         ///
         /// With the fix in place, ExecRequest carries `stdin_rx: Some(rx)`.
-        /// RhopdConnection::exec reads from the receiver and sends StdinData
+        /// XhodConnection::exec reads from the receiver and sends StdinData
         /// messages on req_tx to the remote daemon.
         ///
         /// This test verifies the fix: the mock server MUST receive at least
@@ -800,7 +800,7 @@ mod tests {
         ///
         /// EXPECTED OUTCOME: PASSES on fixed code (confirms bug is fixed).
         #[test]
-        fn prop_bug_rhopd_exec_stdin_never_forwarded(
+        fn prop_bug_xhod_exec_stdin_never_forwarded(
             stdin_payload in proptest::collection::vec(any::<u8>(), 1..64usize),
             argv in proptest::collection::vec("[a-z]{1,10}", 1..4usize),
         ) {
@@ -808,10 +808,10 @@ mod tests {
             rt.block_on(async {
                 let (client, exec_log, _copy_rx) = start_mock_server().await;
 
-                let mut conn = RhopdConnection::new(client, "test-target".to_string());
+                let mut conn = XhodConnection::new(client, "test-target".to_string());
 
                 // Build request WITH stdin_rx carrying the payload.
-                // On fixed code, RhopdConnection::exec will spawn a relay task
+                // On fixed code, XhodConnection::exec will spawn a relay task
                 // that reads from stdin_rx and sends StdinData messages.
                 let (mut request, _events) =
                     make_exec_request_with_stdin(argv.clone(), stdin_payload.clone());
@@ -883,9 +883,9 @@ mod tests {
 
         /// **Validates: Requirements 1.3, 1.4**
         ///
-        /// Bug Condition: RhopdConnection::copy never streams file data.
+        /// Bug Condition: XhodConnection::copy never streams file data.
         ///
-        /// For any upload CopySpec, after calling `RhopdConnection::copy` the
+        /// For any upload CopySpec, after calling `XhodConnection::copy` the
         /// mock server's Copy stream should contain CopyDataChunk messages.
         ///
         /// On unfixed code: only CopyStartRequest is sent, no data chunks.
@@ -896,14 +896,14 @@ mod tests {
         /// at the remote daemon waiting for data that never comes — in the
         /// mock, we immediately complete, but in production it would hang).
         #[test]
-        fn prop_bug_rhopd_copy_upload_no_data_chunks(
+        fn prop_bug_xhod_copy_upload_no_data_chunks(
             file_data in proptest::collection::vec(any::<u8>(), 1..256usize),
         ) {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
                 // Write file data to a temp file for the copy spec.
                 let temp_file = std::env::temp_dir().join(format!(
-                    "rhop-test-copy-{}.bin",
+                    "xho-test-copy-{}.bin",
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -914,7 +914,7 @@ mod tests {
                     .expect("failed to write temp file");
 
                 let (client, _exec_log, mut copy_rx) = start_mock_server().await;
-                let mut conn = RhopdConnection::new(client, "test-target".to_string());
+                let mut conn = XhodConnection::new(client, "test-target".to_string());
 
                 let spec = crate::types::CopySpec {
                     local_path: temp_file.display().to_string(),
@@ -946,11 +946,11 @@ mod tests {
 
                 // EXPECTED BEHAVIOR ASSERTION (will FAIL on unfixed code):
                 // After the fix, CopyRequest oneof should have a data_chunk variant,
-                // and RhopdConnection::copy should stream file data as CopyDataChunk
+                // and XhodConnection::copy should stream file data as CopyDataChunk
                 // messages before sending the EOF chunk.
                 //
                 // On UNFIXED code: the proto has no data_chunk variant in CopyRequest,
-                // and even if it did, RhopdConnection::copy never reads the local file
+                // and even if it did, XhodConnection::copy never reads the local file
                 // or streams any data. This assertion FAILS → confirms bug.
                 //
                 // We check: after StartRequest, at least one additional message was
@@ -960,7 +960,7 @@ mod tests {
 
                 prop_assert!(
                     messages_after_start > 0,
-                    "BUG CONFIRMED: RhopdConnection::copy only sends CopyStartRequest \
+                    "BUG CONFIRMED: XhodConnection::copy only sends CopyStartRequest \
                      and never streams file data. Mock received {} total messages \
                      (expected StartRequest + ≥1 DataChunk), local file had {} bytes.",
                     total_messages,
@@ -979,22 +979,22 @@ mod tests {
 
         /// **Validates: Requirements 1.4, 2.4**
         ///
-        /// Expected Behavior: RhopdConnection::copy download receives
+        /// Expected Behavior: XhodConnection::copy download receives
         /// CopyDataChunk messages and writes the data to the local file.
         ///
         /// With the fix in place, CopyResponse has a DataChunk variant.
         /// The mock sends: DataChunk(data, eof=false) + DataChunk([], eof=true)
-        /// + Complete. RhopdConnection::copy must write the data to local_path.
+        /// + Complete. XhodConnection::copy must write the data to local_path.
         ///
         /// EXPECTED OUTCOME: PASSES on fixed code (confirms bug is fixed).
         #[test]
-        fn prop_bug_rhopd_copy_download_no_data_mechanism(
+        fn prop_bug_xhod_copy_download_no_data_mechanism(
             expected_content in proptest::collection::vec(any::<u8>(), 1..256usize),
         ) {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
                 let download_dest = std::env::temp_dir().join(format!(
-                    "rhop-test-download-{}.bin",
+                    "xho-test-download-{}.bin",
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -1007,7 +1007,7 @@ mod tests {
                 struct DownloadMock { content: Vec<u8> }
 
                 #[tonic::async_trait]
-                impl crate::protocol::rpc::rhop_rpc_server::RhopRpc for DownloadMock {
+                impl crate::protocol::rpc::xho_rpc_server::XhoRpc for DownloadMock {
                     type ExecuteStream = ReceiverStream<Result<crate::protocol::rpc::ExecuteResponse, tonic::Status>>;
                     type CopyStream = ReceiverStream<Result<crate::protocol::rpc::CopyResponse, tonic::Status>>;
 
@@ -1054,7 +1054,7 @@ mod tests {
                 let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF);
                 tokio::spawn(async move {
                     tonic::transport::Server::builder()
-                        .add_service(crate::protocol::rpc::rhop_rpc_server::RhopRpcServer::new(server))
+                        .add_service(crate::protocol::rpc::xho_rpc_server::XhoRpcServer::new(server))
                         .serve_with_incoming(tokio_stream::once(Ok::<_, std::io::Error>(server_io)))
                         .await.ok();
                 });
@@ -1064,9 +1064,9 @@ mod tests {
                         let s = slot.lock().unwrap().take().unwrap();
                         async move { Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(s)) }
                     })).await.expect("connect");
-                let client = crate::protocol::rpc::rhop_rpc_client::RhopRpcClient::new(channel);
+                let client = crate::protocol::rpc::xho_rpc_client::XhoRpcClient::new(channel);
 
-                let mut conn = RhopdConnection::new(client, "test-target".to_string());
+                let mut conn = XhodConnection::new(client, "test-target".to_string());
 
                 let spec = crate::types::CopySpec {
                     local_path: download_dest.display().to_string(),
@@ -1112,7 +1112,7 @@ mod tests {
         /// forwards stdout, stderr, and exit code from the mock gRPC server.
         ///
         /// Mock server emits: Stdout chunk -> Stderr chunk -> ExitStatus.
-        /// RhopdConnection must forward ALL events to the ServerEvent channel.
+        /// XhodConnection must forward ALL events to the ServerEvent channel.
         ///
         /// EXPECTED OUTCOME: PASSES on unfixed code.
         #[test]
@@ -1131,7 +1131,7 @@ mod tests {
                 struct StdoutErrMock { stdout: Vec<u8>, stderr: Vec<u8>, exit: i32 }
 
                 #[tonic::async_trait]
-                impl crate::protocol::rpc::rhop_rpc_server::RhopRpc for StdoutErrMock {
+                impl crate::protocol::rpc::xho_rpc_server::XhoRpc for StdoutErrMock {
                     type ExecuteStream = ReceiverStream<Result<crate::protocol::rpc::ExecuteResponse, tonic::Status>>;
                     type CopyStream = ReceiverStream<Result<crate::protocol::rpc::CopyResponse, tonic::Status>>;
 
@@ -1167,7 +1167,7 @@ mod tests {
                 let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF);
                 tokio::spawn(async move {
                     tonic::transport::Server::builder()
-                        .add_service(crate::protocol::rpc::rhop_rpc_server::RhopRpcServer::new(server))
+                        .add_service(crate::protocol::rpc::xho_rpc_server::XhoRpcServer::new(server))
                         .serve_with_incoming(tokio_stream::once(Ok::<_, std::io::Error>(server_io)))
                         .await.ok();
                 });
@@ -1177,11 +1177,11 @@ mod tests {
                         let s = slot.lock().unwrap().take().unwrap();
                         async move { Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(s)) }
                     })).await.expect("connect");
-                let client = crate::protocol::rpc::rhop_rpc_client::RhopRpcClient::new(channel);
+                let client = crate::protocol::rpc::xho_rpc_client::XhoRpcClient::new(channel);
 
                 let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<ServerEvent>();
                 let mut request = ExecRequest { sender, ..make_exec_request_no_stdin(vec!["ls".to_string()]) };
-                let mut conn = RhopdConnection::new(client, "tgt".to_string());
+                let mut conn = XhodConnection::new(client, "tgt".to_string());
                 let ret_exit = conn.exec(&mut request).await.expect("exec must complete");
                 prop_assert_eq!(ret_exit, exit_code, "exit code forwarded correctly");
 
@@ -1209,7 +1209,7 @@ mod tests {
         /// **Validates: Requirements 3.6**
         ///
         /// Preservation: ReviewResult, ConfirmRequired, and AuthPrompt events
-        /// are forwarded correctly by RhopdConnection::exec.
+        /// are forwarded correctly by XhodConnection::exec.
         ///
         /// Mock sends: ReviewResult -> ConfirmRequired -> AuthPrompt -> ExitStatus.
         /// All must arrive in the ServerEvent channel.
@@ -1224,7 +1224,7 @@ mod tests {
                 struct ControlEventsMock { exit: i32 }
 
                 #[tonic::async_trait]
-                impl crate::protocol::rpc::rhop_rpc_server::RhopRpc for ControlEventsMock {
+                impl crate::protocol::rpc::xho_rpc_server::XhoRpc for ControlEventsMock {
                     type ExecuteStream = ReceiverStream<Result<crate::protocol::rpc::ExecuteResponse, tonic::Status>>;
                     type CopyStream = ReceiverStream<Result<crate::protocol::rpc::CopyResponse, tonic::Status>>;
 
@@ -1259,7 +1259,7 @@ mod tests {
                 let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF);
                 tokio::spawn(async move {
                     tonic::transport::Server::builder()
-                        .add_service(crate::protocol::rpc::rhop_rpc_server::RhopRpcServer::new(server))
+                        .add_service(crate::protocol::rpc::xho_rpc_server::XhoRpcServer::new(server))
                         .serve_with_incoming(tokio_stream::once(Ok::<_, std::io::Error>(server_io)))
                         .await.ok();
                 });
@@ -1269,11 +1269,11 @@ mod tests {
                         let s = slot.lock().unwrap().take().unwrap();
                         async move { Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(s)) }
                     })).await.expect("connect");
-                let client = crate::protocol::rpc::rhop_rpc_client::RhopRpcClient::new(channel);
+                let client = crate::protocol::rpc::xho_rpc_client::XhoRpcClient::new(channel);
 
                 let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<ServerEvent>();
                 let mut request = ExecRequest { sender, ..make_exec_request_no_stdin(vec!["ls".to_string()]) };
-                let mut conn = RhopdConnection::new(client, "tgt".to_string());
+                let mut conn = XhodConnection::new(client, "tgt".to_string());
                 let ret_exit = conn.exec(&mut request).await.expect("exec must complete");
                 prop_assert_eq!(ret_exit, exit_code);
 
@@ -1332,7 +1332,7 @@ mod tests {
                     shell: String::new(),
                 };
 
-                let mut conn = RhopdConnection::new(client, "tgt".to_string());
+                let mut conn = XhodConnection::new(client, "tgt".to_string());
                 let handle = conn.exec_interactive(&request).await
                     .expect("exec_interactive must succeed");
 
@@ -1380,7 +1380,7 @@ mod tests {
 
         /// **Validates: Requirements 3.3, 3.4**
         ///
-        /// Preservation: RhopdConnection::copy sends CopyStartRequest with
+        /// Preservation: XhodConnection::copy sends CopyStartRequest with
         /// correct target/remote_path/direction, and returns Ok when mock
         /// responds with CopyComplete.
         ///
@@ -1395,7 +1395,7 @@ mod tests {
             rt.block_on(async {
                 let (client, _exec_log, mut copy_rx) = start_mock_server().await;
 
-                let mut conn = RhopdConnection::new(client, "my-target".to_string());
+                let mut conn = XhodConnection::new(client, "my-target".to_string());
                 let direction = if upload {
                     crate::types::CopyDirection::Upload
                 } else {
@@ -1430,8 +1430,8 @@ mod tests {
                 prop_assert_eq!(&start.remote_path, &format!("/remote/{}", remote_path), "remote_path correct");
                 prop_assert_eq!(start.recursive, recursive, "recursive field correct");
 
-                // local_path must be empty in the rhopd copy path.
-                prop_assert!(start.local_path.is_empty(), "local_path must be empty for rhopd hops");
+                // local_path must be empty in the xhod copy path.
+                prop_assert!(start.local_path.is_empty(), "local_path must be empty for xhod hops");
 
                 Ok(())
             })?;

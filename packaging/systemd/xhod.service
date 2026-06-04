@@ -1,11 +1,11 @@
 [Unit]
-Description=Remote Hop daemon
+Description=Cross Host Ops daemon
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/rhopd --config /etc/rhop/config.toml --origin external
+ExecStart=/usr/local/bin/xhod --config /etc/xho/config.toml --origin external
 Restart=on-failure
 RestartSec=2s
 

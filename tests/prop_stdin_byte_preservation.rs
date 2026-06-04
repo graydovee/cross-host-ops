@@ -10,7 +10,7 @@
 use proptest::prelude::*;
 
 use prost::Message;
-use rhop::protocol::rpc;
+use xho::protocol::rpc;
 
 // ---------------------------------------------------------------------------
 // Property 2: StdinData byte fidelity (Round-Trip) — arbitrary byte sequences

@@ -1,7 +1,7 @@
 use clap::Parser;
 
-use rhop::cli::ArunCli;
-use rhop::exit_codes::{RhopError, EXIT_INTERNAL};
+use xho::cli::ArunCli;
+use xho::exit_codes::{XhoError, EXIT_INTERNAL};
 
 #[tokio::main]
 async fn main() {
@@ -18,7 +18,7 @@ async fn main() {
                         w[0] == "--output" && w[1] == "json"
                     });
                     if is_json {
-                        rhop::cli::print_version_json();
+                        xho::cli::print_version_json();
                     } else {
                         // Default text version output
                         print!("{}", e);
@@ -32,12 +32,12 @@ async fn main() {
         }
     };
 
-    match rhop::cli::run_cli(cli).await {
+    match xho::cli::run_cli(cli).await {
         Ok(code) => std::process::exit(code),
         Err(error) => {
-            // Attempt to extract a typed RhopError for its exit code.
+            // Attempt to extract a typed XhoError for its exit code.
             let exit_code = error
-                .downcast_ref::<RhopError>()
+                .downcast_ref::<XhoError>()
                 .map(|e| e.exit_code())
                 .unwrap_or(EXIT_INTERNAL);
             eprintln!("{error:#}");

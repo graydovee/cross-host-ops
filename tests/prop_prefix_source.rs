@@ -6,8 +6,8 @@
 //! Property 2: Path prefix round-trip (first-colon split recovers gateway name)
 
 use proptest::prelude::*;
-use rhop::daemon::rpc::prefix_source;
-use rhop::types::ServerListSource;
+use xho::daemon::rpc::prefix_source;
+use xho::types::ServerListSource;
 
 // ---------------------------------------------------------------------------
 // Strategies

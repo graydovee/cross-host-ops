@@ -1,19 +1,19 @@
 [package]
-name = "remote-hop"
+name = "cross-host-ops"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "rhop"
+name = "xho"
 path = "src/lib.rs"
 
 [[bin]]
-name = "rhop"
-path = "src/bin/rhop.rs"
+name = "xho"
+path = "src/bin/xho.rs"
 
 [[bin]]
-name = "rhopd"
-path = "src/bin/rhopd.rs"
+name = "xhod"
+path = "src/bin/xhod.rs"
 
 [dependencies]
 anyhow = "1.0"

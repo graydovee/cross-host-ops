@@ -14,9 +14,9 @@ use async_trait::async_trait;
 use proptest::prelude::*;
 use tokio::sync::mpsc;
 
-use rhop::protocol::ServerListRow;
-use rhop::types::CopySpec;
-use rhop::daemon::gateway::{
+use xho::protocol::ServerListRow;
+use xho::types::CopySpec;
+use xho::daemon::gateway::{
     ErrorKind, ExecRequest, Gateway, GatewayError, GatewayKind, InteractiveHandle,
     InteractiveRequest,
 };

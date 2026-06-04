@@ -1,11 +1,11 @@
-//! Integration-level property tests P1–P4 for the rhopd jumpserver architecture.
+//! Integration-level property tests P1–P4 for the xhod jumpserver architecture.
 //!
 //! These tests verify protocol-level invariants at the gRPC boundary using the
 //! in-process RPC harness. Since the daemon cannot perform real SSH connections
 //! in tests, we verify that the gRPC protocol contracts hold through the
 //! gateway-based daemon.
 //!
-//! NOTE: This test originally used `RhopdGateway` from the deleted `src/jump/`
+//! NOTE: This test originally used `XhodGateway` from the deleted `src/jump/`
 //! module. That module was removed as part of the config-and-legacy-cleanup spec.
 //! The equivalent protocol-level behavior is now tested through the in-process
 //! RPC harness which exercises the full gateway-based daemon.
@@ -15,7 +15,7 @@ mod support;
 
 use proptest::prelude::*;
 
-use rhop::protocol::rpc;
+use xho::protocol::rpc;
 
 use support::in_process_rpc::InProcessRpcHarness;
 

@@ -3,7 +3,7 @@
 
 pub mod direct;
 pub mod jumpserver;
-pub mod rhopd;
+pub mod xhod;
 pub mod shared;
 
 use anyhow::Result;

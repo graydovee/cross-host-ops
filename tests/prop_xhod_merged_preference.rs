@@ -1,23 +1,23 @@
-//! Property-based tests: RhopdGateway merged-over-flat preference and fallback.
+//! Property-based tests: XhodGateway merged-over-flat preference and fallback.
 //!
 //! Feature: server-list-path-prefix
 //!
-//! Property 4: RhopdGateway prefers merged over flat servers
+//! Property 4: XhodGateway prefers merged over flat servers
 //! For any response with both non-empty merged.rows and servers, verify output
 //! comes from merged.rows only.
 //! **Validates: Requirements 1.1, 4.2**
 //!
-//! Property 5: RhopdGateway fallback to flat servers
+//! Property 5: XhodGateway fallback to flat servers
 //! For any response with absent/empty merged, verify output comes from flat
 //! servers with source=Gateway(name).
 //! **Validates: Requirements 4.3**
 
 use proptest::prelude::*;
 
-use rhop::config::ServerEntry;
-use rhop::daemon::rpc::prefix_source;
-use rhop::protocol::ServerListRow;
-use rhop::types::ServerListSource;
+use xho::config::ServerEntry;
+use xho::daemon::rpc::prefix_source;
+use xho::protocol::ServerListRow;
+use xho::types::ServerListSource;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -33,12 +33,12 @@ struct SimulatedRpcRow {
     source: String,
 }
 
-/// Simulate the RhopdGateway::list_servers logic without real gRPC.
+/// Simulate the XhodGateway::list_servers logic without real gRPC.
 ///
 /// This replicates the core decision logic:
 /// - If merged_rows is non-empty, use them (applying prefix_source to each row's source).
 /// - Otherwise fall back to flat_servers with source = Gateway(gateway_name).
-fn simulate_rhopd_list_servers(
+fn simulate_xhod_list_servers(
     gateway_name: &str,
     merged_rows: &[SimulatedRpcRow],
     flat_servers: &[ServerEntry],
@@ -53,7 +53,7 @@ fn simulate_rhopd_list_servers(
                     host: row.host.clone(),
                     port: row.port,
                     user: row.user.clone(),
-                    auth: rhop::config::DirectAuth::Key {
+                    auth: xho::config::DirectAuth::Key {
                         identity_file: String::new(),
                     },
                 };
@@ -128,7 +128,7 @@ fn arb_server_entry() -> impl Strategy<Value = ServerEntry> {
             host,
             port,
             user,
-            auth: rhop::config::DirectAuth::Key {
+            auth: xho::config::DirectAuth::Key {
                 identity_file: String::new(),
             },
         }
@@ -136,7 +136,7 @@ fn arb_server_entry() -> impl Strategy<Value = ServerEntry> {
 }
 
 // ---------------------------------------------------------------------------
-// Property 4: RhopdGateway prefers merged over flat servers
+// Property 4: XhodGateway prefers merged over flat servers
 // ---------------------------------------------------------------------------
 
 proptest! {
@@ -147,12 +147,12 @@ proptest! {
     /// For any response with both non-empty merged.rows and a servers field,
     /// the output must come exclusively from merged.rows (ignoring flat servers).
     #[test]
-    fn prop_rhopd_prefers_merged_over_flat(
+    fn prop_xhod_prefers_merged_over_flat(
         gateway_name in arb_gateway_name(),
         merged_rows in prop::collection::vec(arb_simulated_rpc_row(), 1..=10),
         flat_servers in prop::collection::vec(arb_server_entry(), 1..=10),
     ) {
-        let output = simulate_rhopd_list_servers(&gateway_name, &merged_rows, &flat_servers);
+        let output = simulate_xhod_list_servers(&gateway_name, &merged_rows, &flat_servers);
 
         // Output length must match merged_rows (not flat_servers)
         prop_assert_eq!(
@@ -193,7 +193,7 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
-// Property 5: RhopdGateway fallback to flat servers
+// Property 5: XhodGateway fallback to flat servers
 // ---------------------------------------------------------------------------
 
 proptest! {
@@ -204,13 +204,13 @@ proptest! {
     /// For any response with absent/empty merged, the output must come from
     /// flat servers with source == ServerListSource::Gateway(gateway_name).
     #[test]
-    fn prop_rhopd_fallback_to_flat_servers(
+    fn prop_xhod_fallback_to_flat_servers(
         gateway_name in arb_gateway_name(),
         flat_servers in prop::collection::vec(arb_server_entry(), 1..=10),
     ) {
         // Empty merged_rows triggers fallback
         let merged_rows: Vec<SimulatedRpcRow> = Vec::new();
-        let output = simulate_rhopd_list_servers(&gateway_name, &merged_rows, &flat_servers);
+        let output = simulate_xhod_list_servers(&gateway_name, &merged_rows, &flat_servers);
 
         // Output length must match flat_servers
         prop_assert_eq!(

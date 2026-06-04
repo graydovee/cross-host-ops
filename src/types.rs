@@ -12,7 +12,7 @@ pub enum CopyDirection {
 /// Specification for a single file copy operation.
 ///
 /// The `relay_upload_rx` and `relay_download_tx` fields are used when the
-/// daemon acts as a relay for rhopd-routed copies. In this mode, file data
+/// daemon acts as a relay for xhod-routed copies. In this mode, file data
 /// does not live on the daemon's local disk — it travels on gRPC streams.
 ///
 /// - `relay_upload_rx`: When `Some`, the connection reads upload chunks from

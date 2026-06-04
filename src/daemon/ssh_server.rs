@@ -23,9 +23,9 @@ use super::DaemonState;
 // Subsystem name constant
 // ---------------------------------------------------------------------------
 
-const REMOTE_SUBSYSTEM_NAME: &str = "rhop-rpc";
+const REMOTE_SUBSYSTEM_NAME: &str = "xho-rpc";
 
-/// Returns the SSH subsystem name used for rhop gRPC-over-SSH connections.
+/// Returns the SSH subsystem name used for xho gRPC-over-SSH connections.
 pub(crate) fn remote_subsystem_name() -> &'static str {
     REMOTE_SUBSYSTEM_NAME
 }

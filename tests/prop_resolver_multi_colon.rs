@@ -5,8 +5,8 @@
 
 use proptest::prelude::*;
 
-use rhop::config::{AppConfig, DirectGatewayConfig, GatewayConfig, ServerConfigFile};
-use rhop::daemon::resolver::Resolver;
+use xho::config::{AppConfig, DirectGatewayConfig, GatewayConfig, ServerConfigFile};
+use xho::daemon::resolver::Resolver;
 
 // ---------------------------------------------------------------------------
 // Proptest strategies

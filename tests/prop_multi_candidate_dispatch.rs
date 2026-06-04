@@ -20,9 +20,9 @@ use tokio::sync::mpsc;
 
 use std::collections::HashMap;
 
-use rhop::types::CopySpec;
-use rhop::protocol::ServerListRow;
-use rhop::daemon::gateway::{
+use xho::types::CopySpec;
+use xho::protocol::ServerListRow;
+use xho::daemon::gateway::{
     ErrorKind, ExecRequest, Gateway, GatewayError, GatewayKind, InteractiveHandle,
     InteractiveRequest, Route,
 };

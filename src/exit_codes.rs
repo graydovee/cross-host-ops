@@ -1,14 +1,14 @@
-//! Exit-code taxonomy for the `rhop` CLI.
+//! Exit-code taxonomy for the `xho` CLI.
 //!
 //! This module defines a deterministic mapping from error conditions to process
 //! exit codes, ensuring callers can distinguish remote-command failure from
-//! rhop-internal failure without parsing prose.
+//! xho-internal failure without parsing prose.
 //!
 //! Exit-code bands:
 //! - `0`       — success
 //! - `1..=123` — remote command exit code (transparently forwarded, capped)
 //! - `124`     — `--timeout` deadline expired
-//! - `125`     — rhop/daemon internal error (config, transport, resolver, missing operand)
+//! - `125`     — xho/daemon internal error (config, transport, resolver, missing operand)
 //! - `126`     — cannot execute (auth failure, host-key rejection, review deny, non-interactive prompt)
 //! - `127`     — target not found / unknown alias / unsupported capability
 
@@ -24,7 +24,7 @@ pub const EXIT_USAGE_ERROR: i32 = 2;
 /// Operation aborted because `--timeout` deadline expired.
 pub const EXIT_TIMEOUT: i32 = 124;
 
-/// Rhop/daemon internal error (config, transport, resolver, daemon unreachable).
+/// Xho/daemon internal error (config, transport, resolver, daemon unreachable).
 pub const EXIT_INTERNAL: i32 = 125;
 
 /// Cannot execute: authentication failure, host-key rejection, review deny,
@@ -34,7 +34,7 @@ pub const EXIT_CANNOT_EXECUTE: i32 = 126;
 /// Target not found, unknown alias, or unsupported capability.
 pub const EXIT_TARGET_NOT_FOUND: i32 = 127;
 
-/// Cap a remote command's exit code so it never collides with rhop's reserved
+/// Cap a remote command's exit code so it never collides with xho's reserved
 /// exit-code bands (124–127).
 ///
 /// - If `c` is in `0..=123`, return `c` unchanged.
@@ -55,7 +55,7 @@ pub fn cap_remote_exit_code(c: i32) -> i32 {
 /// Each variant represents a class of failure that the CLI can encounter.
 /// The `exit_code()` method provides the deterministic mapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RhopError {
+pub enum XhoError {
     /// Operation timed out (`--timeout` deadline expired).
     Timeout,
 
@@ -77,39 +77,39 @@ pub enum RhopError {
     General(String),
 }
 
-impl RhopError {
+impl XhoError {
     /// Map this error to its documented exit code.
     pub fn exit_code(&self) -> i32 {
         match self {
-            RhopError::Timeout => EXIT_TIMEOUT,
-            RhopError::Internal(_) => EXIT_INTERNAL,
-            RhopError::UsageError(_) => EXIT_USAGE_ERROR,
-            RhopError::CannotExecute(_) => EXIT_CANNOT_EXECUTE,
-            RhopError::TargetNotFound(_) => EXIT_TARGET_NOT_FOUND,
-            RhopError::General(_) => EXIT_GENERAL_ERROR,
+            XhoError::Timeout => EXIT_TIMEOUT,
+            XhoError::Internal(_) => EXIT_INTERNAL,
+            XhoError::UsageError(_) => EXIT_USAGE_ERROR,
+            XhoError::CannotExecute(_) => EXIT_CANNOT_EXECUTE,
+            XhoError::TargetNotFound(_) => EXIT_TARGET_NOT_FOUND,
+            XhoError::General(_) => EXIT_GENERAL_ERROR,
         }
     }
 
     /// Get the human-readable message for this error.
     pub fn message(&self) -> &str {
         match self {
-            RhopError::Timeout => "operation timed out",
-            RhopError::Internal(msg) => msg,
-            RhopError::UsageError(msg) => msg,
-            RhopError::CannotExecute(msg) => msg,
-            RhopError::TargetNotFound(msg) => msg,
-            RhopError::General(msg) => msg,
+            XhoError::Timeout => "operation timed out",
+            XhoError::Internal(msg) => msg,
+            XhoError::UsageError(msg) => msg,
+            XhoError::CannotExecute(msg) => msg,
+            XhoError::TargetNotFound(msg) => msg,
+            XhoError::General(msg) => msg,
         }
     }
 }
 
-impl std::fmt::Display for RhopError {
+impl std::fmt::Display for XhoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.message())
     }
 }
 
-impl std::error::Error for RhopError {}
+impl std::error::Error for XhoError {}
 
 #[cfg(test)]
 mod tests {
@@ -141,28 +141,28 @@ mod tests {
     }
 
     #[test]
-    fn test_rhop_error_exit_codes() {
-        assert_eq!(RhopError::Timeout.exit_code(), 124);
+    fn test_xho_error_exit_codes() {
+        assert_eq!(XhoError::Timeout.exit_code(), 124);
         assert_eq!(
-            RhopError::Internal("daemon unreachable".into()).exit_code(),
+            XhoError::Internal("daemon unreachable".into()).exit_code(),
             125
         );
         assert_eq!(
-            RhopError::UsageError("missing operand".into()).exit_code(),
+            XhoError::UsageError("missing operand".into()).exit_code(),
             2
         );
         assert_eq!(
-            RhopError::CannotExecute("auth failed".into()).exit_code(),
+            XhoError::CannotExecute("auth failed".into()).exit_code(),
             126
         );
         assert_eq!(
-            RhopError::TargetNotFound("no such target".into()).exit_code(),
+            XhoError::TargetNotFound("no such target".into()).exit_code(),
             127
         );
-        assert_eq!(RhopError::General("something broke".into()).exit_code(), 1);
+        assert_eq!(XhoError::General("something broke".into()).exit_code(), 1);
     }
 
-    // Feature: rhopd-jumpserver-architecture, Property 15: Exit-code semantics consistency
+    // Feature: xhod-jumpserver-architecture, Property 15: Exit-code semantics consistency
     mod prop_exit_codes {
         use super::*;
         use proptest::prelude::*;
@@ -171,7 +171,7 @@ mod tests {
             #![proptest_config(ProptestConfig { cases: 100, .. ProptestConfig::default() })]
 
             /// For any i32 code, `cap_remote_exit_code(code)` is in [0, 123] ∪ {125}
-            /// (never in the 124–127 range that rhop reserves for its own semantics,
+            /// (never in the 124–127 range that xho reserves for its own semantics,
             /// except 125 which is used for negative/unexpected codes).
             ///
             /// **Validates: Requirements 17.10, 17.11, 17.12**

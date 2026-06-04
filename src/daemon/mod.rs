@@ -145,7 +145,7 @@ impl DaemonState {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-struct RhopRpcService {
+struct XhoRpcService {
     state: DaemonState,
 }
 
@@ -388,7 +388,7 @@ pub async fn run_with_overrides(
         loaded.server.log_level = level;
     }
     let _log_guard = init_logging(loaded.server.log_path.clone(), &loaded.server.log_level)?;
-    info!(config_path = %config_path.display(), "starting rhopd");
+    info!(config_path = %config_path.display(), "starting xhod");
 
     let config = Arc::new(RwLock::new(loaded.clone()));
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
@@ -519,7 +519,7 @@ pub async fn run_with_overrides(
 
     let incoming = ReceiverStream::new(receiver_map_incoming(incoming_rx));
     Server::builder()
-        .add_service(proto_rpc::rhop_rpc_server::RhopRpcServer::new(RhopRpcService {
+        .add_service(proto_rpc::xho_rpc_server::XhoRpcServer::new(XhoRpcService {
             state: state.clone(),
         }))
         .serve_with_incoming_shutdown(incoming, async move {
@@ -539,7 +539,7 @@ pub async fn run_with_overrides(
 // ---------------------------------------------------------------------------
 
 #[tonic::async_trait]
-impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
+impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
     type ExecuteStream = ReceiverStream<Result<proto_rpc::ExecuteResponse, Status>>;
     type CopyStream = ReceiverStream<Result<proto_rpc::CopyResponse, Status>>;
 
@@ -611,9 +611,9 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                 };
 
                 // Defense in depth: reject Copy requests received over the
-                // rhop-rpc subsystem when local_path is non-empty.
+                // xho-rpc subsystem when local_path is non-empty.
                 if is_remote && !start.local_path.is_empty() {
-                    bail!("Copy requests received over rhop-rpc must not specify local_path");
+                    bail!("Copy requests received over xho-rpc must not specify local_path");
                 }
 
                 let (target_input, mut spec, timeout_ms): (String, CopySpec, u64) = protocol::copy_spec_from_rpc(start)?;
@@ -640,9 +640,9 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                     .find_gateway(&route.gateway_name)
                     .ok_or_else(|| anyhow!("gateway '{}' not found", route.gateway_name))?;
 
-                // When copy data arrives over an rhop-rpc subsystem, the remote
+                // When copy data arrives over an xho-rpc subsystem, the remote
                 // daemon materializes it into a temp file before handing off to
-                // local SFTP. When the next hop is another rhopd gateway, the
+                // local SFTP. When the next hop is another xhod gateway, the
                 // daemon relays data directly over channels.
                 let mut remote_temp_path: Option<PathBuf> = None;
                 let mut download_relay_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -661,13 +661,13 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                             remote_temp_path = Some(temp_path);
                         }
                     }
-                } else if gateway.kind() == gateway::GatewayKind::Rhopd {
+                } else if gateway.kind() == gateway::GatewayKind::Xhod {
                     use crate::types::CopyDirection;
                     match spec.direction {
                         CopyDirection::Upload => {
                             // Upload relay: spawn a task to forward CopyDataChunk messages
                             // from the client gRPC inbound stream into a channel, which
-                            // RhopdConnection::copy will read instead of a local file.
+                            // XhodConnection::copy will read instead of a local file.
                             let (upload_tx, upload_rx) = mpsc::channel::<(Vec<u8>, bool)>(16);
                             spec.relay_upload_rx = Some(upload_rx);
 
@@ -700,7 +700,7 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                             });
                         }
                         CopyDirection::Download => {
-                            // Download relay: RhopdConnection::copy sends data chunks to this
+                            // Download relay: XhodConnection::copy sends data chunks to this
                             // channel; we forward them as CopyDataChunk events on the gRPC
                             // response stream back to the client.
                             let (download_tx, mut download_rx) = mpsc::channel::<(Vec<u8>, bool)>(16);
@@ -816,7 +816,7 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
             .iter()
             .map(|entry| {
                 let (name, kind, address) = match entry {
-                    GatewayConfig::Rhopd(c) => (c.name.clone(), "rhopd".to_string(), c.address.clone()),
+                    GatewayConfig::Xhod(c) => (c.name.clone(), "xhod".to_string(), c.address.clone()),
                     GatewayConfig::Jumpserver(c) => (c.name.clone(), "jumpserver".to_string(), format!("{}:{}", c.host, c.port)),
                     GatewayConfig::Direct(c) => (c.name.clone(), "direct".to_string(), format!("{}:{}", c.host, c.port)),
                 };
@@ -951,8 +951,8 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
 
                 let kind_str = req.kind.trim().to_string();
                 match kind_str.as_str() {
-                    "rhopd" => {
-                        let new_entry = GatewayConfig::Rhopd(crate::config::RhopdGatewayConfig {
+                    "xhod" => {
+                        let new_entry = GatewayConfig::Xhod(crate::config::XhodGatewayConfig {
                             name: alias.clone(),
                             address: req.address.clone(),
                             identity_file: req.identity_file.clone(),
@@ -987,7 +987,7 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
                         Ok(Response::new(proto_rpc::UpdateConfigResponse {
                             success: false,
                             message: format!(
-                                "add_gateway via RPC only supports kind 'rhopd', got '{}'",
+                                "add_gateway via RPC only supports kind 'xhod', got '{}'",
                                 other
                             ),
                         }))
@@ -1053,7 +1053,7 @@ impl proto_rpc::rhop_rpc_server::RhopRpc for RhopRpcService {
             .iter()
             .map(|entry| {
                 let (name, kind, address) = match entry {
-                    GatewayConfig::Rhopd(c) => (c.name.clone(), "rhopd".to_string(), c.address.clone()),
+                    GatewayConfig::Xhod(c) => (c.name.clone(), "xhod".to_string(), c.address.clone()),
                     GatewayConfig::Jumpserver(c) => (c.name.clone(), "jumpserver".to_string(), format!("{}:{}", c.host, c.port)),
                     GatewayConfig::Direct(c) => (c.name.clone(), "direct".to_string(), format!("{}:{}", c.host, c.port)),
                 };
@@ -1555,7 +1555,7 @@ async fn process_interactive_execute(
 }
 
 fn remote_copy_temp_path(prefix: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("rhop_{}_{}", prefix, Uuid::new_v4()))
+    std::env::temp_dir().join(format!("xho_{}_{}", prefix, Uuid::new_v4()))
 }
 
 async fn receive_copy_upload_to_temp(
@@ -1733,7 +1733,7 @@ async fn ensure_remote_host_key(config: &crate::config::RemoteServerConfig) -> R
     let mut rng = rand_core::UnwrapErr(getrandom::SysRng);
     let mut key = ssh_key::PrivateKey::random(&mut rng, ssh_key::Algorithm::Ed25519)
         .context("failed to generate Ed25519 host key")?;
-    key.set_comment("rhopd host key");
+    key.set_comment("xhod host key");
     key.write_openssh_file(path, LineEnding::LF)
         .with_context(|| format!("failed to write host key {}", path.display()))?;
     #[cfg(unix)]
@@ -1818,19 +1818,19 @@ async fn atomic_write_config(state: &DaemonState) -> Result<()> {
 // Test support
 // ---------------------------------------------------------------------------
 
-/// Test support: exposes the ability to create an `RhopRpcServer` service
+/// Test support: exposes the ability to create an `XhoRpcServer` service
 /// backed by a given `AppConfig` and config path, suitable for serving over
 /// an in-process transport (e.g. `tokio::io::duplex`).
 pub mod test_support {
     use super::*;
 
-    /// Creates a tonic `RhopRpcServer` service instance backed by the given
+    /// Creates a tonic `XhoRpcServer` service instance backed by the given
     /// config. The returned service can be added to a `tonic::transport::Server`
     /// and served over any async I/O transport.
     pub fn make_test_rpc_service(
         config: AppConfig,
         config_path: PathBuf,
-    ) -> proto_rpc::rhop_rpc_server::RhopRpcServer<impl proto_rpc::rhop_rpc_server::RhopRpc> {
+    ) -> proto_rpc::xho_rpc_server::XhoRpcServer<impl proto_rpc::xho_rpc_server::XhoRpc> {
         let config_clone = config.clone();
         let config = Arc::new(RwLock::new(config_clone.clone()));
         let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
@@ -1855,6 +1855,6 @@ pub mod test_support {
             origin: DaemonOrigin::External,
             cli_start_options: CliStartOptions::default(),
         };
-        proto_rpc::rhop_rpc_server::RhopRpcServer::new(RhopRpcService { state })
+        proto_rpc::xho_rpc_server::XhoRpcServer::new(XhoRpcService { state })
     }
 }

@@ -17,7 +17,7 @@
 use proptest::prelude::*;
 
 use prost::Message;
-use rhop::protocol::rpc;
+use xho::protocol::rpc;
 
 // ---------------------------------------------------------------------------
 // Property 4: Window Resize Propagation — arbitrary valid sizes

@@ -50,28 +50,28 @@ jobs:
       - name: Build release binaries
         run: |
           if [ "${{ matrix.use-cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }} --bin rhop --bin rhopd
+            cross build --release --target ${{ matrix.target }} --bin xho --bin xhod
           else
-            cargo build --release --target ${{ matrix.target }} --bin rhop --bin rhopd
+            cargo build --release --target ${{ matrix.target }} --bin xho --bin xhod
           fi
 
       - name: Package release archive
         shell: bash
         run: |
           TAG="${GITHUB_REF_NAME}"
-          PKG="remote-hop-${TAG}-${{ matrix.target }}"
+          PKG="cross-host-ops-${TAG}-${{ matrix.target }}"
           mkdir -p "${PKG}"
-          cp "target/${{ matrix.target }}/release/rhop" "${PKG}/"
-          cp "target/${{ matrix.target }}/release/rhopd" "${PKG}/"
+          cp "target/${{ matrix.target }}/release/xho" "${PKG}/"
+          cp "target/${{ matrix.target }}/release/xhod" "${PKG}/"
           cp config.example.toml "${PKG}/"
-          cp packaging/systemd/rhopd.service "${PKG}/"
+          cp packaging/systemd/xhod.service "${PKG}/"
           tar -czf "${PKG}.tar.gz" "${PKG}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
           name: release-${{ matrix.target }}
-          path: remote-hop-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          path: cross-host-ops-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
 
   docker-ghcr:
     name: docker ghcr
@@ -97,7 +97,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/remote-hop
+          images: ghcr.io/${{ github.repository_owner }}/cross-host-ops
           tags: |
             type=raw,value=${{ github.ref_name }}
             type=raw,value=latest

@@ -15,11 +15,11 @@ use std::time::Duration;
 use proptest::prelude::*;
 use tempfile::NamedTempFile;
 
-use rhop::config::AppConfig;
-use rhop::daemon::gateway::auth::{AuthPrompt, AuthPrompter};
-use rhop::daemon::gateway::local::LocalGateway;
-use rhop::daemon::gateway::Gateway;
-use rhop::types::ServerListSource;
+use xho::config::AppConfig;
+use xho::daemon::gateway::auth::{AuthPrompt, AuthPrompter};
+use xho::daemon::gateway::local::LocalGateway;
+use xho::daemon::gateway::Gateway;
+use xho::types::ServerListSource;
 
 // ---------------------------------------------------------------------------
 // Helpers

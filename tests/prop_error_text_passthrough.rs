@@ -1,4 +1,4 @@
-// Feature: rhopd-connect-and-server-list, Property 6: handler does not modify upstream error Display text
+// Feature: xhod-connect-and-server-list, Property 6: handler does not modify upstream error Display text
 //
 // This property test verifies that the `list_servers` handler's error
 // conversion path preserves the upstream error's Display text byte-for-byte.
@@ -10,7 +10,7 @@
 // exactly `s` in the resulting `ServerListSourceStatus::Error(msg)`.
 
 use proptest::prelude::*;
-use rhop::protocol::ServerListSourceStatus;
+use xho::protocol::ServerListSourceStatus;
 
 /// Simulate the exact error conversion path used in `daemon::list_servers`:
 ///

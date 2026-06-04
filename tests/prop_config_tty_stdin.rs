@@ -5,7 +5,7 @@
 
 use proptest::prelude::*;
 
-use rhop::config::SshConfig;
+use xho::config::SshConfig;
 
 // ---------------------------------------------------------------------------
 // Property tests

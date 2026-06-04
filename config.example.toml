@@ -1,36 +1,36 @@
-# rhop example config
+# xho example config
 #
 # The program can run without any config file.
 # Default behavior with no config:
-# - local daemon socket enabled: ~/.rhop/rhopd.sock
+# - local daemon socket enabled: ~/.xho/xhod.sock
 # - remote daemon listener disabled
 # - target resolution: derive IP from the first CLI argument
 # - direct SSH only: the derived IP must match a Host entry in ~/.ssh/config
 # - gateways: none configured
 # - command review: disabled by default
 #
-# Copy only the sections you need into ~/.rhop/config.toml.
+# Copy only the sections you need into ~/.xho/config.toml.
 # Every setting below is commented out on purpose.
 
 # [server]
-# log_path = "/var/log/rhopd.log"
+# log_path = "/var/log/xhod.log"
 # log_level = "info"
 # reaper_interval = "30s"
 
 # [server.local]
 # enable = true
-# socket_path = "~/.rhop/rhopd.sock"
+# socket_path = "~/.xho/xhod.sock"
 
 # [server.remote]
 # enable = true
 # listen_addr = "0.0.0.0:2222"
-# user = "rhop"
-# host_key_path = "~/.rhop/host_key"
-# authorized_keys_path = "~/.rhop/authorized_keys"
+# user = "xho"
+# host_key_path = "~/.xho/host_key"
+# authorized_keys_path = "~/.xho/authorized_keys"
 
 # [ssh]
 # ssh_config_path = "~/.ssh/config"
-# server_config_path = "~/.rhop/server.toml"
+# server_config_path = "~/.xho/server.toml"
 #
 # Fallback resolution order. Each entry is either:
 #   "local"       — resolve via local ~/.ssh/config
@@ -54,9 +54,9 @@
 # directly reachable via ~/.ssh/config. Each entry has a unique name and a
 # `kind` field that selects the gateway type. The name is used in target
 # resolution:
-#   rhop exec <name>:<server_alias> <cmd>
+#   xho exec <name>:<server_alias> <cmd>
 #
-# Supported kinds: "rhopd", "jumpserver", "direct"
+# Supported kinds: "xhod", "jumpserver", "direct"
 
 # Example: an interactive jumpserver with TOTP MFA
 # [[gateways]]
@@ -70,13 +70,13 @@
 # totp_digits = 6
 # totp_period = 30
 
-# Example: a remote rhopd daemon reachable over SSH
+# Example: a remote xhod daemon reachable over SSH
 # [[gateways]]
-# kind = "rhopd"
+# kind = "xhod"
 # name = "prod"
-# address = "rhop@prod-bastion.example.com:2222"
+# address = "xho@prod-bastion.example.com:2222"
 # identity_file = "~/.ssh/id_ed25519"
-# known_hosts_path = "~/.rhop/known_hosts"
+# known_hosts_path = "~/.xho/known_hosts"
 
 # Example: a named direct SSH entry (useful for explicit routing)
 # [[gateways]]
@@ -88,7 +88,7 @@
 # identity_file = "~/.ssh/id_rsa"
 
 # Enable this only when you want LLM command review before execution.
-# If api_key is omitted, rhop will try RHOP_REVIEW_API_KEY first, then OPENAI_API_KEY.
+# If api_key is omitted, xho will try XHO_REVIEW_API_KEY first, then OPENAI_API_KEY.
 # endpoint, model, prompts, policy, and semantic_whitelist all have code defaults.
 # [review]
 # enable = true

@@ -12,7 +12,7 @@
 
 use proptest::prelude::*;
 
-use rhop::daemon::connection::shared::build_final_command;
+use xho::daemon::connection::shared::build_final_command;
 
 /// Strategy to generate a single argument string of 0–100 chars including
 /// special characters (quotes, backslashes, spaces, newlines, etc.)

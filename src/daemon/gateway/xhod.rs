@@ -1,5 +1,5 @@
-// RhopdGateway implementation.
-// Manages a single gRPC-over-SSH connection to a remote rhopd daemon.
+// XhodGateway implementation.
+// Manages a single gRPC-over-SSH connection to a remote xhod daemon.
 // All requests are multiplexed over the shared gRPC channel.
 
 use std::sync::Arc;
@@ -25,33 +25,33 @@ use super::{
     ExecRequest, Gateway, GatewayError, GatewayKind, InteractiveHandle, InteractiveRequest,
     is_transport_error,
 };
-use crate::daemon::connection::rhopd::RhopdConnection;
+use crate::daemon::connection::xhod::XhodConnection;
 use crate::daemon::connection::{
     Connection, ExecRequest as ConnExecRequest, InteractiveRequest as ConnInteractiveRequest,
 };
 
 // ---------------------------------------------------------------------------
-// RhopdGateway
+// XhodGateway
 // ---------------------------------------------------------------------------
 
-/// A Gateway that forwards operations to a remote rhopd daemon over a
-/// gRPC channel multiplexed on an SSH `rhop-rpc` subsystem.
+/// A Gateway that forwards operations to a remote xhod daemon over a
+/// gRPC channel multiplexed on an SSH `xho-rpc` subsystem.
 ///
 /// The gRPC client is lazily established on first use and shared across
 /// all concurrent operations. On transport errors, the client is discarded
 /// and re-established on the next operation.
-pub struct RhopdGateway {
+pub struct XhodGateway {
     gateway_name: String,
     address: String,
     identity_file: String,
     known_hosts_path: String,
     auth_prompter: Arc<AuthPrompter>,
     /// Single shared gRPC client (lazily connected).
-    client: AsyncMutex<Option<rpc::rhop_rpc_client::RhopRpcClient<Channel>>>,
+    client: AsyncMutex<Option<rpc::xho_rpc_client::XhoRpcClient<Channel>>>,
 }
 
-impl RhopdGateway {
-    /// Construct a new RhopdGateway. No connections are established.
+impl XhodGateway {
+    /// Construct a new XhodGateway. No connections are established.
     pub fn new(
         gateway_name: String,
         address: String,
@@ -74,7 +74,7 @@ impl RhopdGateway {
     /// Returns a clone of the gRPC client.
     async fn ensure_client(
         &self,
-    ) -> Result<rpc::rhop_rpc_client::RhopRpcClient<Channel>, GatewayError> {
+    ) -> Result<rpc::xho_rpc_client::XhoRpcClient<Channel>, GatewayError> {
         let mut guard = self.client.lock().await;
         if let Some(ref client) = *guard {
             return Ok(client.clone());
@@ -87,10 +87,10 @@ impl RhopdGateway {
     }
 
     /// Establish the SSH connection and create a gRPC client.
-    async fn connect_client(&self) -> Result<rpc::rhop_rpc_client::RhopRpcClient<Channel>> {
+    async fn connect_client(&self) -> Result<rpc::xho_rpc_client::XhoRpcClient<Channel>> {
         // Parse address to get host, port, user.
         let target = parse_remote_target(&self.address)
-            .map_err(|e| anyhow!("failed to parse rhopd address {:?}: {}", self.address, e))?;
+            .map_err(|e| anyhow!("failed to parse xhod address {:?}: {}", self.address, e))?;
 
         // Normalize identity_file and known_hosts_path with defaults.
         let id_opt = if self.identity_file.is_empty() {
@@ -111,11 +111,11 @@ impl RhopdGateway {
             host = %target.host,
             port = %target.port,
             user = %target.user,
-            "connecting to remote rhopd"
+            "connecting to remote xhod"
         );
 
-        // Open SSH connection with the "rhop" user from the parsed address
-        // (parse_remote_target defaults to "rhop" user if not specified).
+        // Open SSH connection with the "xho" user from the parsed address
+        // (parse_remote_target defaults to "xho" user if not specified).
         let client_config = client::Config::default();
         let mut handle = client::connect(
             Arc::new(client_config),
@@ -132,7 +132,7 @@ impl RhopdGateway {
             )
         })?;
 
-        // Authenticate with public key (user "rhop"), AuthPrompter fallback.
+        // Authenticate with public key (user "xho"), AuthPrompter fallback.
         let auth_result = self
             .authenticate_ssh(&mut handle, &target.user, &identity_file)
             .await;
@@ -176,7 +176,7 @@ impl RhopdGateway {
                 })?;
         }
 
-        // Open session channel and request the "rhop-rpc" subsystem.
+        // Open session channel and request the "xho-rpc" subsystem.
         let ssh_channel = handle.channel_open_session().await.map_err(|e| {
             anyhow!(
                 "failed to open session channel on {}:{}: {}",
@@ -190,7 +190,7 @@ impl RhopdGateway {
             .await
             .map_err(|e| {
                 anyhow!(
-                    "failed to start rhop-rpc subsystem on {}:{}: {}",
+                    "failed to start xho-rpc subsystem on {}:{}: {}",
                     target.host,
                     target.port,
                     e
@@ -210,10 +210,10 @@ impl RhopdGateway {
                 async move {
                     let stream = slot
                         .lock()
-                        .expect("rhopd stream slot mutex poisoned")
+                        .expect("xhod stream slot mutex poisoned")
                         .take()
                         .ok_or_else(|| {
-                            std::io::Error::other("rhop-rpc subsystem connector already consumed")
+                            std::io::Error::other("xho-rpc subsystem connector already consumed")
                         })?;
                     Ok::<_, std::io::Error>(TokioIo::new(stream))
                 }
@@ -235,7 +235,7 @@ impl RhopdGateway {
             target.port
         );
 
-        Ok(rpc::rhop_rpc_client::RhopRpcClient::new(tonic_channel))
+        Ok(rpc::xho_rpc_client::XhoRpcClient::new(tonic_channel))
     }
 
     /// Attempt publickey authentication. Returns Ok(()) on success, Err on failure.
@@ -281,12 +281,12 @@ impl RhopdGateway {
 // ---------------------------------------------------------------------------
 
 #[async_trait]
-impl Gateway for RhopdGateway {
+impl Gateway for XhodGateway {
     async fn exec(&self, target: &str, request: &ExecRequest) -> Result<i32, GatewayError> {
         let client = self.ensure_client().await?;
 
-        // Create a RhopdConnection and delegate exec to it.
-        let mut conn = RhopdConnection::new(client, target.to_string());
+        // Create a XhodConnection and delegate exec to it.
+        let mut conn = XhodConnection::new(client, target.to_string());
 
         // Take stdin_rx from the gateway request (consuming it so the channel
         // is owned by the connection layer for forwarding).
@@ -321,7 +321,7 @@ impl Gateway for RhopdGateway {
                 self.discard_client().await;
 
                 let new_client = self.ensure_client().await?;
-                let mut retry_conn = RhopdConnection::new(new_client, target.to_string());
+                let mut retry_conn = XhodConnection::new(new_client, target.to_string());
                 let retry_result = retry_conn.exec(&mut conn_request).await;
 
                 match retry_result {
@@ -344,7 +344,7 @@ impl Gateway for RhopdGateway {
     async fn copy(&self, target: &str, spec: CopySpec) -> Result<(), GatewayError> {
         let client = self.ensure_client().await?;
 
-        let mut conn = RhopdConnection::new(client, target.to_string());
+        let mut conn = XhodConnection::new(client, target.to_string());
 
         // First attempt
         let result = conn.copy(spec.clone()).await;
@@ -361,7 +361,7 @@ impl Gateway for RhopdGateway {
                 self.discard_client().await;
 
                 let new_client = self.ensure_client().await?;
-                let mut retry_conn = RhopdConnection::new(new_client, target.to_string());
+                let mut retry_conn = XhodConnection::new(new_client, target.to_string());
                 // Note: relay channels are dropped on clone, so retry is only
                 // effective for non-relay copies (where channels were None).
                 let retry_result = retry_conn.copy(spec).await;
@@ -389,7 +389,7 @@ impl Gateway for RhopdGateway {
     ) -> Result<InteractiveHandle, GatewayError> {
         let client = self.ensure_client().await?;
 
-        let mut conn = RhopdConnection::new(client, target.to_string());
+        let mut conn = XhodConnection::new(client, target.to_string());
         let conn_request = ConnInteractiveRequest {
             argv: request.argv.clone(),
             cols: request.cols,
@@ -449,7 +449,7 @@ impl Gateway for RhopdGateway {
     }
 
     fn kind(&self) -> GatewayKind {
-        GatewayKind::Rhopd
+        GatewayKind::Xhod
     }
 
     fn name(&self) -> &str {
@@ -457,7 +457,7 @@ impl Gateway for RhopdGateway {
     }
 
     async fn prune_idle(&self) {
-        // No-op: RhopdGateway maintains a single persistent gRPC connection.
+        // No-op: XhodGateway maintains a single persistent gRPC connection.
         // Connections are only discarded on transport errors, not idleness.
     }
 }

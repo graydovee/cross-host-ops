@@ -4,7 +4,7 @@
 pub mod auth;
 pub mod jumpserver;
 pub mod local;
-pub mod rhopd;
+pub mod xhod;
 
 
 use std::fmt;
@@ -21,7 +21,7 @@ use crate::protocol::{ServerEvent, ServerListRow};
 use self::auth::AuthPrompter;
 use self::jumpserver::JumpserverGateway;
 use self::local::LocalGateway;
-use self::rhopd::RhopdGateway;
+use self::xhod::XhodGateway;
 
 // ---------------------------------------------------------------------------
 // Gateway trait
@@ -51,7 +51,7 @@ pub trait Gateway: Send + Sync {
     /// The concrete kind of this gateway.
     fn kind(&self) -> GatewayKind;
 
-    /// The configured name of this gateway (e.g., "local", "ali-rhopd").
+    /// The configured name of this gateway (e.g., "local", "remote-xhod").
     fn name(&self) -> &str;
 
     /// Prune idle connections. Called by the daemon's reaper timer.
@@ -66,7 +66,7 @@ pub trait Gateway: Send + Sync {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayKind {
-    Rhopd,
+    Xhod,
     Jumpserver,
     Direct,
 }
@@ -76,7 +76,7 @@ impl std::fmt::Display for GatewayKind {
         match self {
             GatewayKind::Direct => write!(f, "direct"),
             GatewayKind::Jumpserver => write!(f, "jumpserver"),
-            GatewayKind::Rhopd => write!(f, "rhopd"),
+            GatewayKind::Xhod => write!(f, "xhod"),
         }
     }
 }
@@ -238,7 +238,7 @@ pub fn is_resolution_error(error: &anyhow::Error) -> bool {
 
 /// Construct all Gateways from the loaded configuration.
 /// Always creates one LocalGateway named "local".
-/// Creates one RhopdGateway or JumpserverGateway per `[[gateways]]` entry.
+/// Creates one XhodGateway or JumpserverGateway per `[[gateways]]` entry.
 /// No network connections are established during construction.
 pub fn build_gateways(
     config: Arc<RwLock<crate::config::AppConfig>>,
@@ -278,7 +278,7 @@ pub fn build_gateways(
     // Create one gateway per gateways_config entry, preserving declaration order.
     for gc in gateways_config {
         let gateway: Arc<dyn Gateway> = match gc {
-            GatewayConfig::Rhopd(c) => Arc::new(RhopdGateway::new(
+            GatewayConfig::Xhod(c) => Arc::new(XhodGateway::new(
                 c.name.clone(),
                 c.address.clone(),
                 c.identity_file.clone(),

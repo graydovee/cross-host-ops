@@ -14,10 +14,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use proptest::prelude::*;
 
-use rhop::config::{DirectAuth, ServerEntry};
-use rhop::protocol::ServerListRow;
-use rhop::types::{CopySpec, ServerListSource};
-use rhop::daemon::gateway::{
+use xho::config::{DirectAuth, ServerEntry};
+use xho::protocol::ServerListRow;
+use xho::types::{CopySpec, ServerListSource};
+use xho::daemon::gateway::{
     ErrorKind, ExecRequest, Gateway, GatewayError, GatewayKind, InteractiveHandle,
     InteractiveRequest,
 };

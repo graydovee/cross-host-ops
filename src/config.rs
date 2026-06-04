@@ -66,7 +66,7 @@ impl AppConfig {
 
         for gw in &mut self.gateways {
             match gw {
-                GatewayConfig::Rhopd(c) => {
+                GatewayConfig::Xhod(c) => {
                     c.identity_file = expand_tilde(&c.identity_file)?;
                     c.known_hosts_path = expand_tilde(&c.known_hosts_path)?;
                 }
@@ -92,7 +92,7 @@ impl AppConfig {
 pub fn default_config_path() -> PathBuf {
     home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".rhop/config.toml")
+        .join(".xho/config.toml")
 }
 
 pub fn default_client_config_path() -> PathBuf {
@@ -102,7 +102,7 @@ pub fn default_client_config_path() -> PathBuf {
 pub fn default_root_dir() -> PathBuf {
     home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".rhop")
+        .join(".xho")
 }
 
 pub fn default_known_hosts_path() -> PathBuf {
@@ -189,7 +189,7 @@ impl Default for LocalServerConfig {
     fn default() -> Self {
         Self {
             enable: true,
-            socket_path: "~/.rhop/rhopd.sock".to_string(),
+            socket_path: "~/.xho/xhod.sock".to_string(),
         }
     }
 }
@@ -209,9 +209,9 @@ impl Default for RemoteServerConfig {
         Self {
             enable: false,
             listen_addr: "0.0.0.0:2222".to_string(),
-            user: "rhop".to_string(),
-            host_key_path: "~/.rhop/host_key".to_string(),
-            authorized_keys_path: "~/.rhop/authorized_keys".to_string(),
+            user: "xho".to_string(),
+            host_key_path: "~/.xho/host_key".to_string(),
+            authorized_keys_path: "~/.xho/authorized_keys".to_string(),
         }
     }
 }
@@ -241,7 +241,7 @@ impl Default for SshConfig {
     fn default() -> Self {
         Self {
             ssh_config_path: "~/.ssh/config".to_string(),
-            server_config_path: "~/.rhop/server.toml".to_string(),
+            server_config_path: "~/.xho/server.toml".to_string(),
             fallback: vec![FallbackEntry::Local],
             tty: true,
             stdin: false,
@@ -491,7 +491,7 @@ pub fn default_review_model() -> String {
 }
 
 pub fn default_review_api_key() -> Option<String> {
-    env::var("RHOP_REVIEW_API_KEY")
+    env::var("XHO_REVIEW_API_KEY")
         .ok()
         .or_else(|| env::var("OPENAI_API_KEY").ok())
 }
@@ -621,7 +621,7 @@ pub struct LocalClientConfig {
 impl Default for LocalClientConfig {
     fn default() -> Self {
         Self {
-            socket_path: "~/.rhop/rhopd.sock".to_string(),
+            socket_path: "~/.xho/xhod.sock".to_string(),
             auto_start: true,
         }
     }
@@ -1025,7 +1025,7 @@ pub fn validate_gateways(gateways: &[GatewayConfig]) -> Result<(), GatewayValida
 
         // Kind-specific required field validation
         match entry {
-            GatewayConfig::Rhopd(c) => {
+            GatewayConfig::Xhod(c) => {
                 if c.address.is_empty() {
                     return Err(GatewayValidationError::EmptyRequiredField {
                         name: c.name.clone(),
@@ -1100,7 +1100,7 @@ fn default_totp_period() -> u64 {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GatewayConfig {
-    Rhopd(RhopdGatewayConfig),
+    Xhod(XhodGatewayConfig),
     Jumpserver(JumpserverGatewayConfig),
     Direct(DirectGatewayConfig),
 }
@@ -1109,7 +1109,7 @@ impl GatewayConfig {
     /// Returns the name of this gateway entry.
     pub fn name(&self) -> &str {
         match self {
-            Self::Rhopd(c) => &c.name,
+            Self::Xhod(c) => &c.name,
             Self::Jumpserver(c) => &c.name,
             Self::Direct(c) => &c.name,
         }
@@ -1119,7 +1119,7 @@ impl GatewayConfig {
     pub fn gateway_kind(&self) -> crate::daemon::gateway::GatewayKind {
         use crate::daemon::gateway::GatewayKind;
         match self {
-            Self::Rhopd(_) => GatewayKind::Rhopd,
+            Self::Xhod(_) => GatewayKind::Xhod,
             Self::Jumpserver(_) => GatewayKind::Jumpserver,
             Self::Direct(_) => GatewayKind::Direct,
         }
@@ -1127,7 +1127,7 @@ impl GatewayConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct RhopdGatewayConfig {
+pub struct XhodGatewayConfig {
     pub name: String,
     pub address: String,
     #[serde(default)]
@@ -1215,20 +1215,20 @@ mod tests {
     }
 
     #[test]
-    fn defaults_use_rhop_paths() {
-        assert!(default_config_path().ends_with(".rhop/config.toml"));
-        assert!(default_client_config_path().ends_with(".rhop/client.toml"));
-        assert!(default_known_hosts_path().ends_with(".rhop/known_hosts"));
+    fn defaults_use_xho_paths() {
+        assert!(default_config_path().ends_with(".xho/config.toml"));
+        assert!(default_client_config_path().ends_with(".xho/client.toml"));
+        assert!(default_known_hosts_path().ends_with(".xho/known_hosts"));
         let config = AppConfig::default();
-        assert_eq!(config.server.local.socket_path, "~/.rhop/rhopd.sock");
-        assert_eq!(config.server.remote.host_key_path, "~/.rhop/host_key");
+        assert_eq!(config.server.local.socket_path, "~/.xho/xhod.sock");
+        assert_eq!(config.server.remote.host_key_path, "~/.xho/host_key");
         assert_eq!(
             config.server.remote.authorized_keys_path,
-            "~/.rhop/authorized_keys"
+            "~/.xho/authorized_keys"
         );
         assert!(config.copy.preserve_mode);
         let client = ClientConfig::default();
-        assert_eq!(client.local.socket_path, "~/.rhop/rhopd.sock");
+        assert_eq!(client.local.socket_path, "~/.xho/xhod.sock");
     }
 
     #[test]

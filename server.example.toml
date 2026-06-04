@@ -1,7 +1,7 @@
 # server.toml — local server catalog
 #
-# Servers listed here are the "local" source in `rhop server list`.
-# They can be targeted by alias (e.g. `rhop exec devbox hostname`)
+# Servers listed here are the "local" source in `xho ls`.
+# They can be targeted by alias (e.g. `xho exec devbox hostname`)
 # or by matching the `host` field against the derived IP.
 #
 # Authentication priority per entry:

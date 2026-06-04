@@ -12,10 +12,10 @@ use std::sync::Arc;
 
 use proptest::prelude::*;
 
-use rhop::config::{AppConfig, JumpserverGatewayConfig, MfaConfig};
-use rhop::daemon::gateway::auth::{AuthPrompt, AuthPrompter};
-use rhop::daemon::gateway::jumpserver::JumpserverGateway;
-use rhop::daemon::gateway::{ErrorKind, Gateway};
+use xho::config::{AppConfig, JumpserverGatewayConfig, MfaConfig};
+use xho::daemon::gateway::auth::{AuthPrompt, AuthPrompter};
+use xho::daemon::gateway::jumpserver::JumpserverGateway;
+use xho::daemon::gateway::{ErrorKind, Gateway};
 
 // ---------------------------------------------------------------------------
 // Helpers

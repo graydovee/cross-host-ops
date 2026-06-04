@@ -6,7 +6,7 @@ COPY Cargo.toml Cargo.lock build.rs ./
 COPY proto ./proto
 COPY src ./src
 
-RUN cargo build --release --bin rhop --bin rhopd
+RUN cargo build --release --bin xho --bin xhod
 
 FROM debian:bookworm-slim
 
@@ -16,10 +16,10 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY --from=builder /app/target/release/rhop /usr/local/bin/rhop
-COPY --from=builder /app/target/release/rhopd /usr/local/bin/rhopd
-COPY config.example.toml /etc/rhop/config.toml
+COPY --from=builder /app/target/release/xho /usr/local/bin/xho
+COPY --from=builder /app/target/release/xhod /usr/local/bin/xhod
+COPY config.example.toml /etc/xho/config.toml
 
 EXPOSE 2222
 
-CMD ["/usr/local/bin/rhopd", "--config", "/etc/rhop/config.toml", "--origin", "external"]
+CMD ["/usr/local/bin/xhod", "--config", "/etc/xho/config.toml", "--origin", "external"]

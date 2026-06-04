@@ -12,8 +12,8 @@
 
 use proptest::prelude::*;
 
-use rhop::config::SshConfig;
-use rhop::types::{ExecStdinFlags, effective_stdin_decision};
+use xho::config::SshConfig;
+use xho::types::{ExecStdinFlags, effective_stdin_decision};
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: 100, .. ProptestConfig::default() })]

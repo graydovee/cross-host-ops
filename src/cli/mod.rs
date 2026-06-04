@@ -20,7 +20,7 @@ use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
 use crate::config::{
-    AppConfig, ClientConfig, GatewayConfig, RhopdGatewayConfig,
+    AppConfig, ClientConfig, GatewayConfig, XhodGatewayConfig,
     default_config_path, expand_tilde, parse_duration, RESERVED_NAMES,
 };
 use crate::types::{CopyDirection, CopySpec, AddressDefaults, RemoteAddress, ExecTtyFlags, ExecStdinFlags, effective_tty_decision, effective_stdin_decision, should_use_interactive_mode};
@@ -42,8 +42,8 @@ pub enum OutputFormat {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "rhop")]
-#[command(about = "Remote Hop command runner with a local or remote daemon", version)]
+#[command(name = "xho")]
+#[command(about = "Cross Host Ops command runner with a local or remote daemon", version)]
 pub struct ArunCli {
     /// Output format: text (default) or json (NDJSON).
     #[arg(long = "output", default_value = "text")]
@@ -60,10 +60,10 @@ pub struct ArunCli {
 #[derive(Debug, Subcommand)]
 pub enum ArunCommand {
     #[command(
-        about = "Execute a remote command: rhop exec <TARGET> [--] <CMD> [ARGS...]",
+        about = "Execute a remote command: xho exec <TARGET> [--] <CMD> [ARGS...]",
         long_about = "Execute a remote command on the target host.\n\n\
-            Use -- to separate rhop options from remote arguments when remote \
-            arguments begin with a hyphen that could conflict with rhop options.",
+            Use -- to separate xho options from remote arguments when remote \
+            arguments begin with a hyphen that could conflict with xho options.",
         trailing_var_arg = true,
     )]
     Exec {
@@ -92,7 +92,7 @@ pub enum ArunCommand {
         /// Remote target name.
         #[arg(value_name = "TARGET")]
         target: String,
-        /// Remote command and arguments (use -- to separate from rhop options).
+        /// Remote command and arguments (use -- to separate from xho options).
         #[arg(
             value_name = "CMD",
             trailing_var_arg = true,
@@ -324,7 +324,7 @@ pub async fn run_cli(cli: ArunCli) -> Result<i32> {
 
 /// Emit a JSON object describing the binary's version, capabilities, and exit codes.
 ///
-/// Called when `rhop --version --output json` is invoked.
+/// Called when `xho --version --output json` is invoked.
 pub fn print_version_json() {
     let version_info = serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
@@ -344,7 +344,7 @@ pub fn print_version_json() {
             "0": "success",
             "1-123": "remote command exit code",
             "124": "operation timed out",
-            "125": "rhop or daemon failure",
+            "125": "xho or daemon failure",
             "126": "auth/host-key/review denied",
             "127": "target not found / unsupported capability"
         }
@@ -531,7 +531,7 @@ async fn run_command(target: String, argv: Vec<String>, resolved_tty: bool, reso
     }
 
     // Exit code 124 from the daemon means timeout fired. If the client
-    // requested a timeout, pass 124 through directly (it's rhop's own
+    // requested a timeout, pass 124 through directly (it's xho's own
     // semantic, not a remote process exit code). Otherwise cap normally.
     if exit_code == 124 && timeout_ms > 0 {
         Ok(124)
@@ -735,7 +735,7 @@ async fn status() -> Result<i32> {
 async fn run_copy(recursive: bool, source: String, dest: String, timeout_ms: u64) -> Result<i32> {
     let (target, spec) = parse_copy_operands(recursive, &source, &dest)?;
     let config = AppConfig::load(None).unwrap_or_default();
-    let stream_file_data = is_rhopd_target(&target, &config);
+    let stream_file_data = is_xhod_target(&target, &config);
     let mut client = connect_local_copy_client().await?;
     let (tx, rx) = mpsc::channel(8);
     tx.send(crate::protocol::copy_spec_to_rpc(target, spec.clone(), timeout_ms))
@@ -792,10 +792,10 @@ async fn run_copy(recursive: bool, source: String, dest: String, timeout_ms: u64
     Ok(0)
 }
 
-fn is_rhopd_target(target: &str, config: &AppConfig) -> bool {
+fn is_xhod_target(target: &str, config: &AppConfig) -> bool {
     let gateway_name = target.split_once(':').map_or(target, |(prefix, _)| prefix);
     config.gateways.iter().any(|gateway| {
-        gateway.name() == gateway_name && matches!(gateway.gateway_kind(), GatewayKind::Rhopd)
+        gateway.name() == gateway_name && matches!(gateway.gateway_kind(), GatewayKind::Xhod)
     })
 }
 
@@ -1078,12 +1078,12 @@ enum ClientAccess {
 
 async fn connect_data_client(
     access: ClientAccess,
-) -> Result<rpc::rhop_rpc_client::RhopRpcClient<Channel>> {
+) -> Result<rpc::xho_rpc_client::XhoRpcClient<Channel>> {
     let client_config = ClientConfig::load()?;
     connect_local_data_client(&client_config, access).await
 }
 
-async fn connect_local_copy_client() -> Result<rpc::rhop_rpc_client::RhopRpcClient<Channel>> {
+async fn connect_local_copy_client() -> Result<rpc::xho_rpc_client::XhoRpcClient<Channel>> {
     let client_config = ClientConfig::load()?;
     connect_local_data_client(&client_config, ClientAccess::AutoStart).await
 }
@@ -1091,7 +1091,7 @@ async fn connect_local_copy_client() -> Result<rpc::rhop_rpc_client::RhopRpcClie
 async fn connect_local_data_client(
     client_config: &ClientConfig,
     access: ClientAccess,
-) -> Result<rpc::rhop_rpc_client::RhopRpcClient<Channel>> {
+) -> Result<rpc::xho_rpc_client::XhoRpcClient<Channel>> {
     let socket_path = PathBuf::from(&client_config.local.socket_path);
     match connect_unix_client(&socket_path).await {
         Ok(client) => Ok(client),
@@ -1109,7 +1109,7 @@ async fn connect_local_data_client(
 
 async fn connect_unix_client(
     socket_path: &Path,
-) -> Result<rpc::rhop_rpc_client::RhopRpcClient<Channel>> {
+) -> Result<rpc::xho_rpc_client::XhoRpcClient<Channel>> {
     let path = socket_path.to_path_buf();
     let endpoint = Endpoint::from_static("http://[::]:50051");
     let channel = endpoint
@@ -1118,7 +1118,7 @@ async fn connect_unix_client(
             async move { UnixStream::connect(path).await.map(TokioIo::new) }
         }))
         .await?;
-    Ok(rpc::rhop_rpc_client::RhopRpcClient::new(channel))
+    Ok(rpc::xho_rpc_client::XhoRpcClient::new(channel))
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1138,7 +1138,7 @@ async fn daemon_stop() -> Result<i32> {
     let mut client = match connect_unix_client(&socket_path).await {
         Ok(client) => client,
         Err(_) => {
-            eprintln!("rhopd is not running");
+            eprintln!("xhod is not running");
             return Ok(1);
         }
     };
@@ -1213,7 +1213,7 @@ fn daemon_path() -> Result<PathBuf> {
     let directory = current
         .parent()
         .ok_or_else(|| anyhow!("failed to resolve binary directory"))?;
-    Ok(directory.join("rhopd"))
+    Ok(directory.join("xhod"))
 }
 
 fn local_socket_path() -> Result<PathBuf> {
@@ -1274,7 +1274,7 @@ async fn remote_connect(
 
     // --- Step 3: Parse <address> via RemoteAddress::parse ---
     let defaults = AddressDefaults {
-        user: "rhop".to_string(),
+        user: "xho".to_string(),
         port: 2222,
     };
     let remote_addr = match RemoteAddress::parse(&address, &defaults) {
@@ -1327,7 +1327,7 @@ async fn remote_connect(
     }
 
     // --- Step 5: Persist the new entry to the config file ---
-    let new_entry = GatewayConfig::Rhopd(RhopdGatewayConfig {
+    let new_entry = GatewayConfig::Xhod(XhodGatewayConfig {
         name: name.clone(),
         address: remote_addr.format(),
         identity_file: identity_file.clone(),
@@ -1371,9 +1371,9 @@ async fn remote_remove(name: String) -> Result<i32> {
             );
             Ok(1)
         }
-        Some(entry) if entry.gateway_kind() != GatewayKind::Rhopd => {
+        Some(entry) if entry.gateway_kind() != GatewayKind::Xhod => {
             eprintln!(
-                "error: name '{}' is a {:?} gateway; quick-remove only manages rhopd entries",
+                "error: name '{}' is a {:?} gateway; quick-remove only manages xhod entries",
                 name, entry.gateway_kind()
             );
             Ok(1)
@@ -1409,7 +1409,7 @@ fn remote_list() -> Result<i32> {
     println!("{:<10}  {:<12}  {}", "NAME", "KIND", "ADDRESS");
     for entry in &config.gateways {
         let address = match entry {
-            GatewayConfig::Rhopd(c) => c.address.clone(),
+            GatewayConfig::Xhod(c) => c.address.clone(),
             GatewayConfig::Jumpserver(c) => format!("{}:{}", c.host, c.port),
             GatewayConfig::Direct(c) => format!("{}:{}", c.host, c.port),
         };
@@ -1521,21 +1521,21 @@ mod tests {
     use clap::Parser;
     use proptest::prelude::*;
 
-    // Feature: rhopd-jumpserver-architecture, Property 16: Argv pass-through transparency
+    // Feature: xhod-jumpserver-architecture, Property 16: Argv pass-through transparency
     //
     // For any TARGET T and any Vec<String> argv V (including elements that look like
-    // rhop flags such as --non-interactive, --tty, --output, --), parsing
-    // `rhop exec <target> -- <argv>...` produces the exact same argv in the parsed struct.
+    // xho flags such as --non-interactive, --tty, --output, --), parsing
+    // `xho exec <target> -- <argv>...` produces the exact same argv in the parsed struct.
     //
     // Validates: Requirements 17.1, 17.2, 17.4
 
     /// Strategy that generates arbitrary argv elements, including ones that look like
-    /// rhop flags (--output, --non-interactive, --tty, --no-tty, --stdin, --timeout, --).
+    /// xho flags (--output, --non-interactive, --tty, --no-tty, --stdin, --timeout, --).
     fn argv_element_strategy() -> impl Strategy<Value = String> {
         prop_oneof![
             // Plain words
             "[a-zA-Z0-9_./]{1,20}",
-            // Flags that look like rhop's own flags
+            // Flags that look like xho's own flags
             Just("--non-interactive".to_string()),
             Just("--tty".to_string()),
             Just("--no-tty".to_string()),
@@ -1558,10 +1558,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_remote_spec_supports_rhopd_qualified_targets() {
+    fn parse_remote_spec_supports_xhod_qualified_targets() {
         assert_eq!(
-            parse_remote_spec("ali-rhopd:host1:/tmp/x"),
-            Some(("ali-rhopd:host1".to_string(), "/tmp/x".to_string()))
+            parse_remote_spec("remote-xhod:host1:/tmp/x"),
+            Some(("remote-xhod:host1".to_string(), "/tmp/x".to_string()))
         );
     }
 
@@ -1580,10 +1580,10 @@ mod tests {
         fn prop_argv_passthrough_transparency(
             argv in proptest::collection::vec(argv_element_strategy(), 1..10),
         ) {
-            // Build the CLI args: rhop exec <target> -- <argv...>
+            // Build the CLI args: xho exec <target> -- <argv...>
             // Using `--` separator to pass arbitrary argv through (multi-arg mode).
             let target = "my-target";
-            let mut args = vec!["rhop".to_string(), "exec".to_string(), target.to_string(), "--".to_string()];
+            let mut args = vec!["xho".to_string(), "exec".to_string(), target.to_string(), "--".to_string()];
             args.extend(argv.clone());
 
             let parsed = ArunCli::try_parse_from(&args).unwrap();

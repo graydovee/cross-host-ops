@@ -7,7 +7,7 @@
 use clap::Parser;
 use proptest::prelude::*;
 
-use rhop::cli::{ArunCli, ArunCommand};
+use xho::cli::{ArunCli, ArunCommand};
 
 // ---------------------------------------------------------------------------
 // Proptest strategies
@@ -66,7 +66,7 @@ proptest! {
     /// **Validates: Requirements 1.1, 1.5, 1.9, 7.1**
     ///
     /// For any valid TARGET string T and any Vec<String> argv V (1–20 elements,
-    /// arbitrary non-null content), parsing `["rhop", "exec", T, "--", ...V]`
+    /// arbitrary non-null content), parsing `["xho", "exec", T, "--", ...V]`
     /// via `ArunCli::try_parse_from` SHALL produce a parsed result where
     /// `target == T` and `cmd == V` in exact element order and byte content,
     /// and the dispatch SHALL pass V directly as argv without sh -c wrapping.
@@ -75,9 +75,9 @@ proptest! {
         target in arb_target(),
         argv in arb_argv(),
     ) {
-        // Build the command line: ["rhop", "exec", <target>, "--", ...argv]
+        // Build the command line: ["xho", "exec", <target>, "--", ...argv]
         let mut args: Vec<String> = vec![
-            "rhop".to_string(),
+            "xho".to_string(),
             "exec".to_string(),
             target.clone(),
             "--".to_string(),
@@ -134,7 +134,7 @@ proptest! {
     /// **Validates: Requirements 1.2, 1.8, 7.2**
     ///
     /// For any valid TARGET string T and any single non-empty string S
-    /// (1–1024 bytes), parsing `["rhop", "exec", T, S]` (without `--`)
+    /// (1–1024 bytes), parsing `["xho", "exec", T, S]` (without `--`)
     /// SHALL produce a parsed result where `target == T` and `cmd == [S]`,
     /// and the dispatch SHALL transform it to argv `["sh", "-c", S]` for
     /// remote execution.
@@ -143,10 +143,10 @@ proptest! {
         target in arb_target(),
         cmd_str in arb_single_cmd_string(),
     ) {
-        // Build the command line: ["rhop", "exec", <target>, <cmd_str>]
+        // Build the command line: ["xho", "exec", <target>, <cmd_str>]
         // No `--` separator — this is single-string mode.
         let args = vec![
-            "rhop".to_string(),
+            "xho".to_string(),
             "exec".to_string(),
             target.clone(),
             cmd_str.clone(),

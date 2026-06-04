@@ -1,8 +1,8 @@
 syntax = "proto3";
 
-package rhop.rpc;
+package xho.rpc;
 
-service RhopRpc {
+service XhoRpc {
   rpc Execute(stream ExecuteRequest) returns (stream ExecuteResponse);
   rpc Copy(stream CopyRequest) returns (stream CopyResponse);
   rpc Status(StatusRequest) returns (StatusResponse);
@@ -61,7 +61,7 @@ enum CopyDirection {
   COPY_DIRECTION_DOWNLOAD = 2;
 }
 
-// CopyDataChunk streams file content between client and daemon for rhopd-routed copies.
+// CopyDataChunk streams file content between client and daemon for xhod-routed copies.
 // Used on both the request stream (upload) and response stream (download).
 message CopyDataChunk {
   bytes data = 1;

@@ -13,7 +13,7 @@
 
 use proptest::prelude::*;
 
-use rhop::daemon::gateway::{is_resolution_error, is_transport_error};
+use xho::daemon::gateway::{is_resolution_error, is_transport_error};
 
 // ---------------------------------------------------------------------------
 // Strategies

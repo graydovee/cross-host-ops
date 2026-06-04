@@ -11,7 +11,7 @@
 
 use proptest::prelude::*;
 
-use rhop::daemon::connection::shared::resolve_shell;
+use xho::daemon::connection::shared::resolve_shell;
 
 /// Strategy to generate a defaults_shell string of 0–20 alphanumeric chars
 /// (may be empty).

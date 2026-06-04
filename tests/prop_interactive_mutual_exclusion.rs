@@ -11,8 +11,8 @@
 
 use proptest::prelude::*;
 
-use rhop::types::should_use_interactive_mode;
-use rhop::protocol::ExecRequest;
+use xho::types::should_use_interactive_mode;
+use xho::protocol::ExecRequest;
 
 /// Simulate the daemon's validation logic for an ExecRequest.
 /// Returns Ok(()) if the request is valid, Err(reason) if it would be rejected.

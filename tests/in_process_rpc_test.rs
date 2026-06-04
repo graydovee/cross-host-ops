@@ -36,7 +36,7 @@ async fn harness_execute_returns_error_for_nonexistent_target() {
     let has_error = events.iter().any(|e| {
         matches!(
             &e.event,
-            Some(rhop::protocol::rpc::execute_response::Event::Error(_))
+            Some(xho::protocol::rpc::execute_response::Event::Error(_))
         )
     });
     assert!(has_error, "expected an error event for nonexistent target");

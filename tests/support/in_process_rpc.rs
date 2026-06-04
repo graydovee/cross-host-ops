@@ -1,16 +1,16 @@
 //! In-process gRPC test harness.
 //!
-//! Creates two `RhopRpcService` instances connected via `tokio::io::duplex` so
+//! Creates two `XhoRpcService` instances connected via `tokio::io::duplex` so
 //! a "local daemon" client and a "remote daemon" server live in one process.
 //! Exposes helpers to drive `Execute`, `Copy`, and `ListServers` against a stub
 //! end target backed by a tempdir.
 
 use std::path::{Path, PathBuf};
 
-use rhop::config::{AppConfig, DirectAuth, ServerEntry};
-use rhop::daemon::test_support::make_test_rpc_service;
-use rhop::protocol::rpc;
-use rhop::protocol::rpc::rhop_rpc_client::RhopRpcClient;
+use xho::config::{AppConfig, DirectAuth, ServerEntry};
+use xho::daemon::test_support::make_test_rpc_service;
+use xho::protocol::rpc;
+use xho::protocol::rpc::xho_rpc_client::XhoRpcClient;
 
 use tonic::transport::{Channel, Endpoint, Server, Uri};
 use tower::service_fn;
@@ -26,7 +26,7 @@ const DUPLEX_BUFFER_SIZE: usize = 1024 * 1024;
 #[allow(dead_code)]
 pub struct InProcessRpcHarness {
     /// The gRPC client connected to the "remote daemon" server.
-    pub client: RhopRpcClient<Channel>,
+    pub client: XhoRpcClient<Channel>,
     /// Path to the tempdir backing the server config (contains `server.toml`).
     pub tempdir: PathBuf,
     /// The config used by the remote daemon service.
@@ -57,7 +57,7 @@ impl InProcessRpcHarness {
     /// remote daemon's server config.
     pub async fn with_servers(servers: Vec<ServerEntry>) -> Self {
         // Create a tempdir for the server config
-        let tempdir = std::env::temp_dir().join(format!("rhop-test-{}", uuid()));
+        let tempdir = std::env::temp_dir().join(format!("xho-test-{}", uuid()));
         fs::create_dir_all(&tempdir).expect("failed to create tempdir");
 
         // Write a server.toml with the given entries
@@ -240,9 +240,9 @@ impl Drop for InProcessRpcHarness {
 #[allow(dead_code)]
 pub struct PairedRpcHarness {
     /// Client connected to the "local daemon" service.
-    pub local_client: RhopRpcClient<Channel>,
+    pub local_client: XhoRpcClient<Channel>,
     /// Client connected to the "remote daemon" service (for direct testing).
-    pub remote_client: RhopRpcClient<Channel>,
+    pub remote_client: XhoRpcClient<Channel>,
     /// Tempdir for the local daemon's server config.
     pub local_tempdir: PathBuf,
     /// Tempdir for the remote daemon's server config.
@@ -256,7 +256,7 @@ impl PairedRpcHarness {
     /// has an empty server config.
     pub async fn new(remote_servers: Vec<ServerEntry>) -> Self {
         // Set up remote daemon
-        let remote_tempdir = std::env::temp_dir().join(format!("rhop-test-remote-{}", uuid()));
+        let remote_tempdir = std::env::temp_dir().join(format!("xho-test-remote-{}", uuid()));
         fs::create_dir_all(&remote_tempdir).expect("failed to create remote tempdir");
 
         let remote_server_config_path = remote_tempdir.join("server.toml");
@@ -276,7 +276,7 @@ impl PairedRpcHarness {
             make_test_rpc_service(remote_config, remote_config_path);
 
         // Set up local daemon
-        let local_tempdir = std::env::temp_dir().join(format!("rhop-test-local-{}", uuid()));
+        let local_tempdir = std::env::temp_dir().join(format!("xho-test-local-{}", uuid()));
         fs::create_dir_all(&local_tempdir).expect("failed to create local tempdir");
 
         let local_server_config_path = local_tempdir.join("server.toml");
@@ -341,7 +341,7 @@ impl Drop for PairedRpcHarness {
 /// Connect a gRPC client through a pre-connected duplex stream.
 async fn connect_client_via_duplex(
     io: tokio::io::DuplexStream,
-) -> RhopRpcClient<Channel> {
+) -> XhoRpcClient<Channel> {
     // Wrap the duplex stream in a mutex so the service_fn closure can move it
     let io = std::sync::Mutex::new(Some(io));
 
@@ -357,7 +357,7 @@ async fn connect_client_via_duplex(
         .await
         .expect("failed to connect gRPC client via duplex");
 
-    RhopRpcClient::new(channel)
+    XhoRpcClient::new(channel)
 }
 
 /// Build a minimal `server.toml` content from a list of server entries.

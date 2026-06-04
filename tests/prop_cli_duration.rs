@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use proptest::prelude::*;
 
-use rhop::config::parse_duration;
+use xho::config::parse_duration;
 
 // ---------------------------------------------------------------------------
 // Proptest strategies

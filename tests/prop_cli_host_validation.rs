@@ -6,8 +6,8 @@
 use clap::Parser;
 use proptest::prelude::*;
 
-use rhop::cli::{ArunCli, ArunCommand, HostCommand};
-use rhop::config::RESERVED_NAMES;
+use xho::cli::{ArunCli, ArunCommand, HostCommand};
+use xho::config::RESERVED_NAMES;
 
 // ---------------------------------------------------------------------------
 // Proptest strategies
@@ -57,7 +57,7 @@ proptest! {
     /// **Validates: Requirements 3.6**
     ///
     /// For any name string that equals a value in RESERVED_NAMES (currently
-    /// ["local"]), parsing `rhop host add <name> <valid-address>` SHALL
+    /// ["local"]), parsing `xho host add <name> <valid-address>` SHALL
     /// succeed at the clap level and produce a HostCommand::Add with the
     /// reserved name. The handler (run_host_command) rejects such names with
     /// a non-zero exit status before any config modification occurs.
@@ -66,9 +66,9 @@ proptest! {
         reserved_name in arb_reserved_name(),
         address in arb_valid_address(),
     ) {
-        // Build the command line: ["rhop", "host", "add", <reserved_name>, <address>]
+        // Build the command line: ["xho", "host", "add", <reserved_name>, <address>]
         let args = vec![
-            "rhop".to_string(),
+            "xho".to_string(),
             "host".to_string(),
             "add".to_string(),
             reserved_name.clone(),

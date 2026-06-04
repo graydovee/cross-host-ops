@@ -2,12 +2,12 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use rhop::daemon::{CliStartOptions, DaemonOrigin};
+use xho::daemon::{CliStartOptions, DaemonOrigin};
 
 #[derive(Debug, Parser)]
-#[command(name = "rhopd")]
-#[command(about = "rhop daemon", version)]
-struct RhopdCli {
+#[command(name = "xhod")]
+#[command(about = "xho daemon", version)]
+struct XhodCli {
     #[arg(short = 'c', long = "config", value_name = "FILE")]
     config: Option<PathBuf>,
     #[arg(long = "log-level", value_name = "LEVEL")]
@@ -20,7 +20,7 @@ struct RhopdCli {
 
 #[tokio::main]
 async fn main() {
-    let cli = RhopdCli::parse();
+    let cli = XhodCli::parse();
     let origin = parse_origin(&cli.origin);
     let cli_start_options = CliStartOptions {
         config_path: cli.config.as_ref().map(|value| value.display().to_string()),
@@ -33,7 +33,7 @@ async fn main() {
         }
         return;
     }
-    if let Err(error) = rhop::daemon::run_with_overrides(
+    if let Err(error) = xho::daemon::run_with_overrides(
         cli.config.clone(),
         cli.log_level,
         origin,

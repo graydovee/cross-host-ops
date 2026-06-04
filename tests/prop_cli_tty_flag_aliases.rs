@@ -9,7 +9,7 @@
 use clap::Parser;
 use proptest::prelude::*;
 
-use rhop::cli::{ArunCli, ArunCommand};
+use xho::cli::{ArunCli, ArunCommand};
 
 // ---------------------------------------------------------------------------
 // Proptest strategies
@@ -48,7 +48,7 @@ proptest! {
     ) {
         // Build args with --tty (long form)
         let mut long_args: Vec<String> = vec![
-            "rhop".to_string(),
+            "xho".to_string(),
             "exec".to_string(),
             "--tty".to_string(),
             target.clone(),
@@ -58,7 +58,7 @@ proptest! {
 
         // Build args with -t (short form)
         let mut short_args: Vec<String> = vec![
-            "rhop".to_string(),
+            "xho".to_string(),
             "exec".to_string(),
             "-t".to_string(),
             target.clone(),
@@ -126,7 +126,7 @@ proptest! {
     ) {
         // Build args with --stdin (long form)
         let mut long_args: Vec<String> = vec![
-            "rhop".to_string(),
+            "xho".to_string(),
             "exec".to_string(),
             "--stdin".to_string(),
             target.clone(),
@@ -136,7 +136,7 @@ proptest! {
 
         // Build args with -i (short form)
         let mut short_args: Vec<String> = vec![
-            "rhop".to_string(),
+            "xho".to_string(),
             "exec".to_string(),
             "-i".to_string(),
             target.clone(),

@@ -1,7 +1,7 @@
 //! Integration test harness for property tests P1–P4.
 //!
 //! Provides a `TestHarness` that spawns local-daemon and remote-daemon
-//! `RhopRpcService` instances over `tokio::io::duplex`, backed by tempdirs
+//! `XhoRpcService` instances over `tokio::io::duplex`, backed by tempdirs
 //! for filesystem operations. The harness exercises the same control flow as
 //! production while remaining fully in-process.
 
@@ -11,11 +11,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use proptest::prelude::*;
 
-use rhop::config::{AppConfig, DirectAuth, ServerEntry};
-use rhop::daemon::test_support::make_test_rpc_service;
-use rhop::daemon::gateway::GatewayKind;
-use rhop::protocol::rpc;
-use rhop::protocol::rpc::rhop_rpc_client::RhopRpcClient;
+use xho::config::{AppConfig, DirectAuth, ServerEntry};
+use xho::daemon::test_support::make_test_rpc_service;
+use xho::daemon::gateway::GatewayKind;
+use xho::protocol::rpc;
+use xho::protocol::rpc::xho_rpc_client::XhoRpcClient;
 
 use tonic::transport::{Channel, Endpoint, Server, Uri};
 use tower::service_fn;
@@ -40,16 +40,16 @@ pub enum HarnessCopyDirection {
 ///
 /// This harness exercises the same gRPC control flow as production:
 /// - CLI → local daemon (over duplex)
-/// - local daemon → remote daemon (over duplex, for rhopd routes)
+/// - local daemon → remote daemon (over duplex, for xhod routes)
 ///
 /// The end target is a tempdir that the stub `Gateway` performs filesystem
 /// ops against directly.
 #[allow(dead_code)]
 pub struct TestHarness {
     /// gRPC client connected to the "local daemon" service.
-    pub local_client: RhopRpcClient<Channel>,
+    pub local_client: XhoRpcClient<Channel>,
     /// gRPC client connected to the "remote daemon" service (for direct testing).
-    pub remote_client: RhopRpcClient<Channel>,
+    pub remote_client: XhoRpcClient<Channel>,
     /// Tempdir for local-side filesystem operations (simulates the user's machine).
     pub local_tempdir: PathBuf,
     /// Tempdir for remote-side filesystem operations (simulates the end target).
@@ -85,7 +85,7 @@ impl TestHarness {
     /// Create a new test harness with the given server entries on the remote daemon.
     pub async fn with_servers(remote_servers: Vec<ServerEntry>) -> Self {
         let id = HARNESS_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::temp_dir().join(format!("rhop-harness-{}-{}", std::process::id(), id));
+        let base = std::env::temp_dir().join(format!("xho-harness-{}-{}", std::process::id(), id));
 
         // Create tempdirs for filesystem operations
         let local_tempdir = base.join("local-fs");
@@ -275,7 +275,7 @@ impl TestHarness {
     ///
     /// - `Direct` → `"<end_alias>"` (bare alias, resolved as direct SSH)
     /// - `Jumpserver` → `"<end_alias>"` (bare alias, resolved via jumpserver config)
-    /// - `Rhopd` → `"<rhopd_alias>:<end_alias>"` (explicit jump-host qualification)
+    /// - `Xhod` → `"<xhod_alias>:<end_alias>"` (explicit jump-host qualification)
     pub fn target_for(
         &self,
         route_kind: GatewayKind,
@@ -285,7 +285,7 @@ impl TestHarness {
         match route_kind {
             GatewayKind::Direct => end_alias.to_string(),
             GatewayKind::Jumpserver => end_alias.to_string(),
-            GatewayKind::Rhopd => format!("rhopd:{}", end_alias),
+            GatewayKind::Xhod => format!("xhod:{}", end_alias),
         }
     }
 
@@ -377,14 +377,14 @@ pub fn route_kind_strategy() -> impl Strategy<Value = GatewayKind> {
     prop_oneof![
         Just(GatewayKind::Direct),
         Just(GatewayKind::Jumpserver),
-        Just(GatewayKind::Rhopd),
+        Just(GatewayKind::Xhod),
     ]
 }
 
 // --- Private helpers ---
 
 /// Connect a gRPC client through a pre-connected duplex stream.
-async fn connect_client_via_duplex(io: tokio::io::DuplexStream) -> RhopRpcClient<Channel> {
+async fn connect_client_via_duplex(io: tokio::io::DuplexStream) -> XhoRpcClient<Channel> {
     let io = std::sync::Mutex::new(Some(io));
 
     let channel = Endpoint::from_static("http://[::]:50051")
@@ -399,7 +399,7 @@ async fn connect_client_via_duplex(io: tokio::io::DuplexStream) -> RhopRpcClient
         .await
         .expect("failed to connect gRPC client via duplex");
 
-    RhopRpcClient::new(channel)
+    XhoRpcClient::new(channel)
 }
 
 /// Build a minimal `server.toml` content from a list of server entries.
