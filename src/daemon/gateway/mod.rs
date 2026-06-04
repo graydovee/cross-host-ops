@@ -284,12 +284,14 @@ pub fn build_gateways(
                 c.identity_file.clone(),
                 c.known_hosts_path.clone(),
                 auth_prompter.clone(),
+                max_idle_time,
             )),
             GatewayConfig::Jumpserver(c) => Arc::new(JumpserverGateway::new(
                 c.name.clone(),
                 config.clone(),
                 c.clone(),
                 auth_prompter.clone(),
+                max_idle_time,
             )),
             GatewayConfig::Direct(c) => {
                 // Direct gateways are treated as a LocalGateway with their own name.

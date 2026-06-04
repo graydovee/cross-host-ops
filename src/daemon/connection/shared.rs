@@ -422,6 +422,113 @@ impl PtyShell {
             }
         }
     }
+
+    pub(super) async fn into_interactive_command(
+        mut self,
+        command: String,
+        marker_prefix: &str,
+    ) -> Result<crate::daemon::connection::InteractiveHandle> {
+        self.clear_prompt_remainder();
+        let marker = self.make_marker(marker_prefix);
+        let wrapped = self.wrap_shell_command(&command, &marker);
+        self.write_line(&wrapped).await?;
+
+        let PtyShell {
+            mut channel,
+            mut pending,
+            shell_timeout,
+            ..
+        } = self;
+        let prefix = marker.into_bytes();
+
+        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+        let (resize_tx, mut resize_rx) = tokio::sync::mpsc::channel::<(u32, u32)>(8);
+        let (stdout_tx, stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
+
+        tokio::spawn(async move {
+            let mut first_output = true;
+            let mut exit_code = 255;
+
+            loop {
+                tokio::select! {
+                    Some(data) = stdin_rx.recv() => {
+                        if channel.data(Cursor::new(data)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some((cols, rows)) = resize_rx.recv() => {
+                        let _ = channel.window_change(cols, rows, 0, 0).await;
+                    }
+                    message = timeout(shell_timeout, channel.wait()) => {
+                        let message = match message {
+                            Ok(Some(message)) => message,
+                            Ok(None) => break,
+                            Err(_) => break,
+                        };
+
+                        let chunk = match message {
+                            ChannelMsg::Data { data } => data.to_vec(),
+                            ChannelMsg::ExtendedData { data, .. } => data.to_vec(),
+                            ChannelMsg::ExitStatus { exit_status } => {
+                                exit_code = exit_status as i32;
+                                Vec::new()
+                            }
+                            ChannelMsg::ExitSignal { .. } => {
+                                exit_code = 255;
+                                Vec::new()
+                            }
+                            ChannelMsg::Close | ChannelMsg::Eof => break,
+                            _ => Vec::new(),
+                        };
+
+                        if chunk.is_empty() {
+                            continue;
+                        }
+
+                        pending.extend_from_slice(&chunk);
+                        if let Some((code, before, _after)) = extract_sentinel(&pending, &prefix) {
+                            let before = if first_output {
+                                strip_leading_shell_noise(before)
+                            } else {
+                                before
+                            };
+                            if !before.is_empty() {
+                                let _ = stdout_tx.send(before.to_vec());
+                            }
+                            exit_code = code;
+                            break;
+                        }
+
+                        let keep = prefix.len() + 32;
+                        if pending.len() > keep {
+                            let safe_len = pending.len() - keep;
+                            let chunk = if first_output {
+                                first_output = false;
+                                strip_leading_shell_noise(&pending[..safe_len]).to_vec()
+                            } else {
+                                pending[..safe_len].to_vec()
+                            };
+                            pending.drain(..safe_len);
+                            if !chunk.is_empty() {
+                                let _ = stdout_tx.send(chunk);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let _ = channel.close().await;
+            let _ = exit_tx.send(exit_code);
+        });
+
+        Ok(crate::daemon::connection::InteractiveHandle {
+            stdin_tx,
+            resize_tx,
+            stdout_rx,
+            exit_rx,
+        })
+    }
 }
 
 #[cfg(test)]

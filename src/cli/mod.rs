@@ -233,6 +233,30 @@ pub fn set_raw_mode(fd: RawFd) -> Result<RawModeGuard> {
     }
 }
 
+fn raw_mode_diagnostic_bytes(message: &str) -> Vec<u8> {
+    let message = message.trim_end_matches(|c| c == '\r' || c == '\n');
+    if message.is_empty() {
+        return Vec::new();
+    }
+
+    let normalized = message.replace("\r\n", "\n").replace('\r', "\n");
+    let mut bytes = normalized.replace('\n', "\r\n").into_bytes();
+    bytes.extend_from_slice(b"\r\n");
+    bytes
+}
+
+fn write_raw_mode_diagnostic(message: &str) -> Result<()> {
+    let bytes = raw_mode_diagnostic_bytes(message);
+    if bytes.is_empty() {
+        return Ok(());
+    }
+
+    let mut stderr = io::stderr();
+    stderr.write_all(&bytes)?;
+    stderr.flush()?;
+    Ok(())
+}
+
 pub async fn run_cli(cli: ArunCli) -> Result<i32> {
     match cli.command {
         ArunCommand::Exec { target, cmd, timeout, tty, no_tty, stdin, no_stdin, shell, no_shell } => {
@@ -643,15 +667,13 @@ pub(crate) async fn run_interactive(
                 break;
             }
             rpc::execute_response::Event::Error(error) => {
-                eprintln!("error: {}", error.message);
+                write_raw_mode_diagnostic(&format!("error: {}", error.message))?;
                 stdin_task.abort();
                 sigwinch_task.abort();
                 return Ok(1);
             }
             rpc::execute_response::Event::Info(info) => {
-                if !info.message.is_empty() {
-                    eprintln!("{}", info.message);
-                }
+                write_raw_mode_diagnostic(&info.message)?;
             }
             rpc::execute_response::Event::AuthPrompt(prompt) => {
                 let value = prompt_for_auth_input(&prompt.message, prompt.secret)?;
@@ -1576,6 +1598,28 @@ mod tests {
             parse_remote_spec("host1:/tmp/x"),
             Some(("host1".to_string(), "/tmp/x".to_string()))
         );
+    }
+
+    #[test]
+    fn raw_mode_diagnostic_bytes_uses_carriage_return_newline() {
+        assert_eq!(
+            raw_mode_diagnostic_bytes("warning: target matched"),
+            b"warning: target matched\r\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn raw_mode_diagnostic_bytes_normalizes_multiline_messages() {
+        assert_eq!(
+            raw_mode_diagnostic_bytes("first\nsecond\r\nthird\r"),
+            b"first\r\nsecond\r\nthird\r\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn raw_mode_diagnostic_bytes_skips_empty_messages() {
+        assert!(raw_mode_diagnostic_bytes("").is_empty());
+        assert!(raw_mode_diagnostic_bytes("\n\r").is_empty());
     }
 
     proptest! {

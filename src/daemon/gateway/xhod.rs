@@ -3,32 +3,46 @@
 // All requests are multiplexed over the shared gRPC channel.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
 use russh::client;
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
-use tokio::sync::Mutex as AsyncMutex;
+use russh::ChannelStream;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 use tracing::{debug, info};
 
-use crate::types::CopySpec;
-use crate::types::ServerListSource;
-use crate::protocol::{self, rpc, ServerListRow};
-use crate::daemon::rpc::prefix_source;
-use crate::daemon::ssh_server::remote_subsystem_name;
-
-use super::auth::{normalize_paths, parse_remote_target, AuthPrompter, ClientHandler};
-use super::{
-    ExecRequest, Gateway, GatewayError, GatewayKind, InteractiveHandle, InteractiveRequest,
-    is_transport_error,
-};
+use crate::daemon::connection_manager::{ManagedSingleton, SingletonLease};
 use crate::daemon::connection::xhod::XhodConnection;
 use crate::daemon::connection::{
     Connection, ExecRequest as ConnExecRequest, InteractiveRequest as ConnInteractiveRequest,
 };
+use crate::daemon::rpc::prefix_source;
+use crate::daemon::ssh_server::remote_subsystem_name;
+use crate::protocol::{self, rpc, ServerListRow};
+use crate::types::CopySpec;
+use crate::types::ServerListSource;
+
+use super::auth::{normalize_paths, parse_remote_target, AuthPrompter, ClientHandler};
+use super::{
+    ErrorKind, ExecRequest, Gateway, GatewayError, GatewayKind, InteractiveHandle,
+    InteractiveRequest, is_transport_error,
+};
+
+type XhoRpcClient = rpc::xho_rpc_client::XhoRpcClient<Channel>;
+type XhoRpcStream = TokioIo<ChannelStream<client::Msg>>;
+
+#[derive(Clone)]
+struct XhodConnectorConfig {
+    gateway_name: String,
+    address: String,
+    identity_file: String,
+    known_hosts_path: String,
+    auth_prompter: Arc<AuthPrompter>,
+}
 
 // ---------------------------------------------------------------------------
 // XhodGateway
@@ -46,8 +60,9 @@ pub struct XhodGateway {
     identity_file: String,
     known_hosts_path: String,
     auth_prompter: Arc<AuthPrompter>,
+    max_idle_time: Duration,
     /// Single shared gRPC client (lazily connected).
-    client: AsyncMutex<Option<rpc::xho_rpc_client::XhoRpcClient<Channel>>>,
+    client: ManagedSingleton<XhoRpcClient>,
 }
 
 impl XhodGateway {
@@ -58,6 +73,7 @@ impl XhodGateway {
         identity_file: String,
         known_hosts_path: String,
         auth_prompter: Arc<AuthPrompter>,
+        max_idle_time: Duration,
     ) -> Self {
         Self {
             gateway_name,
@@ -65,53 +81,106 @@ impl XhodGateway {
             identity_file,
             known_hosts_path,
             auth_prompter,
-            client: AsyncMutex::new(None),
+            max_idle_time,
+            client: ManagedSingleton::new(),
         }
     }
 
-    /// Ensure the gRPC client is connected. If not, establish a new
-    /// SSH connection → authenticate → open subsystem → create tonic Channel.
-    /// Returns a clone of the gRPC client.
-    async fn ensure_client(
-        &self,
-    ) -> Result<rpc::xho_rpc_client::XhoRpcClient<Channel>, GatewayError> {
-        let mut guard = self.client.lock().await;
-        if let Some(ref client) = *guard {
-            return Ok(client.clone());
+    async fn ensure_client(&self) -> Result<SingletonLease<XhoRpcClient>, GatewayError> {
+        for attempt in 0..=1 {
+            let result = self
+                .client
+                .checkout_or_insert_with(|| async {
+                    self.connect_client().await.map_err(GatewayError::transport)
+                })
+                .await;
+            match result {
+                Ok(lease) => return Ok(lease),
+                Err(e) if attempt == 0 && matches!(e.kind, ErrorKind::Transport) => {
+                    debug!(
+                        gateway = %self.gateway_name,
+                        "transport error creating xhod client, retrying: {}",
+                        e
+                    );
+                }
+                Err(e) => return Err(e),
+            }
         }
-
-        // Connect and store the new client.
-        let client = self.connect_client().await.map_err(GatewayError::transport)?;
-        *guard = Some(client.clone());
-        Ok(client)
+        unreachable!("xhod client checkout loop is bounded")
     }
 
-    /// Establish the SSH connection and create a gRPC client.
-    async fn connect_client(&self) -> Result<rpc::xho_rpc_client::XhoRpcClient<Channel>> {
-        // Parse address to get host, port, user.
-        let target = parse_remote_target(&self.address)
-            .map_err(|e| anyhow!("failed to parse xhod address {:?}: {}", self.address, e))?;
+    fn connector_config(&self) -> XhodConnectorConfig {
+        XhodConnectorConfig {
+            gateway_name: self.gateway_name.clone(),
+            address: self.address.clone(),
+            identity_file: self.identity_file.clone(),
+            known_hosts_path: self.known_hosts_path.clone(),
+            auth_prompter: self.auth_prompter.clone(),
+        }
+    }
 
-        // Normalize identity_file and known_hosts_path with defaults.
-        let id_opt = if self.identity_file.is_empty() {
-            None
-        } else {
-            Some(self.identity_file.as_str())
-        };
-        let kh_opt = if self.known_hosts_path.is_empty() {
-            None
-        } else {
-            Some(self.known_hosts_path.as_str())
-        };
-        let (identity_file, _known_hosts_path) = normalize_paths(id_opt, kh_opt)
-            .map_err(|e| anyhow!("failed to normalize paths for {}: {}", self.gateway_name, e))?;
+    /// Create a tonic gRPC client. The connector opens a fresh SSH
+    /// `xho-rpc` subsystem every time tonic needs a new underlying transport.
+    async fn connect_client(&self) -> Result<XhoRpcClient> {
+        let connector_config = Arc::new(self.connector_config());
+
+        let endpoint = Endpoint::from_static("http://[::]:50051");
+        let tonic_channel: Channel = endpoint
+            .connect_with_connector(service_fn(move |_: Uri| {
+                let connector_config = connector_config.clone();
+                async move { Self::open_rpc_stream(connector_config).await }
+            }))
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "failed to establish gRPC channel over SSH for {}: {}",
+                    self.gateway_name,
+                    e
+                )
+            })?;
 
         info!(
             gateway = %self.gateway_name,
+            "gRPC-over-SSH channel established"
+        );
+
+        Ok(rpc::xho_rpc_client::XhoRpcClient::new(tonic_channel))
+    }
+
+    async fn open_rpc_stream(config: Arc<XhodConnectorConfig>) -> std::io::Result<XhoRpcStream> {
+        Self::open_rpc_stream_inner(config)
+            .await
+            .map(TokioIo::new)
+            .map_err(std::io::Error::other)
+    }
+
+    async fn open_rpc_stream_inner(
+        config: Arc<XhodConnectorConfig>,
+    ) -> Result<ChannelStream<client::Msg>> {
+        // Parse address to get host, port, user.
+        let target = parse_remote_target(&config.address)
+            .map_err(|e| anyhow!("failed to parse xhod address {:?}: {}", config.address, e))?;
+
+        // Normalize identity_file and known_hosts_path with defaults.
+        let id_opt = if config.identity_file.is_empty() {
+            None
+        } else {
+            Some(config.identity_file.as_str())
+        };
+        let kh_opt = if config.known_hosts_path.is_empty() {
+            None
+        } else {
+            Some(config.known_hosts_path.as_str())
+        };
+        let (identity_file, _known_hosts_path) = normalize_paths(id_opt, kh_opt)
+            .map_err(|e| anyhow!("failed to normalize paths for {}: {}", config.gateway_name, e))?;
+
+        info!(
+            gateway = %config.gateway_name,
             host = %target.host,
             port = %target.port,
             user = %target.user,
-            "connecting to remote xhod"
+            "opening xho-rpc subsystem"
         );
 
         // Open SSH connection with the "xho" user from the parsed address
@@ -133,19 +202,17 @@ impl XhodGateway {
         })?;
 
         // Authenticate with public key (user "xho"), AuthPrompter fallback.
-        let auth_result = self
-            .authenticate_ssh(&mut handle, &target.user, &identity_file)
-            .await;
+        let auth_result = Self::authenticate_ssh(&mut handle, &target.user, &identity_file).await;
 
         if let Err(e) = auth_result {
             // Fallback: use AuthPrompter for password
             debug!(
-                gateway = %self.gateway_name,
+                gateway = %config.gateway_name,
                 "publickey auth failed, trying password via AuthPrompter: {}",
                 e
             );
-            let password = (self.auth_prompter)(super::auth::AuthPrompt {
-                gateway_name: self.gateway_name.clone(),
+            let password = (config.auth_prompter)(super::auth::AuthPrompt {
+                gateway_name: config.gateway_name.clone(),
                 message: format!(
                     "Password for {}@{}:{}",
                     target.user, target.host, target.port
@@ -173,7 +240,7 @@ impl XhodGateway {
                         target.port,
                         e
                     )
-                })?;
+            })?;
         }
 
         // Open session channel and request the "xho-rpc" subsystem.
@@ -197,50 +264,11 @@ impl XhodGateway {
                 )
             })?;
 
-        // Wrap the SSH channel stream into a tonic Channel via a one-shot connector.
-        let stream = ssh_channel.into_stream();
-        let stream_slot: Arc<std::sync::Mutex<Option<_>>> =
-            Arc::new(std::sync::Mutex::new(Some(stream)));
-        let connector_slot = stream_slot.clone();
-
-        let endpoint = Endpoint::from_static("http://[::]:50051");
-        let tonic_channel: Channel = endpoint
-            .connect_with_connector(service_fn(move |_: Uri| {
-                let slot = connector_slot.clone();
-                async move {
-                    let stream = slot
-                        .lock()
-                        .expect("xhod stream slot mutex poisoned")
-                        .take()
-                        .ok_or_else(|| {
-                            std::io::Error::other("xho-rpc subsystem connector already consumed")
-                        })?;
-                    Ok::<_, std::io::Error>(TokioIo::new(stream))
-                }
-            }))
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "failed to establish gRPC channel over SSH to {}:{}: {}",
-                    target.host,
-                    target.port,
-                    e
-                )
-            })?;
-
-        info!(
-            gateway = %self.gateway_name,
-            "gRPC-over-SSH connection established to {}:{}",
-            target.host,
-            target.port
-        );
-
-        Ok(rpc::xho_rpc_client::XhoRpcClient::new(tonic_channel))
+        Ok(ssh_channel.into_stream())
     }
 
     /// Attempt publickey authentication. Returns Ok(()) on success, Err on failure.
     async fn authenticate_ssh(
-        &self,
         handle: &mut client::Handle<ClientHandler>,
         user: &str,
         identity_file: &str,
@@ -268,11 +296,55 @@ impl XhodGateway {
         }
     }
 
-    /// Discard the cached client so the next operation reconnects.
-    async fn discard_client(&self) {
-        let mut guard = self.client.lock().await;
-        *guard = None;
-        debug!(gateway = %self.gateway_name, "discarded gRPC client, will reconnect on next use");
+    async fn invalidate_client(&self, generation: u64) {
+        if self.client.invalidate_generation(generation).await {
+            debug!(
+                gateway = %self.gateway_name,
+                generation = %generation,
+                "discarded xhod gRPC client, will reconnect on next use"
+            );
+        }
+    }
+
+    async fn list_servers_with_client(
+        &self,
+        mut client: rpc::xho_rpc_client::XhoRpcClient<Channel>,
+    ) -> Result<Vec<ServerListRow>, GatewayError> {
+        let response = client
+            .list_servers(rpc::ServerListRequest {})
+            .await
+            .map_err(|e| GatewayError::transport(anyhow!("list_servers RPC failed: {}", e)))?
+            .into_inner();
+
+        // Prefer merged.rows if available and non-empty
+        if let Some(ref merged) = response.merged {
+            if !merged.rows.is_empty() {
+                let rows = merged
+                    .rows
+                    .iter()
+                    .filter_map(|rpc_row| {
+                        let server = protocol::server_entry_from_rpc(rpc_row.server.clone()?);
+                        let source = prefix_source(&self.gateway_name, &rpc_row.source);
+                        Some(ServerListRow { source, server })
+                    })
+                    .collect();
+                return Ok(rows);
+            }
+        }
+
+        // Fallback: use flat servers field, treat as source="local"
+        let rows = response
+            .servers
+            .into_iter()
+            .map(|s| {
+                let server = protocol::server_entry_from_rpc(s);
+                ServerListRow {
+                    source: ServerListSource::Gateway(self.gateway_name.clone()),
+                    server,
+                }
+            })
+            .collect();
+        Ok(rows)
     }
 }
 
@@ -283,10 +355,10 @@ impl XhodGateway {
 #[async_trait]
 impl Gateway for XhodGateway {
     async fn exec(&self, target: &str, request: &ExecRequest) -> Result<i32, GatewayError> {
-        let client = self.ensure_client().await?;
+        let lease = self.ensure_client().await?;
 
         // Create a XhodConnection and delegate exec to it.
-        let mut conn = XhodConnection::new(client, target.to_string());
+        let mut conn = XhodConnection::new((*lease.resource()).clone(), target.to_string());
 
         // Take stdin_rx from the gateway request (consuming it so the channel
         // is owned by the connection layer for forwarding).
@@ -305,7 +377,6 @@ impl Gateway for XhodGateway {
             stdin_rx,
         };
 
-        // First attempt
         let result = conn.exec(&mut conn_request).await;
 
         match result {
@@ -314,40 +385,23 @@ impl Gateway for XhodGateway {
                 debug!(
                     gateway = %self.gateway_name,
                     target = %target,
-                    "transport error on first exec attempt, retrying: {}",
+                    generation = %lease.generation(),
+                    "transport error on xhod exec; discarding client without replay: {}",
                     e
                 );
-                // Discard client and retry once.
-                self.discard_client().await;
-
-                let new_client = self.ensure_client().await?;
-                let mut retry_conn = XhodConnection::new(new_client, target.to_string());
-                let retry_result = retry_conn.exec(&mut conn_request).await;
-
-                match retry_result {
-                    Ok(exit_code) => Ok(exit_code),
-                    Err(e) => {
-                        // Discard on any further transport error too.
-                        self.discard_client().await;
-                        if is_transport_error(&e) {
-                            Err(GatewayError::transport(e))
-                        } else {
-                            Err(GatewayError::execution(e))
-                        }
-                    }
-                }
+                self.invalidate_client(lease.generation()).await;
+                Err(GatewayError::transport(e))
             }
             Err(e) => Err(GatewayError::execution(e)),
         }
     }
 
     async fn copy(&self, target: &str, spec: CopySpec) -> Result<(), GatewayError> {
-        let client = self.ensure_client().await?;
+        let lease = self.ensure_client().await?;
 
-        let mut conn = XhodConnection::new(client, target.to_string());
+        let mut conn = XhodConnection::new((*lease.resource()).clone(), target.to_string());
 
-        // First attempt
-        let result = conn.copy(spec.clone()).await;
+        let result = conn.copy(spec).await;
 
         match result {
             Ok(()) => Ok(()),
@@ -355,28 +409,12 @@ impl Gateway for XhodGateway {
                 debug!(
                     gateway = %self.gateway_name,
                     target = %target,
-                    "transport error on copy, retrying: {}",
+                    generation = %lease.generation(),
+                    "transport error on xhod copy; discarding client without replay: {}",
                     e
                 );
-                self.discard_client().await;
-
-                let new_client = self.ensure_client().await?;
-                let mut retry_conn = XhodConnection::new(new_client, target.to_string());
-                // Note: relay channels are dropped on clone, so retry is only
-                // effective for non-relay copies (where channels were None).
-                let retry_result = retry_conn.copy(spec).await;
-
-                match retry_result {
-                    Ok(()) => Ok(()),
-                    Err(e) => {
-                        self.discard_client().await;
-                        if is_transport_error(&e) {
-                            Err(GatewayError::transport(e))
-                        } else {
-                            Err(GatewayError::execution(e))
-                        }
-                    }
-                }
+                self.invalidate_client(lease.generation()).await;
+                Err(GatewayError::transport(e))
             }
             Err(e) => Err(GatewayError::execution(e)),
         }
@@ -387,9 +425,9 @@ impl Gateway for XhodGateway {
         target: &str,
         request: &InteractiveRequest,
     ) -> Result<InteractiveHandle, GatewayError> {
-        let client = self.ensure_client().await?;
+        let lease = self.ensure_client().await?;
 
-        let mut conn = XhodConnection::new(client, target.to_string());
+        let mut conn = XhodConnection::new((*lease.resource()).clone(), target.to_string());
         let conn_request = ConnInteractiveRequest {
             argv: request.argv.clone(),
             cols: request.cols,
@@ -398,13 +436,22 @@ impl Gateway for XhodGateway {
             shell: request.shell.clone(),
         };
 
-        let handle = conn.exec_interactive(&conn_request).await.map_err(|e| {
-            if is_transport_error(&e) {
-                GatewayError::transport(e)
-            } else {
-                GatewayError::execution(e)
+        let result = conn.exec_interactive(&conn_request).await;
+        let handle = match result {
+            Ok(handle) => handle,
+            Err(e) if is_transport_error(&e) => {
+                debug!(
+                    gateway = %self.gateway_name,
+                    target = %target,
+                    generation = %lease.generation(),
+                    "transport error on xhod interactive exec; discarding client without replay: {}",
+                    e
+                );
+                self.invalidate_client(lease.generation()).await;
+                return Err(GatewayError::transport(e));
             }
-        })?;
+            Err(e) => return Err(GatewayError::execution(e)),
+        };
 
         Ok(InteractiveHandle {
             stdin_tx: handle.stdin_tx,
@@ -415,37 +462,33 @@ impl Gateway for XhodGateway {
     }
 
     async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError> {
-        let mut client = self.ensure_client().await?;
+        let lease = self.ensure_client().await?;
+        let client = (*lease.resource()).clone();
 
-        let response = client
-            .list_servers(rpc::ServerListRequest {})
-            .await
-            .map_err(|e| {
-                GatewayError::transport(anyhow!("list_servers RPC failed: {}", e))
-            })?
-            .into_inner();
+        match self.list_servers_with_client(client).await {
+            Ok(rows) => Ok(rows),
+            Err(e) if matches!(e.kind, ErrorKind::Transport) => {
+                debug!(
+                    gateway = %self.gateway_name,
+                    "transport error on list_servers, retrying: {}",
+                    e
+                );
+                self.invalidate_client(lease.generation()).await;
 
-        // Prefer merged.rows if available and non-empty
-        if let Some(ref merged) = response.merged {
-            if !merged.rows.is_empty() {
-                let rows = merged.rows.iter().filter_map(|rpc_row| {
-                    let server = protocol::server_entry_from_rpc(rpc_row.server.clone()?);
-                    let source = prefix_source(&self.gateway_name, &rpc_row.source);
-                    Some(ServerListRow { source, server })
-                }).collect();
-                return Ok(rows);
+                let new_lease = self.ensure_client().await?;
+                let new_client = (*new_lease.resource()).clone();
+                match self.list_servers_with_client(new_client).await {
+                    Ok(rows) => Ok(rows),
+                    Err(e) => {
+                        if matches!(e.kind, ErrorKind::Transport) {
+                            self.invalidate_client(new_lease.generation()).await;
+                        }
+                        Err(e)
+                    }
+                }
             }
+            Err(e) => Err(e),
         }
-
-        // Fallback: use flat servers field, treat as source="local"
-        let rows = response.servers.into_iter().map(|s| {
-            let server = protocol::server_entry_from_rpc(s);
-            ServerListRow {
-                source: ServerListSource::Gateway(self.gateway_name.clone()),
-                server,
-            }
-        }).collect();
-        Ok(rows)
     }
 
     fn kind(&self) -> GatewayKind {
@@ -457,7 +500,6 @@ impl Gateway for XhodGateway {
     }
 
     async fn prune_idle(&self) {
-        // No-op: XhodGateway maintains a single persistent gRPC connection.
-        // Connections are only discarded on transport errors, not idleness.
+        let _ = self.client.prune_idle(self.max_idle_time).await;
     }
 }

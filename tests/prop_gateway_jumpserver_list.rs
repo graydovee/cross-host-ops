@@ -157,6 +157,7 @@ proptest! {
                 config,
                 fields,
                 panic_auth_prompter(),
+                std::time::Duration::from_secs(300),
             );
 
             // Call list_servers — must return immediately with Unsupported error

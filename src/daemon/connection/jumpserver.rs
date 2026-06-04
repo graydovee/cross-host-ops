@@ -27,7 +27,7 @@ struct ShellCommandOutcome {
 /// Commands are executed by writing to the shell and parsing sentinel markers
 /// to extract exit codes and output.
 pub(crate) struct JumpserverConnection {
-    shell: PtyShell,
+    shell: Option<PtyShell>,
 }
 
 /// A borrowed variant of JumpserverConnection that operates on a PtyShell
@@ -42,7 +42,7 @@ impl JumpserverConnection {
     /// The shell should have completed menu navigation and be at a command prompt
     /// on the target host.
     pub(crate) fn new(shell: PtyShell) -> Self {
-        Self { shell }
+        Self { shell: Some(shell) }
     }
 
     /// Create a borrowed variant that operates on a PtyShell reference.
@@ -57,12 +57,13 @@ impl JumpserverConnection {
         sender: &mpsc::UnboundedSender<ServerEvent>,
         marker_prefix: &str,
     ) -> Result<i32> {
-        self.shell.clear_prompt_remainder();
-        let marker = self.shell.make_marker(marker_prefix);
-        let wrapped = self.shell.wrap_shell_command(command, &marker);
-        self.shell.write_line(&wrapped).await?;
-        let (status, _) = self.shell.read_until_sentinel(&marker, Some(sender)).await?;
-        self.shell.finish_roundtrip().await?;
+        let shell = self.shell_mut()?;
+        shell.clear_prompt_remainder();
+        let marker = shell.make_marker(marker_prefix);
+        let wrapped = shell.wrap_shell_command(command, &marker);
+        shell.write_line(&wrapped).await?;
+        let (status, _) = shell.read_until_sentinel(&marker, Some(sender)).await?;
+        shell.finish_roundtrip().await?;
         Ok(status)
     }
 
@@ -72,12 +73,13 @@ impl JumpserverConnection {
         command: &str,
         marker_prefix: &str,
     ) -> Result<ShellCommandOutcome> {
-        self.shell.clear_prompt_remainder();
-        let marker = self.shell.make_marker(marker_prefix);
-        let wrapped = self.shell.wrap_shell_command(command, &marker);
-        self.shell.write_line(&wrapped).await?;
-        let (exit_code, payload) = self.shell.read_until_sentinel(&marker, None).await?;
-        self.shell.finish_roundtrip().await?;
+        let shell = self.shell_mut()?;
+        shell.clear_prompt_remainder();
+        let marker = shell.make_marker(marker_prefix);
+        let wrapped = shell.wrap_shell_command(command, &marker);
+        shell.write_line(&wrapped).await?;
+        let (exit_code, payload) = shell.read_until_sentinel(&marker, None).await?;
+        shell.finish_roundtrip().await?;
         Ok(ShellCommandOutcome { exit_code, payload })
     }
 
@@ -88,19 +90,22 @@ impl JumpserverConnection {
         payload: &[u8],
         marker_prefix: &str,
     ) -> Result<()> {
-        self.shell.clear_prompt_remainder();
-        let marker = self.shell.make_marker(marker_prefix);
+        let shell = self.shell_mut()?;
+        shell.clear_prompt_remainder();
+        let marker = shell.make_marker(marker_prefix);
         let command = format!("{}\r", command.replace("{}", &marker));
-        self.shell.write_raw(command.as_bytes()).await?;
+        shell.write_raw(command.as_bytes()).await?;
         self.stream_shell_payload(payload).await?;
-        self.shell.write_line(&marker).await?;
-        self.shell.finish_roundtrip().await
+        let shell = self.shell_mut()?;
+        shell.write_line(&marker).await?;
+        shell.finish_roundtrip().await
     }
 
     /// Stream a payload to the PTY shell in chunks.
     async fn stream_shell_payload(&mut self, payload: &[u8]) -> Result<()> {
+        let shell = self.shell_mut()?;
         for chunk in payload.chunks(32 * 1024) {
-            self.shell.write_raw(chunk).await?;
+            shell.write_raw(chunk).await?;
         }
         Ok(())
     }
@@ -213,6 +218,12 @@ impl JumpserverConnection {
         }
         Ok(output)
     }
+
+    fn shell_mut(&mut self) -> Result<&mut PtyShell> {
+        self.shell
+            .as_mut()
+            .ok_or_else(|| anyhow!("jumpserver shell has been moved"))
+    }
 }
 
 #[async_trait::async_trait]
@@ -237,47 +248,21 @@ impl Connection for JumpserverConnection {
         &mut self,
         request: &InteractiveRequest,
     ) -> Result<InteractiveHandle> {
-        // For interactive sessions through a jumpserver, we hand off the PTY
-        // channel directly. The command is written to the shell, and the raw
-        // channel I/O is forwarded to the caller.
         let command = build_interactive_shell_command(&request.argv);
-        self.shell.clear_prompt_remainder();
-        self.shell.write_line(&command).await?;
-
-        // Take ownership of the underlying channel for raw I/O forwarding.
-        // We create forwarding channels and spawn a task to bridge them.
-        let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(32);
-        let (resize_tx, _resize_rx) = mpsc::channel::<(u32, u32)>(8);
-        let (stdout_tx, stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (exit_tx, exit_rx) = oneshot::channel::<i32>();
-
-        // Stream output from the shell to the caller.
-        // Since the jumpserver PTY doesn't support clean exit code extraction
-        // for interactive sessions, we read until the channel closes.
-        let sender = request.sender.clone();
-        let shell_timeout = self.shell.shell_timeout();
-
-        // We need to forward I/O through the existing PtyShell.
-        // Spawn a task that reads from the shell and writes stdin.
-        // NOTE: This takes a simplified approach — the interactive session
-        // uses the same PtyShell, reading until disconnect.
-        tokio::spawn(async move {
-            let _ = (stdin_rx, stdout_tx, exit_tx, sender, shell_timeout);
-            // Interactive forwarding through jumpserver PTY is limited.
-            // The gateway layer above handles the full interactive flow.
-            // For now, signal exit with code 0.
-        });
-
-        Ok(InteractiveHandle {
-            stdin_tx,
-            resize_tx,
-            stdout_rx,
-            exit_rx,
-        })
+        let shell = self
+            .shell
+            .take()
+            .ok_or_else(|| anyhow!("jumpserver shell has been moved"))?;
+        shell
+            .into_interactive_command(command, EXEC_SENTINEL_PREFIX)
+            .await
     }
 
     fn is_alive(&self) -> bool {
-        self.shell.is_channel_open()
+        self.shell
+            .as_ref()
+            .map(|shell| shell.is_channel_open())
+            .unwrap_or(false)
     }
 }
 

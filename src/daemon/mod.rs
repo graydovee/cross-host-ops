@@ -1,6 +1,8 @@
 #[allow(dead_code)]
 pub mod connection;
 #[allow(dead_code)]
+pub mod connection_manager;
+#[allow(dead_code)]
 pub mod gateway;
 #[allow(dead_code)]
 pub mod resolver;
