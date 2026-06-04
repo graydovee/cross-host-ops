@@ -101,6 +101,9 @@ pub enum ServerEvent {
     ExitStatus {
         code: i32,
     },
+    Info {
+        message: String,
+    },
     Error {
         message: String,
     },
@@ -158,6 +161,7 @@ pub fn server_event_to_rpc(event: ServerEvent) -> rpc::ExecuteResponse {
         ServerEvent::Stdout { data } => Event::Stdout(rpc::OutputChunk { data }),
         ServerEvent::Stderr { data } => Event::Stderr(rpc::OutputChunk { data }),
         ServerEvent::ExitStatus { code } => Event::ExitStatus(rpc::ExitStatus { code }),
+        ServerEvent::Info { message } => Event::Info(rpc::InfoResponse { message }),
         ServerEvent::Error { message } => Event::Error(rpc::ErrorResponse { message }),
     };
     rpc::ExecuteResponse { event: Some(event) }
@@ -226,6 +230,14 @@ pub fn copy_complete_response(message: impl Into<String>) -> rpc::CopyResponse {
 pub fn copy_error_response(message: impl Into<String>) -> rpc::CopyResponse {
     rpc::CopyResponse {
         event: Some(rpc::copy_response::Event::Error(rpc::ErrorResponse {
+            message: message.into(),
+        })),
+    }
+}
+
+pub fn copy_info_response(message: impl Into<String>) -> rpc::CopyResponse {
+    rpc::CopyResponse {
+        event: Some(rpc::copy_response::Event::Info(rpc::InfoResponse {
             message: message.into(),
         })),
     }

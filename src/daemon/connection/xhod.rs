@@ -202,8 +202,10 @@ impl Connection for XhodConnection {
                             reason: confirm.reason,
                         });
                     }
-                    rpc::execute_response::Event::Info(_info) => {
-                        // Informational; no action needed at the Connection level.
+                    rpc::execute_response::Event::Info(info) => {
+                        let _ = request.sender.send(ServerEvent::Info {
+                            message: info.message,
+                        });
                     }
                     rpc::execute_response::Event::AuthPrompt(prompt) => {
                         // At the Connection level, auth prompts are forwarded as

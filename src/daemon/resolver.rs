@@ -21,6 +21,13 @@ use super::gateway::Route;
 /// The reserved alias representing the local daemon's own `server.toml`.
 const LOCAL_SOURCE_ALIAS: &str = "local";
 
+/// Resolved route candidates plus an optional user-facing warning.
+#[derive(Clone, Debug)]
+pub struct ResolveResult {
+    pub routes: Vec<Route>,
+    pub warning: Option<String>,
+}
+
 /// Pure resolver that maps a CLI target string into an ordered list of
 /// `Route` candidates. Each Route contains a gateway_name and an end_target.
 /// The same inputs always produce the same outputs (idempotence, Req 7.1).
@@ -77,9 +84,16 @@ impl<'a> Resolver<'a> {
     /// 2. `ssh.fallback`-driven candidates in declared order.
     /// 3. No implicit fan-out to all `xhod` gateways.
     pub fn resolve(&self, input: &str) -> Result<Vec<Route>> {
+        Ok(self.resolve_with_warning(input)?.routes)
+    }
+
+    pub fn resolve_with_warning(&self, input: &str) -> Result<ResolveResult> {
         // Try explicit `<jump_name>:<server_alias>` form first.
         if let Some((jump_name, server_alias)) = parse_explicit_qualified(input) {
-            return self.resolve_explicit(jump_name, server_alias);
+            return Ok(ResolveResult {
+                routes: self.resolve_explicit(jump_name, server_alias)?,
+                warning: None,
+            });
         }
 
         // Try bare `<server_alias>` against the merged server-list view.
@@ -88,11 +102,11 @@ impl<'a> Resolver<'a> {
         // If a merged view is available, use it for cross-source disambiguation.
         if !self.merged_rows.is_empty() {
             match self.resolve_bare_from_merged_view(input) {
-                Ok(Some(routes)) => return Ok(routes),
+                Ok(Some(result)) => return Ok(result),
                 Ok(None) => {
                     // Not found in merged view, fall through to legacy path.
                 }
-                Err(e) => return Err(e), // Ambiguous — propagate error.
+                Err(e) => return Err(e),
             }
         } else {
             // No merged view: fall back to local server config only.
@@ -100,7 +114,10 @@ impl<'a> Resolver<'a> {
 
             // If we found server-config matches, return them without fallback.
             if !candidates.is_empty() {
-                return Ok(candidates);
+                return Ok(ResolveResult {
+                    routes: candidates,
+                    warning: None,
+                });
             }
         }
 
@@ -113,7 +130,10 @@ impl<'a> Resolver<'a> {
                 input
             );
         }
-        Ok(candidates)
+        Ok(ResolveResult {
+            routes: candidates,
+            warning: None,
+        })
     }
 
     /// Resolve an explicitly qualified `<jump_name>:<server_alias>`.
@@ -136,18 +156,17 @@ impl<'a> Resolver<'a> {
             .find(|gc| gc.name() == jump_name)
             .ok_or_else(|| anyhow!("gateway name '{}' not found", jump_name))?;
 
-        // If we have a merged view, verify the server alias exists on this source.
+        // If we have a merged view, verify the complete target path exists.
         if !self.merged_rows.is_empty() {
-            let source = ServerListSource::Gateway(jump_name.to_string());
+            let input_display_name = format!("{}:{}", jump_name, server_alias);
             let found = self
                 .merged_rows
                 .iter()
-                .any(|row| row.source == source && row.server.alias == server_alias);
+                .any(|row| full_target_name(&row.source, &row.server.alias) == input_display_name);
             if !found {
                 bail!(
-                    "server alias '{}' not found on gateway '{}'",
-                    server_alias,
-                    jump_name
+                    "target '{}' not found in merged server list",
+                    input_display_name
                 );
             }
         }
@@ -163,10 +182,9 @@ impl<'a> Resolver<'a> {
     /// Resolve a bare `<server_alias>` against the merged server-list view.
     ///
     /// Returns:
-    /// - `Ok(Some(routes))` if the alias is found in exactly one source.
+    /// - `Ok(Some(result))` if the alias is found in one or more sources.
     /// - `Ok(None)` if the alias is not found in any source.
-    /// - `Err(...)` if the alias is ambiguous (found in multiple sources).
-    fn resolve_bare_from_merged_view(&self, alias: &str) -> Result<Option<Vec<Route>>> {
+    fn resolve_bare_from_merged_view(&self, alias: &str) -> Result<Option<ResolveResult>> {
         // Collect all sources that contain this server alias.
         let matching_rows: Vec<&ServerListRow> = self
             .merged_rows
@@ -178,50 +196,36 @@ impl<'a> Resolver<'a> {
             return Ok(None);
         }
 
-        // Deduplicate by source — we only care about unique sources.
-        let mut unique_sources: Vec<&ServerListSource> = Vec::new();
+        // Deduplicate by full display name while preserving merged-list order.
+        let mut matches: Vec<(String, Route)> = Vec::new();
         for row in &matching_rows {
-            if !unique_sources.iter().any(|s| *s == &row.source) {
-                unique_sources.push(&row.source);
+            let display_name = full_target_name(&row.source, alias);
+            if !matches.iter().any(|(name, _)| name == &display_name) {
+                matches.push((display_name, route_from_source(&row.source, alias)?));
             }
         }
 
-        if unique_sources.len() == 1 {
-            // Unique: build the appropriate route based on the source.
-            let source = unique_sources[0];
-            let route = match source {
-                ServerListSource::Local => {
-                    // Direct route — gateway_name = "local"
-                    Route {
-                        gateway_name: "local".to_string(),
-                        end_target: alias.to_string(),
-                    }
-                }
-                ServerListSource::Gateway(jump_alias) => {
-                    // Route through the named gateway — gateway_name = jump_alias
-                    Route {
-                        gateway_name: jump_alias.clone(),
-                        end_target: alias.to_string(),
-                    }
-                }
-            };
-            return Ok(Some(vec![route]));
-        }
-
-        // Ambiguous: found in multiple sources. Build the candidate list.
-        let candidates: Vec<String> = unique_sources
-            .iter()
-            .map(|source| match source {
-                ServerListSource::Local => format!("local:{}", alias),
-                ServerListSource::Gateway(jump_alias) => format!("{}:{}", jump_alias, alias),
-            })
-            .collect();
-
-        bail!(
-            "server alias '{}' is ambiguous; found in: {}",
-            alias,
-            candidates.join(", ")
-        );
+        let chosen = matches
+            .first()
+            .ok_or_else(|| anyhow!("no resolved target candidates"))?;
+        let warning = if matches.len() > 1 {
+            let also_found = matches
+                .iter()
+                .skip(1)
+                .map(|(display_name, _)| display_name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!(
+                "warning: target '{}' matched multiple sources; using {}; also found {}",
+                alias, chosen.0, also_found
+            ))
+        } else {
+            None
+        };
+        Ok(Some(ResolveResult {
+            routes: vec![chosen.1.clone()],
+            warning,
+        }))
     }
 
     /// Append routes from the local server config for a bare alias.
@@ -329,6 +333,38 @@ impl<'a> Resolver<'a> {
             }));
         }
         Ok(None)
+    }
+}
+
+fn full_target_name(source: &ServerListSource, alias: &str) -> String {
+    match source {
+        ServerListSource::Local => format!("{}:{}", LOCAL_SOURCE_ALIAS, alias),
+        ServerListSource::Gateway(path) => format!("{}:{}", path, alias),
+    }
+}
+
+fn route_from_source(source: &ServerListSource, alias: &str) -> Result<Route> {
+    match source {
+        ServerListSource::Local => Ok(Route {
+            gateway_name: LOCAL_SOURCE_ALIAS.to_string(),
+            end_target: alias.to_string(),
+        }),
+        ServerListSource::Gateway(path) => {
+            let (gateway_name, rest) = path
+                .split_once(':')
+                .map_or((path.as_str(), None), |(first, rest)| (first, Some(rest)));
+            if gateway_name.is_empty() {
+                bail!("invalid empty gateway in server-list source '{}'", path);
+            }
+            let end_target = match rest {
+                Some(rest) if !rest.is_empty() => format!("{}:{}", rest, alias),
+                _ => alias.to_string(),
+            };
+            Ok(Route {
+                gateway_name: gateway_name.to_string(),
+                end_target,
+            })
+        }
     }
 }
 
@@ -730,6 +766,30 @@ mod tests {
                     },
                 },
             },
+            ServerListRow {
+                source: ServerListSource::Gateway("remote1:nested-xhod".to_string()),
+                server: ServerEntry {
+                    alias: "deep01".to_string(),
+                    host: "172.16.1.20".to_string(),
+                    port: 22,
+                    user: "admin".to_string(),
+                    auth: DirectAuth::Key {
+                        identity_file: "/tmp/key".to_string(),
+                    },
+                },
+            },
+            ServerListRow {
+                source: ServerListSource::Gateway("remote1:nested-xhod".to_string()),
+                server: ServerEntry {
+                    alias: "shared".to_string(),
+                    host: "172.16.1.21".to_string(),
+                    port: 22,
+                    user: "admin".to_string(),
+                    auth: DirectAuth::Key {
+                        identity_file: "/tmp/key".to_string(),
+                    },
+                },
+            },
         ]
     }
 
@@ -778,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn resolver_merged_view_bare_alias_ambiguous() {
+    fn resolver_merged_view_bare_alias_ambiguous_uses_first_with_warning() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("shared", "10.0.0.5")]);
         let gateways = vec![GatewayConfig::Xhod(XhodGatewayConfig {
@@ -792,17 +852,44 @@ mod tests {
         let resolver =
             Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
 
-        // "shared" exists in both local and remote1 — should be ambiguous
-        let result = resolver.resolve("shared");
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("ambiguous"), "error should mention ambiguous: {}", msg);
-        assert!(msg.contains("local:shared"), "error should list local:shared: {}", msg);
+        // "shared" exists in multiple sources — choose the first merged row.
+        let result = resolver.resolve_with_warning("shared").unwrap();
+        assert_eq!(result.routes.len(), 1);
+        assert_eq!(result.routes[0].gateway_name, "local");
+        assert_eq!(result.routes[0].end_target, "shared");
+        let warning = result.warning.expect("ambiguous match should warn");
         assert!(
-            msg.contains("remote1:shared"),
-            "error should list remote1:shared: {}",
-            msg
+            warning.contains("using local:shared"),
+            "warning should mention chosen target: {}",
+            warning
         );
+        assert!(
+            warning.contains("remote1:shared") && warning.contains("remote1:nested-xhod:shared"),
+            "warning should mention other targets: {}",
+            warning
+        );
+    }
+
+    #[test]
+    fn resolver_merged_view_bare_alias_multi_level_source() {
+        let config = AppConfig::default();
+        let server_config = make_server_config_with(vec![]);
+        let gateways = vec![GatewayConfig::Xhod(XhodGatewayConfig {
+            name: "remote1".to_string(),
+            address: "10.0.0.99:2222".to_string(),
+            identity_file: String::new(),
+            known_hosts_path: String::new(),
+        })];
+        let merged_rows = make_merged_rows();
+
+        let resolver =
+            Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
+
+        let result = resolver.resolve_with_warning("deep01").unwrap();
+        assert_eq!(result.routes.len(), 1);
+        assert_eq!(result.routes[0].gateway_name, "remote1");
+        assert_eq!(result.routes[0].end_target, "nested-xhod:deep01");
+        assert!(result.warning.is_none());
     }
 
     #[test]
@@ -825,6 +912,27 @@ mod tests {
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].gateway_name, "remote1");
         assert_eq!(routes[0].end_target, "db01");
+    }
+
+    #[test]
+    fn resolver_merged_view_explicit_multi_level_gateway_found() {
+        let config = AppConfig::default();
+        let server_config = make_server_config_with(vec![]);
+        let gateways = vec![GatewayConfig::Xhod(XhodGatewayConfig {
+            name: "remote1".to_string(),
+            address: "10.0.0.99:2222".to_string(),
+            identity_file: String::new(),
+            known_hosts_path: String::new(),
+        })];
+        let merged_rows = make_merged_rows();
+
+        let resolver =
+            Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
+
+        let routes = resolver.resolve("remote1:nested-xhod:deep01").unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].gateway_name, "remote1");
+        assert_eq!(routes[0].end_target, "nested-xhod:deep01");
     }
 
     #[test]

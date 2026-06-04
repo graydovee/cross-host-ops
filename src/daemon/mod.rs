@@ -45,7 +45,7 @@ use crate::types::CopySpec;
 use self::gateway::Gateway;
 use self::gateway::auth::AuthPrompter;
 use self::review::CommandReviewer;
-use self::resolver::Resolver;
+use self::resolver::{ResolveResult, Resolver};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -138,6 +138,20 @@ impl DaemonState {
     pub fn find_gateway(&self, name: &str) -> Option<&Arc<dyn Gateway>> {
         self.gateways.iter().find(|(n, _)| n == name).map(|(_, gw)| gw)
     }
+}
+
+async fn resolve_target_with_merged_view(state: &DaemonState, target: &str) -> Result<ResolveResult> {
+    let config = state.config.read().await.clone();
+    let server_config = load_server_config(std::path::Path::new(&config.ssh.server_config_path))
+        .unwrap_or_default();
+    let (tagged_entries, _) = rpc::process_list_servers(state).await;
+    let merged_rows = tagged_entries
+        .into_iter()
+        .map(|(server, source)| protocol::ServerListRow { source, server })
+        .collect::<Vec<_>>();
+    let resolver =
+        Resolver::with_merged_view(&config, &server_config, &config.gateways, &merged_rows);
+    resolver.resolve_with_warning(target)
 }
 
 // ---------------------------------------------------------------------------
@@ -452,7 +466,7 @@ pub async fn run_with_overrides(
                 match result {
                     Ok(stream) => {
                         if local_tx.send(IncomingConn::Local(stream)).await.is_err() {
-                            break;
+                            warn!("failed to hand off local socket connection");
                         }
                     }
                     Err(error) => {
@@ -617,14 +631,16 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                 }
 
                 let (target_input, mut spec, timeout_ms): (String, CopySpec, u64) = protocol::copy_spec_from_rpc(start)?;
-                let config = state.config.read().await.clone();
-                let server_config = load_server_config(std::path::Path::new(&config.ssh.server_config_path))
-                    .unwrap_or_default();
-                let resolver = Resolver::new(&config, &server_config, &config.gateways);
-                let routes = resolver.resolve(&target_input)?;
-                let route = routes
+                let resolved = resolve_target_with_merged_view(&state, &target_input).await?;
+                let route = resolved.routes
                     .first()
                     .ok_or_else(|| anyhow!("no resolved target candidates"))?;
+                if let Some(warning) = resolved.warning {
+                    sender
+                        .send(Ok(protocol::copy_info_response(warning)))
+                        .await
+                        .map_err(|_| anyhow!("copy client stream closed"))?;
+                }
                 info!(
                     target = %route.end_target,
                     gateway = %route.gateway_name,
@@ -1111,13 +1127,13 @@ async fn process_execute(
 
     let execution_id = Uuid::new_v4();
     let config = state.config.read().await.clone();
-    let server_config = load_server_config(std::path::Path::new(&config.ssh.server_config_path))
-        .unwrap_or_default();
-    let resolver = Resolver::new(&config, &server_config, &config.gateways);
-    let routes = resolver.resolve(&request.target)?;
-    let route = routes
+    let resolved = resolve_target_with_merged_view(state, &request.target).await?;
+    let route = resolved.routes
         .first()
         .ok_or_else(|| anyhow!("no resolved target candidates"))?;
+    if let Some(warning) = resolved.warning {
+        send_execute_event(sender, ServerEvent::Info { message: warning }).await?;
+    }
 
     let review_command = request.argv.join(" ");
 
@@ -1365,13 +1381,13 @@ async fn process_interactive_execute(
 ) -> Result<()> {
     let execution_id = Uuid::new_v4();
     let config = state.config.read().await.clone();
-    let server_config = load_server_config(std::path::Path::new(&config.ssh.server_config_path))
-        .unwrap_or_default();
-    let resolver = Resolver::new(&config, &server_config, &config.gateways);
-    let routes = resolver.resolve(&request.target)?;
-    let route = routes
+    let resolved = resolve_target_with_merged_view(state, &request.target).await?;
+    let route = resolved.routes
         .first()
         .ok_or_else(|| anyhow!("no resolved target candidates"))?;
+    if let Some(warning) = resolved.warning {
+        send_execute_event(sender, ServerEvent::Info { message: warning }).await?;
+    }
 
     let review_command = request.argv.join(" ");
 

@@ -648,6 +648,11 @@ pub(crate) async fn run_interactive(
                 sigwinch_task.abort();
                 return Ok(1);
             }
+            rpc::execute_response::Event::Info(info) => {
+                if !info.message.is_empty() {
+                    eprintln!("{}", info.message);
+                }
+            }
             rpc::execute_response::Event::AuthPrompt(prompt) => {
                 let value = prompt_for_auth_input(&prompt.message, prompt.secret)?;
                 tx.send(crate::protocol::execute_auth_input_request(prompt.prompt_id, value))
@@ -779,7 +784,7 @@ async fn run_copy(recursive: bool, source: String, dest: String, timeout_ms: u64
             }
             rpc::copy_response::Event::Info(info) => {
                 if !info.message.is_empty() {
-                    println!("{}", info.message);
+                    eprintln!("{}", info.message);
                 }
             }
             rpc::copy_response::Event::DataChunk(chunk) => {
@@ -1184,7 +1189,7 @@ fn spawn_daemon(options: &CliDaemonStartOptions) -> Result<()> {
 
 async fn wait_for_socket(socket_path: &PathBuf) -> Result<()> {
     for _ in 0..50 {
-        if socket_path.exists() {
+        if socket_path.exists() && connect_unix_client(socket_path).await.is_ok() {
             return Ok(());
         }
         sleep(Duration::from_millis(100)).await;

@@ -1,4 +1,6 @@
 use clap::Parser;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -60,6 +62,15 @@ fn spawn_background(
         command.arg("--log-level").arg(log_level);
     }
     command.arg("--origin").arg(origin.as_str());
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
