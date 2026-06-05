@@ -38,16 +38,19 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::config::{AppConfig, GatewayConfig, ReviewAction, default_config_path, load_server_config, validate_gateways};
+use self::ssh_server::remote_subsystem_name;
+use crate::config::{
+    AppConfig, GatewayConfig, ReviewAction, default_config_path, load_server_config,
+    validate_gateways,
+};
 use crate::logging::{init_logging, reopen_log_output};
 use crate::protocol::{self, ExecRequest, ServerEvent, rpc as proto_rpc};
-use self::ssh_server::remote_subsystem_name;
 use crate::types::CopySpec;
 
 use self::gateway::Gateway;
 use self::gateway::auth::AuthPrompter;
-use self::review::CommandReviewer;
 use self::resolver::{ResolveResult, Resolver};
+use self::review::CommandReviewer;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -138,11 +141,17 @@ impl DaemonState {
 
     /// Find a gateway by name in the ordered list.
     pub fn find_gateway(&self, name: &str) -> Option<&Arc<dyn Gateway>> {
-        self.gateways.iter().find(|(n, _)| n == name).map(|(_, gw)| gw)
+        self.gateways
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, gw)| gw)
     }
 }
 
-async fn resolve_target_with_merged_view(state: &DaemonState, target: &str) -> Result<ResolveResult> {
+async fn resolve_target_with_merged_view(
+    state: &DaemonState,
+    target: &str,
+) -> Result<ResolveResult> {
     let config = state.config.read().await.clone();
     let server_config = load_server_config(std::path::Path::new(&config.ssh.server_config_path))
         .unwrap_or_default();
@@ -221,7 +230,9 @@ impl tokio::io::AsyncRead for IncomingConn {
     ) -> std::task::Poll<io::Result<()>> {
         match &mut *self {
             IncomingConn::Local(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
-            IncomingConn::Remote(stream) => std::pin::Pin::new(&mut stream.stream).poll_read(cx, buf),
+            IncomingConn::Remote(stream) => {
+                std::pin::Pin::new(&mut stream.stream).poll_read(cx, buf)
+            }
         }
     }
 }
@@ -234,7 +245,9 @@ impl tokio::io::AsyncWrite for IncomingConn {
     ) -> std::task::Poll<io::Result<usize>> {
         match &mut *self {
             IncomingConn::Local(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
-            IncomingConn::Remote(stream) => std::pin::Pin::new(&mut stream.stream).poll_write(cx, buf),
+            IncomingConn::Remote(stream) => {
+                std::pin::Pin::new(&mut stream.stream).poll_write(cx, buf)
+            }
         }
     }
 
@@ -254,7 +267,9 @@ impl tokio::io::AsyncWrite for IncomingConn {
     ) -> std::task::Poll<io::Result<()>> {
         match &mut *self {
             IncomingConn::Local(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
-            IncomingConn::Remote(stream) => std::pin::Pin::new(&mut stream.stream).poll_shutdown(cx),
+            IncomingConn::Remote(stream) => {
+                std::pin::Pin::new(&mut stream.stream).poll_shutdown(cx)
+            }
         }
     }
 }
@@ -410,9 +425,7 @@ pub async fn run_with_overrides(
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
 
     // Build all gateways from the configuration.
-    let auth_prompter: Arc<AuthPrompter> = Arc::new(|_req| {
-        Box::pin(async { Ok(String::new()) })
-    });
+    let auth_prompter: Arc<AuthPrompter> = Arc::new(|_req| Box::pin(async { Ok(String::new()) }));
     let gateways = gateway::build_gateways(
         config.clone(),
         &loaded.ssh.server_config_path,
@@ -527,7 +540,9 @@ pub async fn run_with_overrides(
         while sighup.recv().await.is_some() {
             match reopen_log_output() {
                 Ok(()) => info!("reopened log output after SIGHUP"),
-                Err(error) => warn!(error = %format!("{error:#}"), "failed to reopen log output after SIGHUP"),
+                Err(error) => {
+                    warn!(error = %format!("{error:#}"), "failed to reopen log output after SIGHUP")
+                }
             }
             sighup_state.reload_config().await;
         }
@@ -535,9 +550,11 @@ pub async fn run_with_overrides(
 
     let incoming = ReceiverStream::new(receiver_map_incoming(incoming_rx));
     Server::builder()
-        .add_service(proto_rpc::xho_rpc_server::XhoRpcServer::new(XhoRpcService {
-            state: state.clone(),
-        }))
+        .add_service(proto_rpc::xho_rpc_server::XhoRpcServer::new(
+            XhoRpcService {
+                state: state.clone(),
+            },
+        ))
         .serve_with_incoming_shutdown(incoming, async move {
             let _ = shutdown_rx.recv().await;
         })
@@ -834,9 +851,19 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
             .iter()
             .map(|entry| {
                 let (name, kind, address) = match entry {
-                    GatewayConfig::Xhod(c) => (c.name.clone(), "xhod".to_string(), c.address.clone()),
-                    GatewayConfig::Jumpserver(c) => (c.name.clone(), "jumpserver".to_string(), format!("{}:{}", c.host, c.port)),
-                    GatewayConfig::Direct(c) => (c.name.clone(), "direct".to_string(), format!("{}:{}", c.host, c.port)),
+                    GatewayConfig::Xhod(c) => {
+                        (c.name.clone(), "xhod".to_string(), c.address.clone())
+                    }
+                    GatewayConfig::Jumpserver(c) => (
+                        c.name.clone(),
+                        "jumpserver".to_string(),
+                        format!("{}:{}", c.host, c.port),
+                    ),
+                    GatewayConfig::Direct(c) => (
+                        c.name.clone(),
+                        "direct".to_string(),
+                        format!("{}:{}", c.host, c.port),
+                    ),
                 };
                 proto_rpc::GatewayStatus {
                     name,
@@ -1001,15 +1028,13 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                             message: format!("gateway '{}' added successfully", alias),
                         }))
                     }
-                    other => {
-                        Ok(Response::new(proto_rpc::UpdateConfigResponse {
-                            success: false,
-                            message: format!(
-                                "add_gateway via RPC only supports kind 'xhod', got '{}'",
-                                other
-                            ),
-                        }))
-                    }
+                    other => Ok(Response::new(proto_rpc::UpdateConfigResponse {
+                        success: false,
+                        message: format!(
+                            "add_gateway via RPC only supports kind 'xhod', got '{}'",
+                            other
+                        ),
+                    })),
                 }
             }
             "remove_gateway" => {
@@ -1071,9 +1096,19 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
             .iter()
             .map(|entry| {
                 let (name, kind, address) = match entry {
-                    GatewayConfig::Xhod(c) => (c.name.clone(), "xhod".to_string(), c.address.clone()),
-                    GatewayConfig::Jumpserver(c) => (c.name.clone(), "jumpserver".to_string(), format!("{}:{}", c.host, c.port)),
-                    GatewayConfig::Direct(c) => (c.name.clone(), "direct".to_string(), format!("{}:{}", c.host, c.port)),
+                    GatewayConfig::Xhod(c) => {
+                        (c.name.clone(), "xhod".to_string(), c.address.clone())
+                    }
+                    GatewayConfig::Jumpserver(c) => (
+                        c.name.clone(),
+                        "jumpserver".to_string(),
+                        format!("{}:{}", c.host, c.port),
+                    ),
+                    GatewayConfig::Direct(c) => (
+                        c.name.clone(),
+                        "direct".to_string(),
+                        format!("{}:{}", c.host, c.port),
+                    ),
                 };
                 proto_rpc::GatewayStatus {
                     name,
@@ -1108,7 +1143,9 @@ async fn process_execute(
             send_execute_event(
                 sender,
                 ServerEvent::Error {
-                    message: "interactive mode requires pty (--pty) and is incompatible with --no-pty".to_string(),
+                    message:
+                        "interactive mode requires pty (--pty) and is incompatible with --no-pty"
+                            .to_string(),
                 },
             )
             .await?;
@@ -1118,7 +1155,8 @@ async fn process_execute(
             send_execute_event(
                 sender,
                 ServerEvent::Error {
-                    message: "interactive mode requires term_cols > 0 and term_rows > 0".to_string(),
+                    message: "interactive mode requires term_cols > 0 and term_rows > 0"
+                        .to_string(),
                 },
             )
             .await?;
@@ -1130,7 +1168,8 @@ async fn process_execute(
     let execution_id = Uuid::new_v4();
     let config = state.config.read().await.clone();
     let resolved = resolve_target_with_merged_view(state, &request.target).await?;
-    let route = resolved.routes
+    let route = resolved
+        .routes
         .first()
         .ok_or_else(|| anyhow!("no resolved target candidates"))?;
     if let Some(warning) = resolved.warning {
@@ -1150,7 +1189,12 @@ async fn process_execute(
     // Review logic
     let decision = match state
         .reviewer
-        .review(&config.review, &route.end_target, &request.argv, &review_command)
+        .review(
+            &config.review,
+            &route.end_target,
+            &request.argv,
+            &review_command,
+        )
         .await
     {
         Ok(result) => result,
@@ -1265,9 +1309,7 @@ async fn process_execute(
     let stdin_enabled = request.stdin;
     let gw = gateway.clone();
     let end_target = route.end_target.clone();
-    let exec_task = tokio::spawn(async move {
-        gw.exec(&end_target, &gw_request).await
-    });
+    let exec_task = tokio::spawn(async move { gw.exec(&end_target, &gw_request).await });
     tokio::pin!(exec_task);
 
     // If timeout is specified, create a deadline future.
@@ -1384,7 +1426,8 @@ async fn process_interactive_execute(
     let execution_id = Uuid::new_v4();
     let config = state.config.read().await.clone();
     let resolved = resolve_target_with_merged_view(state, &request.target).await?;
-    let route = resolved.routes
+    let route = resolved
+        .routes
         .first()
         .ok_or_else(|| anyhow!("no resolved target candidates"))?;
     if let Some(warning) = resolved.warning {
@@ -1405,7 +1448,12 @@ async fn process_interactive_execute(
     // Run review
     let decision = match state
         .reviewer
-        .review(&config.review, &route.end_target, &request.argv, &review_command)
+        .review(
+            &config.review,
+            &route.end_target,
+            &request.argv,
+            &review_command,
+        )
         .await
     {
         Ok(result) => result,
@@ -1738,7 +1786,12 @@ async fn ensure_remote_parent(config: &crate::config::RemoteServerConfig) -> Res
     fs::create_dir_all(host_parent).await?;
     let auth_parent = Path::new(&config.authorized_keys_path)
         .parent()
-        .ok_or_else(|| anyhow!("invalid authorized_keys path {}", config.authorized_keys_path))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "invalid authorized_keys path {}",
+                config.authorized_keys_path
+            )
+        })?;
     fs::create_dir_all(auth_parent).await?;
     Ok(())
 }
@@ -1803,8 +1856,7 @@ fn is_authorized_key(path: &Path, candidate: &ssh_key::PublicKey) -> Result<bool
 /// Atomically writes the current in-memory config to disk using a temp file + rename.
 async fn atomic_write_config(state: &DaemonState) -> Result<()> {
     let config = state.config.read().await.clone();
-    let toml_str = toml::to_string_pretty(&config)
-        .context("failed to serialize config to TOML")?;
+    let toml_str = toml::to_string_pretty(&config).context("failed to serialize config to TOML")?;
 
     let config_path = &state.config_path;
     let parent = config_path
@@ -1818,15 +1870,13 @@ async fn atomic_write_config(state: &DaemonState) -> Result<()> {
         .with_context(|| format!("failed to write temp config {}", tmp_path.display()))?;
 
     // Atomic rename
-    fs::rename(&tmp_path, config_path)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to rename {} to {}",
-                tmp_path.display(),
-                config_path.display()
-            )
-        })?;
+    fs::rename(&tmp_path, config_path).await.with_context(|| {
+        format!(
+            "failed to rename {} to {}",
+            tmp_path.display(),
+            config_path.display()
+        )
+    })?;
 
     info!(config_path = %config_path.display(), "config written atomically");
     Ok(())
@@ -1854,9 +1904,8 @@ pub mod test_support {
         let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
 
         // Build gateways from config for test.
-        let auth_prompter: Arc<AuthPrompter> = Arc::new(|_req| {
-            Box::pin(async { Ok(String::new()) })
-        });
+        let auth_prompter: Arc<AuthPrompter> =
+            Arc::new(|_req| Box::pin(async { Ok(String::new()) }));
         let gateways = gateway::build_gateways(
             config.clone(),
             &config_clone.ssh.server_config_path,

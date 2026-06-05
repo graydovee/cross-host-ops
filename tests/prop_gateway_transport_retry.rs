@@ -14,12 +14,12 @@ use async_trait::async_trait;
 use proptest::prelude::*;
 use tokio::sync::mpsc;
 
-use xho::protocol::ServerListRow;
-use xho::types::CopySpec;
 use xho::daemon::gateway::{
     ErrorKind, ExecRequest, Gateway, GatewayError, GatewayKind, InteractiveHandle,
     InteractiveRequest,
 };
+use xho::protocol::ServerListRow;
+use xho::types::CopySpec;
 
 // ---------------------------------------------------------------------------
 // Model for transport retry behavior
@@ -109,16 +109,12 @@ impl Gateway for RetryMockGateway {
 
                     match &self.scenario.retry_attempt {
                         AttemptOutcome::Success(code) => Ok(*code),
-                        AttemptOutcome::TransportError => {
-                            Err(GatewayError::transport(anyhow::anyhow!(
-                                "transport error on retry"
-                            )))
-                        }
-                        AttemptOutcome::ExecutionError => {
-                            Err(GatewayError::execution(anyhow::anyhow!(
-                                "execution error on retry"
-                            )))
-                        }
+                        AttemptOutcome::TransportError => Err(GatewayError::transport(
+                            anyhow::anyhow!("transport error on retry"),
+                        )),
+                        AttemptOutcome::ExecutionError => Err(GatewayError::execution(
+                            anyhow::anyhow!("execution error on retry"),
+                        )),
                     }
                 }
                 AttemptOutcome::ExecutionError => Err(GatewayError::execution(anyhow::anyhow!(

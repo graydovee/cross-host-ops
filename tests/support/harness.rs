@@ -12,14 +12,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use proptest::prelude::*;
 
 use xho::config::{AppConfig, DirectAuth, ServerEntry};
-use xho::daemon::test_support::make_test_rpc_service;
 use xho::daemon::gateway::GatewayKind;
+use xho::daemon::test_support::make_test_rpc_service;
 use xho::protocol::rpc;
 use xho::protocol::rpc::xho_rpc_client::XhoRpcClient;
 
+use hyper_util::rt::TokioIo;
 use tonic::transport::{Channel, Endpoint, Server, Uri};
 use tower::service_fn;
-use hyper_util::rt::TokioIo;
 
 /// The buffer size for the in-process duplex channel (1 MB).
 const DUPLEX_BUFFER_SIZE: usize = 1024 * 1024;
@@ -115,8 +115,11 @@ impl TestHarness {
 
         // --- Local daemon setup ---
         let local_server_config_path = local_config_dir.join("server.toml");
-        fs::write(&local_server_config_path, "[defaults]\nuser = \"testuser\"\nport = 22\n")
-            .expect("failed to write local server.toml");
+        fs::write(
+            &local_server_config_path,
+            "[defaults]\nuser = \"testuser\"\nport = 22\n",
+        )
+        .expect("failed to write local server.toml");
 
         let local_config_path = local_config_dir.join("config.toml");
         let mut local_config = AppConfig::default();
@@ -145,9 +148,7 @@ impl TestHarness {
         tokio::spawn(async move {
             Server::builder()
                 .add_service(local_service)
-                .serve_with_incoming(tokio_stream::once(Ok::<_, std::io::Error>(
-                    local_server_io,
-                )))
+                .serve_with_incoming(tokio_stream::once(Ok::<_, std::io::Error>(local_server_io)))
                 .await
                 .expect("local gRPC server failed");
         });
@@ -169,11 +170,7 @@ impl TestHarness {
     ///
     /// Sends a `StartRequest` to the local daemon's `Execute` RPC and collects
     /// all response events, extracting stdout/stderr bytes and the exit code.
-    pub async fn cli_exec(
-        &mut self,
-        target: &str,
-        argv: &[&str],
-    ) -> (i32, Vec<u8>, Vec<u8>) {
+    pub async fn cli_exec(&mut self, target: &str, argv: &[&str]) -> (i32, Vec<u8>, Vec<u8>) {
         let start_request = rpc::ExecuteRequest {
             request: Some(rpc::execute_request::Request::Start(rpc::StartRequest {
                 target: target.to_string(),
@@ -292,13 +289,8 @@ impl TestHarness {
     /// Read a file from the local tempdir.
     pub fn read_local(&self, relative_path: &str) -> Vec<u8> {
         let path = self.local_tempdir.join(relative_path);
-        fs::read(&path).unwrap_or_else(|e| {
-            panic!(
-                "failed to read local file {}: {}",
-                path.display(),
-                e
-            )
-        })
+        fs::read(&path)
+            .unwrap_or_else(|e| panic!("failed to read local file {}: {}", path.display(), e))
     }
 
     /// Write data to a file in the local tempdir.
@@ -307,13 +299,8 @@ impl TestHarness {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("failed to create parent dirs");
         }
-        fs::write(&path, data).unwrap_or_else(|e| {
-            panic!(
-                "failed to write local file {}: {}",
-                path.display(),
-                e
-            )
-        });
+        fs::write(&path, data)
+            .unwrap_or_else(|e| panic!("failed to write local file {}: {}", path.display(), e));
     }
 
     /// Generate a fresh file path in the local tempdir.
@@ -327,13 +314,8 @@ impl TestHarness {
     /// Read a file from the remote tempdir (end-target filesystem).
     pub fn read_remote(&self, relative_path: &str) -> Vec<u8> {
         let path = self.remote_tempdir.join(relative_path);
-        fs::read(&path).unwrap_or_else(|e| {
-            panic!(
-                "failed to read remote file {}: {}",
-                path.display(),
-                e
-            )
-        })
+        fs::read(&path)
+            .unwrap_or_else(|e| panic!("failed to read remote file {}: {}", path.display(), e))
     }
 
     /// Write data to a file in the remote tempdir (end-target filesystem).
@@ -342,13 +324,8 @@ impl TestHarness {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("failed to create parent dirs");
         }
-        fs::write(&path, data).unwrap_or_else(|e| {
-            panic!(
-                "failed to write remote file {}: {}",
-                path.display(),
-                e
-            )
-        });
+        fs::write(&path, data)
+            .unwrap_or_else(|e| panic!("failed to write remote file {}: {}", path.display(), e));
     }
 
     /// Returns the path to the local tempdir.

@@ -109,15 +109,20 @@ fn arb_remote_source() -> impl Strategy<Value = String> {
 
 /// Strategy for a simulated RPC merged row.
 fn arb_simulated_rpc_row() -> impl Strategy<Value = SimulatedRpcRow> {
-    (arb_alias(), arb_host(), 1u16..=65535u16, arb_user(), arb_remote_source()).prop_map(
-        |(alias, host, port, user, source)| SimulatedRpcRow {
+    (
+        arb_alias(),
+        arb_host(),
+        1u16..=65535u16,
+        arb_user(),
+        arb_remote_source(),
+    )
+        .prop_map(|(alias, host, port, user, source)| SimulatedRpcRow {
             alias,
             host,
             port,
             user,
             source,
-        },
-    )
+        })
 }
 
 /// Strategy for a ServerEntry (used as flat server).

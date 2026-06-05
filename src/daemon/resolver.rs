@@ -6,11 +6,11 @@ use std::path::Path;
 use anyhow::{Result, anyhow, bail};
 
 use crate::config::{
-    AppConfig, FallbackEntry, GatewayConfig, ServerConfigFile,
-    parse_ssh_config, resolve_server_entry, resolve_ssh_host,
+    AppConfig, FallbackEntry, GatewayConfig, ServerConfigFile, parse_ssh_config,
+    resolve_server_entry, resolve_ssh_host,
 };
-use crate::types::ServerListSource;
 use crate::protocol::ServerListRow;
+use crate::types::ServerListSource;
 
 use super::gateway::Route;
 
@@ -254,11 +254,7 @@ impl<'a> Resolver<'a> {
     /// Append fallback-driven candidates in the order declared in `ssh.fallback`.
     /// When `ssh.fallback` is empty or all entries are disabled, this contributes
     /// zero candidates.
-    fn append_fallback_routes(
-        &self,
-        candidates: &mut Vec<Route>,
-        input: &str,
-    ) -> Result<()> {
+    fn append_fallback_routes(&self, candidates: &mut Vec<Route>, input: &str) -> Result<()> {
         let ip = derive_target_ip(input);
 
         for entry in &self.config.ssh.fallback {
@@ -418,8 +414,8 @@ pub fn derive_target_ip(input: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::{
-        AppConfig, FallbackEntry, GatewayConfig, XhodGatewayConfig,
-        JumpserverGatewayConfig, ServerConfigFile, ServerDefaults, ServerHostConfig,
+        AppConfig, FallbackEntry, GatewayConfig, JumpserverGatewayConfig, ServerConfigFile,
+        ServerDefaults, ServerHostConfig, XhodGatewayConfig,
     };
     use std::collections::HashMap;
 
@@ -805,8 +801,7 @@ mod tests {
         })];
         let merged_rows = make_merged_rows();
 
-        let resolver =
-            Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
+        let resolver = Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
 
         // "db01" is unique (only in remote1)
         let routes = resolver.resolve("db01").unwrap();
@@ -827,8 +822,7 @@ mod tests {
         })];
         let merged_rows = make_merged_rows();
 
-        let resolver =
-            Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
+        let resolver = Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
 
         // "web01" is unique (only in local)
         let routes = resolver.resolve("web01").unwrap();
@@ -849,8 +843,7 @@ mod tests {
         })];
         let merged_rows = make_merged_rows();
 
-        let resolver =
-            Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
+        let resolver = Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
 
         // "shared" exists in multiple sources — choose the first merged row.
         let result = resolver.resolve_with_warning("shared").unwrap();
@@ -882,8 +875,7 @@ mod tests {
         })];
         let merged_rows = make_merged_rows();
 
-        let resolver =
-            Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
+        let resolver = Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
 
         let result = resolver.resolve_with_warning("deep01").unwrap();
         assert_eq!(result.routes.len(), 1);
@@ -904,8 +896,7 @@ mod tests {
         })];
         let merged_rows = make_merged_rows();
 
-        let resolver =
-            Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
+        let resolver = Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
 
         // Explicit "remote1:db01" should work
         let routes = resolver.resolve("remote1:db01").unwrap();
@@ -926,8 +917,7 @@ mod tests {
         })];
         let merged_rows = make_merged_rows();
 
-        let resolver =
-            Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
+        let resolver = Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
 
         let routes = resolver.resolve("remote1:nested-xhod:deep01").unwrap();
         assert_eq!(routes.len(), 1);
@@ -947,14 +937,17 @@ mod tests {
         })];
         let merged_rows = make_merged_rows();
 
-        let resolver =
-            Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
+        let resolver = Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
 
         // Explicit "remote1:nonexistent" should fail
         let result = resolver.resolve("remote1:nonexistent");
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("not found"), "error should mention not found: {}", msg);
+        assert!(
+            msg.contains("not found"),
+            "error should mention not found: {}",
+            msg
+        );
     }
 
     #[test]
@@ -964,8 +957,7 @@ mod tests {
         let gateways: Vec<GatewayConfig> = vec![];
         let merged_rows = make_merged_rows();
 
-        let resolver =
-            Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
+        let resolver = Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
 
         // Explicit "local:web01" should work
         let routes = resolver.resolve("local:web01").unwrap();
@@ -995,8 +987,7 @@ mod tests {
         })];
         let merged_rows = make_merged_rows();
 
-        let resolver =
-            Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
+        let resolver = Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
 
         // "unknown_host" is not in the merged view — should fall through to fallback
         let routes = resolver.resolve("unknown_host").unwrap();

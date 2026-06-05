@@ -24,8 +24,7 @@ fn arb_cli_event() -> impl Strategy<Value = CliEvent> {
         // ExitStatus with arbitrary code
         any::<i32>().prop_map(CliEvent::exit_status),
         // Error with arbitrary message and kind
-        ("[^\x00]{0,100}", "[a-z_]{1,20}")
-            .prop_map(|(msg, kind)| CliEvent::error(msg, kind)),
+        ("[^\x00]{0,100}", "[a-z_]{1,20}").prop_map(|(msg, kind)| CliEvent::error(msg, kind)),
         // Info with arbitrary message
         "[^\x00]{0,100}".prop_map(CliEvent::info),
         // AuthPrompt with arbitrary fields
@@ -49,11 +48,12 @@ fn arb_cli_event() -> impl Strategy<Value = CliEvent> {
         ("[a-z]{3,10}", "[^\x00]{0,50}")
             .prop_map(|(action, reason)| CliEvent::ReviewResult { action, reason }),
         // ConfirmRequired
-        ("[a-f0-9]{8,32}", "[^\x00]{0,100}")
-            .prop_map(|(execution_id, reason)| CliEvent::ConfirmRequired {
+        ("[a-f0-9]{8,32}", "[^\x00]{0,100}").prop_map(|(execution_id, reason)| {
+            CliEvent::ConfirmRequired {
                 execution_id,
                 reason,
-            }),
+            }
+        }),
         // CopyComplete
         "[^\x00]{0,100}".prop_map(CliEvent::copy_complete),
     ]

@@ -15,12 +15,12 @@ use async_trait::async_trait;
 use proptest::prelude::*;
 
 use xho::config::{DirectAuth, ServerEntry};
-use xho::protocol::ServerListRow;
-use xho::types::{CopySpec, ServerListSource};
 use xho::daemon::gateway::{
     ErrorKind, ExecRequest, Gateway, GatewayError, GatewayKind, InteractiveHandle,
     InteractiveRequest,
 };
+use xho::protocol::ServerListRow;
+use xho::types::{CopySpec, ServerListSource};
 
 // ---------------------------------------------------------------------------
 // Mock Gateway implementation
@@ -100,7 +100,7 @@ async fn simulate_list_servers(
 /// to ensure uniqueness across gateways.
 fn arb_server_entry_with_prefix(prefix: String) -> impl Strategy<Value = ServerEntry> {
     (
-        "[a-z][a-z0-9]{1,5}",       // alias suffix
+        "[a-z][a-z0-9]{1,5}", // alias suffix
         (1u8..=254u8, 0u8..=255u8, 0u8..=255u8, 1u8..=254u8),
         1u16..=65535u16,
         "[a-z]{1,6}",

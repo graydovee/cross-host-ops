@@ -74,7 +74,7 @@ pub enum ServerListSource {
 
 // --- Address parsing (migrated from jump/address.rs) ---
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 /// Defaults applied when the input string omits user or port.
 #[derive(Clone, Debug)]
@@ -206,10 +206,7 @@ pub fn effective_tty_decision(
 /// 1. --no-stdin → false
 /// 2. --stdin → true
 /// 3. Otherwise → ssh_config.stdin
-pub fn effective_stdin_decision(
-    flags: &ExecStdinFlags,
-    ssh_config: &SshConfig,
-) -> bool {
+pub fn effective_stdin_decision(flags: &ExecStdinFlags, ssh_config: &SshConfig) -> bool {
     if flags.force_no_stdin {
         return false;
     }

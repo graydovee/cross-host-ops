@@ -106,10 +106,12 @@ fn stdin_data_all_256_byte_values() {
     let mut buf = Vec::new();
     stdin_msg.encode(&mut buf).expect("encode should succeed");
 
-    let decoded = rpc::StdinData::decode(buf.as_slice())
-        .expect("decode should succeed");
+    let decoded = rpc::StdinData::decode(buf.as_slice()).expect("decode should succeed");
 
-    assert_eq!(decoded.data, all_bytes, "all 256 byte values must be preserved");
+    assert_eq!(
+        decoded.data, all_bytes,
+        "all 256 byte values must be preserved"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -130,10 +132,12 @@ fn stdin_data_null_bytes() {
     let mut buf = Vec::new();
     stdin_msg.encode(&mut buf).expect("encode should succeed");
 
-    let decoded = rpc::StdinData::decode(buf.as_slice())
-        .expect("decode should succeed");
+    let decoded = rpc::StdinData::decode(buf.as_slice()).expect("decode should succeed");
 
-    assert_eq!(decoded.data, null_bytes, "null byte sequence must be preserved");
+    assert_eq!(
+        decoded.data, null_bytes,
+        "null byte sequence must be preserved"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -155,8 +159,7 @@ fn stdin_data_non_utf8_sequences() {
     let mut buf = Vec::new();
     stdin_msg.encode(&mut buf).expect("encode should succeed");
 
-    let decoded = rpc::StdinData::decode(buf.as_slice())
-        .expect("decode should succeed");
+    let decoded = rpc::StdinData::decode(buf.as_slice()).expect("decode should succeed");
 
     assert_eq!(decoded.data, non_utf8, "non-UTF8 bytes must be preserved");
 }
@@ -179,8 +182,7 @@ fn stdin_data_empty_bytes() {
     let mut buf = Vec::new();
     stdin_msg.encode(&mut buf).expect("encode should succeed");
 
-    let decoded = rpc::StdinData::decode(buf.as_slice())
-        .expect("decode should succeed");
+    let decoded = rpc::StdinData::decode(buf.as_slice()).expect("decode should succeed");
 
     assert_eq!(decoded.data, empty, "empty byte sequence must be preserved");
 }

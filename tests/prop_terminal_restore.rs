@@ -20,7 +20,7 @@
 use proptest::prelude::*;
 use std::os::unix::io::RawFd;
 
-use xho::cli::{set_raw_mode, RawModeGuard};
+use xho::cli::{RawModeGuard, set_raw_mode};
 
 /// Compile-time verification that `RawModeGuard` implements `Drop`.
 /// If this function compiles, the Drop trait is implemented.

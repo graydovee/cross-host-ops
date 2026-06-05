@@ -5,28 +5,28 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
-use russh::client;
-use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
 use russh::ChannelStream;
+use russh::client;
+use russh::keys::{PrivateKeyWithHashAlg, load_secret_key};
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 use tracing::{debug, info};
 
-use crate::daemon::connection_manager::{ManagedSingleton, SingletonLease};
 use crate::daemon::connection::xhod::XhodConnection;
 use crate::daemon::connection::{
     Connection, ExecRequest as ConnExecRequest, InteractiveRequest as ConnInteractiveRequest,
 };
+use crate::daemon::connection_manager::{ManagedSingleton, SingletonLease};
 use crate::daemon::rpc::prefix_source;
 use crate::daemon::ssh_server::remote_subsystem_name;
-use crate::protocol::{self, rpc, ServerListRow};
+use crate::protocol::{self, ServerListRow, rpc};
 use crate::types::CopySpec;
 use crate::types::ServerListSource;
 
-use super::auth::{normalize_paths, parse_remote_target, AuthPrompter, ClientHandler};
+use super::auth::{AuthPrompter, ClientHandler, normalize_paths, parse_remote_target};
 use super::{
     ErrorKind, ExecRequest, Gateway, GatewayError, GatewayKind, InteractiveHandle,
     InteractiveRequest, is_transport_error,
@@ -172,8 +172,13 @@ impl XhodGateway {
         } else {
             Some(config.known_hosts_path.as_str())
         };
-        let (identity_file, _known_hosts_path) = normalize_paths(id_opt, kh_opt)
-            .map_err(|e| anyhow!("failed to normalize paths for {}: {}", config.gateway_name, e))?;
+        let (identity_file, _known_hosts_path) = normalize_paths(id_opt, kh_opt).map_err(|e| {
+            anyhow!(
+                "failed to normalize paths for {}: {}",
+                config.gateway_name,
+                e
+            )
+        })?;
 
         info!(
             gateway = %config.gateway_name,
@@ -240,7 +245,7 @@ impl XhodGateway {
                         target.port,
                         e
                     )
-            })?;
+                })?;
         }
 
         // Open session channel and request the "xho-rpc" subsystem.
@@ -275,15 +280,9 @@ impl XhodGateway {
     ) -> Result<()> {
         let key = load_secret_key(identity_file, None)
             .map_err(|e| anyhow!("failed to load key {}: {}", identity_file, e))?;
-        let hash_alg = handle
-            .best_supported_rsa_hash()
-            .await?
-            .flatten();
+        let hash_alg = handle.best_supported_rsa_hash().await?.flatten();
         let auth = handle
-            .authenticate_publickey(
-                user,
-                PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg),
-            )
+            .authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg))
             .await?;
         if auth.success() {
             Ok(())

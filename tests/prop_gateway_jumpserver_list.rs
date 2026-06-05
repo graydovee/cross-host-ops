@@ -80,12 +80,6 @@ fn arb_mfa_config() -> impl Strategy<Value = MfaConfig> {
     ]
 }
 
-/// Strategy for generating random shell prompt suffixes (kept for reference).
-#[allow(dead_code)]
-fn arb_shell_prompt_suffixes() -> impl Strategy<Value = Vec<String>> {
-    prop::collection::vec("[#$>]{1,3}", 1..=4)
-}
-
 /// Strategy for generating a random JumpserverGatewayConfig.
 fn arb_jumpserver_fields() -> impl Strategy<Value = JumpserverGatewayConfig> {
     (
@@ -98,15 +92,7 @@ fn arb_jumpserver_fields() -> impl Strategy<Value = JumpserverGatewayConfig> {
         arb_mfa_config(),
     )
         .prop_map(
-            |(
-                name,
-                host,
-                port,
-                user,
-                identity_file,
-                pubkey_accepted_algorithms,
-                mfa,
-            )| {
+            |(name, host, port, user, identity_file, pubkey_accepted_algorithms, mfa)| {
                 JumpserverGatewayConfig {
                     name,
                     host,

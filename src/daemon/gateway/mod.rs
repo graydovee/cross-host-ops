@@ -6,17 +6,16 @@ pub mod jumpserver;
 pub mod local;
 pub mod xhod;
 
-
 use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{RwLock, mpsc, oneshot};
 
 use crate::config::GatewayConfig;
-use crate::types::CopySpec;
 use crate::protocol::{ServerEvent, ServerListRow};
+use crate::types::CopySpec;
 
 use self::auth::AuthPrompter;
 use self::jumpserver::JumpserverGateway;
@@ -180,22 +179,34 @@ impl std::error::Error for GatewayError {
 impl GatewayError {
     /// Create a Resolution error from any error source.
     pub fn resolution(source: impl Into<anyhow::Error>) -> Self {
-        Self { kind: ErrorKind::Resolution, source: source.into() }
+        Self {
+            kind: ErrorKind::Resolution,
+            source: source.into(),
+        }
     }
 
     /// Create a Transport error from any error source.
     pub fn transport(source: impl Into<anyhow::Error>) -> Self {
-        Self { kind: ErrorKind::Transport, source: source.into() }
+        Self {
+            kind: ErrorKind::Transport,
+            source: source.into(),
+        }
     }
 
     /// Create an Execution error from any error source.
     pub fn execution(source: impl Into<anyhow::Error>) -> Self {
-        Self { kind: ErrorKind::Execution, source: source.into() }
+        Self {
+            kind: ErrorKind::Execution,
+            source: source.into(),
+        }
     }
 
     /// Create an Unsupported error from any error source.
     pub fn unsupported(source: impl Into<anyhow::Error>) -> Self {
-        Self { kind: ErrorKind::Unsupported, source: source.into() }
+        Self {
+            kind: ErrorKind::Unsupported,
+            source: source.into(),
+        }
     }
 }
 

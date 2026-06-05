@@ -29,10 +29,9 @@ fn arb_remote_source() -> impl Strategy<Value = String> {
 
 /// Generate a non-"local", non-empty remote source (for testing the concatenation branch).
 fn arb_non_local_remote_source() -> impl Strategy<Value = String> {
-    "[a-z][a-z0-9_:-]{0,20}".prop_filter(
-        "must not be \"local\" or empty",
-        |s| s != "local" && !s.is_empty(),
-    )
+    "[a-z][a-z0-9_:-]{0,20}".prop_filter("must not be \"local\" or empty", |s| {
+        s != "local" && !s.is_empty()
+    })
 }
 
 // ---------------------------------------------------------------------------

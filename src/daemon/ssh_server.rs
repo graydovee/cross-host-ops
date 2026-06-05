@@ -130,9 +130,7 @@ impl tokio::io::AsyncWrite for IncomingConn {
     ) -> std::task::Poll<io::Result<()>> {
         match &mut *self {
             IncomingConn::Local(stream) => std::pin::Pin::new(stream).poll_flush(cx),
-            IncomingConn::Remote(stream) => {
-                std::pin::Pin::new(&mut stream.stream).poll_flush(cx)
-            }
+            IncomingConn::Remote(stream) => std::pin::Pin::new(&mut stream.stream).poll_flush(cx),
         }
     }
 
@@ -187,10 +185,7 @@ impl server::Handler for RemoteSshHandler {
                 partial_success: false,
             });
         }
-        if !is_authorized_key(
-            Path::new(&config.server.remote.authorized_keys_path),
-            key,
-        )? {
+        if !is_authorized_key(Path::new(&config.server.remote.authorized_keys_path), key)? {
             return Ok(Auth::Reject {
                 proceed_with_methods: None,
                 partial_success: false,

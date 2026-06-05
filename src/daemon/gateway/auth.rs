@@ -14,9 +14,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use data_encoding::BASE32_NOPAD;
 use hmac::{Hmac, Mac};
+use russh::MethodKind;
 use russh::client::{self, AuthResult, Handle, KeyboardInteractiveAuthResponse};
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, known_hosts, load_secret_key, ssh_key};
-use russh::MethodKind;
 use sha1::Sha1;
 use tokio::time::timeout;
 use tracing::info;
@@ -77,7 +77,10 @@ pub fn parse_remote_target(input: &str) -> Result<RemoteTarget> {
 
 /// Connect to a remote target and retrieve its host key.
 /// Used by the CLI trust flow when adding new xhod hosts.
-pub async fn fetch_remote_host_key(target: &RemoteTarget, identity_file: &str) -> Result<ssh_key::PublicKey> {
+pub async fn fetch_remote_host_key(
+    target: &RemoteTarget,
+    identity_file: &str,
+) -> Result<ssh_key::PublicKey> {
     use std::sync::Mutex;
 
     struct HostKeyCapture {
@@ -142,9 +145,8 @@ pub async fn fetch_remote_host_key(target: &RemoteTarget, identity_file: &str) -
 
 /// Callback for interactive authentication prompts.
 /// Injected into Gateway at construction time.
-pub type AuthPrompter = dyn Fn(AuthPrompt) -> Pin<Box<dyn Future<Output = Result<String>> + Send>>
-    + Send
-    + Sync;
+pub type AuthPrompter =
+    dyn Fn(AuthPrompt) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> + Send + Sync;
 
 /// Authentication prompt payload.
 #[derive(Clone, Debug)]

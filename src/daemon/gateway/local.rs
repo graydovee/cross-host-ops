@@ -11,8 +11,7 @@ use tokio::sync::RwLock;
 use tracing::debug;
 
 use crate::config::{
-    AppConfig, DirectAuth, list_server_entries, load_server_config,
-    resolve_server_entry,
+    AppConfig, DirectAuth, list_server_entries, load_server_config, resolve_server_entry,
 };
 use crate::protocol::ServerListRow;
 use crate::types::{CopySpec, ServerListSource};
@@ -24,8 +23,7 @@ use super::{
 };
 use crate::daemon::connection::direct::DirectConnection;
 use crate::daemon::connection::{
-    Connection, ExecRequest as ConnExecRequest,
-    InteractiveRequest as ConnInteractiveRequest,
+    Connection, ExecRequest as ConnExecRequest, InteractiveRequest as ConnInteractiveRequest,
 };
 use crate::daemon::connection_manager::{ManagedPool, PoolLease};
 
@@ -109,10 +107,7 @@ impl LocalGateway {
             config,
             server_config_path,
             auth_prompter,
-            pool: Arc::new(ManagedPool::new(
-                max_connections_per_address,
-                max_idle_time,
-            )),
+            pool: Arc::new(ManagedPool::new(max_connections_per_address, max_idle_time)),
             max_connections_per_address,
         }
     }
@@ -132,11 +127,7 @@ impl LocalGateway {
 
         let entry = resolve_server_entry(target, server_host_config, &server_config.defaults)
             .map_err(|e| {
-                GatewayError::resolution(anyhow!(
-                    "failed to resolve target '{}': {}",
-                    target,
-                    e
-                ))
+                GatewayError::resolution(anyhow!("failed to resolve target '{}': {}", target, e))
             })?;
 
         Ok(ResolvedTarget {
@@ -357,13 +348,15 @@ impl Gateway for LocalGateway {
 
     async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError> {
         let path = Path::new(&self.server_config_path);
-        let entries = list_server_entries(path).map_err(|e| {
-            GatewayError::resolution(anyhow!("failed to list servers: {}", e))
-        })?;
-        let rows = entries.into_iter().map(|server| ServerListRow {
-            source: ServerListSource::Local,
-            server,
-        }).collect();
+        let entries = list_server_entries(path)
+            .map_err(|e| GatewayError::resolution(anyhow!("failed to list servers: {}", e)))?;
+        let rows = entries
+            .into_iter()
+            .map(|server| ServerListRow {
+                source: ServerListSource::Local,
+                server,
+            })
+            .collect();
         Ok(rows)
     }
 
@@ -399,16 +392,14 @@ mod tests {
 
     #[test]
     fn direct_pool_key_includes_user_and_auth_identity() {
-        let password_key = DirectPoolKey::from_resolved(&resolved_with_auth(
-            DirectAuth::Password {
+        let password_key =
+            DirectPoolKey::from_resolved(&resolved_with_auth(DirectAuth::Password {
                 password: "one".to_string(),
-            },
-        ));
-        let different_password_key = DirectPoolKey::from_resolved(&resolved_with_auth(
-            DirectAuth::Password {
+            }));
+        let different_password_key =
+            DirectPoolKey::from_resolved(&resolved_with_auth(DirectAuth::Password {
                 password: "two".to_string(),
-            },
-        ));
+            }));
         let key_auth = DirectPoolKey::from_resolved(&resolved_with_auth(DirectAuth::Key {
             identity_file: "~/.ssh/id_rsa".to_string(),
         }));
@@ -439,8 +430,7 @@ mod tests {
     #[tokio::test]
     async fn real_gateway_pool_starts_empty_with_configured_capacity() {
         let config = Arc::new(RwLock::new(AppConfig::default()));
-        let auth_prompter: Arc<AuthPrompter> =
-            Arc::new(|_| Box::pin(async { Ok(String::new()) }));
+        let auth_prompter: Arc<AuthPrompter> = Arc::new(|_| Box::pin(async { Ok(String::new()) }));
         let gateway = LocalGateway::new(
             "test".to_string(),
             config,
@@ -451,6 +441,11 @@ mod tests {
         );
 
         assert_eq!(gateway.max_connections_per_address, 3);
-        assert!(gateway.pool.status_snapshot_with(|key| key.label()).is_empty());
+        assert!(
+            gateway
+                .pool
+                .status_snapshot_with(|key| key.label())
+                .is_empty()
+        );
     }
 }

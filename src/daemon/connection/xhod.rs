@@ -8,8 +8,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tracing::warn;
 
+use crate::protocol::{ServerEvent, rpc};
 use crate::types::{CopyDirection, CopySpec};
-use crate::protocol::{rpc, ServerEvent};
 
 use super::{Connection, ExecRequest, InteractiveHandle, InteractiveRequest};
 
@@ -66,9 +66,10 @@ impl Connection for XhodConnection {
         };
 
         let (req_tx, req_rx) = mpsc::channel::<rpc::ExecuteRequest>(4);
-        req_tx.send(start).await.map_err(|_| {
-            anyhow::anyhow!("failed to send start request into stream")
-        })?;
+        req_tx
+            .send(start)
+            .await
+            .map_err(|_| anyhow::anyhow!("failed to send start request into stream"))?;
 
         // Build the request stream and start the bidirectional RPC FIRST,
         // so that tonic begins consuming the stream and forwarding messages
@@ -78,11 +79,7 @@ impl Connection for XhodConnection {
         // before tonic has a chance to set up the HTTP/2 stream, which on
         // SSH-tunneled gRPC has been observed to drop buffered messages.
         let request_stream = ReceiverStream::new(req_rx);
-        let mut response_stream = self
-            .client
-            .execute(request_stream)
-            .await?
-            .into_inner();
+        let mut response_stream = self.client.execute(request_stream).await?.into_inner();
 
         // Hold a clone of req_tx for the duration of the RPC so the request
         // stream stays open even after the relay task finishes.  This is
@@ -111,8 +108,16 @@ impl Connection for XhodConnection {
                             )),
                         };
                         match req_tx.send(msg).await {
-                            Ok(_) => tracing::info!(sent_chunks, sent_bytes, "xhod-relay: forwarded explicit EOF sentinel"),
-                            Err(_) => tracing::info!(sent_chunks, sent_bytes, "xhod-relay: failed to forward EOF sentinel"),
+                            Ok(_) => tracing::info!(
+                                sent_chunks,
+                                sent_bytes,
+                                "xhod-relay: forwarded explicit EOF sentinel"
+                            ),
+                            Err(_) => tracing::info!(
+                                sent_chunks,
+                                sent_bytes,
+                                "xhod-relay: failed to forward EOF sentinel"
+                            ),
                         }
                         break;
                     }
@@ -120,14 +125,20 @@ impl Connection for XhodConnection {
                     sent_chunks += 1;
                     let len = data.len();
                     let msg = rpc::ExecuteRequest {
-                        request: Some(rpc::execute_request::Request::StdinData(
-                            rpc::StdinData { data },
-                        )),
+                        request: Some(rpc::execute_request::Request::StdinData(rpc::StdinData {
+                            data,
+                        })),
                     };
                     match req_tx.send(msg).await {
-                        Ok(_) => tracing::info!(len, sent_chunks, "xhod-relay: forwarded StdinData"),
+                        Ok(_) => {
+                            tracing::info!(len, sent_chunks, "xhod-relay: forwarded StdinData")
+                        }
                         Err(_) => {
-                            tracing::info!(sent_chunks, sent_bytes, "xhod-relay: send failed, stopping");
+                            tracing::info!(
+                                sent_chunks,
+                                sent_bytes,
+                                "xhod-relay: send failed, stopping"
+                            );
                             return;
                         }
                     }
@@ -135,11 +146,15 @@ impl Connection for XhodConnection {
                 // If we reached here without seeing an explicit empty sentinel
                 // (i.e. rx was dropped without sending one), still emit one so
                 // the remote daemon can stop waiting for stdin.
-                tracing::info!(sent_chunks, sent_bytes, "xhod-relay: rx exhausted without sentinel, emitting fallback EOF");
+                tracing::info!(
+                    sent_chunks,
+                    sent_bytes,
+                    "xhod-relay: rx exhausted without sentinel, emitting fallback EOF"
+                );
                 let eof = rpc::ExecuteRequest {
-                    request: Some(rpc::execute_request::Request::StdinData(
-                        rpc::StdinData { data: Vec::new() },
-                    )),
+                    request: Some(rpc::execute_request::Request::StdinData(rpc::StdinData {
+                        data: Vec::new(),
+                    })),
                 };
                 let _ = req_tx.send(eof).await;
                 // req_tx (the relay clone) drops here.  The keepalive clone
@@ -156,10 +171,14 @@ impl Connection for XhodConnection {
             if let Some(event) = response.event {
                 match event {
                     rpc::execute_response::Event::Stdout(chunk) => {
-                        let _ = request.sender.send(ServerEvent::Stdout { data: chunk.data });
+                        let _ = request
+                            .sender
+                            .send(ServerEvent::Stdout { data: chunk.data });
                     }
                     rpc::execute_response::Event::Stderr(chunk) => {
-                        let _ = request.sender.send(ServerEvent::Stderr { data: chunk.data });
+                        let _ = request
+                            .sender
+                            .send(ServerEvent::Stderr { data: chunk.data });
                     }
                     rpc::execute_response::Event::ExitStatus(status) => {
                         exit_code = Some(status.code);
@@ -247,9 +266,10 @@ impl Connection for XhodConnection {
 
         // Use a larger channel buffer for file streaming.
         let (req_tx, req_rx) = mpsc::channel::<rpc::CopyRequest>(16);
-        req_tx.send(start).await.map_err(|_| {
-            anyhow::anyhow!("failed to send copy start request into stream")
-        })?;
+        req_tx
+            .send(start)
+            .await
+            .map_err(|_| anyhow::anyhow!("failed to send copy start request into stream"))?;
 
         // Take relay channels out of spec (they are not Clone).
         let relay_upload_rx = spec.relay_upload_rx.take();
@@ -367,9 +387,8 @@ impl Connection for XhodConnection {
                             use tokio::io::AsyncWriteExt as _;
 
                             if download_file.is_none() {
-                                let f = tokio::fs::File::create(&local_path)
-                                    .await
-                                    .map_err(|e| {
+                                let f =
+                                    tokio::fs::File::create(&local_path).await.map_err(|e| {
                                         anyhow::anyhow!(
                                             "download: failed to create local file {:?}: {}",
                                             local_path,
@@ -433,16 +452,13 @@ impl Connection for XhodConnection {
         };
 
         let (req_tx, req_rx) = mpsc::channel::<rpc::ExecuteRequest>(32);
-        req_tx.send(start).await.map_err(|_| {
-            anyhow::anyhow!("failed to send interactive start request into stream")
-        })?;
+        req_tx
+            .send(start)
+            .await
+            .map_err(|_| anyhow::anyhow!("failed to send interactive start request into stream"))?;
 
         let request_stream = ReceiverStream::new(req_rx);
-        let mut response_stream = self
-            .client
-            .execute(request_stream)
-            .await?
-            .into_inner();
+        let mut response_stream = self.client.execute(request_stream).await?.into_inner();
 
         // Set up the InteractiveHandle channels.
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(32);
@@ -547,14 +563,14 @@ impl Connection for XhodConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper_util::rt::TokioIo;
+    use proptest::prelude::*;
     use std::sync::Arc;
     use tokio::sync::Mutex as AsyncMutex;
+    use tokio_stream::wrappers::ReceiverStream;
     use tonic::transport::{Channel, Endpoint, Server, Uri};
     use tonic::{Request, Response, Status, Streaming};
     use tower::service_fn;
-    use hyper_util::rt::TokioIo;
-    use tokio_stream::wrappers::ReceiverStream;
-    use proptest::prelude::*;
 
     use crate::protocol::ServerEvent;
 
@@ -599,13 +615,10 @@ mod tests {
             tokio::spawn(async move {
                 // Collect messages with a 200ms window to gather any
                 // StdinData that might be forwarded (none on unfixed code).
-                let collect_deadline = tokio::time::Instant::now()
-                    + tokio::time::Duration::from_millis(200);
+                let collect_deadline =
+                    tokio::time::Instant::now() + tokio::time::Duration::from_millis(200);
                 loop {
-                    match tokio::time::timeout_at(
-                        collect_deadline,
-                        inbound.message(),
-                    ).await {
+                    match tokio::time::timeout_at(collect_deadline, inbound.message()).await {
                         Ok(Ok(Some(msg))) => {
                             log.lock().await.messages.push(msg);
                         }
@@ -614,11 +627,13 @@ mod tests {
                     }
                 }
                 // Send exit status so the XhodConnection caller can complete.
-                let _ = resp_tx.send(Ok(crate::protocol::rpc::ExecuteResponse {
-                    event: Some(crate::protocol::rpc::execute_response::Event::ExitStatus(
-                        crate::protocol::rpc::ExitStatus { code: 42 },
-                    )),
-                })).await;
+                let _ = resp_tx
+                    .send(Ok(crate::protocol::rpc::ExecuteResponse {
+                        event: Some(crate::protocol::rpc::execute_response::Event::ExitStatus(
+                            crate::protocol::rpc::ExitStatus { code: 42 },
+                        )),
+                    }))
+                    .await;
             });
 
             Ok(Response::new(ReceiverStream::new(resp_rx)))
@@ -634,49 +649,57 @@ mod tests {
             tokio::spawn(async move {
                 // Collect messages with a short window — same reason as execute:
                 // on buggy code req_tx stays alive without sending more messages.
-                let collect_deadline = tokio::time::Instant::now()
-                    + tokio::time::Duration::from_millis(200);
+                let collect_deadline =
+                    tokio::time::Instant::now() + tokio::time::Duration::from_millis(200);
                 loop {
-                    match tokio::time::timeout_at(
-                        collect_deadline,
-                        inbound.message(),
-                    ).await {
-                        Ok(Ok(Some(msg))) => { let _ = tx.send(msg); }
+                    match tokio::time::timeout_at(collect_deadline, inbound.message()).await {
+                        Ok(Ok(Some(msg))) => {
+                            let _ = tx.send(msg);
+                        }
                         _ => break,
                     }
                 }
                 // Send completion so XhodConnection copy() returns.
-                let _ = resp_tx.send(Ok(crate::protocol::rpc::CopyResponse {
-                    event: Some(crate::protocol::rpc::copy_response::Event::Complete(
-                        crate::protocol::rpc::CopyComplete { message: String::new() },
-                    )),
-                })).await;
+                let _ = resp_tx
+                    .send(Ok(crate::protocol::rpc::CopyResponse {
+                        event: Some(crate::protocol::rpc::copy_response::Event::Complete(
+                            crate::protocol::rpc::CopyComplete {
+                                message: String::new(),
+                            },
+                        )),
+                    }))
+                    .await;
             });
             Ok(Response::new(ReceiverStream::new(resp_rx)))
         }
 
         async fn status(
-            &self, _: Request<crate::protocol::rpc::StatusRequest>,
+            &self,
+            _: Request<crate::protocol::rpc::StatusRequest>,
         ) -> Result<Response<crate::protocol::rpc::StatusResponse>, Status> {
             Ok(Response::new(Default::default()))
         }
         async fn list_servers(
-            &self, _: Request<crate::protocol::rpc::ServerListRequest>,
+            &self,
+            _: Request<crate::protocol::rpc::ServerListRequest>,
         ) -> Result<Response<crate::protocol::rpc::ServerListResponse>, Status> {
             Ok(Response::new(Default::default()))
         }
         async fn shutdown(
-            &self, _: Request<crate::protocol::rpc::ShutdownRequest>,
+            &self,
+            _: Request<crate::protocol::rpc::ShutdownRequest>,
         ) -> Result<Response<crate::protocol::rpc::InfoResponse>, Status> {
             Ok(Response::new(Default::default()))
         }
         async fn update_config(
-            &self, _: Request<crate::protocol::rpc::UpdateConfigRequest>,
+            &self,
+            _: Request<crate::protocol::rpc::UpdateConfigRequest>,
         ) -> Result<Response<crate::protocol::rpc::UpdateConfigResponse>, Status> {
             Ok(Response::new(Default::default()))
         }
         async fn list_gateways(
-            &self, _: Request<crate::protocol::rpc::ListGatewaysRequest>,
+            &self,
+            _: Request<crate::protocol::rpc::ListGatewaysRequest>,
         ) -> Result<Response<crate::protocol::rpc::ListGatewaysResponse>, Status> {
             Ok(Response::new(Default::default()))
         }
@@ -705,12 +728,10 @@ mod tests {
 
         tokio::spawn(async move {
             Server::builder()
-                .add_service(
-                    crate::protocol::rpc::xho_rpc_server::XhoRpcServer::new(server),
-                )
-                .serve_with_incoming(tokio_stream::once(
-                    Ok::<_, std::io::Error>(server_io),
+                .add_service(crate::protocol::rpc::xho_rpc_server::XhoRpcServer::new(
+                    server,
                 ))
+                .serve_with_incoming(tokio_stream::once(Ok::<_, std::io::Error>(server_io)))
                 .await
                 .ok();
         });
@@ -757,7 +778,10 @@ mod tests {
     fn make_exec_request_with_stdin(
         argv: Vec<String>,
         stdin_data: Vec<u8>,
-    ) -> (ExecRequest, tokio::sync::mpsc::UnboundedReceiver<ServerEvent>) {
+    ) -> (
+        ExecRequest,
+        tokio::sync::mpsc::UnboundedReceiver<ServerEvent>,
+    ) {
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<ServerEvent>();
         // Buffer the entire payload in the channel before exec() is called,
         // then drop the sender so the receiver will return None after reading.
@@ -1439,5 +1463,4 @@ mod tests {
             })?;
         }
     }
-
 } // end #[cfg(test)] mod tests

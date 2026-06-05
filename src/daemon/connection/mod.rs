@@ -3,15 +3,15 @@
 
 pub mod direct;
 pub mod jumpserver;
-pub mod xhod;
 pub mod shared;
+pub mod xhod;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::types::CopySpec;
 use crate::protocol::ServerEvent;
+use crate::types::CopySpec;
 
 // ---------------------------------------------------------------------------
 // Placeholder types for the Connection trait.
@@ -81,7 +81,8 @@ pub(super) trait Connection: Send {
     async fn copy(&mut self, spec: CopySpec) -> Result<()>;
 
     /// Open an interactive PTY session.
-    async fn exec_interactive(&mut self, request: &InteractiveRequest) -> Result<InteractiveHandle>;
+    async fn exec_interactive(&mut self, request: &InteractiveRequest)
+    -> Result<InteractiveHandle>;
 
     /// Check whether the connection is still alive.
     fn is_alive(&self) -> bool;

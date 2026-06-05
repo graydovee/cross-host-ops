@@ -6,13 +6,12 @@ use anyhow::{Result, anyhow};
 use tracing::warn;
 
 use crate::config::{ServerEntry, load_server_config};
+use crate::protocol::ServerListSourceStatus;
 use crate::types::CopySpec;
 use crate::types::ServerListSource;
-use crate::protocol::ServerListSourceStatus;
 
-
-use super::gateway::{ErrorKind, ExecRequest};
 use super::DaemonState;
+use super::gateway::{ErrorKind, ExecRequest};
 use super::resolver::Resolver;
 
 /// Apply path prefix logic to a remote source string.
@@ -40,9 +39,8 @@ pub async fn process_execute(
     request: &ExecRequest,
 ) -> Result<i32> {
     let config = state.config.read().await.clone();
-    let server_config =
-        load_server_config(std::path::Path::new(&config.ssh.server_config_path))
-            .unwrap_or_default();
+    let server_config = load_server_config(std::path::Path::new(&config.ssh.server_config_path))
+        .unwrap_or_default();
     let resolver = Resolver::new(&config, &server_config, &config.gateways);
     let routes = resolver.resolve(target)?;
 
@@ -69,15 +67,10 @@ pub async fn process_execute(
 /// Process a copy request by resolving routes and iterating candidates.
 ///
 /// Same multi-candidate fallback logic as process_execute.
-pub async fn process_copy(
-    state: &DaemonState,
-    target: &str,
-    spec: CopySpec,
-) -> Result<()> {
+pub async fn process_copy(state: &DaemonState, target: &str, spec: CopySpec) -> Result<()> {
     let config = state.config.read().await.clone();
-    let server_config =
-        load_server_config(std::path::Path::new(&config.ssh.server_config_path))
-            .unwrap_or_default();
+    let server_config = load_server_config(std::path::Path::new(&config.ssh.server_config_path))
+        .unwrap_or_default();
     let resolver = Resolver::new(&config, &server_config, &config.gateways);
     let routes = resolver.resolve(target)?;
 
@@ -107,7 +100,10 @@ pub async fn process_copy(
 /// Returns a tuple of (rows with source tags, source status) for building the RPC response.
 pub async fn process_list_servers(
     state: &DaemonState,
-) -> (Vec<(ServerEntry, ServerListSource)>, Vec<(ServerListSource, ServerListSourceStatus)>) {
+) -> (
+    Vec<(ServerEntry, ServerListSource)>,
+    Vec<(ServerListSource, ServerListSourceStatus)>,
+) {
     let mut results: Vec<(ServerEntry, ServerListSource)> = Vec::new();
     let mut source_status: Vec<(ServerListSource, ServerListSourceStatus)> = Vec::new();
 
@@ -148,5 +144,3 @@ pub async fn process_list_servers(
 
     (results, source_status)
 }
-
-

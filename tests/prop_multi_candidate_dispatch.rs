@@ -20,12 +20,12 @@ use tokio::sync::mpsc;
 
 use std::collections::HashMap;
 
-use xho::types::CopySpec;
-use xho::protocol::ServerListRow;
 use xho::daemon::gateway::{
     ErrorKind, ExecRequest, Gateway, GatewayError, GatewayKind, InteractiveHandle,
     InteractiveRequest, Route,
 };
+use xho::protocol::ServerListRow;
+use xho::types::CopySpec;
 
 // ---------------------------------------------------------------------------
 // Mock Gateway that returns configurable results and records call order.
@@ -83,12 +83,14 @@ impl Gateway for MockGateway {
 
         match result {
             MockResult::Ok(code) => Ok(code),
-            MockResult::ResolutionError => {
-                Err(GatewayError::resolution(anyhow::anyhow!("not found: {}", target)))
-            }
-            MockResult::ExecutionError => {
-                Err(GatewayError::execution(anyhow::anyhow!("exec failed: {}", target)))
-            }
+            MockResult::ResolutionError => Err(GatewayError::resolution(anyhow::anyhow!(
+                "not found: {}",
+                target
+            ))),
+            MockResult::ExecutionError => Err(GatewayError::execution(anyhow::anyhow!(
+                "exec failed: {}",
+                target
+            ))),
         }
     }
 
@@ -166,7 +168,7 @@ fn arb_mock_result() -> impl Strategy<Value = MockResult> {
 /// Strategy for generating a single route candidate.
 fn arb_route() -> impl Strategy<Value = (Route, MockResult)> {
     (
-        "[a-z]{3,8}",  // gateway_name
+        "[a-z]{3,8}",     // gateway_name
         "[a-z0-9]{3,12}", // end_target
         arb_mock_result(),
     )

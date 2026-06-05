@@ -110,8 +110,7 @@ fn window_resize_minimum_size() {
     let mut buf = Vec::new();
     resize_msg.encode(&mut buf).expect("encode should succeed");
 
-    let decoded = rpc::WindowResize::decode(buf.as_slice())
-        .expect("decode should succeed");
+    let decoded = rpc::WindowResize::decode(buf.as_slice()).expect("decode should succeed");
 
     assert_eq!(decoded.cols, 1, "minimum cols must be preserved");
     assert_eq!(decoded.rows, 1, "minimum rows must be preserved");
@@ -128,11 +127,11 @@ fn window_resize_minimum_size() {
 fn window_resize_maximum_reasonable_sizes() {
     // Large but reasonable terminal sizes
     let test_cases: Vec<(u32, u32)> = vec![
-        (500, 200),   // max from our generator range
-        (320, 100),   // 4K ultra-wide
-        (240, 67),    // typical large terminal
-        (80, 24),     // classic VT100
-        (132, 43),    // classic VT132
+        (500, 200), // max from our generator range
+        (320, 100), // 4K ultra-wide
+        (240, 67),  // typical large terminal
+        (80, 24),   // classic VT100
+        (132, 43),  // classic VT132
     ];
 
     for (cols, rows) in test_cases {
@@ -141,8 +140,7 @@ fn window_resize_maximum_reasonable_sizes() {
         let mut buf = Vec::new();
         resize_msg.encode(&mut buf).expect("encode should succeed");
 
-        let decoded = rpc::WindowResize::decode(buf.as_slice())
-            .expect("decode should succeed");
+        let decoded = rpc::WindowResize::decode(buf.as_slice()).expect("decode should succeed");
 
         assert_eq!(decoded.cols, cols, "cols {} must be preserved", cols);
         assert_eq!(decoded.rows, rows, "rows {} must be preserved", rows);

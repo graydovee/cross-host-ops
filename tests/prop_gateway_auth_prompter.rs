@@ -17,11 +17,9 @@ use std::sync::Arc;
 use proptest::prelude::*;
 
 use xho::config::MfaConfig;
-use xho::daemon::gateway::auth::{generate_totp, AuthPrompt, AuthPrompter};
+use xho::config::{AppConfig, GatewayConfig, JumpserverGatewayConfig, XhodGatewayConfig};
+use xho::daemon::gateway::auth::{AuthPrompt, AuthPrompter, generate_totp};
 use xho::daemon::gateway::build_gateways;
-use xho::config::{
-    AppConfig, GatewayConfig, XhodGatewayConfig, JumpserverGatewayConfig,
-};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -45,11 +43,7 @@ fn panic_auth_prompter() -> Arc<AuthPrompter> {
 /// Base32 without padding requires the encoded length to satisfy: len % 8 != 1, 3, or 6.
 /// We use lengths that are multiples of 8 (16, 24, 32) to guarantee valid base32.
 fn arb_valid_base32_secret() -> impl Strategy<Value = String> {
-    prop_oneof![
-        "[A-Z2-7]{16}",
-        "[A-Z2-7]{24}",
-        "[A-Z2-7]{32}",
-    ]
+    prop_oneof!["[A-Z2-7]{16}", "[A-Z2-7]{24}", "[A-Z2-7]{32}",]
 }
 
 /// Strategy for generating a valid MfaConfig with a non-empty totp_secret_base32.
@@ -121,8 +115,8 @@ fn arb_jumpserver_with_totp(name: String) -> impl Strategy<Value = GatewayConfig
 
 /// Strategy for generating a Jumpserver GatewayConfig without TOTP (empty secret).
 fn arb_jumpserver_without_totp(name: String) -> impl Strategy<Value = GatewayConfig> {
-    (arb_host(), 1u16..=65535u16, arb_user(), arb_file_path())
-        .prop_map(move |(host, port, user, identity_file)| {
+    (arb_host(), 1u16..=65535u16, arb_user(), arb_file_path()).prop_map(
+        move |(host, port, user, identity_file)| {
             GatewayConfig::Jumpserver(JumpserverGatewayConfig {
                 name: name.clone(),
                 host,
@@ -134,7 +128,8 @@ fn arb_jumpserver_without_totp(name: String) -> impl Strategy<Value = GatewayCon
                 totp_digits: 6,
                 totp_period: 30,
             })
-        })
+        },
+    )
 }
 
 /// Strategy for generating a Xhod GatewayConfig (always has key credential).

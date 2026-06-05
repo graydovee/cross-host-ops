@@ -5,33 +5,29 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::{debug, info};
 
 use crate::config::{AppConfig, JumpserverGatewayConfig, MfaConfig};
+use crate::daemon::connection::jumpserver::JumpserverConnection;
+use crate::daemon::connection::shared::{PtyShell, request_default_pty};
 use crate::daemon::connection::{
     Connection, ExecRequest as ConnExecRequest, InteractiveRequest as ConnInteractiveRequest,
 };
-use crate::daemon::connection::jumpserver::JumpserverConnection;
-use crate::daemon::connection::shared::{request_default_pty, PtyShell};
 use crate::daemon::connection_manager::{ManagedSingleton, SingletonLease};
 use crate::daemon::resolver::derive_target_ip;
 use crate::protocol::ServerListRow;
 use crate::types::CopySpec;
 
-use super::auth::{
-    AuthPrompt, AuthPrompter, ClientHandler, authenticate_with_key, connect_handle,
-};
+use super::auth::{AuthPrompt, AuthPrompter, ClientHandler, authenticate_with_key, connect_handle};
 use super::{
     ErrorKind, ExecRequest, Gateway, GatewayError, GatewayKind, InteractiveHandle,
     InteractiveRequest, is_transport_error,
 };
 
-/// Hardcoded prompt detection strings for jumpserver interactive shells.
-/// These values are specific to the jumpserver protocol and do not vary
-/// between deployments; only auth credentials differ.
+const MENU_PROMPT_CONTAINS: &str = "Opt";
 const MFA_PROMPT_CONTAINS: &str = "MFA";
 const SHELL_PROMPT_SUFFIXES: &[&str] = &["$ ", "# "];
 
@@ -69,9 +65,7 @@ impl JumpserverGateway {
         }
     }
 
-    async fn ensure_transport(
-        &self,
-    ) -> Result<SingletonLease<JumpserverTransport>, GatewayError> {
+    async fn ensure_transport(&self) -> Result<SingletonLease<JumpserverTransport>, GatewayError> {
         for attempt in 0..=1 {
             let result = self
                 .transport
@@ -118,12 +112,11 @@ impl JumpserverGateway {
         } else {
             Some(&mfa_config)
         };
-        let auth_prompter: Option<&AuthPrompter> =
-            if mfa_config.totp_secret_base32.is_empty() {
-                Some(self.auth_prompter.as_ref())
-            } else {
-                None
-            };
+        let auth_prompter: Option<&AuthPrompter> = if mfa_config.totp_secret_base32.is_empty() {
+            Some(self.auth_prompter.as_ref())
+        } else {
+            None
+        };
 
         authenticate_with_key(
             &mut handle,
@@ -168,10 +161,7 @@ impl JumpserverGateway {
                 )));
             }
             let channel = guard.handle.channel_open_session().await.map_err(|e| {
-                GatewayError::transport(anyhow!(
-                    "failed to open jumpserver PTY channel: {}",
-                    e
-                ))
+                GatewayError::transport(anyhow!("failed to open jumpserver PTY channel: {}", e))
             })?;
             (channel, guard.connect_timeout)
         };
@@ -181,27 +171,25 @@ impl JumpserverGateway {
         })?;
         let mut shell = PtyShell::new(
             channel,
-            SHELL_PROMPT_SUFFIXES.iter().map(|s| s.to_string()).collect(),
+            SHELL_PROMPT_SUFFIXES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             connect_timeout,
         );
         shell.request_shell().await.map_err(|e| {
             GatewayError::transport(anyhow!("failed to start jumpserver shell: {}", e))
         })?;
 
-        self.navigate_initial_shell(&mut shell).await.map_err(|e| {
-            if is_transport_error(&e) {
-                GatewayError::transport(e)
-            } else {
-                GatewayError::execution(e)
-            }
-        })?;
-        self.navigate_to_target(&mut shell, target).await.map_err(|e| {
-            if is_transport_error(&e) {
-                GatewayError::transport(e)
-            } else {
-                GatewayError::execution(e)
-            }
-        })?;
+        self.establish_target_shell(&mut shell, target)
+            .await
+            .map_err(|e| {
+                if is_transport_error(&e) {
+                    GatewayError::transport(e)
+                } else {
+                    GatewayError::execution(e)
+                }
+            })?;
         Ok(shell)
     }
 
@@ -234,7 +222,11 @@ impl JumpserverGateway {
         unreachable!("jumpserver shell preparation loop is bounded")
     }
 
-    async fn navigate_initial_shell(&self, shell: &mut PtyShell) -> Result<()> {
+    async fn establish_target_shell(&self, shell: &mut PtyShell, target: &str) -> Result<()> {
+        let ip = derive_target_ip(target);
+        debug!(gateway = %self.gateway_name, target = %target, ip = %ip, "waiting for jumpserver menu");
+
+        let mut selected = false;
         let mut mfa_sent = false;
         loop {
             let chunk = shell.read_chunk().await?;
@@ -261,28 +253,23 @@ impl JumpserverGateway {
                 shell.write_line(&code).await?;
                 shell.clear_pending();
                 mfa_sent = true;
+                info!(gateway = %self.gateway_name, target = %target, "jumpserver MFA completed");
                 continue;
             }
 
-            if shell.pending_has_prompt() {
+            if !selected && text.contains(MENU_PROMPT_CONTAINS) {
+                debug!(gateway = %self.gateway_name, target = %target, ip = %ip, "jumpserver menu detected, selecting target");
+                shell.write_line(&ip).await?;
+                shell.clear_pending();
+                selected = true;
+                continue;
+            }
+
+            if selected && shell.pending_has_prompt() {
+                debug!(gateway = %self.gateway_name, target = %target, "remote shell prompt detected");
                 break;
             }
         }
-        shell.clear_pending();
-
-        shell.write_line("stty -echo").await?;
-        shell.wait_for_prompt().await?;
-        shell.clear_pending();
-
-        Ok(())
-    }
-
-    async fn navigate_to_target(&self, shell: &mut PtyShell, target: &str) -> Result<()> {
-        let ip = derive_target_ip(target);
-        debug!(gateway = %self.gateway_name, target = %target, ip = %ip, "navigating to target");
-
-        shell.write_line(&ip).await?;
-        shell.wait_for_prompt().await?;
         shell.clear_pending();
 
         shell.write_line("stty -echo").await?;

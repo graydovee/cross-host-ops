@@ -14,7 +14,7 @@ use std::sync::Arc;
 use proptest::prelude::*;
 
 use xho::config::{
-    AppConfig, GatewayConfig, XhodGatewayConfig, JumpserverGatewayConfig, DirectGatewayConfig,
+    AppConfig, DirectGatewayConfig, GatewayConfig, JumpserverGatewayConfig, XhodGatewayConfig,
 };
 use xho::daemon::gateway::auth::{AuthPrompt, AuthPrompter};
 use xho::daemon::gateway::build_gateways;
@@ -87,13 +87,8 @@ fn arb_xhod_gateway(name: String) -> impl Strategy<Value = GatewayConfig> {
 
 /// Strategy for generating a Jumpserver GatewayConfig.
 fn arb_jumpserver_gateway(name: String) -> impl Strategy<Value = GatewayConfig> {
-    (
-        arb_host(),
-        1u16..=65535u16,
-        arb_user(),
-        arb_file_path(),
-    )
-        .prop_map(move |(host, port, user, identity_file)| {
+    (arb_host(), 1u16..=65535u16, arb_user(), arb_file_path()).prop_map(
+        move |(host, port, user, identity_file)| {
             GatewayConfig::Jumpserver(JumpserverGatewayConfig {
                 name: name.clone(),
                 host,
@@ -105,7 +100,8 @@ fn arb_jumpserver_gateway(name: String) -> impl Strategy<Value = GatewayConfig> 
                 totp_digits: 6,
                 totp_period: 30,
             })
-        })
+        },
+    )
 }
 
 /// Strategy for generating a Direct GatewayConfig.

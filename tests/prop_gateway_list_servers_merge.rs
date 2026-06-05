@@ -15,12 +15,12 @@ use async_trait::async_trait;
 use proptest::prelude::*;
 
 use xho::config::{DirectAuth, ServerEntry};
-use xho::protocol::ServerListRow;
-use xho::types::{CopySpec, ServerListSource};
 use xho::daemon::gateway::{
     ErrorKind, ExecRequest, Gateway, GatewayError, GatewayKind, InteractiveHandle,
     InteractiveRequest,
 };
+use xho::protocol::ServerListRow;
+use xho::types::{CopySpec, ServerListSource};
 
 // ---------------------------------------------------------------------------
 // Mock Gateway implementations
@@ -120,9 +120,7 @@ impl Gateway for UnsupportedGateway {
 
 /// Simulates the daemon's list_servers merge logic as specified in the design.
 /// Iterates the Vec in order, preserving gateway declaration ordering.
-async fn merge_list_servers(
-    gateways: &[(String, Arc<dyn Gateway>)],
-) -> Vec<ServerListRow> {
+async fn merge_list_servers(gateways: &[(String, Arc<dyn Gateway>)]) -> Vec<ServerListRow> {
     let mut results = Vec::new();
     for (_name, gateway) in gateways {
         match gateway.list_servers().await {
@@ -141,11 +139,11 @@ async fn merge_list_servers(
 /// Strategy for generating a random ServerEntry.
 fn arb_server_entry() -> impl Strategy<Value = ServerEntry> {
     (
-        "[a-z][a-z0-9]{1,7}",       // alias
+        "[a-z][a-z0-9]{1,7}",                                 // alias
         (1u8..=254u8, 0u8..=255u8, 0u8..=255u8, 1u8..=254u8), // host parts
-        1u16..=65535u16,             // port
-        "[a-z]{1,8}",               // user
-        any::<bool>(),              // use key or password
+        1u16..=65535u16,                                      // port
+        "[a-z]{1,8}",                                         // user
+        any::<bool>(),                                        // use key or password
     )
         .prop_map(|(alias, (a, b, c, d), port, user, use_key)| {
             let host = format!("{}.{}.{}.{}", a, b, c, d);
@@ -194,10 +192,7 @@ fn arb_gateway_behavior() -> impl Strategy<Value = GatewayBehavior> {
 
 /// Strategy for generating a set of 2-5 gateways with unique names and behaviors.
 fn arb_gateway_set() -> impl Strategy<Value = Vec<(String, GatewayBehavior)>> {
-    proptest::collection::vec(
-        ("[a-z]{2,8}", arb_gateway_behavior()),
-        2..=5,
-    )
+    proptest::collection::vec(("[a-z]{2,8}", arb_gateway_behavior()), 2..=5)
         .prop_map(|gateways| {
             // Ensure unique names
             let mut seen = std::collections::HashSet::new();
@@ -206,16 +201,17 @@ fn arb_gateway_set() -> impl Strategy<Value = Vec<(String, GatewayBehavior)>> {
                 .filter(|(name, _)| seen.insert(name.clone()))
                 .collect()
         })
-        .prop_filter("need at least 2 gateways", |gws: &Vec<(String, GatewayBehavior)>| gws.len() >= 2)
+        .prop_filter(
+            "need at least 2 gateways",
+            |gws: &Vec<(String, GatewayBehavior)>| gws.len() >= 2,
+        )
 }
 
 // ---------------------------------------------------------------------------
 // Helper: build gateways Vec from test data.
 // ---------------------------------------------------------------------------
 
-fn build_gateways(
-    gateway_set: &[(String, GatewayBehavior)],
-) -> Vec<(String, Arc<dyn Gateway>)> {
+fn build_gateways(gateway_set: &[(String, GatewayBehavior)]) -> Vec<(String, Arc<dyn Gateway>)> {
     let mut gateways: Vec<(String, Arc<dyn Gateway>)> = Vec::new();
 
     for (name, behavior) in gateway_set {

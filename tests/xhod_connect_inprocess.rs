@@ -33,7 +33,9 @@ async fn connect_end_to_end_list_servers() {
 #[tokio::test]
 async fn connect_exec_nonexistent_target_errors() {
     let mut harness = InProcessRpcHarness::new().await;
-    let events = harness.execute("nonexistent-host", &["echo", "hello"]).await;
+    let events = harness
+        .execute("nonexistent-host", &["echo", "hello"])
+        .await;
 
     // Should get an error event (target not found)
     let has_error = events.iter().any(|e| {

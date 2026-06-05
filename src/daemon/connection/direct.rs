@@ -15,8 +15,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
 use crate::config::{AppConfig, DirectAuth};
-use crate::types::{CopyDirection, CopySpec};
 use crate::protocol::ServerEvent;
+use crate::types::{CopyDirection, CopySpec};
 
 use super::shared::build_final_command;
 use super::{Connection, ExecRequest, InteractiveHandle, InteractiveRequest};
@@ -67,13 +67,8 @@ impl DirectConnection {
         let mut handle = connect_handle(host, port, config).await?;
         match auth {
             DirectAuth::Key { identity_file } => {
-                authenticate_with_key(
-                    &mut handle,
-                    user,
-                    identity_file,
-                    pubkey_accepted_algorithms,
-                )
-                .await?;
+                authenticate_with_key(&mut handle, user, identity_file, pubkey_accepted_algorithms)
+                    .await?;
             }
             DirectAuth::Password { password } => {
                 authenticate_with_password(&mut handle, user, password).await?;
@@ -93,7 +88,15 @@ impl Connection for DirectConnection {
         let mut channel = self.handle.channel_open_session().await?;
         if request.pty {
             channel
-                .request_pty(true, "xterm-256color", request.cols, request.rows, 0, 0, &[])
+                .request_pty(
+                    true,
+                    "xterm-256color",
+                    request.cols,
+                    request.rows,
+                    0,
+                    0,
+                    &[],
+                )
                 .await?;
         }
         channel.exec(true, command.as_str()).await?;
@@ -174,7 +177,15 @@ impl Connection for DirectConnection {
 
         // Request PTY with caller-specified dimensions
         channel
-            .request_pty(true, "xterm-256color", request.cols, request.rows, 0, 0, &[])
+            .request_pty(
+                true,
+                "xterm-256color",
+                request.cols,
+                request.rows,
+                0,
+                0,
+                &[],
+            )
             .await?;
 
         // Build and execute the command
@@ -244,7 +255,11 @@ impl Connection for DirectConnection {
 // SSH connection and authentication helpers
 // ---------------------------------------------------------------------------
 
-async fn connect_handle(host: &str, port: u16, config: &AppConfig) -> Result<Handle<ClientHandler>> {
+async fn connect_handle(
+    host: &str,
+    port: u16,
+    config: &AppConfig,
+) -> Result<Handle<ClientHandler>> {
     let client_config = client::Config {
         inactivity_timeout: Some(config.ssh.keepalive_interval * 2),
         ..Default::default()
@@ -473,7 +488,12 @@ fn join_remote_path(home: &str, suffix: &str) -> String {
 fn upload_destination_for_directory(local_path: &Path, remote_dir: &str) -> Result<String> {
     let basename = local_path
         .file_name()
-        .ok_or_else(|| anyhow!("failed to derive local basename from {}", local_path.display()))?
+        .ok_or_else(|| {
+            anyhow!(
+                "failed to derive local basename from {}",
+                local_path.display()
+            )
+        })?
         .to_string_lossy()
         .to_string();
     Ok(format!("{}/{}", remote_dir.trim_end_matches('/'), basename))
@@ -512,11 +532,7 @@ fn path_to_string(path: &Path) -> Result<String> {
 // SFTP file/directory copy helpers
 // ---------------------------------------------------------------------------
 
-async fn copy_local_file_to_remote(
-    sftp: &SftpSession,
-    local: &Path,
-    remote: &Path,
-) -> Result<()> {
+async fn copy_local_file_to_remote(sftp: &SftpSession, local: &Path, remote: &Path) -> Result<()> {
     let bytes = tokio::fs::read(local)
         .await
         .with_context(|| format!("failed to read {}", local.display()))?;
@@ -532,11 +548,7 @@ async fn copy_local_file_to_remote(
     Ok(())
 }
 
-async fn copy_remote_file_to_local(
-    sftp: &SftpSession,
-    remote: &Path,
-    local: &Path,
-) -> Result<()> {
+async fn copy_remote_file_to_local(sftp: &SftpSession, remote: &Path, local: &Path) -> Result<()> {
     let mut file = sftp
         .open(path_to_string(remote)?)
         .await
@@ -595,7 +607,9 @@ async fn copy_remote_dir_to_local(
 ) -> Result<()> {
     tokio::fs::create_dir_all(local_root).await?;
     Box::pin(copy_remote_dir_to_local_recursive(
-        sftp, remote_root, local_root,
+        sftp,
+        remote_root,
+        local_root,
     ))
     .await
 }

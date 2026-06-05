@@ -31,8 +31,8 @@
 mod support;
 
 use proptest::prelude::*;
-use xho::protocol::rpc;
 use support::in_process_rpc::InProcessRpcHarness;
+use xho::protocol::rpc;
 
 // ---------------------------------------------------------------------------
 // Strategies

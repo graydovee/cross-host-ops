@@ -14,8 +14,7 @@ use xho::daemon::connection::shared::wrap_in_shell;
 
 /// Strategy for generating random shell name strings: 1–20 alphanumeric chars.
 fn arb_shell_name() -> impl Strategy<Value = String> {
-    prop::string::string_regex("[a-zA-Z0-9]{1,20}")
-        .unwrap()
+    prop::string::string_regex("[a-zA-Z0-9]{1,20}").unwrap()
 }
 
 // ---------------------------------------------------------------------------

@@ -58,9 +58,13 @@ fn arb_shell() -> impl Strategy<Value = &'static str> {
 /// last `'`, then reverse the `'\''` escape (replace `'\''` with `'`).
 fn simulate_shell_unwrap(wrapped: &str) -> String {
     // Find the first single quote — marks the start of the payload
-    let first_quote = wrapped.find('\'').expect("wrapped output must contain a quote");
+    let first_quote = wrapped
+        .find('\'')
+        .expect("wrapped output must contain a quote");
     // Find the last single quote — marks the end of the payload
-    let last_quote = wrapped.rfind('\'').expect("wrapped output must contain a quote");
+    let last_quote = wrapped
+        .rfind('\'')
+        .expect("wrapped output must contain a quote");
 
     // Extract the content between the outer quotes
     let payload = &wrapped[first_quote + 1..last_quote];

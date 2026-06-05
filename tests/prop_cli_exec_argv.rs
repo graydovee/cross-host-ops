@@ -26,11 +26,8 @@ fn arb_argv_element() -> impl Strategy<Value = String> {
     // Generate strings of 1–100 chars from printable ASCII (0x20–0x7e)
     // plus some common non-null bytes. This covers the interesting cases
     // including hyphens, spaces, special chars, etc.
-    prop::collection::vec(
-        prop::char::range('\x20', '\x7e'),
-        1..=100,
-    )
-    .prop_map(|chars| chars.into_iter().collect::<String>())
+    prop::collection::vec(prop::char::range('\x20', '\x7e'), 1..=100)
+        .prop_map(|chars| chars.into_iter().collect::<String>())
 }
 
 /// Strategy for generating argv vectors (1–20 elements).

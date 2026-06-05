@@ -12,9 +12,9 @@ use xho::daemon::test_support::make_test_rpc_service;
 use xho::protocol::rpc;
 use xho::protocol::rpc::xho_rpc_client::XhoRpcClient;
 
+use hyper_util::rt::TokioIo;
 use tonic::transport::{Channel, Endpoint, Server, Uri};
 use tower::service_fn;
-use hyper_util::rt::TokioIo;
 
 use std::fs;
 
@@ -95,8 +95,7 @@ impl InProcessRpcHarness {
 
         let harness_config = {
             let mut c = AppConfig::default();
-            c.ssh.server_config_path =
-                tempdir.join("server.toml").display().to_string();
+            c.ssh.server_config_path = tempdir.join("server.toml").display().to_string();
             c.server.local.enable = false;
             c.server.remote.enable = false;
             c.review.enable = false;
@@ -125,11 +124,7 @@ impl InProcessRpcHarness {
     ///
     /// Note: This sends a single `StartRequest` and collects all response
     /// events. It does not handle interactive prompts (confirm/auth).
-    pub async fn execute(
-        &mut self,
-        target: &str,
-        argv: &[&str],
-    ) -> Vec<rpc::ExecuteResponse> {
+    pub async fn execute(&mut self, target: &str, argv: &[&str]) -> Vec<rpc::ExecuteResponse> {
         self.execute_with_timeout(target, argv, 0).await
     }
 
@@ -266,14 +261,12 @@ impl PairedRpcHarness {
 
         let remote_config_path = remote_tempdir.join("config.toml");
         let mut remote_config = AppConfig::default();
-        remote_config.ssh.server_config_path =
-            remote_server_config_path.display().to_string();
+        remote_config.ssh.server_config_path = remote_server_config_path.display().to_string();
         remote_config.server.local.enable = false;
         remote_config.server.remote.enable = false;
         remote_config.review.enable = false;
 
-        let remote_service =
-            make_test_rpc_service(remote_config, remote_config_path);
+        let remote_service = make_test_rpc_service(remote_config, remote_config_path);
 
         // Set up local daemon
         let local_tempdir = std::env::temp_dir().join(format!("xho-test-local-{}", uuid()));
@@ -285,14 +278,12 @@ impl PairedRpcHarness {
 
         let local_config_path = local_tempdir.join("config.toml");
         let mut local_config = AppConfig::default();
-        local_config.ssh.server_config_path =
-            local_server_config_path.display().to_string();
+        local_config.ssh.server_config_path = local_server_config_path.display().to_string();
         local_config.server.local.enable = false;
         local_config.server.remote.enable = false;
         local_config.review.enable = false;
 
-        let local_service =
-            make_test_rpc_service(local_config, local_config_path);
+        let local_service = make_test_rpc_service(local_config, local_config_path);
 
         // Wire up remote daemon
         let (remote_client_io, remote_server_io) = tokio::io::duplex(DUPLEX_BUFFER_SIZE);
@@ -312,9 +303,7 @@ impl PairedRpcHarness {
         tokio::spawn(async move {
             Server::builder()
                 .add_service(local_service)
-                .serve_with_incoming(tokio_stream::once(Ok::<_, std::io::Error>(
-                    local_server_io,
-                )))
+                .serve_with_incoming(tokio_stream::once(Ok::<_, std::io::Error>(local_server_io)))
                 .await
                 .expect("local gRPC server failed");
         });
@@ -339,9 +328,7 @@ impl Drop for PairedRpcHarness {
 // --- Private helpers ---
 
 /// Connect a gRPC client through a pre-connected duplex stream.
-async fn connect_client_via_duplex(
-    io: tokio::io::DuplexStream,
-) -> XhoRpcClient<Channel> {
+async fn connect_client_via_duplex(io: tokio::io::DuplexStream) -> XhoRpcClient<Channel> {
     // Wrap the duplex stream in a mutex so the service_fn closure can move it
     let io = std::sync::Mutex::new(Some(io));
 

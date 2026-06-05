@@ -14,8 +14,8 @@
 use proptest::prelude::*;
 use prost::Message;
 
-use xho::protocol::{ServerEvent, server_event_to_rpc};
 use xho::protocol::rpc;
+use xho::protocol::{ServerEvent, server_event_to_rpc};
 
 // ---------------------------------------------------------------------------
 // Property 5.1: ServerEvent::ExitStatus → rpc::ExecuteResponse preserves code

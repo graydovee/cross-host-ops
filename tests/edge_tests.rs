@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 
 use xho::config::{
-    AppConfig, GatewayConfig, GatewayValidationError, XhodGatewayConfig,
-    ServerConfigFile, ServerDefaults, ServerHostConfig, RESERVED_NAMES, validate_gateways,
+    AppConfig, GatewayConfig, GatewayValidationError, RESERVED_NAMES, ServerConfigFile,
+    ServerDefaults, ServerHostConfig, XhodGatewayConfig, validate_gateways,
 };
 use xho::daemon::resolver::Resolver;
 
@@ -37,10 +37,7 @@ fn edge_14_2_reserved_alias_local_rejected() {
             assert_eq!(name, "local");
             assert_eq!(reserved, RESERVED_NAMES);
         }
-        other => panic!(
-            "expected ReservedName error, got: {:?}",
-            other
-        ),
+        other => panic!("expected ReservedName error, got: {:?}", other),
     }
 }
 
@@ -139,6 +136,9 @@ fn edge_15_5_explicit_local_source_lookup() {
     let routes = resolver.resolve("local:db01").unwrap();
 
     assert_eq!(routes.len(), 1);
-    assert_eq!(routes[0].gateway_name, "local", "local source should route through 'local' gateway");
+    assert_eq!(
+        routes[0].gateway_name, "local",
+        "local source should route through 'local' gateway"
+    );
     assert_eq!(routes[0].end_target, "db01");
 }

@@ -20,16 +20,19 @@ use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
 use crate::config::{
-    AppConfig, ClientConfig, GatewayConfig, XhodGatewayConfig,
-    default_config_path, expand_tilde, parse_duration, RESERVED_NAMES,
+    AppConfig, ClientConfig, GatewayConfig, RESERVED_NAMES, XhodGatewayConfig, default_config_path,
+    expand_tilde, parse_duration,
 };
-use crate::types::{CopyDirection, CopySpec, AddressDefaults, RemoteAddress, ExecTtyFlags, ExecStdinFlags, effective_tty_decision, effective_stdin_decision, should_use_interactive_mode};
-use crate::exit_codes::cap_remote_exit_code;
 use crate::daemon::gateway::GatewayKind;
-use crate::protocol::rpc;
 use crate::daemon::gateway::auth::{
     KnownHostState, fetch_remote_host_key, inspect_known_host,
     normalize_paths as normalize_remote_paths, parse_remote_target, trust_known_host,
+};
+use crate::exit_codes::cap_remote_exit_code;
+use crate::protocol::rpc;
+use crate::types::{
+    AddressDefaults, CopyDirection, CopySpec, ExecStdinFlags, ExecTtyFlags, RemoteAddress,
+    effective_stdin_decision, effective_tty_decision, should_use_interactive_mode,
 };
 
 /// Output format for CLI responses.
@@ -43,7 +46,10 @@ pub enum OutputFormat {
 
 #[derive(Debug, Parser)]
 #[command(name = "xho")]
-#[command(about = "Cross Host Ops command runner with a local or remote daemon", version)]
+#[command(
+    about = "Cross Host Ops command runner with a local or remote daemon",
+    version
+)]
 pub struct ArunCli {
     /// Output format: text (default) or json (NDJSON).
     #[arg(long = "output", default_value = "text")]
@@ -64,7 +70,7 @@ pub enum ArunCommand {
         long_about = "Execute a remote command on the target host.\n\n\
             Use -- to separate xho options from remote arguments when remote \
             arguments begin with a hyphen that could conflict with xho options.",
-        trailing_var_arg = true,
+        trailing_var_arg = true
     )]
     Exec {
         /// Allocate a TTY for the remote command.
@@ -96,7 +102,7 @@ pub enum ArunCommand {
         #[arg(
             value_name = "CMD",
             trailing_var_arg = true,
-            allow_hyphen_values = true,
+            allow_hyphen_values = true
         )]
         cmd: Vec<String>,
     },
@@ -162,7 +168,11 @@ pub enum HostCommand {
         known_hosts: Option<String>,
         #[arg(long = "accept-new-host-key", conflicts_with = "fingerprint")]
         accept_new_host_key: bool,
-        #[arg(long = "fingerprint", value_name = "SHA256", conflicts_with = "accept_new_host_key")]
+        #[arg(
+            long = "fingerprint",
+            value_name = "SHA256",
+            conflicts_with = "accept_new_host_key"
+        )]
         fingerprint: Option<String>,
     },
     /// Remove a jump host entry.
@@ -210,20 +220,14 @@ pub fn set_raw_mode(fd: RawFd) -> Result<RawModeGuard> {
     unsafe {
         let mut original_termios: libc::termios = std::mem::zeroed();
         if libc::tcgetattr(fd, &mut original_termios) != 0 {
-            return Err(anyhow!(
-                "tcgetattr failed: {}",
-                io::Error::last_os_error()
-            ));
+            return Err(anyhow!("tcgetattr failed: {}", io::Error::last_os_error()));
         }
 
         let mut raw = original_termios;
         libc::cfmakeraw(&mut raw);
 
         if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
-            return Err(anyhow!(
-                "tcsetattr failed: {}",
-                io::Error::last_os_error()
-            ));
+            return Err(anyhow!("tcsetattr failed: {}", io::Error::last_os_error()));
         }
 
         Ok(RawModeGuard {
@@ -259,7 +263,17 @@ fn write_raw_mode_diagnostic(message: &str) -> Result<()> {
 
 pub async fn run_cli(cli: ArunCli) -> Result<i32> {
     match cli.command {
-        ArunCommand::Exec { target, cmd, timeout, tty, no_tty, stdin, no_stdin, shell, no_shell } => {
+        ArunCommand::Exec {
+            target,
+            cmd,
+            timeout,
+            tty,
+            no_tty,
+            stdin,
+            no_stdin,
+            shell,
+            no_shell,
+        } => {
             // Validate --timeout if provided: parse and bounds-check (1–86400 seconds).
             let timeout_ms: u64 = if let Some(ref timeout_str) = timeout {
                 match parse_duration(timeout_str) {
@@ -306,12 +320,28 @@ pub async fn run_cli(cli: ArunCli) -> Result<i32> {
             // Resolve TTY and stdin decisions using the new decision functions.
             let stdout_is_tty = std::io::stdout().is_terminal();
             let config = AppConfig::load(None).unwrap_or_default();
-            let tty_flags = ExecTtyFlags { force_tty: tty, force_no_tty: no_tty };
-            let stdin_flags = ExecStdinFlags { force_stdin: stdin, force_no_stdin: no_stdin };
+            let tty_flags = ExecTtyFlags {
+                force_tty: tty,
+                force_no_tty: no_tty,
+            };
+            let stdin_flags = ExecStdinFlags {
+                force_stdin: stdin,
+                force_no_stdin: no_stdin,
+            };
             let resolved_tty = effective_tty_decision(&tty_flags, &config.ssh, stdout_is_tty);
             let resolved_stdin = effective_stdin_decision(&stdin_flags, &config.ssh);
 
-            run_command(target, argv, resolved_tty, resolved_stdin, timeout_ms, shell, no_shell, &config).await
+            run_command(
+                target,
+                argv,
+                resolved_tty,
+                resolved_stdin,
+                timeout_ms,
+                shell,
+                no_shell,
+                &config,
+            )
+            .await
         }
         ArunCommand::Cp {
             recursive,
@@ -392,10 +422,7 @@ fn detect_double_dash_separator(target: &str) -> bool {
     };
 
     // Find the target position after "exec" (skip options like --tty, --timeout, etc.)
-    let target_pos = match raw_args[exec_pos + 1..]
-        .iter()
-        .position(|a| a == target_os)
-    {
+    let target_pos = match raw_args[exec_pos + 1..].iter().position(|a| a == target_os) {
         Some(p) => exec_pos + 1 + p,
         None => return false,
     };
@@ -407,7 +434,16 @@ fn detect_double_dash_separator(target: &str) -> bool {
         .unwrap_or(false)
 }
 
-async fn run_command(target: String, argv: Vec<String>, resolved_tty: bool, resolved_stdin: bool, timeout_ms: u64, shell: Option<String>, no_shell: bool, _config: &AppConfig) -> Result<i32> {
+async fn run_command(
+    target: String,
+    argv: Vec<String>,
+    resolved_tty: bool,
+    resolved_stdin: bool,
+    timeout_ms: u64,
+    shell: Option<String>,
+    no_shell: bool,
+    _config: &AppConfig,
+) -> Result<i32> {
     // Pass raw CLI flags to daemon; daemon resolves effective shell from server.toml.
     let cli_shell = shell.unwrap_or_default();
 
@@ -518,16 +554,17 @@ async fn run_command(target: String, argv: Vec<String>, resolved_tty: bool, reso
                         "received ConfirmRequired but no response channel available"
                     ));
                 };
-                response_tx.send(rpc::ExecuteRequest {
-                    request: Some(rpc::execute_request::Request::Confirm(
-                        rpc::ConfirmRequest {
-                            execution_id: confirm.execution_id,
-                            allow,
-                        },
-                    )),
-                })
-                .await
-                .map_err(|_| anyhow!("failed to send confirmation request"))?;
+                response_tx
+                    .send(rpc::ExecuteRequest {
+                        request: Some(rpc::execute_request::Request::Confirm(
+                            rpc::ConfirmRequest {
+                                execution_id: confirm.execution_id,
+                                allow,
+                            },
+                        )),
+                    })
+                    .await
+                    .map_err(|_| anyhow!("failed to send confirmation request"))?;
             }
             rpc::execute_response::Event::AuthPrompt(prompt) => {
                 let value = prompt_for_auth_input(&prompt.message, prompt.secret)?;
@@ -536,7 +573,11 @@ async fn run_command(target: String, argv: Vec<String>, resolved_tty: bool, reso
                         "received AuthPrompt but no response channel available"
                     ));
                 };
-                response_tx.send(crate::protocol::execute_auth_input_request(prompt.prompt_id, value))
+                response_tx
+                    .send(crate::protocol::execute_auth_input_request(
+                        prompt.prompt_id,
+                        value,
+                    ))
                     .await
                     .map_err(|_| anyhow!("failed to send auth input request"))?;
             }
@@ -613,11 +654,9 @@ pub(crate) async fn run_interactive(
                 Ok(0) => break,
                 Ok(n) => {
                     let msg = rpc::ExecuteRequest {
-                        request: Some(rpc::execute_request::Request::StdinData(
-                            rpc::StdinData {
-                                data: buf[..n].to_vec(),
-                            },
-                        )),
+                        request: Some(rpc::execute_request::Request::StdinData(rpc::StdinData {
+                            data: buf[..n].to_vec(),
+                        })),
                     };
                     if stdin_tx.send(msg).await.is_err() {
                         break;
@@ -677,9 +716,12 @@ pub(crate) async fn run_interactive(
             }
             rpc::execute_response::Event::AuthPrompt(prompt) => {
                 let value = prompt_for_auth_input(&prompt.message, prompt.secret)?;
-                tx.send(crate::protocol::execute_auth_input_request(prompt.prompt_id, value))
-                    .await
-                    .map_err(|_| anyhow!("failed to send auth input request"))?;
+                tx.send(crate::protocol::execute_auth_input_request(
+                    prompt.prompt_id,
+                    value,
+                ))
+                .await
+                .map_err(|_| anyhow!("failed to send auth input request"))?;
             }
             rpc::execute_response::Event::ConfirmRequired(confirm) => {
                 let allow = prompt_for_confirmation(&confirm.reason)?;
@@ -712,7 +754,10 @@ async fn status() -> Result<i32> {
     println!("  cli_controllable: {}", response.cli_controllable);
     println!("  active_executions: {}", response.active_executions);
     if !response.cli_start_config_path.is_empty() {
-        println!("  cli_start_config_path: {}", response.cli_start_config_path);
+        println!(
+            "  cli_start_config_path: {}",
+            response.cli_start_config_path
+        );
     }
     if !response.cli_start_log_level.is_empty() {
         println!("  cli_start_log_level: {}", response.cli_start_log_level);
@@ -765,14 +810,20 @@ async fn run_copy(recursive: bool, source: String, dest: String, timeout_ms: u64
     let stream_file_data = is_xhod_target(&target, &config);
     let mut client = connect_local_copy_client().await?;
     let (tx, rx) = mpsc::channel(8);
-    tx.send(crate::protocol::copy_spec_to_rpc(target, spec.clone(), timeout_ms))
-        .await
-        .map_err(|_| anyhow!("failed to send copy start request"))?;
+    tx.send(crate::protocol::copy_spec_to_rpc(
+        target,
+        spec.clone(),
+        timeout_ms,
+    ))
+    .await
+    .map_err(|_| anyhow!("failed to send copy start request"))?;
 
     let upload_file = if stream_file_data && spec.direction == CopyDirection::Upload {
-        Some(tokio::fs::File::open(&spec.local_path).await.with_context(|| {
-            format!("failed to open upload source {}", spec.local_path)
-        })?)
+        Some(
+            tokio::fs::File::open(&spec.local_path)
+                .await
+                .with_context(|| format!("failed to open upload source {}", spec.local_path))?,
+        )
     } else {
         None
     };
@@ -790,9 +841,12 @@ async fn run_copy(recursive: bool, source: String, dest: String, timeout_ms: u64
         {
             rpc::copy_response::Event::AuthPrompt(prompt) => {
                 let value = prompt_for_auth_input(&prompt.message, prompt.secret)?;
-                tx.send(crate::protocol::copy_auth_input_request(prompt.prompt_id, value))
-                    .await
-                    .map_err(|_| anyhow!("failed to send copy auth input request"))?;
+                tx.send(crate::protocol::copy_auth_input_request(
+                    prompt.prompt_id,
+                    value,
+                ))
+                .await
+                .map_err(|_| anyhow!("failed to send copy auth input request"))?;
             }
             rpc::copy_response::Event::Error(error) => {
                 eprintln!("error: {}", error.message);
@@ -840,24 +894,20 @@ fn spawn_copy_upload_stream(tx: mpsc::Sender<rpc::CopyRequest>, mut file: tokio:
                 }
             };
             let msg = rpc::CopyRequest {
-                request: Some(rpc::copy_request::Request::DataChunk(
-                    rpc::CopyDataChunk {
-                        data: buf[..n].to_vec(),
-                        eof: false,
-                    },
-                )),
+                request: Some(rpc::copy_request::Request::DataChunk(rpc::CopyDataChunk {
+                    data: buf[..n].to_vec(),
+                    eof: false,
+                })),
             };
             if tx.send(msg).await.is_err() {
                 return;
             }
         }
         let eof = rpc::CopyRequest {
-            request: Some(rpc::copy_request::Request::DataChunk(
-                rpc::CopyDataChunk {
-                    data: Vec::new(),
-                    eof: true,
-                },
-            )),
+            request: Some(rpc::copy_request::Request::DataChunk(rpc::CopyDataChunk {
+                data: Vec::new(),
+                eof: true,
+            })),
         };
         let _ = tx.send(eof).await;
     });
@@ -919,24 +969,22 @@ async fn run_host_command(command: HostCommand) -> Result<i32> {
     }
 }
 
-
-
 async fn run_daemon_command(command: DaemonCommand) -> Result<i32> {
     match command {
-        DaemonCommand::Start { config, log_level } => daemon_start(CliDaemonStartOptions {
-            config,
-            log_level,
-        }),
+        DaemonCommand::Start { config, log_level } => {
+            daemon_start(CliDaemonStartOptions { config, log_level })
+        }
         DaemonCommand::Stop => daemon_stop().await,
         DaemonCommand::Restart => daemon_restart().await,
     }
 }
 
-
-
 async fn list_servers(refresh: bool) -> Result<i32> {
     let mut client = connect_data_client(ClientAccess::AutoStart).await?;
-    let response = client.list_servers(rpc::ServerListRequest {}).await?.into_inner();
+    let response = client
+        .list_servers(rpc::ServerListRequest {})
+        .await?
+        .into_inner();
 
     // If the response includes a merged server list, use it for source-tagged output.
     if let Some(merged) = response.merged {
@@ -972,7 +1020,12 @@ fn print_merged_server_list(merged: &rpc::MergedServerList) {
     let port_width = merged
         .rows
         .iter()
-        .map(|row| row.server.as_ref().map(|s| s.port.to_string().len()).unwrap_or(0))
+        .map(|row| {
+            row.server
+                .as_ref()
+                .map(|s| s.port.to_string().len())
+                .unwrap_or(0)
+        })
         .max()
         .unwrap_or(4)
         .max("PORT".len());
@@ -994,7 +1047,11 @@ fn print_merged_server_list(merged: &rpc::MergedServerList) {
     // Print header.
     println!(
         "{:<name_width$}  {:<host_width$}  {:<port_width$}  {:<user_width$}  {:<auth_width$}",
-        "NAME", "HOST", "PORT", "USER", "AUTH",
+        "NAME",
+        "HOST",
+        "PORT",
+        "USER",
+        "AUTH",
         name_width = name_width,
         host_width = host_width,
         port_width = port_width,
@@ -1128,11 +1185,13 @@ async fn connect_local_data_client(
             connect_unix_client(&socket_path).await
         }
         Err(error) => Err(error).with_context(|| {
-            format!("failed to connect to local daemon socket {}", socket_path.display())
+            format!(
+                "failed to connect to local daemon socket {}",
+                socket_path.display()
+            )
         }),
     }
 }
-
 
 async fn connect_unix_client(
     socket_path: &Path,
@@ -1266,7 +1325,8 @@ async fn current_cli_start_options() -> Result<CliDaemonStartOptions> {
     Ok(CliDaemonStartOptions {
         config: (!response.cli_start_config_path.is_empty())
             .then(|| PathBuf::from(response.cli_start_config_path)),
-        log_level: (!response.cli_start_log_level.is_empty()).then_some(response.cli_start_log_level),
+        log_level: (!response.cli_start_log_level.is_empty())
+            .then_some(response.cli_start_log_level),
     })
 }
 
@@ -1294,7 +1354,8 @@ async fn remote_connect(
     if let Some(entry) = config.gateways.iter().find(|g| g.name() == name) {
         eprintln!(
             "error: name '{}' is already used by a {:?} gateway",
-            name, entry.gateway_kind()
+            name,
+            entry.gateway_kind()
         );
         return Ok(1);
     }
@@ -1313,12 +1374,19 @@ async fn remote_connect(
     };
 
     // --- Step 4: SSH host-key trust flow ---
-    let (identity_file, known_hosts_path) =
-        normalize_remote_paths(identity_file_override.as_deref(), known_hosts_override.as_deref())?;
+    let (identity_file, known_hosts_path) = normalize_remote_paths(
+        identity_file_override.as_deref(),
+        known_hosts_override.as_deref(),
+    )?;
 
     let target = parse_remote_target(&remote_addr.format())?;
     let public_key = fetch_remote_host_key(&target, &identity_file).await?;
-    let state = inspect_known_host(&target.host, target.port, &public_key, &std::path::PathBuf::from(&known_hosts_path));
+    let state = inspect_known_host(
+        &target.host,
+        target.port,
+        &public_key,
+        &std::path::PathBuf::from(&known_hosts_path),
+    );
     match state {
         KnownHostState::Known => {}
         KnownHostState::Unknown {
@@ -1366,8 +1434,7 @@ async fn remote_connect(
     config.gateways.push(new_entry);
 
     // Write the updated config atomically
-    let raw = toml::to_string_pretty(&config)
-        .context("failed to serialize config")?;
+    let raw = toml::to_string_pretty(&config).context("failed to serialize config")?;
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -1392,16 +1459,14 @@ async fn remote_remove(name: String) -> Result<i32> {
 
     match entry {
         None => {
-            eprintln!(
-                "error: name '{}' not found in gateways configuration",
-                name
-            );
+            eprintln!("error: name '{}' not found in gateways configuration", name);
             Ok(1)
         }
         Some(entry) if entry.gateway_kind() != GatewayKind::Xhod => {
             eprintln!(
                 "error: name '{}' is a {:?} gateway; quick-remove only manages xhod entries",
-                name, entry.gateway_kind()
+                name,
+                entry.gateway_kind()
             );
             Ok(1)
         }
@@ -1410,8 +1475,7 @@ async fn remote_remove(name: String) -> Result<i32> {
             let mut config = config;
             config.gateways.retain(|g| g.name() != name);
 
-            let raw = toml::to_string_pretty(&config)
-                .context("failed to serialize config")?;
+            let raw = toml::to_string_pretty(&config).context("failed to serialize config")?;
             if let Some(parent) = config_path.parent() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -1440,13 +1504,16 @@ fn remote_list() -> Result<i32> {
             GatewayConfig::Jumpserver(c) => format!("{}:{}", c.host, c.port),
             GatewayConfig::Direct(c) => format!("{}:{}", c.host, c.port),
         };
-        println!("{:<10}  {:<12}  {}", entry.name(), entry.gateway_kind(), address);
+        println!(
+            "{:<10}  {:<12}  {}",
+            entry.name(),
+            entry.gateway_kind(),
+            address
+        );
     }
 
     Ok(0)
 }
-
-
 
 fn prompt_for_confirmation(reason: &str) -> Result<bool> {
     eprintln!("confirmation required: {}", reason);

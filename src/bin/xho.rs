@@ -1,7 +1,7 @@
 use clap::Parser;
 
 use xho::cli::ArunCli;
-use xho::exit_codes::{XhoError, EXIT_INTERNAL};
+use xho::exit_codes::{EXIT_INTERNAL, XhoError};
 
 #[tokio::main]
 async fn main() {
@@ -14,9 +14,9 @@ async fn main() {
                 clap::error::ErrorKind::DisplayVersion => {
                     // Check if --output json was passed by inspecting raw args
                     let args: Vec<String> = std::env::args().collect();
-                    let is_json = args.windows(2).any(|w| {
-                        w[0] == "--output" && w[1] == "json"
-                    });
+                    let is_json = args
+                        .windows(2)
+                        .any(|w| w[0] == "--output" && w[1] == "json");
                     if is_json {
                         xho::cli::print_version_json();
                     } else {

@@ -473,7 +473,7 @@ async fn new_shell(&self) -> Result<PtyShell> {
 
     // Step 3: MFA (may require user input or auto-TOTP)
     if let Some(mfa_config) = &self.config.mfa {
-        shell.wait_for_prompt(&self.config.mfa_prompt_contains).await?;
+        shell.wait_for_prompt(MFA_PROMPT_CONTAINS).await?;
         let code = if let Some(totp_secret) = &mfa_config.totp_secret_base32 {
             generate_totp(totp_secret, mfa_config)?  // automatic
         } else {
@@ -488,7 +488,7 @@ async fn new_shell(&self) -> Result<PtyShell> {
     }
 
     // Step 4: Wait for menu ready
-    shell.wait_for_prompt(&self.config.menu_prompt_contains).await?;
+    shell.wait_for_prompt(MENU_PROMPT_CONTAINS).await?;
 
     Ok(shell)
 }
@@ -567,4 +567,3 @@ identity_file = "~/.ssh/id_rsa"
 totp_secret_base32 = "..."   # 有值 → 自动生成 TOTP code
 # totp_secret_base32 省略 → 连接时 prompt 用户输入 MFA code
 ```
-

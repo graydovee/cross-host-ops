@@ -20,10 +20,7 @@ fn arb_shell_name() -> impl Strategy<Value = String> {
 
 /// Strategy for generating a defaults_shell value: either empty or a valid name.
 fn arb_defaults_shell() -> impl Strategy<Value = String> {
-    prop_oneof![
-        Just(String::new()),
-        arb_shell_name(),
-    ]
+    prop_oneof![Just(String::new()), arb_shell_name(),]
 }
 
 /// Strategy for generating an optional per-server shell:

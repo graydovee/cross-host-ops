@@ -7,10 +7,10 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::types::{CopyDirection, CopySpec};
 use crate::protocol::ServerEvent;
+use crate::types::{CopyDirection, CopySpec};
 
-use super::shared::{build_interactive_shell_command, PtyShell};
+use super::shared::{PtyShell, build_interactive_shell_command};
 use super::{Connection, ExecRequest, InteractiveHandle, InteractiveRequest};
 
 const EXEC_SENTINEL_PREFIX: &str = "__ARUN_EXEC__";
@@ -114,9 +114,7 @@ impl JumpserverConnection {
     async fn copy_upload(&mut self, spec: &CopySpec) -> Result<()> {
         validate_copy_spec(spec)?;
         let local = Path::new(&spec.local_path);
-        let remote_path = self
-            .normalize_remote_upload_path(spec, local)
-            .await?;
+        let remote_path = self.normalize_remote_upload_path(spec, local).await?;
         let mut spec = spec.clone();
         spec.remote_path = remote_path;
         let payload = build_upload_payload(&spec).await?;
@@ -282,7 +280,10 @@ impl<'a> BorrowedJumpserverConnection<'a> {
         let marker = self.shell.make_marker(marker_prefix);
         let wrapped = self.shell.wrap_shell_command(command, &marker);
         self.shell.write_line(&wrapped).await?;
-        let (status, _) = self.shell.read_until_sentinel(&marker, Some(sender)).await?;
+        let (status, _) = self
+            .shell
+            .read_until_sentinel(&marker, Some(sender))
+            .await?;
         self.shell.finish_roundtrip().await?;
         Ok(status)
     }
@@ -589,7 +590,12 @@ fn join_remote_path(home: &str, suffix: &str) -> String {
 fn upload_destination_for_directory(local_path: &Path, remote_dir: &str) -> Result<String> {
     let basename = local_path
         .file_name()
-        .ok_or_else(|| anyhow!("failed to derive local basename from {}", local_path.display()))?
+        .ok_or_else(|| {
+            anyhow!(
+                "failed to derive local basename from {}",
+                local_path.display()
+            )
+        })?
         .to_string_lossy()
         .to_string();
     Ok(format!("{}/{}", remote_dir.trim_end_matches('/'), basename))

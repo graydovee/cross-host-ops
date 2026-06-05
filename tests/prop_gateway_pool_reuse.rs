@@ -19,8 +19,8 @@
 //! (acquire → reuse idle → create new → return → enforce capacity).
 
 use proptest::prelude::*;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------

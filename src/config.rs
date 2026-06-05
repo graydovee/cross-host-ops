@@ -131,7 +131,10 @@ pub fn expand_tilde(value: &str) -> Result<String> {
 pub struct ServerConfig {
     pub log_path: Option<String>,
     pub log_level: String,
-    #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]
+    #[serde(
+        deserialize_with = "deserialize_duration",
+        serialize_with = "serialize_duration"
+    )]
     pub reaper_interval: Duration,
     pub local: LocalServerConfig,
     pub remote: RemoteServerConfig,
@@ -228,11 +231,20 @@ pub struct SshConfig {
     pub stdin: bool,
     /// When true, auto-detect TTY based on stdout. If stdout is not a TTY, disable TTY.
     pub auto_tty_detect: bool,
-    #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]
+    #[serde(
+        deserialize_with = "deserialize_duration",
+        serialize_with = "serialize_duration"
+    )]
     pub connect_timeout: Duration,
-    #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]
+    #[serde(
+        deserialize_with = "deserialize_duration",
+        serialize_with = "serialize_duration"
+    )]
     pub keepalive_interval: Duration,
-    #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]
+    #[serde(
+        deserialize_with = "deserialize_duration",
+        serialize_with = "serialize_duration"
+    )]
     pub max_idle_time: Duration,
     pub max_connections_per_ip: usize,
 }
@@ -267,8 +279,6 @@ impl Default for CopyConfig {
         }
     }
 }
-
-
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -394,7 +404,10 @@ pub struct ReviewConfig {
     pub endpoint: String,
     pub model: String,
     pub api_key: Option<String>,
-    #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]
+    #[serde(
+        deserialize_with = "deserialize_duration",
+        serialize_with = "serialize_duration"
+    )]
     pub timeout: Duration,
     pub failure_action: ReviewAction,
     pub headers: HashMap<String, String>,
@@ -627,8 +640,6 @@ impl Default for LocalClientConfig {
     }
 }
 
-
-
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewAction {
@@ -816,8 +827,8 @@ pub fn load_server_config(path: &Path) -> Result<ServerConfigFile> {
     if !path.exists() {
         return Ok(ServerConfigFile::default());
     }
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     let mut config: ServerConfigFile =
         toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
     expand_server_config_paths(&mut config)?;
@@ -1172,9 +1183,9 @@ pub struct DirectGatewayConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppConfig, ClientConfig, FallbackEntry,
-        SshHostEntry, default_client_config_path, default_config_path, default_known_hosts_path,
-        glob_match, parse_duration, resolve_ssh_host,
+        AppConfig, ClientConfig, FallbackEntry, SshHostEntry, default_client_config_path,
+        default_config_path, default_known_hosts_path, glob_match, parse_duration,
+        resolve_ssh_host,
     };
     use proptest::prelude::*;
     use serde::{Deserialize, Serialize};
@@ -1267,8 +1278,7 @@ mod tests {
 
     /// Strategy to generate a non-empty string that is not "local".
     fn arb_non_local_string() -> impl Strategy<Value = String> {
-        "[a-zA-Z][a-zA-Z0-9_-]{0,19}"
-            .prop_filter("must not be 'local'", |s| s != "local")
+        "[a-zA-Z][a-zA-Z0-9_-]{0,19}".prop_filter("must not be 'local'", |s| s != "local")
     }
 
     proptest! {

@@ -16,9 +16,9 @@ use proptest::prelude::*;
 use tempfile::NamedTempFile;
 
 use xho::config::AppConfig;
+use xho::daemon::gateway::Gateway;
 use xho::daemon::gateway::auth::{AuthPrompt, AuthPrompter};
 use xho::daemon::gateway::local::LocalGateway;
-use xho::daemon::gateway::Gateway;
 use xho::types::ServerListSource;
 
 // ---------------------------------------------------------------------------
@@ -73,9 +73,8 @@ fn arb_alias() -> impl Strategy<Value = String> {
 
 /// Strategy for generating a valid host (IP-like pattern).
 fn arb_host() -> impl Strategy<Value = String> {
-    (1u8..=254u8, 0u8..=255u8, 0u8..=255u8, 1u8..=254u8).prop_map(|(a, b, c, d)| {
-        format!("{}.{}.{}.{}", a, b, c, d)
-    })
+    (1u8..=254u8, 0u8..=255u8, 0u8..=255u8, 1u8..=254u8)
+        .prop_map(|(a, b, c, d)| format!("{}.{}.{}.{}", a, b, c, d))
 }
 
 /// Strategy for generating a valid user (lowercase alpha, 1-8 chars).
@@ -85,15 +84,20 @@ fn arb_user() -> impl Strategy<Value = String> {
 
 /// Strategy for generating a single GenServerEntry.
 fn arb_gen_server_entry() -> impl Strategy<Value = GenServerEntry> {
-    (arb_alias(), arb_host(), 1u16..=65535u16, arb_user(), any::<bool>()).prop_map(
-        |(alias, host, port, user, use_key)| GenServerEntry {
+    (
+        arb_alias(),
+        arb_host(),
+        1u16..=65535u16,
+        arb_user(),
+        any::<bool>(),
+    )
+        .prop_map(|(alias, host, port, user, use_key)| GenServerEntry {
             alias,
             host,
             port,
             user,
             use_key,
-        },
-    )
+        })
 }
 
 /// Strategy for generating a list of GenServerEntry with unique aliases.
