@@ -155,13 +155,18 @@ async fn resolve_target_with_merged_view(
     let config = state.config.read().await.clone();
     let server_config = load_server_config(std::path::Path::new(&config.ssh.server_config_path))
         .unwrap_or_default();
-    let (tagged_entries, _) = rpc::process_list_servers(state).await;
+    let (tagged_entries, source_status) = rpc::process_list_servers(state).await;
     let merged_rows = tagged_entries
         .into_iter()
         .map(|(server, source)| protocol::ServerListRow { source, server })
         .collect::<Vec<_>>();
-    let resolver =
-        Resolver::with_merged_view(&config, &server_config, &config.gateways, &merged_rows);
+    let resolver = Resolver::with_merged_view(
+        &config,
+        &server_config,
+        &config.gateways,
+        &merged_rows,
+        &source_status,
+    );
     resolver.resolve_with_warning(target)
 }
 

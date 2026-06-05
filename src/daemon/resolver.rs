@@ -9,7 +9,7 @@ use crate::config::{
     AppConfig, FallbackEntry, GatewayConfig, ServerConfigFile, parse_ssh_config,
     resolve_server_entry, resolve_ssh_host,
 };
-use crate::protocol::ServerListRow;
+use crate::protocol::{ServerListRow, ServerListSourceStatus};
 use crate::types::ServerListSource;
 
 use super::gateway::Route;
@@ -37,9 +37,10 @@ pub struct Resolver<'a> {
     gateways: &'a [GatewayConfig],
     /// Optional pre-computed merged server-list view from the aggregator.
     /// When provided, bare-alias resolution checks all sources for uniqueness
-    /// and explicit `<jump_name>:<server_alias>` lookups verify the alias
-    /// exists in the named source.
+    /// and explicit `<jump_name>:<server_alias>` lookups can verify the alias
+    /// exists in sources that successfully reported a list.
     merged_rows: &'a [ServerListRow],
+    source_status: &'a [(ServerListSource, ServerListSourceStatus)],
 }
 
 impl<'a> Resolver<'a> {
@@ -53,6 +54,7 @@ impl<'a> Resolver<'a> {
             server_config,
             gateways,
             merged_rows: &[],
+            source_status: &[],
         }
     }
 
@@ -63,12 +65,14 @@ impl<'a> Resolver<'a> {
         server_config: &'a ServerConfigFile,
         gateways: &'a [GatewayConfig],
         merged_rows: &'a [ServerListRow],
+        source_status: &'a [(ServerListSource, ServerListSourceStatus)],
     ) -> Self {
         Self {
             config,
             server_config,
             gateways,
             merged_rows,
+            source_status,
         }
     }
 
@@ -156,8 +160,10 @@ impl<'a> Resolver<'a> {
             .find(|gc| gc.name() == jump_name)
             .ok_or_else(|| anyhow!("gateway name '{}' not found", jump_name))?;
 
-        // If we have a merged view, verify the complete target path exists.
-        if !self.merged_rows.is_empty() {
+        // Validate explicit targets only when the relevant source successfully
+        // reported a list. An empty successful list proves absence; an
+        // unsupported source such as jumpserver cannot prove absence.
+        if self.explicit_source_reported_ok(jump_name, server_alias) {
             let input_display_name = format!("{}:{}", jump_name, server_alias);
             let found = self
                 .merged_rows
@@ -329,6 +335,35 @@ impl<'a> Resolver<'a> {
             }));
         }
         Ok(None)
+    }
+
+    fn explicit_source_reported_ok(&self, jump_name: &str, server_alias: &str) -> bool {
+        let exact_source = explicit_source_path(jump_name, server_alias);
+        if let Some(status) = self.gateway_source_status(&exact_source) {
+            return matches!(status, ServerListSourceStatus::Ok);
+        }
+        if exact_source != jump_name {
+            if let Some(status) = self.gateway_source_status(jump_name) {
+                return matches!(status, ServerListSourceStatus::Ok);
+            }
+        }
+        false
+    }
+
+    fn gateway_source_status(&self, path: &str) -> Option<&ServerListSourceStatus> {
+        self.source_status
+            .iter()
+            .find_map(|(source, status)| match source {
+                ServerListSource::Gateway(source_path) if source_path == path => Some(status),
+                _ => None,
+            })
+    }
+}
+
+fn explicit_source_path(jump_name: &str, server_alias: &str) -> String {
+    match server_alias.rsplit_once(':') {
+        Some((nested_source, _)) => format!("{}:{}", jump_name, nested_source),
+        None => jump_name.to_string(),
     }
 }
 
@@ -789,6 +824,20 @@ mod tests {
         ]
     }
 
+    fn make_source_status() -> Vec<(ServerListSource, ServerListSourceStatus)> {
+        vec![
+            (ServerListSource::Local, ServerListSourceStatus::Ok),
+            (
+                ServerListSource::Gateway("remote1".to_string()),
+                ServerListSourceStatus::Ok,
+            ),
+            (
+                ServerListSource::Gateway("remote1:nested-xhod".to_string()),
+                ServerListSourceStatus::Ok,
+            ),
+        ]
+    }
+
     #[test]
     fn resolver_merged_view_bare_alias_unique() {
         let config = AppConfig::default();
@@ -800,8 +849,18 @@ mod tests {
             known_hosts_path: String::new(),
         })];
         let merged_rows = make_merged_rows();
+        let source_status = vec![(
+            ServerListSource::Gateway("corp-jump".to_string()),
+            ServerListSourceStatus::Unsupported,
+        )];
 
-        let resolver = Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
+        let resolver = Resolver::with_merged_view(
+            &config,
+            &server_config,
+            &gateways,
+            &merged_rows,
+            &source_status,
+        );
 
         // "db01" is unique (only in remote1)
         let routes = resolver.resolve("db01").unwrap();
@@ -821,8 +880,18 @@ mod tests {
             known_hosts_path: String::new(),
         })];
         let merged_rows = make_merged_rows();
+        let source_status = vec![(
+            ServerListSource::Gateway("corp-jump".to_string()),
+            ServerListSourceStatus::Unsupported,
+        )];
 
-        let resolver = Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
+        let resolver = Resolver::with_merged_view(
+            &config,
+            &server_config,
+            &gateways,
+            &merged_rows,
+            &source_status,
+        );
 
         // "web01" is unique (only in local)
         let routes = resolver.resolve("web01").unwrap();
@@ -842,8 +911,15 @@ mod tests {
             known_hosts_path: String::new(),
         })];
         let merged_rows = make_merged_rows();
+        let source_status = make_source_status();
 
-        let resolver = Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
+        let resolver = Resolver::with_merged_view(
+            &config,
+            &server_config,
+            &gateways,
+            &merged_rows,
+            &source_status,
+        );
 
         // "shared" exists in multiple sources — choose the first merged row.
         let result = resolver.resolve_with_warning("shared").unwrap();
@@ -874,8 +950,15 @@ mod tests {
             known_hosts_path: String::new(),
         })];
         let merged_rows = make_merged_rows();
+        let source_status = make_source_status();
 
-        let resolver = Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
+        let resolver = Resolver::with_merged_view(
+            &config,
+            &server_config,
+            &gateways,
+            &merged_rows,
+            &source_status,
+        );
 
         let result = resolver.resolve_with_warning("deep01").unwrap();
         assert_eq!(result.routes.len(), 1);
@@ -895,8 +978,15 @@ mod tests {
             known_hosts_path: String::new(),
         })];
         let merged_rows = make_merged_rows();
+        let source_status = make_source_status();
 
-        let resolver = Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
+        let resolver = Resolver::with_merged_view(
+            &config,
+            &server_config,
+            &gateways,
+            &merged_rows,
+            &source_status,
+        );
 
         // Explicit "remote1:db01" should work
         let routes = resolver.resolve("remote1:db01").unwrap();
@@ -916,8 +1006,15 @@ mod tests {
             known_hosts_path: String::new(),
         })];
         let merged_rows = make_merged_rows();
+        let source_status = make_source_status();
 
-        let resolver = Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
+        let resolver = Resolver::with_merged_view(
+            &config,
+            &server_config,
+            &gateways,
+            &merged_rows,
+            &source_status,
+        );
 
         let routes = resolver.resolve("remote1:nested-xhod:deep01").unwrap();
         assert_eq!(routes.len(), 1);
@@ -936,8 +1033,15 @@ mod tests {
             known_hosts_path: String::new(),
         })];
         let merged_rows = make_merged_rows();
+        let source_status = make_source_status();
 
-        let resolver = Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
+        let resolver = Resolver::with_merged_view(
+            &config,
+            &server_config,
+            &gateways,
+            &merged_rows,
+            &source_status,
+        );
 
         // Explicit "remote1:nonexistent" should fail
         let result = resolver.resolve("remote1:nonexistent");
@@ -951,13 +1055,88 @@ mod tests {
     }
 
     #[test]
+    fn resolver_merged_view_explicit_jumpserver_bypasses_list_validation() {
+        let config = AppConfig::default();
+        let server_config = ServerConfigFile::default();
+        let gateways = vec![GatewayConfig::Jumpserver(JumpserverGatewayConfig {
+            name: "corp-jump".to_string(),
+            host: "jump.example.com".to_string(),
+            port: 22,
+            user: "admin".to_string(),
+            identity_file: String::new(),
+            pubkey_accepted_algorithms: None,
+            totp_secret_base32: String::new(),
+            totp_digits: 6,
+            totp_period: 30,
+        })];
+        let merged_rows = make_merged_rows();
+        let source_status = make_source_status();
+
+        let resolver = Resolver::with_merged_view(
+            &config,
+            &server_config,
+            &gateways,
+            &merged_rows,
+            &source_status,
+        );
+
+        let routes = resolver
+            .resolve("corp-jump:asset-198-51-100-22")
+            .unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].gateway_name, "corp-jump");
+        assert_eq!(routes[0].end_target, "asset-198-51-100-22");
+    }
+
+    #[test]
+    fn resolver_merged_view_explicit_empty_ok_source_rejects_missing_target() {
+        let config = AppConfig::default();
+        let server_config = ServerConfigFile::default();
+        let gateways = vec![GatewayConfig::Xhod(XhodGatewayConfig {
+            name: "remote1".to_string(),
+            address: "10.0.0.99:2222".to_string(),
+            identity_file: String::new(),
+            known_hosts_path: String::new(),
+        })];
+        let merged_rows = Vec::new();
+        let source_status = vec![(
+            ServerListSource::Gateway("remote1".to_string()),
+            ServerListSourceStatus::Ok,
+        )];
+
+        let resolver = Resolver::with_merged_view(
+            &config,
+            &server_config,
+            &gateways,
+            &merged_rows,
+            &source_status,
+        );
+
+        let result = resolver.resolve("remote1:db01");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("not found in merged server list"),
+            "error should mention merged-list absence: {}",
+            msg
+        );
+    }
+
+    #[test]
     fn resolver_merged_view_explicit_local_found() {
         let config = AppConfig::default();
         let server_config = make_server_config_with(vec![("web01", "10.0.0.1")]);
         let gateways: Vec<GatewayConfig> = vec![];
         let merged_rows = make_merged_rows();
+        let source_status = make_source_status();
 
-        let resolver = Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
+        let resolver = Resolver::with_merged_view(
+            &config,
+            &server_config,
+            &gateways,
+            &merged_rows,
+            &source_status,
+        );
 
         // Explicit "local:web01" should work
         let routes = resolver.resolve("local:web01").unwrap();
@@ -986,8 +1165,15 @@ mod tests {
             totp_period: 30,
         })];
         let merged_rows = make_merged_rows();
+        let source_status = make_source_status();
 
-        let resolver = Resolver::with_merged_view(&config, &server_config, &gateways, &merged_rows);
+        let resolver = Resolver::with_merged_view(
+            &config,
+            &server_config,
+            &gateways,
+            &merged_rows,
+            &source_status,
+        );
 
         // "unknown_host" is not in the merged view — should fall through to fallback
         let routes = resolver.resolve("unknown_host").unwrap();
