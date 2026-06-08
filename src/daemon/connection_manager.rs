@@ -107,11 +107,31 @@ impl<T> ManagedSingleton<T> {
         should_clear
     }
 
+    pub(crate) async fn current_generation(&self) -> Option<u64> {
+        let guard = self.inner.lock().await;
+        guard.as_ref().map(|entry| entry.generation)
+    }
+
+    pub(crate) async fn checkout_generation(&self, generation: u64) -> Option<SingletonLease<T>> {
+        let mut guard = self.inner.lock().await;
+        let entry = guard.as_mut()?;
+        if entry.generation != generation {
+            return None;
+        }
+        entry.last_used = Instant::now();
+        Some(SingletonLease {
+            resource: entry.resource.clone(),
+            generation: entry.generation,
+        })
+    }
+
     pub(crate) async fn prune_idle(&self, max_idle: Duration) -> bool {
         let mut guard = self.inner.lock().await;
         let should_clear = guard
             .as_ref()
-            .map(|entry| entry.last_used.elapsed() > max_idle)
+            .map(|entry| {
+                Arc::strong_count(&entry.resource) == 1 && entry.last_used.elapsed() > max_idle
+            })
             .unwrap_or(false);
         if should_clear {
             *guard = None;
@@ -297,6 +317,27 @@ where
         changed
     }
 
+    pub(crate) fn discard_idle_where<F>(&self, should_discard: F) -> usize
+    where
+        F: Fn(&T) -> bool,
+    {
+        let mut inner = self.inner.lock();
+        let mut discarded = 0usize;
+        for state in inner.values_mut() {
+            let before = state.idle.len();
+            state
+                .idle
+                .retain(|entry| !should_discard(&entry.resource));
+            let removed = before.saturating_sub(state.idle.len());
+            if removed > 0 {
+                discarded += removed;
+                state.notify.notify_waiters();
+            }
+        }
+        inner.retain(|_, state| state.active > 0 || !state.idle.is_empty());
+        discarded
+    }
+
     pub(crate) fn discard(&self, mut lease: PoolLease<K, T>) {
         lease.resource.take();
         lease.permit.take();
@@ -322,6 +363,14 @@ where
             }
         }
         inner.retain(|_, state| state.active > 0 || !state.idle.is_empty());
+    }
+
+    pub(crate) fn total_entries(&self) -> usize {
+        let inner = self.inner.lock();
+        inner
+            .values()
+            .map(|state| state.active + state.idle.len())
+            .sum()
     }
 
     pub(crate) fn status_snapshot_with<F>(&self, key_label: F) -> Vec<ConnectionStatusSnapshot>
@@ -408,6 +457,12 @@ impl<T> PoolState<T> {
 }
 
 impl<K, T> PoolLease<K, T> {
+    pub(crate) fn resource(&self) -> &T {
+        self.resource
+            .as_ref()
+            .expect("managed pool lease resource already consumed")
+    }
+
     pub(crate) fn resource_mut(&mut self) -> &mut T {
         self.resource
             .as_mut()
@@ -445,7 +500,32 @@ mod tests {
             .await
             .unwrap();
         assert!(!manager.invalidate_generation(first.generation()).await);
+        assert_eq!(manager.current_generation().await, Some(second.generation()));
+        assert_eq!(
+            manager
+                .checkout_generation(second.generation())
+                .await
+                .map(|lease| *lease.resource()),
+            Some(2)
+        );
+        assert!(manager.checkout_generation(first.generation()).await.is_none());
         assert_eq!(*second.resource(), 2);
+    }
+
+    #[tokio::test]
+    async fn singleton_prune_keeps_active_lease() {
+        let manager = ManagedSingleton::new();
+        let lease = manager
+            .checkout_or_insert_with(|| async { Ok::<_, ()>(1usize) })
+            .await
+            .unwrap();
+
+        assert!(!manager.prune_idle(Duration::ZERO).await);
+        assert_eq!(manager.current_generation().await, Some(lease.generation()));
+
+        drop(lease);
+        assert!(manager.prune_idle(Duration::ZERO).await);
+        assert_eq!(manager.current_generation().await, None);
     }
 
     #[tokio::test]
@@ -512,6 +592,29 @@ mod tests {
         manager.return_healthy(lease);
         let lease = waiter.await.unwrap();
         assert_eq!(*lease.resource.as_ref().unwrap(), 10);
+    }
+
+    #[tokio::test]
+    async fn managed_pool_discards_idle_entries_by_predicate() {
+        let manager = ManagedPool::new(2, Duration::from_secs(60));
+        let keep = manager
+            .checkout_or_create_with("a", || async { Ok::<_, ()>(10usize) })
+            .await
+            .unwrap();
+        let discard = manager
+            .checkout_or_create_with("b", || async { Ok::<_, ()>(20usize) })
+            .await
+            .unwrap();
+        manager.return_healthy(keep);
+        manager.return_healthy(discard);
+
+        assert_eq!(manager.total_entries(), 2);
+        assert_eq!(manager.discard_idle_where(|value| *value == 20), 1);
+        assert_eq!(manager.total_entries(), 1);
+
+        let snapshot = manager.status_snapshot_with(|key| key.to_string());
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].key, "a");
     }
 
     #[test]

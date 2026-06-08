@@ -1,6 +1,6 @@
 // JumpserverGateway implementation.
-// Reuses one authenticated SSH transport and opens a fresh PTY shell channel
-// for each routed operation.
+// Reuses one authenticated SSH transport and caches target-level PTY shells
+// for non-interactive exec/copy operations.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +16,7 @@ use crate::daemon::connection::shared::{PtyShell, request_default_pty};
 use crate::daemon::connection::{
     Connection, ExecRequest as ConnExecRequest, InteractiveRequest as ConnInteractiveRequest,
 };
-use crate::daemon::connection_manager::{ManagedSingleton, SingletonLease};
+use crate::daemon::connection_manager::{ManagedPool, ManagedSingleton, PoolLease, SingletonLease};
 use crate::daemon::resolver::derive_target_ip;
 use crate::protocol::ServerListRow;
 use crate::types::CopySpec;
@@ -39,12 +39,21 @@ pub struct JumpserverGateway {
     fields: JumpserverGatewayConfig,
     auth_prompter: Arc<AuthPrompter>,
     transport: ManagedSingleton<JumpserverTransport>,
+    target_shells: ManagedPool<JumpserverTargetKey, JumpserverTargetShell>,
     max_idle_time: Duration,
 }
 
 struct JumpserverTransportState {
     handle: russh::client::Handle<ClientHandler>,
     connect_timeout: Duration,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct JumpserverTargetKey(String);
+
+struct JumpserverTargetShell {
+    shell: PtyShell,
+    transport_generation: u64,
 }
 
 impl JumpserverGateway {
@@ -61,6 +70,7 @@ impl JumpserverGateway {
             fields,
             auth_prompter,
             transport: ManagedSingleton::new(),
+            target_shells: ManagedPool::new(1, max_idle_time),
             max_idle_time,
         }
     }
@@ -139,9 +149,11 @@ impl JumpserverGateway {
 
     async fn invalidate_transport(&self, generation: u64) {
         if self.transport.invalidate_generation(generation).await {
+            let discarded_shells = self.discard_idle_target_shells_for_generation(generation);
             debug!(
                 gateway = %self.gateway_name,
                 generation = %generation,
+                discarded_shells = %discarded_shells,
                 "discarded jumpserver SSH transport, will reconnect on next use"
             );
         }
@@ -222,6 +234,81 @@ impl JumpserverGateway {
         unreachable!("jumpserver shell preparation loop is bounded")
     }
 
+    fn target_key(&self, target: &str) -> JumpserverTargetKey {
+        JumpserverTargetKey(derive_target_ip(target))
+    }
+
+    async fn checkout_target_shell(
+        &self,
+        target: &str,
+    ) -> Result<PoolLease<JumpserverTargetKey, JumpserverTargetShell>, GatewayError> {
+        let key = self.target_key(target);
+        let target = target.to_string();
+        self.target_shells
+            .checkout_or_create_with(key.clone(), || async move {
+                let (transport_lease, shell) = self.open_target_shell_with_retry(&target).await?;
+                Ok(JumpserverTargetShell {
+                    shell,
+                    transport_generation: transport_lease.generation(),
+                })
+            })
+            .await
+    }
+
+    async fn return_target_shell_if_current(
+        &self,
+        lease: PoolLease<JumpserverTargetKey, JumpserverTargetShell>,
+    ) {
+        let shell_generation = lease.resource().transport_generation;
+        if self.transport.current_generation().await == Some(shell_generation) {
+            self.target_shells.return_healthy(lease);
+        } else {
+            debug!(
+                gateway = %self.gateway_name,
+                shell_generation = %shell_generation,
+                "discarding jumpserver target shell from stale transport generation"
+            );
+            self.target_shells.discard(lease);
+        }
+    }
+
+    fn discard_idle_target_shells_for_generation(&self, generation: u64) -> usize {
+        self.target_shells
+            .discard_idle_where(|shell| shell.transport_generation == generation)
+    }
+
+    async fn transport_generation_is_closed(&self, generation: u64) -> bool {
+        let Some(lease) = self.transport.checkout_generation(generation).await else {
+            return true;
+        };
+        let transport = lease.resource();
+        let guard = transport.lock().await;
+        guard.handle.is_closed()
+    }
+
+    async fn classify_cached_shell_error(
+        &self,
+        error: anyhow::Error,
+        lease: PoolLease<JumpserverTargetKey, JumpserverTargetShell>,
+    ) -> GatewayError {
+        let shell_generation = lease.resource().transport_generation;
+        debug!(
+            gateway = %self.gateway_name,
+            shell_generation = %shell_generation,
+            "discarding jumpserver target shell after operation error: {}",
+            error
+        );
+        self.target_shells.discard(lease);
+        if is_transport_error(&error) {
+            if self.transport_generation_is_closed(shell_generation).await {
+                self.invalidate_transport(shell_generation).await;
+            }
+            GatewayError::transport(error)
+        } else {
+            GatewayError::execution(error)
+        }
+    }
+
     async fn establish_target_shell(&self, shell: &mut PtyShell, target: &str) -> Result<()> {
         let ip = derive_target_ip(target);
         debug!(gateway = %self.gateway_name, target = %target, ip = %ip, "waiting for jumpserver menu");
@@ -283,7 +370,7 @@ impl JumpserverGateway {
 #[async_trait]
 impl Gateway for JumpserverGateway {
     async fn exec(&self, target: &str, request: &ExecRequest) -> Result<i32, GatewayError> {
-        let (lease, shell) = self.open_target_shell_with_retry(target).await?;
+        let mut lease = self.checkout_target_shell(target).await?;
         let stdin_rx = request.stdin_rx.lock().ok().and_then(|mut g| g.take());
 
         let mut conn_request = ConnExecRequest {
@@ -299,27 +386,33 @@ impl Gateway for JumpserverGateway {
             stdin_rx,
         };
 
-        let mut conn = JumpserverConnection::new(shell);
-        match conn.exec(&mut conn_request).await {
-            Ok(exit_code) => Ok(exit_code),
-            Err(e) if is_transport_error(&e) => {
-                self.invalidate_transport(lease.generation()).await;
-                Err(GatewayError::transport(e))
+        let result = {
+            let mut conn = JumpserverConnection::new_borrowed(&mut lease.resource_mut().shell);
+            conn.exec(&mut conn_request).await
+        };
+
+        match result {
+            Ok(exit_code) => {
+                self.return_target_shell_if_current(lease).await;
+                Ok(exit_code)
             }
-            Err(e) => Err(GatewayError::execution(e)),
+            Err(e) => Err(self.classify_cached_shell_error(e, lease).await),
         }
     }
 
     async fn copy(&self, target: &str, spec: CopySpec) -> Result<(), GatewayError> {
-        let (lease, shell) = self.open_target_shell_with_retry(target).await?;
-        let mut conn = JumpserverConnection::new(shell);
-        match conn.copy(spec).await {
-            Ok(()) => Ok(()),
-            Err(e) if is_transport_error(&e) => {
-                self.invalidate_transport(lease.generation()).await;
-                Err(GatewayError::transport(e))
+        let mut lease = self.checkout_target_shell(target).await?;
+        let result = {
+            let mut conn = JumpserverConnection::new_borrowed(&mut lease.resource_mut().shell);
+            conn.copy(spec).await
+        };
+
+        match result {
+            Ok(()) => {
+                self.return_target_shell_if_current(lease).await;
+                Ok(())
             }
-            Err(e) => Err(GatewayError::execution(e)),
+            Err(e) => Err(self.classify_cached_shell_error(e, lease).await),
         }
     }
 
@@ -347,11 +440,24 @@ impl Gateway for JumpserverGateway {
             Err(e) => return Err(GatewayError::execution(e)),
         };
 
+        let crate::daemon::connection::InteractiveHandle {
+            stdin_tx,
+            resize_tx,
+            stdout_rx,
+            exit_rx,
+        } = handle;
+        let (gateway_exit_tx, gateway_exit_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let exit_code = exit_rx.await.unwrap_or(255);
+            drop(lease);
+            let _ = gateway_exit_tx.send(exit_code);
+        });
+
         Ok(InteractiveHandle {
-            stdin_tx: handle.stdin_tx,
-            resize_tx: handle.resize_tx,
-            stdout_rx: handle.stdout_rx,
-            exit_rx: handle.exit_rx,
+            stdin_tx,
+            resize_tx,
+            stdout_rx,
+            exit_rx: gateway_exit_rx,
         })
     }
 
@@ -371,6 +477,57 @@ impl Gateway for JumpserverGateway {
     }
 
     async fn prune_idle(&self) {
-        let _ = self.transport.prune_idle(self.max_idle_time).await;
+        self.target_shells
+            .prune_idle_with(|target_shell| target_shell.shell.is_channel_open());
+        if self.target_shells.total_entries() == 0 {
+            let _ = self.transport.prune_idle(self.max_idle_time).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_gateway() -> JumpserverGateway {
+        JumpserverGateway::new(
+            "jump".to_string(),
+            Arc::new(RwLock::new(AppConfig::default())),
+            JumpserverGatewayConfig {
+                name: "jump".to_string(),
+                host: "jump.example.test".to_string(),
+                port: 22,
+                user: "admin".to_string(),
+                identity_file: "~/.ssh/id_rsa".to_string(),
+                pubkey_accepted_algorithms: None,
+                totp_secret_base32: String::new(),
+                totp_digits: 6,
+                totp_period: 30,
+            },
+            Arc::new(|_| Box::pin(async { Ok(String::new()) })),
+            Duration::from_secs(60),
+        )
+    }
+
+    #[test]
+    fn target_key_uses_derived_target_ip() {
+        let gateway = test_gateway();
+        assert_eq!(
+            gateway.target_key("asset-198-51-100-22"),
+            JumpserverTargetKey("198.51.100.22".to_string())
+        );
+        assert_eq!(
+            gateway.target_key("plain-target"),
+            JumpserverTargetKey("plain-target".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn list_servers_does_not_create_transport_or_target_shell_cache() {
+        let gateway = test_gateway();
+        let result = gateway.list_servers().await;
+        assert!(result.is_err());
+        assert_eq!(gateway.transport.current_generation().await, None);
+        assert_eq!(gateway.target_shells.total_entries(), 0);
     }
 }
