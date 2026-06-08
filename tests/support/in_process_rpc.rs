@@ -172,7 +172,7 @@ impl InProcessRpcHarness {
     pub async fn copy(
         &mut self,
         target: &str,
-        local_path: &str,
+        source_name: &str,
         remote_path: &str,
         direction: rpc::CopyDirection,
         recursive: bool,
@@ -180,10 +180,10 @@ impl InProcessRpcHarness {
         let start_request = rpc::CopyRequest {
             request: Some(rpc::copy_request::Request::Start(rpc::CopyStartRequest {
                 target: target.to_string(),
-                local_path: local_path.to_string(),
                 remote_path: remote_path.to_string(),
                 recursive,
                 direction: direction as i32,
+                source_name: source_name.to_string(),
                 ..Default::default()
             })),
         };

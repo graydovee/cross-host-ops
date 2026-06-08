@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use uuid::Uuid;
 
 use crate::config::{ReviewAction, RiskLevel, ServerEntry};
-use crate::types::{CopyDirection, CopySpec, ServerListSource};
+use crate::types::{CopyDirection, CopyFrame, CopySpec, ServerListSource};
 
 pub mod rpc {
     tonic::include_proto!("xho.rpc");
@@ -32,18 +32,18 @@ pub struct AuthPromptMessage {
     pub message: String,
 }
 
-pub fn copy_spec_to_rpc(target: String, spec: CopySpec, timeout_ms: u64) -> rpc::CopyRequest {
+pub fn copy_spec_to_rpc(target: String, spec: &CopySpec, timeout_ms: u64) -> rpc::CopyRequest {
     rpc::CopyRequest {
         request: Some(rpc::copy_request::Request::Start(rpc::CopyStartRequest {
             target,
-            local_path: spec.local_path,
-            remote_path: spec.remote_path,
+            remote_path: spec.remote_path.clone(),
             recursive: spec.recursive,
             direction: match spec.direction {
                 CopyDirection::Upload => rpc::CopyDirection::Upload as i32,
                 CopyDirection::Download => rpc::CopyDirection::Download as i32,
             },
             timeout_ms,
+            source_name: spec.source_name.clone(),
         })),
     }
 }
@@ -62,14 +62,87 @@ pub fn copy_spec_from_rpc(request: rpc::CopyStartRequest) -> Result<(String, Cop
         request.target,
         CopySpec {
             direction,
-            local_path: request.local_path,
             remote_path: request.remote_path,
             recursive: request.recursive,
-            relay_upload_rx: None,
-            relay_download_tx: None,
+            source_name: request.source_name,
+            upload_rx: None,
+            download_tx: None,
         },
         request.timeout_ms,
     ))
+}
+
+pub fn copy_frame_to_rpc(frame: CopyFrame) -> rpc::CopyFrame {
+    use rpc::copy_frame::Frame;
+    let frame = match frame {
+        CopyFrame::BeginFile {
+            relative_path,
+            mode,
+            size,
+            mtime,
+        } => Frame::BeginFile(rpc::CopyBeginFile {
+            relative_path,
+            mode,
+            size,
+            mtime,
+        }),
+        CopyFrame::FileData { data } => Frame::FileData(rpc::CopyFileData { data }),
+        CopyFrame::EndFile => Frame::EndFile(rpc::CopyEndFile {}),
+        CopyFrame::BeginDirectory {
+            relative_path,
+            mode,
+            mtime,
+        } => Frame::BeginDirectory(rpc::CopyBeginDirectory {
+            relative_path,
+            mode,
+            mtime,
+        }),
+        CopyFrame::Symlink {
+            relative_path,
+            target,
+        } => Frame::Symlink(rpc::CopySymlink {
+            relative_path,
+            target,
+        }),
+        CopyFrame::EndOfStream => Frame::EndOfStream(rpc::CopyEndOfStream {}),
+    };
+    rpc::CopyFrame { frame: Some(frame) }
+}
+
+pub fn copy_frame_from_rpc(frame: rpc::CopyFrame) -> Result<CopyFrame> {
+    use rpc::copy_frame::Frame;
+    match frame.frame.ok_or_else(|| anyhow!("empty copy frame"))? {
+        Frame::BeginFile(frame) => Ok(CopyFrame::BeginFile {
+            relative_path: frame.relative_path,
+            mode: frame.mode,
+            size: frame.size,
+            mtime: frame.mtime,
+        }),
+        Frame::FileData(frame) => Ok(CopyFrame::FileData { data: frame.data }),
+        Frame::EndFile(_) => Ok(CopyFrame::EndFile),
+        Frame::BeginDirectory(frame) => Ok(CopyFrame::BeginDirectory {
+            relative_path: frame.relative_path,
+            mode: frame.mode,
+            mtime: frame.mtime,
+        }),
+        Frame::Symlink(frame) => Ok(CopyFrame::Symlink {
+            relative_path: frame.relative_path,
+            target: frame.target,
+        }),
+        Frame::EndOfStream(_) => Ok(CopyFrame::EndOfStream),
+    }
+}
+
+pub fn copy_frame_request(frame: CopyFrame) -> rpc::CopyRequest {
+    rpc::CopyRequest {
+        request: Some(rpc::copy_request::Request::Frame(copy_frame_to_rpc(frame))),
+    }
+}
+
+pub fn copy_frame_response(frame: CopyFrame) -> rpc::CopyResponse {
+    rpc::CopyResponse {
+        event: Some(rpc::copy_response::Event::Frame(copy_frame_to_rpc(frame))),
+    }
 }
 
 #[derive(Debug)]

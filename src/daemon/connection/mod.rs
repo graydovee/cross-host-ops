@@ -75,9 +75,8 @@ pub(super) trait Connection: Send {
 
     /// Copy files to/from the connected end target.
     ///
-    /// Takes owned `CopySpec` so that implementations can take relay channels
-    /// (`relay_upload_rx`, `relay_download_tx`) out of it without needing
-    /// `&mut self` style awkwardness.
+    /// Takes owned `CopySpec` so implementations can consume upload/download
+    /// frame channels without borrowing gymnastics.
     async fn copy(&mut self, spec: CopySpec) -> Result<()>;
 
     /// Open an interactive PTY session.

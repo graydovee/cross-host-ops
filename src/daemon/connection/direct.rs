@@ -10,13 +10,14 @@ use anyhow::{Context, Result, anyhow, bail};
 use russh::ChannelMsg;
 use russh::client::{self, Handle};
 use russh_sftp::client::SftpSession;
+use russh_sftp::client::fs::{File as SftpFile, Metadata as SftpMetadata};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
 use crate::config::{AppConfig, DirectAuth};
 use crate::protocol::ServerEvent;
-use crate::types::{CopyDirection, CopySpec};
+use crate::types::{CopyDirection, CopyFrame, CopySpec};
 
 use super::shared::build_final_command;
 use super::{Connection, ExecRequest, InteractiveHandle, InteractiveRequest};
@@ -162,10 +163,10 @@ impl Connection for DirectConnection {
         Ok(exit_code.unwrap_or(255))
     }
 
-    async fn copy(&mut self, spec: CopySpec) -> Result<()> {
+    async fn copy(&mut self, mut spec: CopySpec) -> Result<()> {
         match spec.direction {
-            CopyDirection::Upload => self.copy_upload(&spec).await,
-            CopyDirection::Download => self.copy_download(&spec).await,
+            CopyDirection::Upload => self.copy_upload(&mut spec).await,
+            CopyDirection::Download => self.copy_download(&mut spec).await,
         }
     }
 
@@ -336,41 +337,118 @@ async fn probe_session(handle: &mut Handle<ClientHandler>) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 impl DirectConnection {
-    async fn copy_upload(&mut self, spec: &CopySpec) -> Result<()> {
+    async fn copy_upload(&mut self, spec: &mut CopySpec) -> Result<()> {
         validate_copy_spec(spec)?;
         let sftp = self.open_sftp().await?;
-        let local = PathBuf::from(&spec.local_path);
-        let remote_path = self
-            .normalize_remote_upload_path(spec, &local, &sftp)
-            .await?;
-        if spec.recursive {
-            copy_local_dir_to_remote(&sftp, &local, Path::new(&remote_path)).await
-        } else {
-            copy_local_file_to_remote(&sftp, &local, Path::new(&remote_path)).await
+        let remote_root = PathBuf::from(self.expand_remote_copy_path(&spec.remote_path).await?);
+        let remote_root_is_dir = remote_path_is_dir(&sftp, &remote_root).await;
+        let mut upload_rx = spec
+            .upload_rx
+            .take()
+            .ok_or_else(|| anyhow!("upload copy frame stream missing"))?;
+        let mut current_file: Option<SftpFile> = None;
+
+        while let Some(frame) = upload_rx.recv().await {
+            match frame {
+                CopyFrame::BeginFile { relative_path, .. } => {
+                    if current_file.is_some() {
+                        bail!("copy stream began a new file before ending the previous file");
+                    }
+                    let remote_path = if spec.recursive {
+                        join_relative_path(&remote_root, &relative_path)?
+                    } else if remote_root_is_dir {
+                        remote_root.join(copy_entry_name(&relative_path, &spec.source_name))
+                    } else {
+                        remote_root.clone()
+                    };
+                    if let Some(parent) = remote_path.parent() {
+                        create_remote_dirs(&sftp, parent).await?;
+                    }
+                    current_file = Some(
+                        sftp.create(path_to_string(&remote_path)?)
+                            .await
+                            .with_context(|| {
+                                format!("failed to create remote {}", remote_path.display())
+                            })?,
+                    );
+                }
+                CopyFrame::FileData { data } => {
+                    let file = current_file
+                        .as_mut()
+                        .ok_or_else(|| anyhow!("copy stream sent file data before BeginFile"))?;
+                    file.write_all(&data).await?;
+                }
+                CopyFrame::EndFile => {
+                    let mut file = current_file
+                        .take()
+                        .ok_or_else(|| anyhow!("copy stream sent EndFile before BeginFile"))?;
+                    file.shutdown().await?;
+                }
+                CopyFrame::BeginDirectory { relative_path, .. } => {
+                    if !spec.recursive {
+                        bail!("remote directory frame requires recursive copy");
+                    }
+                    let remote_path = join_relative_path(&remote_root, &relative_path)?;
+                    create_remote_dirs(&sftp, &remote_path).await?;
+                }
+                CopyFrame::Symlink {
+                    relative_path,
+                    target,
+                } => {
+                    let remote_path = if spec.recursive {
+                        join_relative_path(&remote_root, &relative_path)?
+                    } else if remote_root_is_dir {
+                        remote_root.join(copy_entry_name(&relative_path, &spec.source_name))
+                    } else {
+                        remote_root.clone()
+                    };
+                    if let Some(parent) = remote_path.parent() {
+                        create_remote_dirs(&sftp, parent).await?;
+                    }
+                    let _ = sftp.remove_file(path_to_string(&remote_path)?).await;
+                    sftp.symlink(path_to_string(&remote_path)?, target)
+                        .await
+                        .with_context(|| {
+                            format!("failed to create remote symlink {}", remote_path.display())
+                        })?;
+                }
+                CopyFrame::EndOfStream => break,
+            }
         }
+
+        if current_file.is_some() {
+            bail!("copy stream ended before EndFile");
+        }
+        Ok(())
     }
 
-    async fn copy_download(&mut self, spec: &CopySpec) -> Result<()> {
+    async fn copy_download(&mut self, spec: &mut CopySpec) -> Result<()> {
         validate_copy_spec(spec)?;
         let sftp = self.open_sftp().await?;
         let remote_path = self.expand_remote_copy_path(&spec.remote_path).await?;
-        let local = PathBuf::from(maybe_local_download_target(
-            Path::new(&spec.local_path),
-            &remote_path,
-        )?);
         let remote = Path::new(&remote_path);
         let metadata = sftp
-            .metadata(path_to_string(remote)?)
+            .symlink_metadata(path_to_string(remote)?)
             .await
             .with_context(|| format!("failed to stat remote path {}", remote.display()))?;
+        let tx = spec
+            .download_tx
+            .take()
+            .ok_or_else(|| anyhow!("download copy frame stream missing"))?;
         if metadata.is_dir() {
             if !spec.recursive {
                 bail!("copying a remote directory requires -r");
             }
-            copy_remote_dir_to_local(&sftp, remote, &local).await
+            send_remote_dir_frames(&sftp, remote, Path::new(""), &tx).await?;
         } else {
-            copy_remote_file_to_local(&sftp, remote, &local).await
+            let relative_path = copy_entry_name("", &remote_source_name(&remote_path));
+            send_remote_entry_frame(&sftp, remote, Path::new(&relative_path), &metadata, &tx)
+                .await?;
         }
+        tx.send(CopyFrame::EndOfStream)
+            .await
+            .map_err(|_| anyhow!("download copy frame stream closed"))?;
+        Ok(())
     }
 
     async fn open_sftp(&mut self) -> Result<SftpSession> {
@@ -391,25 +469,6 @@ impl DirectConnection {
             None => self.remote_home_for_current_user().await?,
         };
         Ok(join_remote_path(&home, suffix))
-    }
-
-    async fn normalize_remote_upload_path(
-        &mut self,
-        spec: &CopySpec,
-        local_path: &Path,
-        sftp: &SftpSession,
-    ) -> Result<String> {
-        let remote_path = self.expand_remote_copy_path(&spec.remote_path).await?;
-        if spec.recursive {
-            return Ok(remote_path);
-        }
-        match sftp.metadata(remote_path.clone()).await {
-            Ok(metadata) if metadata.is_dir() => {
-                upload_destination_for_directory(local_path, &remote_path)
-            }
-            Ok(_) => Ok(remote_path),
-            Err(_) => Ok(remote_path),
-        }
     }
 
     async fn remote_home_for_current_user(&mut self) -> Result<String> {
@@ -485,39 +544,9 @@ fn join_remote_path(home: &str, suffix: &str) -> String {
     }
 }
 
-fn upload_destination_for_directory(local_path: &Path, remote_dir: &str) -> Result<String> {
-    let basename = local_path
-        .file_name()
-        .ok_or_else(|| {
-            anyhow!(
-                "failed to derive local basename from {}",
-                local_path.display()
-            )
-        })?
-        .to_string_lossy()
-        .to_string();
-    Ok(format!("{}/{}", remote_dir.trim_end_matches('/'), basename))
-}
-
-fn maybe_local_download_target(local_path: &Path, remote_path: &str) -> Result<String> {
-    if local_path.exists() && local_path.is_dir() {
-        let basename = Path::new(remote_path)
-            .file_name()
-            .ok_or_else(|| anyhow!("failed to derive remote basename from {}", remote_path))?
-            .to_string_lossy()
-            .to_string();
-        return Ok(local_path.join(basename).display().to_string());
-    }
-    Ok(local_path.display().to_string())
-}
-
 fn validate_copy_spec(spec: &CopySpec) -> Result<()> {
-    if spec.local_path.is_empty() || spec.remote_path.is_empty() {
-        bail!("local_path and remote_path must not be empty");
-    }
-    let local = Path::new(&spec.local_path);
-    if matches!(spec.direction, CopyDirection::Upload) && local.is_dir() && !spec.recursive {
-        bail!("copying a directory requires -r");
+    if spec.remote_path.is_empty() {
+        bail!("remote_path must not be empty");
     }
     Ok(())
 }
@@ -528,121 +557,163 @@ fn path_to_string(path: &Path) -> Result<String> {
         .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", path.display()))
 }
 
+fn relative_path_to_string(path: &Path) -> Result<String> {
+    validate_relative_path(path)?;
+    path_to_string(path)
+}
+
+fn validate_relative_path(path: &Path) -> Result<()> {
+    if path.is_absolute() {
+        bail!(
+            "copy frame relative path must not be absolute: {}",
+            path.display()
+        );
+    }
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                bail!(
+                    "copy frame relative path contains invalid component: {}",
+                    path.display()
+                );
+            }
+            std::path::Component::CurDir | std::path::Component::Normal(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn join_relative_path(root: &Path, relative_path: &str) -> Result<PathBuf> {
+    if relative_path.is_empty() {
+        return Ok(root.to_path_buf());
+    }
+    let relative = Path::new(relative_path);
+    validate_relative_path(relative)?;
+    Ok(root.join(relative))
+}
+
+fn copy_entry_name(relative_path: &str, source_name: &str) -> String {
+    Path::new(relative_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .or_else(|| (!source_name.trim().is_empty()).then_some(source_name.trim()))
+        .unwrap_or("copy")
+        .to_string()
+}
+
+fn remote_source_name(remote_path: &str) -> String {
+    Path::new(remote_path.trim_end_matches('/'))
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("download")
+        .to_string()
+}
+
+async fn remote_path_is_dir(sftp: &SftpSession, remote_path: &Path) -> bool {
+    sftp.metadata(path_to_string(remote_path).unwrap_or_default())
+        .await
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // SFTP file/directory copy helpers
 // ---------------------------------------------------------------------------
 
-async fn copy_local_file_to_remote(sftp: &SftpSession, local: &Path, remote: &Path) -> Result<()> {
-    let bytes = tokio::fs::read(local)
-        .await
-        .with_context(|| format!("failed to read {}", local.display()))?;
-    if let Some(parent) = remote.parent() {
-        create_remote_dirs(sftp, parent).await?;
-    }
-    let mut file = sftp
-        .create(path_to_string(remote)?)
-        .await
-        .with_context(|| format!("failed to create remote {}", remote.display()))?;
-    file.write_all(&bytes).await?;
-    file.shutdown().await?;
-    Ok(())
-}
-
-async fn copy_remote_file_to_local(sftp: &SftpSession, remote: &Path, local: &Path) -> Result<()> {
-    let mut file = sftp
-        .open(path_to_string(remote)?)
-        .await
-        .with_context(|| format!("failed to open remote {}", remote.display()))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).await?;
-    if let Some(parent) = local.parent() {
-        if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-    }
-    tokio::fs::write(local, bytes)
-        .await
-        .with_context(|| format!("failed to write {}", local.display()))?;
-    Ok(())
-}
-
-async fn copy_local_dir_to_remote(
-    sftp: &SftpSession,
-    local_root: &Path,
-    remote_root: &Path,
-) -> Result<()> {
-    create_remote_dirs(sftp, remote_root).await?;
-    copy_local_dir_to_remote_recursive(sftp, local_root, remote_root).await
-}
-
-async fn copy_local_dir_to_remote_recursive(
-    sftp: &SftpSession,
-    local_dir: &Path,
-    remote_dir: &Path,
-) -> Result<()> {
-    let mut entries = tokio::fs::read_dir(local_dir).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let file_type = entry.file_type().await?;
-        let local_path = entry.path();
-        let remote_path = remote_dir.join(entry.file_name());
-        if file_type.is_dir() {
-            create_remote_dirs(sftp, &remote_path).await?;
-            Box::pin(copy_local_dir_to_remote_recursive(
-                sftp,
-                &local_path,
-                &remote_path,
-            ))
-            .await?;
-        } else if file_type.is_file() {
-            copy_local_file_to_remote(sftp, &local_path, &remote_path).await?;
-        }
-    }
-    Ok(())
-}
-
-async fn copy_remote_dir_to_local(
+async fn send_remote_dir_frames(
     sftp: &SftpSession,
     remote_root: &Path,
-    local_root: &Path,
+    relative_root: &Path,
+    tx: &mpsc::Sender<CopyFrame>,
 ) -> Result<()> {
-    tokio::fs::create_dir_all(local_root).await?;
-    Box::pin(copy_remote_dir_to_local_recursive(
-        sftp,
-        remote_root,
-        local_root,
-    ))
+    tx.send(CopyFrame::BeginDirectory {
+        relative_path: relative_path_to_string(relative_root)?,
+        mode: 0,
+        mtime: 0,
+    })
     .await
-}
+    .map_err(|_| anyhow!("download copy frame stream closed"))?;
 
-async fn copy_remote_dir_to_local_recursive(
-    sftp: &SftpSession,
-    remote_dir: &Path,
-    local_dir: &Path,
-) -> Result<()> {
     let mut entries = sftp
-        .read_dir(path_to_string(remote_dir)?)
+        .read_dir(path_to_string(remote_root)?)
         .await
-        .with_context(|| format!("failed to read remote dir {}", remote_dir.display()))?;
+        .with_context(|| format!("failed to read remote dir {}", remote_root.display()))?;
     while let Some(entry) = entries.next() {
         let file_name = entry.file_name();
         if file_name == "." || file_name == ".." {
             continue;
         }
-        let remote_path = remote_dir.join(&file_name);
-        let local_path = local_dir.join(&file_name);
+        let remote_path = remote_root.join(&file_name);
+        let relative_path = relative_root.join(&file_name);
         let metadata = entry.metadata();
-        if metadata.is_dir() {
-            tokio::fs::create_dir_all(&local_path).await?;
-            Box::pin(copy_remote_dir_to_local_recursive(
-                sftp,
-                &remote_path,
-                &local_path,
-            ))
-            .await?;
-        } else {
-            copy_remote_file_to_local(sftp, &remote_path, &local_path).await?;
-        }
+        send_remote_entry_frame(sftp, &remote_path, &relative_path, &metadata, tx).await?;
     }
+    Ok(())
+}
+
+async fn send_remote_entry_frame(
+    sftp: &SftpSession,
+    remote_path: &Path,
+    relative_path: &Path,
+    metadata: &SftpMetadata,
+    tx: &mpsc::Sender<CopyFrame>,
+) -> Result<()> {
+    if metadata.is_dir() {
+        return Box::pin(send_remote_dir_frames(sftp, remote_path, relative_path, tx)).await;
+    }
+    if metadata.is_symlink() {
+        let target = sftp
+            .read_link(path_to_string(remote_path)?)
+            .await
+            .with_context(|| format!("failed to read remote symlink {}", remote_path.display()))?;
+        tx.send(CopyFrame::Symlink {
+            relative_path: relative_path_to_string(relative_path)?,
+            target,
+        })
+        .await
+        .map_err(|_| anyhow!("download copy frame stream closed"))?;
+        return Ok(());
+    }
+    if !metadata.is_regular() {
+        bail!(
+            "unsupported remote file type for copy: {}",
+            remote_path.display()
+        );
+    }
+
+    tx.send(CopyFrame::BeginFile {
+        relative_path: relative_path_to_string(relative_path)?,
+        mode: metadata.permissions.unwrap_or(0),
+        size: metadata.len(),
+        mtime: metadata.mtime.map(i64::from).unwrap_or(0),
+    })
+    .await
+    .map_err(|_| anyhow!("download copy frame stream closed"))?;
+
+    let mut file = sftp
+        .open(path_to_string(remote_path)?)
+        .await
+        .with_context(|| format!("failed to open remote {}", remote_path.display()))?;
+    const CHUNK_SIZE: usize = 64 * 1024;
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        tx.send(CopyFrame::FileData {
+            data: buf[..n].to_vec(),
+        })
+        .await
+        .map_err(|_| anyhow!("download copy frame stream closed"))?;
+    }
+    tx.send(CopyFrame::EndFile)
+        .await
+        .map_err(|_| anyhow!("download copy frame stream closed"))?;
     Ok(())
 }
 

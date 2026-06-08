@@ -2,13 +2,16 @@
 // Wraps a PtyShell to execute commands through an interactive jumpserver shell.
 // Implements the Connection trait using sentinel-based exit code extraction.
 
-use std::path::Path;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
+use uuid::Uuid;
 
 use crate::protocol::ServerEvent;
-use crate::types::{CopyDirection, CopySpec};
+use crate::types::{CopyDirection, CopyFrame, CopySpec};
 
 use super::shared::{PtyShell, build_interactive_shell_command};
 use super::{Connection, ExecRequest, InteractiveHandle, InteractiveRequest};
@@ -111,27 +114,22 @@ impl JumpserverConnection {
     }
 
     /// Upload files via base64-encoded heredoc through the PTY shell.
-    async fn copy_upload(&mut self, spec: &CopySpec) -> Result<()> {
+    async fn copy_upload(&mut self, spec: &mut CopySpec) -> Result<()> {
         validate_copy_spec(spec)?;
-        let local = Path::new(&spec.local_path);
-        let remote_path = self.normalize_remote_upload_path(spec, local).await?;
-        let mut spec = spec.clone();
+        let remote_path = self.normalize_remote_upload_path(spec).await?;
         spec.remote_path = remote_path;
-        let payload = build_upload_payload(&spec).await?;
-        let command = upload_here_doc_command(&spec, "{}");
+        let payload = build_upload_payload_from_frames(spec).await?;
+        let command = upload_here_doc_command(spec, "{}");
         self.run_shell_heredoc_upload(&command, &payload, COPY_HEREDOC_PREFIX)
             .await
     }
 
     /// Download files via base64-encoded output through the PTY shell.
-    async fn copy_download(&mut self, spec: &CopySpec) -> Result<()> {
+    async fn copy_download(&mut self, spec: &mut CopySpec) -> Result<()> {
         validate_copy_spec(spec)?;
         let remote_path = self.expand_remote_copy_path(&spec.remote_path).await?;
-        let local_path = maybe_local_download_target(Path::new(&spec.local_path), &remote_path)?;
-        let mut spec = spec.clone();
         spec.remote_path = remote_path;
-        spec.local_path = local_path;
-        let command = download_command(&spec)?;
+        let command = download_command(spec)?;
         let outcome = self
             .run_shell_command_capture(&command, COPY_SENTINEL_PREFIX)
             .await?;
@@ -142,7 +140,7 @@ impl JumpserverConnection {
             );
         }
         let payload = strip_trailing_newlines(outcome.payload);
-        consume_download_payload(&spec, payload).await
+        send_download_payload_as_frames(spec, payload).await
     }
 
     /// Expand ~ paths on the remote by executing shell commands.
@@ -160,17 +158,17 @@ impl JumpserverConnection {
     }
 
     /// Normalize upload path, checking if remote path is a directory.
-    async fn normalize_remote_upload_path(
-        &mut self,
-        spec: &CopySpec,
-        local_path: &Path,
-    ) -> Result<String> {
+    async fn normalize_remote_upload_path(&mut self, spec: &CopySpec) -> Result<String> {
         let remote_path = self.expand_remote_copy_path(&spec.remote_path).await?;
         if spec.recursive {
             return Ok(remote_path);
         }
         if self.remote_path_is_dir(&remote_path).await? {
-            return upload_destination_for_directory(local_path, &remote_path);
+            return Ok(format!(
+                "{}/{}",
+                remote_path.trim_end_matches('/'),
+                shell_path_basename_or(&spec.source_name, "copy")
+            ));
         }
         Ok(remote_path)
     }
@@ -235,10 +233,10 @@ impl Connection for JumpserverConnection {
             .await
     }
 
-    async fn copy(&mut self, spec: CopySpec) -> Result<()> {
+    async fn copy(&mut self, mut spec: CopySpec) -> Result<()> {
         match spec.direction {
-            CopyDirection::Upload => self.copy_upload(&spec).await,
-            CopyDirection::Download => self.copy_download(&spec).await,
+            CopyDirection::Upload => self.copy_upload(&mut spec).await,
+            CopyDirection::Download => self.copy_download(&mut spec).await,
         }
     }
 
@@ -328,27 +326,22 @@ impl<'a> BorrowedJumpserverConnection<'a> {
     }
 
     /// Upload files via base64-encoded heredoc through the PTY shell.
-    async fn copy_upload(&mut self, spec: &CopySpec) -> Result<()> {
+    async fn copy_upload(&mut self, spec: &mut CopySpec) -> Result<()> {
         validate_copy_spec(spec)?;
-        let local = Path::new(&spec.local_path);
-        let remote_path = self.normalize_remote_upload_path(spec, local).await?;
-        let mut spec = spec.clone();
+        let remote_path = self.normalize_remote_upload_path(spec).await?;
         spec.remote_path = remote_path;
-        let payload = build_upload_payload(&spec).await?;
-        let command = upload_here_doc_command(&spec, "{}");
+        let payload = build_upload_payload_from_frames(spec).await?;
+        let command = upload_here_doc_command(spec, "{}");
         self.run_shell_heredoc_upload(&command, &payload, COPY_HEREDOC_PREFIX)
             .await
     }
 
     /// Download files via base64-encoded output through the PTY shell.
-    async fn copy_download(&mut self, spec: &CopySpec) -> Result<()> {
+    async fn copy_download(&mut self, spec: &mut CopySpec) -> Result<()> {
         validate_copy_spec(spec)?;
         let remote_path = self.expand_remote_copy_path(&spec.remote_path).await?;
-        let local_path = maybe_local_download_target(Path::new(&spec.local_path), &remote_path)?;
-        let mut spec = spec.clone();
         spec.remote_path = remote_path;
-        spec.local_path = local_path;
-        let command = download_command(&spec)?;
+        let command = download_command(spec)?;
         let outcome = self
             .run_shell_command_capture(&command, COPY_SENTINEL_PREFIX)
             .await?;
@@ -359,7 +352,7 @@ impl<'a> BorrowedJumpserverConnection<'a> {
             );
         }
         let payload = strip_trailing_newlines(outcome.payload);
-        consume_download_payload(&spec, payload).await
+        send_download_payload_as_frames(spec, payload).await
     }
 
     /// Expand ~ paths on the remote by executing shell commands.
@@ -377,17 +370,17 @@ impl<'a> BorrowedJumpserverConnection<'a> {
     }
 
     /// Normalize upload path, checking if remote path is a directory.
-    async fn normalize_remote_upload_path(
-        &mut self,
-        spec: &CopySpec,
-        local_path: &Path,
-    ) -> Result<String> {
+    async fn normalize_remote_upload_path(&mut self, spec: &CopySpec) -> Result<String> {
         let remote_path = self.expand_remote_copy_path(&spec.remote_path).await?;
         if spec.recursive {
             return Ok(remote_path);
         }
         if self.remote_path_is_dir(&remote_path).await? {
-            return upload_destination_for_directory(local_path, &remote_path);
+            return Ok(format!(
+                "{}/{}",
+                remote_path.trim_end_matches('/'),
+                shell_path_basename_or(&spec.source_name, "copy")
+            ));
         }
         Ok(remote_path)
     }
@@ -443,10 +436,10 @@ impl Connection for BorrowedJumpserverConnection<'_> {
             .await
     }
 
-    async fn copy(&mut self, spec: CopySpec) -> Result<()> {
+    async fn copy(&mut self, mut spec: CopySpec) -> Result<()> {
         match spec.direction {
-            CopyDirection::Upload => self.copy_upload(&spec).await,
-            CopyDirection::Download => self.copy_download(&spec).await,
+            CopyDirection::Upload => self.copy_upload(&mut spec).await,
+            CopyDirection::Download => self.copy_download(&mut spec).await,
         }
     }
 
@@ -488,14 +481,8 @@ impl Connection for BorrowedJumpserverConnection<'_> {
 // ---------------------------------------------------------------------------
 
 fn validate_copy_spec(spec: &CopySpec) -> Result<()> {
-    if spec.local_path.is_empty() || spec.remote_path.is_empty() {
-        bail!("local_path and remote_path must not be empty");
-    }
-    if !spec.recursive {
-        let path = Path::new(&spec.local_path);
-        if matches!(spec.direction, CopyDirection::Upload) && path.is_dir() {
-            bail!("copying a directory requires -r");
-        }
+    if spec.remote_path.is_empty() {
+        bail!("remote_path must not be empty");
     }
     Ok(())
 }
@@ -587,32 +574,6 @@ fn join_remote_path(home: &str, suffix: &str) -> String {
     }
 }
 
-fn upload_destination_for_directory(local_path: &Path, remote_dir: &str) -> Result<String> {
-    let basename = local_path
-        .file_name()
-        .ok_or_else(|| {
-            anyhow!(
-                "failed to derive local basename from {}",
-                local_path.display()
-            )
-        })?
-        .to_string_lossy()
-        .to_string();
-    Ok(format!("{}/{}", remote_dir.trim_end_matches('/'), basename))
-}
-
-fn maybe_local_download_target(local_path: &Path, remote_path: &str) -> Result<String> {
-    if local_path.exists() && local_path.is_dir() {
-        let basename = Path::new(remote_path)
-            .file_name()
-            .ok_or_else(|| anyhow!("failed to derive remote basename from {}", remote_path))?
-            .to_string_lossy()
-            .to_string();
-        return Ok(local_path.join(basename).display().to_string());
-    }
-    Ok(local_path.display().to_string())
-}
-
 fn strip_trailing_newlines(mut bytes: Vec<u8>) -> Vec<u8> {
     while matches!(bytes.last(), Some(b'\n' | b'\r')) {
         bytes.pop();
@@ -620,25 +581,32 @@ fn strip_trailing_newlines(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes
 }
 
-/// Build upload payload by base64-encoding the file or tar archive.
-async fn build_upload_payload(spec: &CopySpec) -> Result<Vec<u8>> {
+/// Build an upload payload from standard copy frames. The base64/tar transport
+/// is a jumpserver-only detail and never leaves this module.
+async fn build_upload_payload_from_frames(spec: &mut CopySpec) -> Result<Vec<u8>> {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use std::io::Read;
     use std::process::{Command, Stdio};
 
-    let spec = spec.clone();
-    tokio::task::spawn_blocking(move || {
-        if spec.recursive {
+    let mut upload_rx = spec
+        .upload_rx
+        .take()
+        .ok_or_else(|| anyhow!("upload copy frame stream missing"))?;
+    if spec.recursive {
+        let temp_dir = InternalTempDir::new("xho_jump_upload")?;
+        materialize_frames_to_dir(temp_dir.path(), &mut upload_rx).await?;
+        let temp_root = temp_dir.path().to_path_buf();
+        tokio::task::spawn_blocking(move || {
             let mut child = Command::new("tar")
                 .arg("cf")
                 .arg("-")
                 .arg("-C")
-                .arg(&spec.local_path)
+                .arg(&temp_root)
                 .arg(".")
                 .stdout(Stdio::piped())
                 .spawn()
-                .with_context(|| format!("failed to spawn tar for {}", spec.local_path))?;
+                .context("failed to spawn tar for jumpserver upload frames")?;
             let mut stdout = child
                 .stdout
                 .take()
@@ -647,68 +615,391 @@ async fn build_upload_payload(spec: &CopySpec) -> Result<Vec<u8>> {
             stdout.read_to_end(&mut tar_bytes)?;
             let status = child.wait()?;
             if !status.success() {
-                bail!("tar command failed for {}", spec.local_path);
+                bail!("tar command failed for jumpserver upload frames");
             }
             let mut encoded = BASE64_STANDARD.encode(tar_bytes).into_bytes();
             encoded.push(b'\n');
             Ok(encoded)
-        } else {
-            let data = std::fs::read(&spec.local_path)
-                .with_context(|| format!("failed to read {}", spec.local_path))?;
-            let mut encoded = BASE64_STANDARD.encode(data).into_bytes();
-            encoded.push(b'\n');
-            Ok(encoded)
-        }
-    })
-    .await
-    .map_err(|error| anyhow!("upload payload task failed: {}", error))?
+        })
+        .await
+        .map_err(|error| anyhow!("upload payload task failed: {}", error))?
+    } else {
+        let data = collect_single_file_upload(&mut upload_rx).await?;
+        let mut encoded = BASE64_STANDARD.encode(data).into_bytes();
+        encoded.push(b'\n');
+        Ok(encoded)
+    }
 }
 
-/// Consume a base64-encoded download payload and write to local filesystem.
-async fn consume_download_payload(spec: &CopySpec, payload: Vec<u8>) -> Result<()> {
+/// Decode a jumpserver download payload and emit standard copy frames.
+async fn send_download_payload_as_frames(spec: &mut CopySpec, payload: Vec<u8>) -> Result<()> {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    let spec = spec.clone();
-    tokio::task::spawn_blocking(move || {
-        let data = BASE64_STANDARD
-            .decode(payload)
-            .context("failed to decode base64 download payload")?;
-        if spec.recursive {
-            std::fs::create_dir_all(&spec.local_path)
-                .with_context(|| format!("failed to create {}", spec.local_path))?;
+    let data = BASE64_STANDARD
+        .decode(payload)
+        .context("failed to decode base64 download payload")?;
+    let tx = spec
+        .download_tx
+        .take()
+        .ok_or_else(|| anyhow!("download copy frame stream missing"))?;
+
+    if spec.recursive {
+        let temp_dir = InternalTempDir::new("xho_jump_download")?;
+        let temp_root = temp_dir.path().to_path_buf();
+        let data_for_extract = data;
+        tokio::task::spawn_blocking(move || {
             let mut child = Command::new("tar")
                 .arg("xf")
                 .arg("-")
                 .arg("-C")
-                .arg(&spec.local_path)
+                .arg(&temp_root)
                 .stdin(Stdio::piped())
                 .spawn()
-                .with_context(|| format!("failed to spawn tar extract for {}", spec.local_path))?;
+                .context("failed to spawn tar extract for jumpserver download payload")?;
             let mut stdin = child
                 .stdin
                 .take()
                 .ok_or_else(|| anyhow!("failed to open tar stdin"))?;
-            stdin.write_all(&data)?;
+            stdin.write_all(&data_for_extract)?;
             drop(stdin);
             let status = child.wait()?;
             if !status.success() {
-                bail!("tar extract failed for {}", spec.local_path);
+                bail!("tar extract failed for jumpserver download payload");
             }
             Ok(())
-        } else {
-            if let Some(parent) = Path::new(&spec.local_path).parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent)?;
+        })
+        .await
+        .map_err(|error| anyhow!("download payload task failed: {}", error))??;
+
+        let source_root = extracted_tar_root(temp_dir.path(), &spec.source_name)?;
+        emit_local_path_frames(&source_root, Path::new(""), true, &tx).await?;
+    } else {
+        let name = shell_path_basename_or(&spec.source_name, "download");
+        tx.send(CopyFrame::BeginFile {
+            relative_path: name,
+            mode: 0,
+            size: data.len() as u64,
+            mtime: 0,
+        })
+        .await
+        .map_err(|_| anyhow!("download copy frame stream closed"))?;
+        for chunk in data.chunks(64 * 1024) {
+            tx.send(CopyFrame::FileData {
+                data: chunk.to_vec(),
+            })
+            .await
+            .map_err(|_| anyhow!("download copy frame stream closed"))?;
+        }
+        tx.send(CopyFrame::EndFile)
+            .await
+            .map_err(|_| anyhow!("download copy frame stream closed"))?;
+    }
+
+    tx.send(CopyFrame::EndOfStream)
+        .await
+        .map_err(|_| anyhow!("download copy frame stream closed"))?;
+    Ok(())
+}
+
+struct InternalTempDir {
+    path: PathBuf,
+}
+
+impl InternalTempDir {
+    fn new(prefix: &str) -> Result<Self> {
+        let path = std::env::temp_dir().join(format!("{}_{}", prefix, Uuid::new_v4()));
+        std::fs::create_dir_all(&path)
+            .with_context(|| format!("failed to create temp dir {}", path.display()))?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for InternalTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+async fn materialize_frames_to_dir(
+    root: &Path,
+    upload_rx: &mut mpsc::Receiver<CopyFrame>,
+) -> Result<()> {
+    let mut current_file: Option<tokio::fs::File> = None;
+    while let Some(frame) = upload_rx.recv().await {
+        match frame {
+            CopyFrame::BeginDirectory {
+                relative_path,
+                mode,
+                ..
+            } => {
+                let path = join_relative_path(root, &relative_path)?;
+                tokio::fs::create_dir_all(&path)
+                    .await
+                    .with_context(|| format!("failed to create {}", path.display()))?;
+                if mode != 0 {
+                    tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                        .await
+                        .with_context(|| format!("failed to chmod {}", path.display()))?;
                 }
             }
-            std::fs::write(&spec.local_path, data)
-                .with_context(|| format!("failed to write {}", spec.local_path))?;
-            Ok(())
+            CopyFrame::BeginFile {
+                relative_path,
+                mode,
+                ..
+            } => {
+                if current_file.is_some() {
+                    bail!("copy stream began a new file before ending the previous file");
+                }
+                let path = join_relative_path(root, &relative_path)?;
+                if let Some(parent) = path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                }
+                let file = tokio::fs::File::create(&path)
+                    .await
+                    .with_context(|| format!("failed to create {}", path.display()))?;
+                if mode != 0 {
+                    tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                        .await
+                        .with_context(|| format!("failed to chmod {}", path.display()))?;
+                }
+                current_file = Some(file);
+            }
+            CopyFrame::FileData { data } => {
+                let file = current_file
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("copy stream sent file data before BeginFile"))?;
+                file.write_all(&data).await?;
+            }
+            CopyFrame::EndFile => {
+                let mut file = current_file
+                    .take()
+                    .ok_or_else(|| anyhow!("copy stream sent EndFile before BeginFile"))?;
+                file.flush().await?;
+            }
+            CopyFrame::Symlink {
+                relative_path,
+                target,
+            } => {
+                let path = join_relative_path(root, &relative_path)?;
+                if let Some(parent) = path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                }
+                let _ = tokio::fs::remove_file(&path).await;
+                std::os::unix::fs::symlink(target, &path)
+                    .with_context(|| format!("failed to create symlink {}", path.display()))?;
+            }
+            CopyFrame::EndOfStream => break,
         }
+    }
+    if current_file.is_some() {
+        bail!("copy stream ended before EndFile");
+    }
+    Ok(())
+}
+
+async fn collect_single_file_upload(upload_rx: &mut mpsc::Receiver<CopyFrame>) -> Result<Vec<u8>> {
+    let mut data = Vec::new();
+    let mut in_file = false;
+    while let Some(frame) = upload_rx.recv().await {
+        match frame {
+            CopyFrame::BeginFile { .. } if !in_file => {
+                in_file = true;
+            }
+            CopyFrame::FileData { data: chunk } if in_file => {
+                data.extend_from_slice(&chunk);
+            }
+            CopyFrame::EndFile if in_file => {
+                in_file = false;
+            }
+            CopyFrame::EndOfStream => break,
+            CopyFrame::BeginDirectory { .. } => {
+                bail!("non-recursive jumpserver upload received a directory frame");
+            }
+            CopyFrame::Symlink { .. } => {
+                bail!("non-recursive jumpserver symlink upload is not supported");
+            }
+            other => bail!("unexpected copy frame in single-file upload: {:?}", other),
+        }
+    }
+    if in_file {
+        bail!("copy stream ended before EndFile");
+    }
+    Ok(data)
+}
+
+async fn emit_local_path_frames(
+    root: &Path,
+    relative_root: &Path,
+    include_root: bool,
+    tx: &mpsc::Sender<CopyFrame>,
+) -> Result<()> {
+    let metadata = tokio::fs::symlink_metadata(root)
+        .await
+        .with_context(|| format!("failed to inspect {}", root.display()))?;
+    if include_root {
+        send_local_entry_frame(root, relative_root, &metadata, tx).await?;
+    }
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        let mut stack = vec![(root.to_path_buf(), relative_root.to_path_buf())];
+        while let Some((dir, rel_dir)) = stack.pop() {
+            let mut entries = tokio::fs::read_dir(&dir)
+                .await
+                .with_context(|| format!("failed to read {}", dir.display()))?;
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                let rel = rel_dir.join(entry.file_name());
+                let metadata = tokio::fs::symlink_metadata(&path)
+                    .await
+                    .with_context(|| format!("failed to inspect {}", path.display()))?;
+                send_local_entry_frame(&path, &rel, &metadata, tx).await?;
+                if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                    stack.push((path, rel));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn send_local_entry_frame(
+    path: &Path,
+    relative_path: &Path,
+    metadata: &std::fs::Metadata,
+    tx: &mpsc::Sender<CopyFrame>,
+) -> Result<()> {
+    validate_relative_path(relative_path)?;
+    let relative_path = relative_path_to_string(relative_path)?;
+    if metadata.file_type().is_symlink() {
+        let target = tokio::fs::read_link(path)
+            .await
+            .with_context(|| format!("failed to read symlink {}", path.display()))?;
+        tx.send(CopyFrame::Symlink {
+            relative_path,
+            target: target.to_string_lossy().to_string(),
+        })
+        .await
+        .map_err(|_| anyhow!("download copy frame stream closed"))?;
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        tx.send(CopyFrame::BeginDirectory {
+            relative_path,
+            mode: metadata.permissions().mode(),
+            mtime: metadata.mtime(),
+        })
+        .await
+        .map_err(|_| anyhow!("download copy frame stream closed"))?;
+        return Ok(());
+    }
+    if !metadata.is_file() {
+        bail!(
+            "unsupported file type for jumpserver copy: {}",
+            path.display()
+        );
+    }
+    tx.send(CopyFrame::BeginFile {
+        relative_path,
+        mode: metadata.permissions().mode(),
+        size: metadata.len(),
+        mtime: metadata.mtime(),
     })
     .await
-    .map_err(|error| anyhow!("download payload task failed: {}", error))?
+    .map_err(|_| anyhow!("download copy frame stream closed"))?;
+
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        tx.send(CopyFrame::FileData {
+            data: buf[..n].to_vec(),
+        })
+        .await
+        .map_err(|_| anyhow!("download copy frame stream closed"))?;
+    }
+    tx.send(CopyFrame::EndFile)
+        .await
+        .map_err(|_| anyhow!("download copy frame stream closed"))?;
+    Ok(())
+}
+
+fn extracted_tar_root(temp_dir: &Path, source_name: &str) -> Result<PathBuf> {
+    if let Some(name) = shell_path_basename(source_name) {
+        let preferred = temp_dir.join(name);
+        if preferred.exists() {
+            return Ok(preferred);
+        }
+    }
+    let mut entries = std::fs::read_dir(temp_dir)
+        .with_context(|| format!("failed to read extracted tar dir {}", temp_dir.display()))?
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    if entries.len() == 1 {
+        return Ok(entries.remove(0).path());
+    }
+    Ok(temp_dir.to_path_buf())
+}
+
+fn shell_path_basename(value: &str) -> Option<String> {
+    Path::new(value.trim_end_matches('/'))
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(ToString::to_string)
+}
+
+fn shell_path_basename_or(value: &str, fallback: &str) -> String {
+    shell_path_basename(value).unwrap_or_else(|| fallback.to_string())
+}
+
+fn relative_path_to_string(path: &Path) -> Result<String> {
+    validate_relative_path(path)?;
+    path.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", path.display()))
+}
+
+fn validate_relative_path(path: &Path) -> Result<()> {
+    if path.is_absolute() {
+        bail!(
+            "copy frame relative path must not be absolute: {}",
+            path.display()
+        );
+    }
+    for component in path.components() {
+        match component {
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!(
+                    "copy frame relative path contains invalid component: {}",
+                    path.display()
+                );
+            }
+            Component::CurDir | Component::Normal(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn join_relative_path(root: &Path, relative_path: &str) -> Result<PathBuf> {
+    if relative_path.is_empty() {
+        return Ok(root.to_path_buf());
+    }
+    let relative = Path::new(relative_path);
+    validate_relative_path(relative)?;
+    Ok(root.join(relative))
 }

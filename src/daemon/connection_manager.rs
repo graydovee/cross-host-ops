@@ -325,9 +325,7 @@ where
         let mut discarded = 0usize;
         for state in inner.values_mut() {
             let before = state.idle.len();
-            state
-                .idle
-                .retain(|entry| !should_discard(&entry.resource));
+            state.idle.retain(|entry| !should_discard(&entry.resource));
             let removed = before.saturating_sub(state.idle.len());
             if removed > 0 {
                 discarded += removed;
@@ -500,7 +498,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!manager.invalidate_generation(first.generation()).await);
-        assert_eq!(manager.current_generation().await, Some(second.generation()));
+        assert_eq!(
+            manager.current_generation().await,
+            Some(second.generation())
+        );
         assert_eq!(
             manager
                 .checkout_generation(second.generation())
@@ -508,7 +509,12 @@ mod tests {
                 .map(|lease| *lease.resource()),
             Some(2)
         );
-        assert!(manager.checkout_generation(first.generation()).await.is_none());
+        assert!(
+            manager
+                .checkout_generation(first.generation())
+                .await
+                .is_none()
+        );
         assert_eq!(*second.resource(), 2);
     }
 

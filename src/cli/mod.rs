@@ -2,8 +2,9 @@ use std::env;
 use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::io::RawFd;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -31,8 +32,8 @@ use crate::daemon::gateway::auth::{
 use crate::exit_codes::cap_remote_exit_code;
 use crate::protocol::rpc;
 use crate::types::{
-    AddressDefaults, CopyDirection, CopySpec, ExecStdinFlags, ExecTtyFlags, RemoteAddress,
-    effective_stdin_decision, effective_tty_decision, should_use_interactive_mode,
+    AddressDefaults, CopyDirection, CopyFrame, CopySpec, ExecStdinFlags, ExecTtyFlags,
+    RemoteAddress, effective_stdin_decision, effective_tty_decision, should_use_interactive_mode,
 };
 
 /// Output format for CLI responses.
@@ -805,35 +806,34 @@ async fn status() -> Result<i32> {
 }
 
 async fn run_copy(recursive: bool, source: String, dest: String, timeout_ms: u64) -> Result<i32> {
-    let (target, spec) = parse_copy_operands(recursive, &source, &dest)?;
-    let config = AppConfig::load(None).unwrap_or_default();
-    let stream_file_data = is_xhod_target(&target, &config);
+    let CopyCliPlan {
+        target,
+        spec,
+        local_path,
+    } = parse_copy_operands(recursive, &source, &dest)?;
+    if spec.direction == CopyDirection::Upload {
+        validate_upload_source(Path::new(&local_path), recursive).await?;
+    }
     let mut client = connect_local_copy_client().await?;
     let (tx, rx) = mpsc::channel(8);
-    tx.send(crate::protocol::copy_spec_to_rpc(
-        target,
-        spec.clone(),
-        timeout_ms,
-    ))
-    .await
-    .map_err(|_| anyhow!("failed to send copy start request"))?;
+    tx.send(crate::protocol::copy_spec_to_rpc(target, &spec, timeout_ms))
+        .await
+        .map_err(|_| anyhow!("failed to send copy start request"))?;
 
-    let upload_file = if stream_file_data && spec.direction == CopyDirection::Upload {
-        Some(
-            tokio::fs::File::open(&spec.local_path)
-                .await
-                .with_context(|| format!("failed to open upload source {}", spec.local_path))?,
-        )
+    let response = client.copy(ReceiverStream::new(rx)).await?;
+    if spec.direction == CopyDirection::Upload {
+        spawn_copy_upload_frames(tx.clone(), PathBuf::from(&local_path), recursive);
+    }
+    let mut stream = response.into_inner();
+    let mut download_writer = if spec.direction == CopyDirection::Download {
+        Some(CopyDownloadWriter::new(
+            PathBuf::from(&local_path),
+            recursive,
+            spec.source_name.clone(),
+        ))
     } else {
         None
     };
-
-    let response = client.copy(ReceiverStream::new(rx)).await?;
-    if let Some(file) = upload_file {
-        spawn_copy_upload_stream(tx.clone(), file);
-    }
-    let mut stream = response.into_inner();
-    let mut download_file: Option<tokio::fs::File> = None;
     while let Some(message) = stream.message().await? {
         match message
             .event
@@ -863,9 +863,10 @@ async fn run_copy(recursive: bool, source: String, dest: String, timeout_ms: u64
                     eprintln!("{}", info.message);
                 }
             }
-            rpc::copy_response::Event::DataChunk(chunk) => {
-                if stream_file_data && spec.direction == CopyDirection::Download {
-                    write_copy_download_chunk(&mut download_file, &spec.local_path, chunk).await?;
+            rpc::copy_response::Event::Frame(frame) => {
+                let frame = crate::protocol::copy_frame_from_rpc(frame)?;
+                if let Some(writer) = download_writer.as_mut() {
+                    writer.apply(frame).await?;
                 }
             }
         }
@@ -873,74 +874,392 @@ async fn run_copy(recursive: bool, source: String, dest: String, timeout_ms: u64
     Ok(0)
 }
 
-fn is_xhod_target(target: &str, config: &AppConfig) -> bool {
-    let gateway_name = target.split_once(':').map_or(target, |(prefix, _)| prefix);
-    config.gateways.iter().any(|gateway| {
-        gateway.name() == gateway_name && matches!(gateway.gateway_kind(), GatewayKind::Xhod)
-    })
-}
-
-fn spawn_copy_upload_stream(tx: mpsc::Sender<rpc::CopyRequest>, mut file: tokio::fs::File) {
+fn spawn_copy_upload_frames(
+    tx: mpsc::Sender<rpc::CopyRequest>,
+    local_path: PathBuf,
+    recursive: bool,
+) {
     tokio::spawn(async move {
-        const CHUNK_SIZE: usize = 64 * 1024;
-        let mut buf = vec![0u8; CHUNK_SIZE];
-        loop {
-            let n = match file.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(error) => {
-                    tracing::warn!(error = %error, "failed to read copy upload source");
-                    return;
-                }
-            };
-            let msg = rpc::CopyRequest {
-                request: Some(rpc::copy_request::Request::DataChunk(rpc::CopyDataChunk {
-                    data: buf[..n].to_vec(),
-                    eof: false,
-                })),
-            };
-            if tx.send(msg).await.is_err() {
-                return;
-            }
+        if let Err(error) = send_path_copy_frames(&tx, &local_path, recursive).await {
+            tracing::warn!(error = %error, path = %local_path.display(), "failed to stream copy upload frames");
         }
-        let eof = rpc::CopyRequest {
-            request: Some(rpc::copy_request::Request::DataChunk(rpc::CopyDataChunk {
-                data: Vec::new(),
-                eof: true,
-            })),
-        };
-        let _ = tx.send(eof).await;
     });
 }
 
-async fn write_copy_download_chunk(
-    download_file: &mut Option<tokio::fs::File>,
-    local_path: &str,
-    chunk: rpc::CopyDataChunk,
+async fn validate_upload_source(path: &Path, recursive: bool) -> Result<()> {
+    let metadata = tokio::fs::symlink_metadata(path)
+        .await
+        .with_context(|| format!("failed to inspect upload source {}", path.display()))?;
+    if metadata.is_dir() && !recursive {
+        bail!(
+            "{} is a directory; use -r to copy directories",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+async fn send_path_copy_frames(
+    tx: &mpsc::Sender<rpc::CopyRequest>,
+    local_path: &Path,
+    recursive: bool,
 ) -> Result<()> {
-    if download_file.is_none() {
-        let path = Path::new(local_path);
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent).await?;
+    let metadata = tokio::fs::symlink_metadata(local_path)
+        .await
+        .with_context(|| format!("failed to inspect {}", local_path.display()))?;
+
+    if metadata.is_dir() {
+        if !recursive {
+            bail!(
+                "{} is a directory; use -r to copy directories",
+                local_path.display()
+            );
+        }
+        tx.send(crate::protocol::copy_frame_request(
+            CopyFrame::BeginDirectory {
+                relative_path: String::new(),
+                mode: metadata.permissions().mode(),
+                mtime: metadata.mtime(),
+            },
+        ))
+        .await
+        .map_err(|_| anyhow!("failed to send root directory copy frame"))?;
+        send_directory_contents_frames(tx, local_path, local_path).await?;
+    } else {
+        let relative_path = local_basename(local_path)?;
+        send_path_entry_frame(tx, local_path, Path::new(&relative_path)).await?;
+    }
+
+    tx.send(crate::protocol::copy_frame_request(CopyFrame::EndOfStream))
+        .await
+        .map_err(|_| anyhow!("failed to send copy end-of-stream frame"))?;
+    Ok(())
+}
+
+async fn send_directory_contents_frames(
+    tx: &mpsc::Sender<rpc::CopyRequest>,
+    root: &Path,
+    dir: &Path,
+) -> Result<()> {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current_dir) = stack.pop() {
+        let mut entries = tokio::fs::read_dir(&current_dir)
+            .await
+            .with_context(|| format!("failed to read directory {}", current_dir.display()))?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let relative = path.strip_prefix(root).with_context(|| {
+                format!("failed to derive relative path for {}", path.display())
+            })?;
+            let metadata = tokio::fs::symlink_metadata(&path)
+                .await
+                .with_context(|| format!("failed to inspect {}", path.display()))?;
+            send_path_entry_frame_with_metadata(tx, &path, relative, &metadata).await?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                stack.push(path);
             }
         }
-        *download_file = Some(tokio::fs::File::create(path).await?);
     }
-
-    if !chunk.data.is_empty() {
-        if let Some(file) = download_file.as_mut() {
-            file.write_all(&chunk.data).await?;
-        }
-    }
-
-    if chunk.eof {
-        if let Some(mut file) = download_file.take() {
-            file.flush().await?;
-        }
-    }
-
     Ok(())
+}
+
+async fn send_path_entry_frame(
+    tx: &mpsc::Sender<rpc::CopyRequest>,
+    path: &Path,
+    relative_path: &Path,
+) -> Result<()> {
+    validate_relative_path(relative_path)?;
+    let metadata = tokio::fs::symlink_metadata(path)
+        .await
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    send_path_entry_frame_with_metadata(tx, path, relative_path, &metadata).await
+}
+
+async fn send_path_entry_frame_with_metadata(
+    tx: &mpsc::Sender<rpc::CopyRequest>,
+    path: &Path,
+    relative_path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<()> {
+    validate_relative_path(relative_path)?;
+    let relative_path = relative_path_to_string(relative_path)?;
+    if metadata.file_type().is_symlink() {
+        let target = tokio::fs::read_link(path)
+            .await
+            .with_context(|| format!("failed to read symlink {}", path.display()))?;
+        tx.send(crate::protocol::copy_frame_request(CopyFrame::Symlink {
+            relative_path,
+            target: target.to_string_lossy().to_string(),
+        }))
+        .await
+        .map_err(|_| anyhow!("failed to send symlink copy frame"))?;
+        return Ok(());
+    }
+
+    if metadata.is_dir() {
+        tx.send(crate::protocol::copy_frame_request(
+            CopyFrame::BeginDirectory {
+                relative_path: relative_path.clone(),
+                mode: metadata.permissions().mode(),
+                mtime: metadata.mtime(),
+            },
+        ))
+        .await
+        .map_err(|_| anyhow!("failed to send directory copy frame"))?;
+        return Ok(());
+    }
+
+    if !metadata.is_file() {
+        bail!("unsupported file type for copy: {}", path.display());
+    }
+
+    tx.send(crate::protocol::copy_frame_request(CopyFrame::BeginFile {
+        relative_path,
+        mode: metadata.permissions().mode(),
+        size: metadata.len(),
+        mtime: metadata.mtime(),
+    }))
+    .await
+    .map_err(|_| anyhow!("failed to send file copy frame"))?;
+
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    const CHUNK_SIZE: usize = 64 * 1024;
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .await
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        tx.send(crate::protocol::copy_frame_request(CopyFrame::FileData {
+            data: buf[..n].to_vec(),
+        }))
+        .await
+        .map_err(|_| anyhow!("failed to send file data copy frame"))?;
+    }
+    tx.send(crate::protocol::copy_frame_request(CopyFrame::EndFile))
+        .await
+        .map_err(|_| anyhow!("failed to send end-file copy frame"))?;
+    Ok(())
+}
+
+struct CopyDownloadWriter {
+    dest: PathBuf,
+    recursive: bool,
+    source_name: String,
+    root: Option<PathBuf>,
+    current_file: Option<tokio::fs::File>,
+}
+
+impl CopyDownloadWriter {
+    fn new(dest: PathBuf, recursive: bool, source_name: String) -> Self {
+        Self {
+            dest,
+            recursive,
+            source_name,
+            root: None,
+            current_file: None,
+        }
+    }
+
+    async fn apply(&mut self, frame: CopyFrame) -> Result<()> {
+        match frame {
+            CopyFrame::BeginFile {
+                relative_path,
+                mode,
+                ..
+            } => {
+                let path = self.destination_for_file(&relative_path).await?;
+                if let Some(parent) = path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                }
+                let file = tokio::fs::File::create(&path)
+                    .await
+                    .with_context(|| format!("failed to create {}", path.display()))?;
+                if mode != 0 {
+                    let permissions = std::fs::Permissions::from_mode(mode);
+                    tokio::fs::set_permissions(&path, permissions)
+                        .await
+                        .with_context(|| {
+                            format!("failed to set permissions on {}", path.display())
+                        })?;
+                }
+                self.current_file = Some(file);
+            }
+            CopyFrame::FileData { data } => {
+                let file = self
+                    .current_file
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("copy stream sent file data before BeginFile"))?;
+                file.write_all(&data).await?;
+            }
+            CopyFrame::EndFile => {
+                if let Some(mut file) = self.current_file.take() {
+                    file.flush().await?;
+                }
+            }
+            CopyFrame::BeginDirectory {
+                relative_path,
+                mode,
+                ..
+            } => {
+                if !self.recursive {
+                    bail!("remote source is a directory; use -r to copy directories");
+                }
+                let root = self.download_root().await?;
+                let path = join_relative_path(&root, &relative_path)?;
+                tokio::fs::create_dir_all(&path)
+                    .await
+                    .with_context(|| format!("failed to create directory {}", path.display()))?;
+                if mode != 0 {
+                    let permissions = std::fs::Permissions::from_mode(mode);
+                    tokio::fs::set_permissions(&path, permissions)
+                        .await
+                        .with_context(|| {
+                            format!("failed to set permissions on {}", path.display())
+                        })?;
+                }
+            }
+            CopyFrame::Symlink {
+                relative_path,
+                target,
+            } => {
+                let path = if self.recursive {
+                    let root = self.download_root().await?;
+                    join_relative_path(&root, &relative_path)?
+                } else {
+                    self.destination_for_single_entry(&relative_path).await?
+                };
+                if let Some(parent) = path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                }
+                let _ = tokio::fs::remove_file(&path).await;
+                std::os::unix::fs::symlink(target, &path)
+                    .with_context(|| format!("failed to create symlink {}", path.display()))?;
+            }
+            CopyFrame::EndOfStream => {
+                if let Some(mut file) = self.current_file.take() {
+                    file.flush().await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn destination_for_file(&mut self, relative_path: &str) -> Result<PathBuf> {
+        if self.recursive {
+            let root = self.download_root().await?;
+            join_relative_path(&root, relative_path)
+        } else {
+            self.destination_for_single_entry(relative_path).await
+        }
+    }
+
+    async fn destination_for_single_entry(&self, relative_path: &str) -> Result<PathBuf> {
+        if path_is_existing_dir(&self.dest).await? {
+            let name = copy_entry_name(relative_path, &self.source_name)?;
+            Ok(self.dest.join(name))
+        } else {
+            Ok(self.dest.clone())
+        }
+    }
+
+    async fn download_root(&mut self) -> Result<PathBuf> {
+        if let Some(root) = &self.root {
+            return Ok(root.clone());
+        }
+        let root = if path_is_existing_dir(&self.dest).await? {
+            self.dest
+                .join(non_empty_name(&self.source_name, "download"))
+        } else {
+            self.dest.clone()
+        };
+        self.root = Some(root.clone());
+        Ok(root)
+    }
+}
+
+async fn path_is_existing_dir(path: &Path) -> Result<bool> {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+fn copy_entry_name(relative_path: &str, source_name: &str) -> Result<String> {
+    let fallback = non_empty_name(source_name, "download");
+    if relative_path.is_empty() {
+        return Ok(fallback);
+    }
+    let path = Path::new(relative_path);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&fallback);
+    Ok(name.to_string())
+}
+
+fn non_empty_name(value: &str, fallback: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn local_basename(path: &Path) -> Result<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| anyhow!("failed to derive basename from {}", path.display()))
+}
+
+fn relative_path_to_string(path: &Path) -> Result<String> {
+    validate_relative_path(path)?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+fn validate_relative_path(path: &Path) -> Result<()> {
+    if path.is_absolute() {
+        bail!(
+            "copy frame relative path must not be absolute: {}",
+            path.display()
+        );
+    }
+    for component in path.components() {
+        match component {
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!(
+                    "copy frame relative path contains invalid component: {}",
+                    path.display()
+                );
+            }
+            Component::CurDir | Component::Normal(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn join_relative_path(root: &Path, relative_path: impl AsRef<str>) -> Result<PathBuf> {
+    let relative_path = relative_path.as_ref();
+    if relative_path.is_empty() {
+        return Ok(root.to_path_buf());
+    }
+    let path = Path::new(relative_path);
+    validate_relative_path(path)?;
+    Ok(root.join(path))
 }
 
 /// Dispatch a HostCommand to the appropriate handler function.
@@ -1562,35 +1881,56 @@ fn read_secret_line() -> Result<String> {
     }
 }
 
-fn parse_copy_operands(recursive: bool, source: &str, dest: &str) -> Result<(String, CopySpec)> {
+struct CopyCliPlan {
+    target: String,
+    spec: CopySpec,
+    local_path: String,
+}
+
+fn parse_copy_operands(recursive: bool, source: &str, dest: &str) -> Result<CopyCliPlan> {
     let src_remote = parse_remote_spec(source);
     let dst_remote = parse_remote_spec(dest);
     match (src_remote, dst_remote) {
-        (Some((target, remote_path)), None) => Ok((
+        (Some((target, remote_path)), None) => Ok(CopyCliPlan {
             target,
-            CopySpec {
+            spec: CopySpec {
                 direction: CopyDirection::Download,
-                local_path: expand_tilde(dest)?,
-                remote_path,
+                remote_path: remote_path.clone(),
                 recursive,
-                relay_upload_rx: None,
-                relay_download_tx: None,
+                source_name: remote_source_name(&remote_path),
+                upload_rx: None,
+                download_tx: None,
             },
-        )),
-        (None, Some((target, remote_path))) => Ok((
-            target,
-            CopySpec {
-                direction: CopyDirection::Upload,
-                local_path: expand_tilde(source)?,
-                remote_path,
-                recursive,
-                relay_upload_rx: None,
-                relay_download_tx: None,
-            },
-        )),
+            local_path: expand_tilde(dest)?,
+        }),
+        (None, Some((target, remote_path))) => {
+            let local_path = expand_tilde(source)?;
+            Ok(CopyCliPlan {
+                target,
+                spec: CopySpec {
+                    direction: CopyDirection::Upload,
+                    remote_path,
+                    recursive,
+                    source_name: local_basename(Path::new(&local_path))?,
+                    upload_rx: None,
+                    download_tx: None,
+                },
+                local_path,
+            })
+        }
         (Some(_), Some(_)) => bail!("copy supports exactly one remote operand"),
         (None, None) => bail!("copy requires one remote operand like host:/path"),
     }
+}
+
+fn remote_source_name(remote_path: &str) -> String {
+    let trimmed = remote_path.trim_end_matches('/');
+    Path::new(trimmed)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("download")
+        .to_string()
 }
 
 fn parse_remote_spec(value: &str) -> Option<(String, String)> {

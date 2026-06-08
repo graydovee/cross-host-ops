@@ -61,28 +61,59 @@ enum CopyDirection {
   COPY_DIRECTION_DOWNLOAD = 2;
 }
 
-// CopyDataChunk streams file content between client and daemon for xhod-routed copies.
-// Used on both the request stream (upload) and response stream (download).
-message CopyDataChunk {
-  bytes data = 1;
-  bool eof = 2;
-}
-
 message CopyRequest {
   oneof request {
     CopyStartRequest start = 1;
     AuthInputRequest auth_input = 2;
-    CopyDataChunk data_chunk = 3;
+    CopyFrame frame = 3;
   }
 }
 
 message CopyStartRequest {
   string target = 1;
-  string local_path = 2;
-  string remote_path = 3;
-  bool recursive = 4;
-  CopyDirection direction = 5;
-  uint64 timeout_ms = 6;
+  string remote_path = 2;
+  bool recursive = 3;
+  CopyDirection direction = 4;
+  uint64 timeout_ms = 5;
+  string source_name = 6;
+}
+
+message CopyFrame {
+  oneof frame {
+    CopyBeginFile begin_file = 1;
+    CopyFileData file_data = 2;
+    CopyEndFile end_file = 3;
+    CopyBeginDirectory begin_directory = 4;
+    CopySymlink symlink = 5;
+    CopyEndOfStream end_of_stream = 6;
+  }
+}
+
+message CopyBeginFile {
+  string relative_path = 1;
+  uint32 mode = 2;
+  uint64 size = 3;
+  int64 mtime = 4;
+}
+
+message CopyFileData {
+  bytes data = 1;
+}
+
+message CopyEndFile {}
+
+message CopyBeginDirectory {
+  string relative_path = 1;
+  uint32 mode = 2;
+  int64 mtime = 3;
+}
+
+message CopySymlink {
+  string relative_path = 1;
+  string target = 2;
+}
+
+message CopyEndOfStream {
 }
 
 message ExecuteResponse {
@@ -104,7 +135,7 @@ message CopyResponse {
     ErrorResponse error = 2;
     AuthPrompt auth_prompt = 3;
     CopyComplete complete = 4;
-    CopyDataChunk data_chunk = 5;
+    CopyFrame frame = 5;
   }
 }
 

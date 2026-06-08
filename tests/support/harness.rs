@@ -220,7 +220,7 @@ impl TestHarness {
     /// all response events. Returns `Ok(())` on success or the error message.
     pub async fn cli_cp(
         &mut self,
-        local_path: &str,
+        source_name: &str,
         remote_path: &str,
         direction: HarnessCopyDirection,
     ) -> Result<(), String> {
@@ -232,10 +232,10 @@ impl TestHarness {
         let start_request = rpc::CopyRequest {
             request: Some(rpc::copy_request::Request::Start(rpc::CopyStartRequest {
                 target: "stub-target".to_string(),
-                local_path: local_path.to_string(),
                 remote_path: remote_path.to_string(),
                 recursive: false,
                 direction: rpc_direction as i32,
+                source_name: source_name.to_string(),
                 ..Default::default()
             })),
         };

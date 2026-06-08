@@ -8,8 +8,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tracing::warn;
 
-use crate::protocol::{ServerEvent, rpc};
-use crate::types::{CopyDirection, CopySpec};
+use crate::protocol::{self, ServerEvent, rpc};
+use crate::types::{CopyDirection, CopyFrame, CopySpec};
 
 use super::{Connection, ExecRequest, InteractiveHandle, InteractiveRequest};
 
@@ -246,8 +246,6 @@ impl Connection for XhodConnection {
     }
 
     async fn copy(&mut self, mut spec: CopySpec) -> Result<()> {
-        // Build CopyStartRequest with local_path intentionally set to "" for
-        // xhod hops — the remote daemon must not touch local paths on this side.
         let direction = match spec.direction {
             CopyDirection::Upload => rpc::CopyDirection::Upload as i32,
             CopyDirection::Download => rpc::CopyDirection::Download as i32,
@@ -256,103 +254,48 @@ impl Connection for XhodConnection {
         let start = rpc::CopyRequest {
             request: Some(rpc::copy_request::Request::Start(rpc::CopyStartRequest {
                 target: self.target_label.clone(),
-                local_path: String::new(), // intentionally empty for xhod hops
                 remote_path: spec.remote_path.clone(),
                 recursive: spec.recursive,
                 direction,
-                ..Default::default()
+                timeout_ms: 0,
+                source_name: spec.source_name.clone(),
             })),
         };
 
-        // Use a larger channel buffer for file streaming.
         let (req_tx, req_rx) = mpsc::channel::<rpc::CopyRequest>(16);
         req_tx
             .send(start)
             .await
             .map_err(|_| anyhow::anyhow!("failed to send copy start request into stream"))?;
 
-        // Take relay channels out of spec (they are not Clone).
-        let relay_upload_rx = spec.relay_upload_rx.take();
-        let relay_download_tx = spec.relay_download_tx.take();
+        let upload_rx = spec.upload_rx.take();
+        let download_tx = spec.download_tx.take();
 
         if spec.direction == CopyDirection::Upload {
-            if let Some(mut upload_rx) = relay_upload_rx {
-                // Relay upload path: forward (data, eof) tuples from the relay
-                // channel (populated by the daemon's copy RPC handler from the
-                // client gRPC stream) as CopyDataChunk messages.
-                tokio::spawn(async move {
-                    while let Some((data, eof)) = upload_rx.recv().await {
-                        let msg = rpc::CopyRequest {
-                            request: Some(rpc::copy_request::Request::DataChunk(
-                                rpc::CopyDataChunk { data, eof },
-                            )),
-                        };
-                        if req_tx.send(msg).await.is_err() {
-                            return;
-                        }
-                        if eof {
-                            // EOF chunk sent — stop reading from relay.
-                            break;
-                        }
+            let mut upload_rx =
+                upload_rx.ok_or_else(|| anyhow::anyhow!("upload copy frame stream missing"))?;
+            tokio::spawn(async move {
+                while let Some(frame) = upload_rx.recv().await {
+                    let eof = matches!(frame, CopyFrame::EndOfStream);
+                    if req_tx
+                        .send(protocol::copy_frame_request(frame))
+                        .await
+                        .is_err()
+                    {
+                        return;
                     }
-                    // req_tx drops here, closing the gRPC request stream.
-                });
-            } else {
-                // Local file upload path: read the local file and stream its
-                // contents as CopyDataChunk messages.
-                let local_path = spec.local_path.clone();
-                tokio::spawn(async move {
-                    const CHUNK_SIZE: usize = 64 * 1024; // 64 KB chunks
-                    match tokio::fs::read(&local_path).await {
-                        Ok(file_bytes) => {
-                            // Stream file contents in chunks.
-                            for chunk in file_bytes.chunks(CHUNK_SIZE) {
-                                let msg = rpc::CopyRequest {
-                                    request: Some(rpc::copy_request::Request::DataChunk(
-                                        rpc::CopyDataChunk {
-                                            data: chunk.to_vec(),
-                                            eof: false,
-                                        },
-                                    )),
-                                };
-                                if req_tx.send(msg).await.is_err() {
-                                    // Remote end closed the stream unexpectedly.
-                                    return;
-                                }
-                            }
-                            // Send the final EOF chunk to signal end of file.
-                            let eof_msg = rpc::CopyRequest {
-                                request: Some(rpc::copy_request::Request::DataChunk(
-                                    rpc::CopyDataChunk {
-                                        data: vec![],
-                                        eof: true,
-                                    },
-                                )),
-                            };
-                            let _ = req_tx.send(eof_msg).await;
-                            // req_tx drops here, closing the gRPC request stream.
-                        }
-                        Err(e) => {
-                            // File read failure — drop req_tx to signal abort to remote.
-                            warn!(error = %e, path = %local_path, "upload: failed to read local file");
-                        }
+                    if eof {
+                        break;
                     }
-                });
-            }
+                }
+            });
         } else {
-            // Download path: no data to send from client side — drop req_tx
-            // after the start message to close the upload half of the stream.
             drop(req_tx);
         }
 
         let request_stream = ReceiverStream::new(req_rx);
         let mut response_stream = self.client.copy(request_stream).await?.into_inner();
 
-        // For local-file download, open the destination file lazily on first DataChunk.
-        let mut download_file: Option<tokio::fs::File> = None;
-        let local_path = spec.local_path.clone();
-
-        // Bridge CopyResponse events.
         while let Some(response) = response_stream.message().await? {
             if let Some(event) = response.event {
                 match event {
@@ -371,58 +314,15 @@ impl Connection for XhodConnection {
                         // stream. The owning XhodGateway handles auth at a
                         // higher level. If we reach here, we silently skip.
                     }
-                    rpc::copy_response::Event::DataChunk(chunk) => {
-                        if let Some(ref tx) = relay_download_tx {
-                            // Relay download path: forward the chunk to the daemon's
-                            // gRPC response sender. If the relay channel is closed,
-                            // abort gracefully.
-                            let eof = chunk.eof;
-                            if tx.send((chunk.data, eof)).await.is_err() {
-                                return Err(anyhow::anyhow!(
-                                    "download relay channel closed unexpectedly"
-                                ));
-                            }
-                        } else {
-                            // Local file download path: write received bytes to file.
-                            use tokio::io::AsyncWriteExt as _;
-
-                            if download_file.is_none() {
-                                let f =
-                                    tokio::fs::File::create(&local_path).await.map_err(|e| {
-                                        anyhow::anyhow!(
-                                            "download: failed to create local file {:?}: {}",
-                                            local_path,
-                                            e
-                                        )
-                                    })?;
-                                download_file = Some(f);
-                            }
-
-                            if !chunk.data.is_empty() {
-                                if let Some(f) = download_file.as_mut() {
-                                    f.write_all(&chunk.data).await.map_err(|e| {
-                                        anyhow::anyhow!(
-                                            "download: failed to write to local file {:?}: {}",
-                                            local_path,
-                                            e
-                                        )
-                                    })?;
-                                }
-                            }
-
-                            if chunk.eof {
-                                // Flush and close the file; the remote will send
-                                // a Complete event next, but we're ready.
-                                if let Some(mut f) = download_file.take() {
-                                    f.flush().await.map_err(|e| {
-                                        anyhow::anyhow!(
-                                            "download: failed to flush local file {:?}: {}",
-                                            local_path,
-                                            e
-                                        )
-                                    })?;
-                                }
-                            }
+                    rpc::copy_response::Event::Frame(frame) => {
+                        let tx = download_tx
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("download copy frame stream missing"))?;
+                        let frame = protocol::copy_frame_from_rpc(frame)?;
+                        if tx.send(frame).await.is_err() {
+                            return Err(anyhow::anyhow!(
+                                "download frame channel closed unexpectedly"
+                            ));
                         }
                     }
                 }
@@ -909,59 +809,45 @@ mod tests {
 
         /// **Validates: Requirements 1.3, 1.4**
         ///
-        /// Bug Condition: XhodConnection::copy never streams file data.
-        ///
-        /// For any upload CopySpec, after calling `XhodConnection::copy` the
-        /// mock server's Copy stream should contain CopyDataChunk messages.
-        ///
-        /// On unfixed code: only CopyStartRequest is sent, no data chunks.
-        /// The proto oneof in CopyRequest has no `data_chunk` variant.
-        ///
-        /// EXPECTED OUTCOME: Test FAILS on unfixed code because we assert
-        /// that data chunks ARE received, but they never arrive (copy hangs
-        /// at the remote daemon waiting for data that never comes — in the
-        /// mock, we immediately complete, but in production it would hang).
         #[test]
-        fn prop_bug_xhod_copy_upload_no_data_chunks(
+        fn prop_xhod_copy_upload_streams_copy_frames(
             file_data in proptest::collection::vec(any::<u8>(), 1..256usize),
         ) {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                // Write file data to a temp file for the copy spec.
-                let temp_file = std::env::temp_dir().join(format!(
-                    "xho-test-copy-{}.bin",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .subsec_nanos()
-                ));
-                tokio::fs::write(&temp_file, &file_data)
-                    .await
-                    .expect("failed to write temp file");
-
                 let (client, _exec_log, mut copy_rx) = start_mock_server().await;
                 let mut conn = XhodConnection::new(client, "test-target".to_string());
+                let (upload_tx, upload_rx) = tokio::sync::mpsc::channel(8);
+                upload_tx.send(crate::types::CopyFrame::BeginFile {
+                    relative_path: "upload.bin".to_string(),
+                    mode: 0o644,
+                    size: file_data.len() as u64,
+                    mtime: 0,
+                }).await.unwrap();
+                upload_tx.send(crate::types::CopyFrame::FileData {
+                    data: file_data.clone(),
+                }).await.unwrap();
+                upload_tx.send(crate::types::CopyFrame::EndFile).await.unwrap();
+                upload_tx.send(crate::types::CopyFrame::EndOfStream).await.unwrap();
+                drop(upload_tx);
 
                 let spec = crate::types::CopySpec {
-                    local_path: temp_file.display().to_string(),
                     remote_path: "/tmp/remote-dest.bin".to_string(),
                     direction: crate::types::CopyDirection::Upload,
                     recursive: false,
-                    relay_upload_rx: None,
-                    relay_download_tx: None,
+                    source_name: "upload.bin".to_string(),
+                    upload_rx: Some(upload_rx),
+                    download_tx: None,
                 };
 
-                // Perform the copy — on unfixed code this only sends StartRequest.
                 let result = conn.copy(spec).await;
                 assert!(result.is_ok(), "copy should complete (mock always responds with Complete)");
 
-                // Collect all CopyRequest messages received by mock server.
                 let mut copy_messages = Vec::new();
                 while let Ok(msg) = copy_rx.try_recv() {
                     copy_messages.push(msg);
                 }
 
-                // Verify StartRequest was received.
                 let has_start = copy_messages.iter().any(|m| {
                     matches!(
                         &m.request,
@@ -970,31 +856,25 @@ mod tests {
                 });
                 prop_assert!(has_start, "mock server should receive CopyStartRequest");
 
-                // EXPECTED BEHAVIOR ASSERTION (will FAIL on unfixed code):
-                // After the fix, CopyRequest oneof should have a data_chunk variant,
-                // and XhodConnection::copy should stream file data as CopyDataChunk
-                // messages before sending the EOF chunk.
-                //
-                // On UNFIXED code: the proto has no data_chunk variant in CopyRequest,
-                // and even if it did, XhodConnection::copy never reads the local file
-                // or streams any data. This assertion FAILS → confirms bug.
-                //
-                // We check: after StartRequest, at least one additional message was
-                // sent (the data chunk). On unfixed code, only StartRequest is sent.
-                let total_messages = copy_messages.len();
-                let messages_after_start = total_messages.saturating_sub(1);
+                let mut saw_file_data = false;
+                let mut saw_eof = false;
+                for message in &copy_messages {
+                    if let Some(crate::protocol::rpc::copy_request::Request::Frame(frame)) = &message.request {
+                        let frame = crate::protocol::copy_frame_from_rpc(frame.clone()).unwrap();
+                        match frame {
+                            crate::types::CopyFrame::FileData { data } if data == file_data => {
+                                saw_file_data = true;
+                            }
+                            crate::types::CopyFrame::EndOfStream => {
+                                saw_eof = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
 
-                prop_assert!(
-                    messages_after_start > 0,
-                    "BUG CONFIRMED: XhodConnection::copy only sends CopyStartRequest \
-                     and never streams file data. Mock received {} total messages \
-                     (expected StartRequest + ≥1 DataChunk), local file had {} bytes.",
-                    total_messages,
-                    file_data.len()
-                );
-
-                // Cleanup
-                let _ = tokio::fs::remove_file(&temp_file).await;
+                prop_assert!(saw_file_data, "upload data must be forwarded as CopyFrame::FileData");
+                prop_assert!(saw_eof, "upload must forward CopyFrame::EndOfStream");
                 Ok(())
             })?;
         }
@@ -1005,29 +885,12 @@ mod tests {
 
         /// **Validates: Requirements 1.4, 2.4**
         ///
-        /// Expected Behavior: XhodConnection::copy download receives
-        /// CopyDataChunk messages and writes the data to the local file.
-        ///
-        /// With the fix in place, CopyResponse has a DataChunk variant.
-        /// The mock sends: DataChunk(data, eof=false) + DataChunk([], eof=true)
-        /// + Complete. XhodConnection::copy must write the data to local_path.
-        ///
-        /// EXPECTED OUTCOME: PASSES on fixed code (confirms bug is fixed).
         #[test]
-        fn prop_bug_xhod_copy_download_no_data_mechanism(
+        fn prop_xhod_copy_download_streams_copy_frames(
             expected_content in proptest::collection::vec(any::<u8>(), 1..256usize),
         ) {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let download_dest = std::env::temp_dir().join(format!(
-                    "xho-test-download-{}.bin",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .subsec_nanos()
-                ));
-
-                // Build a dedicated mock server that sends CopyDataChunk responses.
                 let content_for_mock = expected_content.clone();
 
                 struct DownloadMock { content: Vec<u8> }
@@ -1043,26 +906,26 @@ mod tests {
                         Ok(tonic::Response::new(ReceiverStream::new(r)))
                     }
 
-                    async fn copy(&self, _: tonic::Request<tonic::Streaming<crate::protocol::rpc::CopyRequest>>) -> Result<tonic::Response<Self::CopyStream>, tonic::Status> {
-                        let content = self.content.clone();
-                        let (resp_tx, resp_rx) = tokio::sync::mpsc::channel(4);
-                        tokio::spawn(async move {
-                            // Send data chunk with the content.
-                            let _ = resp_tx.send(Ok(crate::protocol::rpc::CopyResponse {
-                                event: Some(crate::protocol::rpc::copy_response::Event::DataChunk(
-                                    crate::protocol::rpc::CopyDataChunk { data: content, eof: false },
-                                )),
-                            })).await;
-                            // Send EOF chunk.
-                            let _ = resp_tx.send(Ok(crate::protocol::rpc::CopyResponse {
-                                event: Some(crate::protocol::rpc::copy_response::Event::DataChunk(
-                                    crate::protocol::rpc::CopyDataChunk { data: vec![], eof: true },
-                                )),
-                            })).await;
-                            // Send completion.
-                            let _ = resp_tx.send(Ok(crate::protocol::rpc::CopyResponse {
-                                event: Some(crate::protocol::rpc::copy_response::Event::Complete(
-                                    crate::protocol::rpc::CopyComplete { message: String::new() },
+                        async fn copy(&self, _: tonic::Request<tonic::Streaming<crate::protocol::rpc::CopyRequest>>) -> Result<tonic::Response<Self::CopyStream>, tonic::Status> {
+                            let content = self.content.clone();
+                            let (resp_tx, resp_rx) = tokio::sync::mpsc::channel(4);
+                            tokio::spawn(async move {
+                                let _ = resp_tx.send(Ok(crate::protocol::copy_frame_response(crate::types::CopyFrame::BeginFile {
+                                    relative_path: "remote.bin".to_string(),
+                                    mode: 0o644,
+                                    size: content.len() as u64,
+                                    mtime: 0,
+                                }))).await;
+                                let _ = resp_tx.send(Ok(crate::protocol::rpc::CopyResponse {
+                                    event: Some(crate::protocol::rpc::copy_response::Event::Frame(
+                                        crate::protocol::copy_frame_to_rpc(crate::types::CopyFrame::FileData { data: content }),
+                                    )),
+                                })).await;
+                                let _ = resp_tx.send(Ok(crate::protocol::copy_frame_response(crate::types::CopyFrame::EndFile))).await;
+                                let _ = resp_tx.send(Ok(crate::protocol::copy_frame_response(crate::types::CopyFrame::EndOfStream))).await;
+                                let _ = resp_tx.send(Ok(crate::protocol::rpc::CopyResponse {
+                                    event: Some(crate::protocol::rpc::copy_response::Event::Complete(
+                                        crate::protocol::rpc::CopyComplete { message: String::new() },
                                 )),
                             })).await;
                         });
@@ -1092,33 +955,35 @@ mod tests {
                     })).await.expect("connect");
                 let client = crate::protocol::rpc::xho_rpc_client::XhoRpcClient::new(channel);
 
-                let mut conn = XhodConnection::new(client, "test-target".to_string());
+                    let mut conn = XhodConnection::new(client, "test-target".to_string());
+                    let (download_tx, mut download_rx) = tokio::sync::mpsc::channel(8);
 
-                let spec = crate::types::CopySpec {
-                    local_path: download_dest.display().to_string(),
-                    remote_path: "/tmp/remote-source.bin".to_string(),
-                    direction: crate::types::CopyDirection::Download,
-                    recursive: false,
-                    relay_upload_rx: None,
-                    relay_download_tx: None,
-                };
+                    let spec = crate::types::CopySpec {
+                        remote_path: "/tmp/remote-source.bin".to_string(),
+                        direction: crate::types::CopyDirection::Download,
+                        recursive: false,
+                        source_name: "remote.bin".to_string(),
+                        upload_rx: None,
+                        download_tx: Some(download_tx),
+                    };
 
-                let result = conn.copy(spec).await;
-                assert!(result.is_ok(), "copy should complete: {:?}", result);
+                    let result = conn.copy(spec).await;
+                    assert!(result.is_ok(), "copy should complete: {:?}", result);
 
-                // Verify the downloaded file contains the expected content.
-                let written_bytes = tokio::fs::read(&download_dest).await.unwrap_or_default();
-                prop_assert_eq!(
-                    written_bytes,
-                    expected_content,
-                    "downloaded file must contain the exact bytes sent by mock server"
-                );
-
-                // Cleanup
-                let _ = tokio::fs::remove_file(&download_dest).await;
-                Ok(())
-            })?;
-        }
+                    let mut collected = Vec::new();
+                    let mut saw_eof = false;
+                    while let Ok(frame) = download_rx.try_recv() {
+                        match frame {
+                            crate::types::CopyFrame::FileData { data } => collected.extend_from_slice(&data),
+                            crate::types::CopyFrame::EndOfStream => saw_eof = true,
+                            _ => {}
+                        }
+                    }
+                    prop_assert_eq!(collected, expected_content);
+                    prop_assert!(saw_eof, "download must forward CopyFrame::EndOfStream");
+                    Ok(())
+                })?;
+            }
     }
 
     // -----------------------------------------------------------------------
@@ -1422,19 +1287,27 @@ mod tests {
                 let (client, _exec_log, mut copy_rx) = start_mock_server().await;
 
                 let mut conn = XhodConnection::new(client, "my-target".to_string());
-                let direction = if upload {
-                    crate::types::CopyDirection::Upload
-                } else {
-                    crate::types::CopyDirection::Download
-                };
-                let spec = crate::types::CopySpec {
-                    local_path: "/tmp/local.bin".to_string(),
-                    remote_path: format!("/remote/{}", remote_path),
-                    direction,
-                    recursive,
-                    relay_upload_rx: None,
-                    relay_download_tx: None,
-                };
+                    let direction = if upload {
+                        crate::types::CopyDirection::Upload
+                    } else {
+                        crate::types::CopyDirection::Download
+                    };
+                    let (upload_rx, download_tx) = if upload {
+                        let (tx, rx) = tokio::sync::mpsc::channel(2);
+                        tx.send(crate::types::CopyFrame::EndOfStream).await.unwrap();
+                        (Some(rx), None)
+                    } else {
+                        let (tx, _rx) = tokio::sync::mpsc::channel(2);
+                        (None, Some(tx))
+                    };
+                    let spec = crate::types::CopySpec {
+                        remote_path: format!("/remote/{}", remote_path),
+                        direction,
+                        recursive,
+                        source_name: "source.bin".to_string(),
+                        upload_rx,
+                        download_tx,
+                    };
 
                 let result = conn.copy(spec).await;
                 prop_assert!(result.is_ok(), "copy must return Ok: {:?}", result.err());
@@ -1456,11 +1329,10 @@ mod tests {
                 prop_assert_eq!(&start.remote_path, &format!("/remote/{}", remote_path), "remote_path correct");
                 prop_assert_eq!(start.recursive, recursive, "recursive field correct");
 
-                // local_path must be empty in the xhod copy path.
-                prop_assert!(start.local_path.is_empty(), "local_path must be empty for xhod hops");
+                    prop_assert_eq!(&start.source_name, "source.bin", "source_name correct");
 
-                Ok(())
-            })?;
+                    Ok(())
+                })?;
         }
     }
 } // end #[cfg(test)] mod tests
