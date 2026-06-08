@@ -25,6 +25,7 @@ getrandom = "0.4"
 home = "0.5"
 hmac = "0.12"
 hyper-util = { version = "0.1", features = ["tokio"] }
+indicatif = "0.17"
 libc = "0.2"
 parking_lot = "0.12"
 prost = "0.14"

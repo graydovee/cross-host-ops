@@ -11,6 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use hyper_util::rt::TokioIo;
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::signal::unix::SignalKind;
@@ -111,6 +112,9 @@ pub enum ArunCommand {
     Cp {
         #[arg(short = 'r', long = "recursive")]
         recursive: bool,
+        /// Suppress progress bars and non-error copy messages.
+        #[arg(short = 'q', long = "quiet")]
+        quiet: bool,
         /// Abort the operation after this duration (e.g. 30s, 2m).
         #[arg(long = "timeout", value_name = "DURATION")]
         timeout: Option<String>,
@@ -346,6 +350,7 @@ pub async fn run_cli(cli: ArunCli) -> Result<i32> {
         }
         ArunCommand::Cp {
             recursive,
+            quiet,
             source,
             dest,
             timeout,
@@ -368,7 +373,7 @@ pub async fn run_cli(cli: ArunCli) -> Result<i32> {
             } else {
                 0
             };
-            run_copy(recursive, source, dest, timeout_ms).await
+            run_copy(recursive, quiet, source, dest, timeout_ms).await
         }
         ArunCommand::Status => status().await,
         ArunCommand::Ls { refresh } => list_servers(refresh).await,
@@ -805,7 +810,13 @@ async fn status() -> Result<i32> {
     Ok(0)
 }
 
-async fn run_copy(recursive: bool, source: String, dest: String, timeout_ms: u64) -> Result<i32> {
+async fn run_copy(
+    recursive: bool,
+    quiet: bool,
+    source: String,
+    dest: String,
+    timeout_ms: u64,
+) -> Result<i32> {
     let CopyCliPlan {
         target,
         spec,
@@ -821,8 +832,14 @@ async fn run_copy(recursive: bool, source: String, dest: String, timeout_ms: u64
         .map_err(|_| anyhow!("failed to send copy start request"))?;
 
     let response = client.copy(ReceiverStream::new(rx)).await?;
+    let show_progress = !quiet && io::stderr().is_terminal();
     if spec.direction == CopyDirection::Upload {
-        spawn_copy_upload_frames(tx.clone(), PathBuf::from(&local_path), recursive);
+        spawn_copy_upload_frames(
+            tx.clone(),
+            PathBuf::from(&local_path),
+            recursive,
+            CopyProgressReporter::new(show_progress),
+        );
     }
     let mut stream = response.into_inner();
     let mut download_writer = if spec.direction == CopyDirection::Download {
@@ -830,6 +847,7 @@ async fn run_copy(recursive: bool, source: String, dest: String, timeout_ms: u64
             PathBuf::from(&local_path),
             recursive,
             spec.source_name.clone(),
+            CopyProgressReporter::new(show_progress),
         ))
     } else {
         None
@@ -853,13 +871,13 @@ async fn run_copy(recursive: bool, source: String, dest: String, timeout_ms: u64
                 return Ok(1);
             }
             rpc::copy_response::Event::Complete(done) => {
-                if !done.message.is_empty() {
+                if !quiet && !done.message.is_empty() {
                     println!("{}", done.message);
                 }
                 break;
             }
             rpc::copy_response::Event::Info(info) => {
-                if !info.message.is_empty() {
+                if !quiet && !info.message.is_empty() {
                     eprintln!("{}", info.message);
                 }
             }
@@ -878,12 +896,145 @@ fn spawn_copy_upload_frames(
     tx: mpsc::Sender<rpc::CopyRequest>,
     local_path: PathBuf,
     recursive: bool,
+    progress: CopyProgressReporter,
 ) {
     tokio::spawn(async move {
-        if let Err(error) = send_path_copy_frames(&tx, &local_path, recursive).await {
+        if let Err(error) = send_path_copy_frames(&tx, &local_path, recursive, progress).await {
             tracing::warn!(error = %error, path = %local_path.display(), "failed to stream copy upload frames");
         }
     });
+}
+
+struct CopyProgressReporter {
+    enabled: bool,
+    draw_target: CopyProgressDrawTarget,
+    current: Option<CopyProgressFile>,
+}
+
+#[derive(Clone, Copy)]
+enum CopyProgressDrawTarget {
+    Stderr,
+    #[cfg(test)]
+    Hidden,
+}
+
+struct CopyProgressFile {
+    name: String,
+    size: u64,
+    bytes: u64,
+    bar: ProgressBar,
+}
+
+impl CopyProgressReporter {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            draw_target: CopyProgressDrawTarget::Stderr,
+            current: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_test(enabled: bool) -> Self {
+        Self {
+            enabled,
+            draw_target: CopyProgressDrawTarget::Hidden,
+            current: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn begin_file(&mut self, display_name: impl Into<String>, size: u64) {
+        if !self.enabled {
+            return;
+        }
+        self.finish_current();
+        let name = non_empty_name(&display_name.into(), "copy");
+        let draw_target = match self.draw_target {
+            CopyProgressDrawTarget::Stderr => ProgressDrawTarget::stderr(),
+            #[cfg(test)]
+            CopyProgressDrawTarget::Hidden => ProgressDrawTarget::hidden(),
+        };
+        let bar = ProgressBar::with_draw_target(Some(size), draw_target);
+        let style = ProgressStyle::with_template(
+            "{msg} {percent:>3}% {bytes}/{total_bytes} {bytes_per_sec} {elapsed_precise}",
+        )
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
+        .progress_chars("=> ");
+        bar.set_style(style);
+        bar.set_message(name.clone());
+        self.current = Some(CopyProgressFile {
+            name,
+            size,
+            bytes: 0,
+            bar,
+        });
+    }
+
+    fn add_bytes(&mut self, bytes: usize) {
+        if !self.enabled {
+            return;
+        }
+        if let Some(current) = self.current.as_mut() {
+            let bytes = bytes as u64;
+            current.bytes = current.bytes.saturating_add(bytes).min(current.size);
+            current.bar.inc(bytes);
+        }
+    }
+
+    fn finish_file(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        self.finish_current();
+    }
+
+    #[cfg(test)]
+    fn current_bytes(&self) -> Option<u64> {
+        self.current.as_ref().map(|current| current.bytes)
+    }
+
+    #[cfg(test)]
+    fn current_name(&self) -> Option<&str> {
+        self.current.as_ref().map(|current| current.name.as_str())
+    }
+
+    fn finish_current(&mut self) {
+        if let Some(current) = self.current.take() {
+            current.bar.set_position(current.size);
+            current.bar.finish_with_message(format!(
+                "{} 100% {}/{}",
+                current.name,
+                human_bytes(current.size),
+                human_bytes(current.size)
+            ));
+        }
+    }
+}
+
+impl Drop for CopyProgressReporter {
+    fn drop(&mut self) {
+        self.finish_current();
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{}{}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.1}{}", UNITS[unit])
+    }
 }
 
 async fn validate_upload_source(path: &Path, recursive: bool) -> Result<()> {
@@ -903,6 +1054,7 @@ async fn send_path_copy_frames(
     tx: &mpsc::Sender<rpc::CopyRequest>,
     local_path: &Path,
     recursive: bool,
+    mut progress: CopyProgressReporter,
 ) -> Result<()> {
     let metadata = tokio::fs::symlink_metadata(local_path)
         .await
@@ -924,10 +1076,10 @@ async fn send_path_copy_frames(
         ))
         .await
         .map_err(|_| anyhow!("failed to send root directory copy frame"))?;
-        send_directory_contents_frames(tx, local_path, local_path).await?;
+        send_directory_contents_frames(tx, local_path, local_path, &mut progress).await?;
     } else {
         let relative_path = local_basename(local_path)?;
-        send_path_entry_frame(tx, local_path, Path::new(&relative_path)).await?;
+        send_path_entry_frame(tx, local_path, Path::new(&relative_path), &mut progress).await?;
     }
 
     tx.send(crate::protocol::copy_frame_request(CopyFrame::EndOfStream))
@@ -940,6 +1092,7 @@ async fn send_directory_contents_frames(
     tx: &mpsc::Sender<rpc::CopyRequest>,
     root: &Path,
     dir: &Path,
+    progress: &mut CopyProgressReporter,
 ) -> Result<()> {
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current_dir) = stack.pop() {
@@ -954,7 +1107,7 @@ async fn send_directory_contents_frames(
             let metadata = tokio::fs::symlink_metadata(&path)
                 .await
                 .with_context(|| format!("failed to inspect {}", path.display()))?;
-            send_path_entry_frame_with_metadata(tx, &path, relative, &metadata).await?;
+            send_path_entry_frame_with_metadata(tx, &path, relative, &metadata, progress).await?;
             if metadata.is_dir() && !metadata.file_type().is_symlink() {
                 stack.push(path);
             }
@@ -967,12 +1120,13 @@ async fn send_path_entry_frame(
     tx: &mpsc::Sender<rpc::CopyRequest>,
     path: &Path,
     relative_path: &Path,
+    progress: &mut CopyProgressReporter,
 ) -> Result<()> {
     validate_relative_path(relative_path)?;
     let metadata = tokio::fs::symlink_metadata(path)
         .await
         .with_context(|| format!("failed to inspect {}", path.display()))?;
-    send_path_entry_frame_with_metadata(tx, path, relative_path, &metadata).await
+    send_path_entry_frame_with_metadata(tx, path, relative_path, &metadata, progress).await
 }
 
 async fn send_path_entry_frame_with_metadata(
@@ -980,6 +1134,7 @@ async fn send_path_entry_frame_with_metadata(
     path: &Path,
     relative_path: &Path,
     metadata: &std::fs::Metadata,
+    progress: &mut CopyProgressReporter,
 ) -> Result<()> {
     validate_relative_path(relative_path)?;
     let relative_path = relative_path_to_string(relative_path)?;
@@ -1013,8 +1168,9 @@ async fn send_path_entry_frame_with_metadata(
         bail!("unsupported file type for copy: {}", path.display());
     }
 
+    progress.begin_file(relative_path.clone(), metadata.len());
     tx.send(crate::protocol::copy_frame_request(CopyFrame::BeginFile {
-        relative_path,
+        relative_path: relative_path.clone(),
         mode: metadata.permissions().mode(),
         size: metadata.len(),
         mtime: metadata.mtime(),
@@ -1040,10 +1196,12 @@ async fn send_path_entry_frame_with_metadata(
         }))
         .await
         .map_err(|_| anyhow!("failed to send file data copy frame"))?;
+        progress.add_bytes(n);
     }
     tx.send(crate::protocol::copy_frame_request(CopyFrame::EndFile))
         .await
         .map_err(|_| anyhow!("failed to send end-file copy frame"))?;
+    progress.finish_file();
     Ok(())
 }
 
@@ -1053,16 +1211,23 @@ struct CopyDownloadWriter {
     source_name: String,
     root: Option<PathBuf>,
     current_file: Option<tokio::fs::File>,
+    progress: CopyProgressReporter,
 }
 
 impl CopyDownloadWriter {
-    fn new(dest: PathBuf, recursive: bool, source_name: String) -> Self {
+    fn new(
+        dest: PathBuf,
+        recursive: bool,
+        source_name: String,
+        progress: CopyProgressReporter,
+    ) -> Self {
         Self {
             dest,
             recursive,
             source_name,
             root: None,
             current_file: None,
+            progress,
         }
     }
 
@@ -1071,6 +1236,7 @@ impl CopyDownloadWriter {
             CopyFrame::BeginFile {
                 relative_path,
                 mode,
+                size,
                 ..
             } => {
                 let path = self.destination_for_file(&relative_path).await?;
@@ -1090,6 +1256,8 @@ impl CopyDownloadWriter {
                             format!("failed to set permissions on {}", path.display())
                         })?;
                 }
+                self.progress
+                    .begin_file(download_progress_name(&path, &relative_path), size);
                 self.current_file = Some(file);
             }
             CopyFrame::FileData { data } => {
@@ -1098,11 +1266,13 @@ impl CopyDownloadWriter {
                     .as_mut()
                     .ok_or_else(|| anyhow!("copy stream sent file data before BeginFile"))?;
                 file.write_all(&data).await?;
+                self.progress.add_bytes(data.len());
             }
             CopyFrame::EndFile => {
                 if let Some(mut file) = self.current_file.take() {
                     file.flush().await?;
                 }
+                self.progress.finish_file();
             }
             CopyFrame::BeginDirectory {
                 relative_path,
@@ -1149,6 +1319,7 @@ impl CopyDownloadWriter {
                 if let Some(mut file) = self.current_file.take() {
                     file.flush().await?;
                 }
+                self.progress.finish_file();
             }
         }
         Ok(())
@@ -1207,6 +1378,17 @@ fn copy_entry_name(relative_path: &str, source_name: &str) -> Result<String> {
         .filter(|name| !name.is_empty())
         .unwrap_or(&fallback);
     Ok(name.to_string())
+}
+
+fn download_progress_name(path: &Path, relative_path: &str) -> String {
+    if !relative_path.is_empty() {
+        return relative_path.to_string();
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("download")
+        .to_string()
 }
 
 fn non_empty_name(value: &str, fallback: &str) -> String {
@@ -2027,6 +2209,91 @@ mod tests {
     fn raw_mode_diagnostic_bytes_skips_empty_messages() {
         assert!(raw_mode_diagnostic_bytes("").is_empty());
         assert!(raw_mode_diagnostic_bytes("\n\r").is_empty());
+    }
+
+    #[test]
+    fn cp_quiet_short_flag_parses() {
+        let parsed =
+            ArunCli::try_parse_from(["xho", "cp", "-q", "local.txt", "host1:/tmp/local.txt"])
+                .unwrap();
+        match parsed.command {
+            ArunCommand::Cp {
+                quiet,
+                source,
+                dest,
+                ..
+            } => {
+                assert!(quiet);
+                assert_eq!(source, "local.txt");
+                assert_eq!(dest, "host1:/tmp/local.txt");
+            }
+            _ => panic!("expected cp command"),
+        }
+    }
+
+    #[test]
+    fn cp_quiet_long_flag_parses_with_recursive_and_timeout() {
+        let parsed = ArunCli::try_parse_from([
+            "xho",
+            "cp",
+            "--quiet",
+            "-r",
+            "--timeout",
+            "30s",
+            "dir",
+            "host1:/tmp/dir",
+        ])
+        .unwrap();
+        match parsed.command {
+            ArunCommand::Cp {
+                quiet,
+                recursive,
+                timeout,
+                source,
+                dest,
+            } => {
+                assert!(quiet);
+                assert!(recursive);
+                assert_eq!(timeout.as_deref(), Some("30s"));
+                assert_eq!(source, "dir");
+                assert_eq!(dest, "host1:/tmp/dir");
+            }
+            _ => panic!("expected cp command"),
+        }
+    }
+
+    #[test]
+    fn copy_progress_reporter_disabled_is_noop() {
+        let mut reporter = CopyProgressReporter::new_for_test(false);
+        assert!(!reporter.is_enabled());
+        reporter.begin_file("file.txt", 10);
+        reporter.add_bytes(5);
+        assert_eq!(reporter.current_bytes(), None);
+        assert_eq!(reporter.current_name(), None);
+        reporter.finish_file();
+        assert_eq!(reporter.current_bytes(), None);
+    }
+
+    #[test]
+    fn copy_progress_reporter_tracks_bytes_when_enabled() {
+        let mut reporter = CopyProgressReporter::new_for_test(true);
+        assert!(reporter.is_enabled());
+        reporter.begin_file("file.txt", 10);
+        assert_eq!(reporter.current_name(), Some("file.txt"));
+        reporter.add_bytes(4);
+        reporter.add_bytes(20);
+        assert_eq!(reporter.current_bytes(), Some(10));
+        reporter.finish_file();
+        assert_eq!(reporter.current_bytes(), None);
+    }
+
+    #[test]
+    fn copy_progress_reporter_handles_zero_byte_file() {
+        let mut reporter = CopyProgressReporter::new_for_test(true);
+        reporter.begin_file("empty", 0);
+        assert_eq!(reporter.current_bytes(), Some(0));
+        reporter.finish_file();
+        assert_eq!(reporter.current_bytes(), None);
     }
 
     proptest! {
