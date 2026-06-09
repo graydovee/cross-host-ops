@@ -37,6 +37,8 @@ struct ResolvedTarget {
     port: u16,
     user: String,
     auth: DirectAuth,
+    shell: Option<String>,
+    defaults_shell: String,
 }
 
 /// Pool identity for a direct SSH transport.
@@ -135,7 +137,20 @@ impl LocalGateway {
             port: entry.port,
             user: entry.user,
             auth: entry.auth,
+            shell: server_host_config.shell.clone(),
+            defaults_shell: server_config.defaults.shell.clone(),
         })
+    }
+
+    fn effective_shell(request_shell: &str, no_shell: bool, resolved: &ResolvedTarget) -> String {
+        let cli_shell = (!request_shell.is_empty()).then_some(request_shell);
+        crate::daemon::connection::shared::resolve_shell(
+            cli_shell,
+            no_shell,
+            resolved.shell.as_deref(),
+            &resolved.defaults_shell,
+        )
+        .unwrap_or_default()
     }
 
     /// Create a new DirectConnection to the resolved target.
@@ -231,7 +246,7 @@ impl Gateway for LocalGateway {
             pty: request.pty,
             cols: request.cols,
             rows: request.rows,
-            shell: request.shell.clone(),
+            shell: Self::effective_shell(&request.shell, request.no_shell, &resolved),
             no_shell: request.no_shell,
             timeout_ms: request.timeout_ms,
             stdin: request.stdin,
@@ -305,7 +320,7 @@ impl Gateway for LocalGateway {
             cols: request.cols,
             rows: request.rows,
             sender: request.sender.clone(),
-            shell: request.shell.clone(),
+            shell: Self::effective_shell(&request.shell, false, &resolved),
         };
 
         let handle = match lease.resource_mut().exec_interactive(&conn_request).await {
@@ -387,7 +402,28 @@ mod tests {
             port: 22,
             user: "admin".to_string(),
             auth,
+            shell: None,
+            defaults_shell: String::new(),
         }
+    }
+
+    #[test]
+    fn effective_shell_uses_cli_server_defaults_precedence() {
+        let mut resolved = resolved_with_auth(DirectAuth::Password {
+            password: "one".to_string(),
+        });
+        resolved.shell = Some("zsh".to_string());
+        resolved.defaults_shell = "bash".to_string();
+
+        assert_eq!(LocalGateway::effective_shell("", false, &resolved), "zsh");
+        assert_eq!(
+            LocalGateway::effective_shell("fish", false, &resolved),
+            "fish"
+        );
+        assert_eq!(LocalGateway::effective_shell("", true, &resolved), "");
+
+        resolved.shell = None;
+        assert_eq!(LocalGateway::effective_shell("", false, &resolved), "bash");
     }
 
     #[test]
