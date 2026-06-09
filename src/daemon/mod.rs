@@ -378,9 +378,14 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                 let exec = ExecRequest {
                     target: start.target,
                     argv: start.argv,
-                    pty: start.pty,
-                    no_pty: start.no_pty,
+                    tty: start.tty,
+                    tty_intent: proto_rpc::FlagIntent::try_from(start.tty_intent)
+                        .unwrap_or(proto_rpc::FlagIntent::Default)
+                        .into(),
                     stdin: start.stdin,
+                    stdin_intent: proto_rpc::FlagIntent::try_from(start.stdin_intent)
+                        .unwrap_or(proto_rpc::FlagIntent::Default)
+                        .into(),
                     timeout_ms: start.timeout_ms,
                     interactive: start.interactive,
                     term_cols: start.term_cols,
@@ -857,13 +862,11 @@ async fn process_execute(
 
     // Dispatch to interactive execution path when requested.
     if request.interactive {
-        if !request.pty || request.no_pty {
+        if !request.tty {
             send_execute_event(
                 sender,
                 ServerEvent::Error {
-                    message:
-                        "interactive mode requires pty (--pty) and is incompatible with --no-pty"
-                            .to_string(),
+                    message: "interactive mode requires tty (--tty)".to_string(),
                 },
             )
             .await?;
@@ -1013,13 +1016,15 @@ async fn process_execute(
     let gw_request = gateway::ExecRequest {
         argv: request.argv.clone(),
         sender: event_tx,
-        pty: request.pty,
+        tty: request.tty,
+        tty_intent: request.tty_intent,
         cols: request.term_cols,
         rows: request.term_rows,
         shell: request.shell.clone(),
         no_shell: request.no_shell,
         timeout_ms: request.timeout_ms,
         stdin: request.stdin,
+        stdin_intent: request.stdin_intent,
         stdin_rx: std::sync::Mutex::new(stdin_rx),
     };
 
@@ -1266,6 +1271,7 @@ async fn process_interactive_execute(
         rows: request.term_rows,
         sender: event_tx,
         shell: request.shell.clone(),
+        no_shell: request.no_shell,
     };
 
     let mut handle = gateway

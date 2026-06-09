@@ -12,7 +12,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::config::AppConfig;
 use crate::exit_codes::cap_remote_exit_code;
 use crate::protocol::rpc;
-use crate::types::should_use_interactive_mode;
+use crate::types::{FlagIntent, should_use_interactive_mode};
 
 use super::client::{ClientAccess, connect_data_client};
 use super::prompt::{prompt_for_auth_input, prompt_for_confirmation};
@@ -148,7 +148,9 @@ pub(crate) async fn run_command(
     target: String,
     argv: Vec<String>,
     resolved_tty: bool,
+    tty_intent: FlagIntent,
     resolved_stdin: bool,
+    stdin_intent: FlagIntent,
     timeout_ms: u64,
     shell: Option<String>,
     no_shell: bool,
@@ -162,7 +164,16 @@ pub(crate) async fn run_command(
     let stdout_is_tty = io::stdout().is_terminal();
 
     if should_use_interactive_mode(resolved_tty, resolved_stdin, stdin_is_tty, stdout_is_tty) {
-        return run_interactive(target, argv, timeout_ms, cli_shell, no_shell).await;
+        return run_interactive(
+            target,
+            argv,
+            timeout_ms,
+            cli_shell,
+            no_shell,
+            tty_intent,
+            stdin_intent,
+        )
+        .await;
     }
 
     // Batch execution path: request_pty + exec without sentinel.
@@ -173,9 +184,10 @@ pub(crate) async fn run_command(
         request: Some(rpc::execute_request::Request::Start(rpc::StartRequest {
             target,
             argv,
-            pty: resolved_tty,
-            no_pty: !resolved_tty,
+            tty: resolved_tty,
+            tty_intent: rpc::FlagIntent::from(tty_intent) as i32,
             stdin: resolved_stdin,
+            stdin_intent: rpc::FlagIntent::from(stdin_intent) as i32,
             timeout_ms,
             interactive: false,
             term_cols: 0,
@@ -323,6 +335,8 @@ pub(crate) async fn run_interactive(
     timeout_ms: u64,
     shell: String,
     no_shell: bool,
+    tty_intent: FlagIntent,
+    stdin_intent: FlagIntent,
 ) -> Result<i32> {
     // Step 1: Get initial terminal size.
     let (cols, rows) = get_terminal_size();
@@ -334,9 +348,10 @@ pub(crate) async fn run_interactive(
         request: Some(rpc::execute_request::Request::Start(rpc::StartRequest {
             target,
             argv,
-            pty: true,
-            no_pty: false,
-            stdin: false,
+            tty: true,
+            tty_intent: rpc::FlagIntent::from(tty_intent) as i32,
+            stdin: true,
+            stdin_intent: rpc::FlagIntent::from(stdin_intent) as i32,
             timeout_ms,
             interactive: true,
             term_cols: cols as u32,

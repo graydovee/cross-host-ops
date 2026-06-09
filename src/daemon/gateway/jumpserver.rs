@@ -2,15 +2,16 @@
 // Reuses one authenticated SSH transport and caches target-level PTY shells
 // for non-interactive exec/copy operations.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::{debug, info};
 
-use crate::config::{AppConfig, JumpserverGatewayConfig, MfaConfig};
+use crate::config::{AppConfig, JumpserverGatewayConfig, MfaConfig, load_server_config};
 use crate::daemon::connection::jumpserver::JumpserverConnection;
 use crate::daemon::connection::shared::{PtyShell, request_default_pty};
 use crate::daemon::connection::{
@@ -19,7 +20,7 @@ use crate::daemon::connection::{
 use crate::daemon::connection_manager::{ManagedPool, ManagedSingleton, PoolLease, SingletonLease};
 use crate::daemon::resolver::derive_target_ip;
 use crate::protocol::ServerListRow;
-use crate::types::CopySpec;
+use crate::types::{CopySpec, FlagIntent};
 
 use super::auth::{AuthPrompt, AuthPrompter, ClientHandler, authenticate_with_key, connect_handle};
 use super::{
@@ -30,6 +31,7 @@ use super::{
 const MENU_PROMPT_CONTAINS: &str = "Opt";
 const MFA_PROMPT_CONTAINS: &str = "MFA";
 const SHELL_PROMPT_SUFFIXES: &[&str] = &["$ ", "# "];
+const PAGE_PROMPT_CONTAINS: &str = "上一页";
 
 type JumpserverTransport = AsyncMutex<JumpserverTransportState>;
 
@@ -54,6 +56,145 @@ struct JumpserverTargetKey(String);
 struct JumpserverTargetShell {
     shell: PtyShell,
     transport_generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct JumpserverAssetRow {
+    id: String,
+    ip: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PageStatus {
+    current: u32,
+    total: u32,
+}
+
+fn strip_ansi(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = String::with_capacity(input.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == 0x1b {
+            index += 1;
+            if index >= bytes.len() {
+                break;
+            }
+            match bytes[index] {
+                b'[' => {
+                    index += 1;
+                    while index < bytes.len() {
+                        let byte = bytes[index];
+                        index += 1;
+                        if (0x40..=0x7e).contains(&byte) {
+                            break;
+                        }
+                    }
+                }
+                b']' => {
+                    index += 1;
+                    while index < bytes.len() {
+                        let byte = bytes[index];
+                        index += 1;
+                        if byte == 0x07 {
+                            break;
+                        }
+                        if byte == 0x1b && bytes.get(index) == Some(&b'\\') {
+                            index += 1;
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    index += 1;
+                }
+            }
+            continue;
+        }
+
+        if let Some(ch) = input[index..].chars().next() {
+            output.push(ch);
+            index += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    output
+}
+
+fn parse_asset_rows(text: &str) -> Vec<JumpserverAssetRow> {
+    let clean = strip_ansi(text);
+    clean
+        .lines()
+        .filter_map(|line| {
+            let columns = line.split('|').map(str::trim).collect::<Vec<_>>();
+            if columns.len() < 3 {
+                return None;
+            }
+            let id = columns[0];
+            let ip = columns[2];
+            if id.chars().all(|ch| ch.is_ascii_digit()) && looks_like_ipv4(ip) {
+                Some(JumpserverAssetRow {
+                    id: id.to_string(),
+                    ip: ip.to_string(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn select_exact_asset_id(text: &str, ip: &str) -> Result<Option<String>> {
+    let matches = parse_asset_rows(text)
+        .into_iter()
+        .filter(|row| row.ip == ip)
+        .collect::<Vec<_>>();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(Some(matches[0].id.clone())),
+        count => bail!(
+            "jumpserver asset search for {} returned {} exact matches",
+            ip,
+            count
+        ),
+    }
+}
+
+fn looks_like_ipv4(value: &str) -> bool {
+    let parts = value.split('.').collect::<Vec<_>>();
+    parts.len() == 4
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn parse_page_status(text: &str) -> Option<PageStatus> {
+    let clean = strip_ansi(text);
+    let (_, rest) = clean.split_once("页码：")?;
+    let current = rest
+        .split(|ch: char| !ch.is_ascii_digit())
+        .find(|part| !part.is_empty())?
+        .parse()
+        .ok()?;
+    let (_, rest) = clean.split_once("总页数：")?;
+    let total = rest
+        .split(|ch: char| !ch.is_ascii_digit())
+        .find(|part| !part.is_empty())?
+        .parse()
+        .ok()?;
+    Some(PageStatus { current, total })
+}
+
+fn contains_menu_prompt(text: &str) -> bool {
+    strip_ansi(text).contains(MENU_PROMPT_CONTAINS)
+}
+
+fn contains_page_prompt(text: &str) -> bool {
+    let clean = strip_ansi(text);
+    clean.contains(PAGE_PROMPT_CONTAINS) && clean.trim_end().ends_with(':')
 }
 
 impl JumpserverGateway {
@@ -309,18 +450,40 @@ impl JumpserverGateway {
         }
     }
 
+    fn validate_exec_request(&self, request: &ExecRequest) -> Result<(), GatewayError> {
+        if request.tty_intent == FlagIntent::Disable {
+            return Err(GatewayError::unsupported(anyhow!(
+                "jumpserver gateway requires an internal tty; --no-tty is not supported"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn effective_shell(&self, request_shell: &str, no_shell: bool) -> String {
+        let cli_shell = (!request_shell.is_empty()).then_some(request_shell);
+        let defaults_shell = {
+            let config = self.config.read().await;
+            load_server_config(Path::new(&config.ssh.server_config_path))
+                .map(|server_config| server_config.defaults.shell)
+                .unwrap_or_default()
+        };
+        crate::daemon::connection::shared::resolve_shell(cli_shell, no_shell, None, &defaults_shell)
+            .unwrap_or_default()
+    }
+
     async fn establish_target_shell(&self, shell: &mut PtyShell, target: &str) -> Result<()> {
         let ip = derive_target_ip(target);
         debug!(gateway = %self.gateway_name, target = %target, ip = %ip, "waiting for jumpserver menu");
 
-        let mut selected = false;
+        let mut search_sent = false;
+        let mut asset_id_sent = false;
         let mut mfa_sent = false;
         loop {
             let chunk = shell.read_chunk().await?;
             shell.extend_pending(&chunk);
             let text = shell.pending_text();
 
-            if !mfa_sent && text.contains(MFA_PROMPT_CONTAINS) {
+            if !mfa_sent && strip_ansi(&text).contains(MFA_PROMPT_CONTAINS) {
                 let code = if !self.fields.totp_secret_base32.is_empty() {
                     let mfa_config = MfaConfig {
                         totp_secret_base32: self.fields.totp_secret_base32.clone(),
@@ -344,15 +507,69 @@ impl JumpserverGateway {
                 continue;
             }
 
-            if !selected && text.contains(MENU_PROMPT_CONTAINS) {
+            if !search_sent && contains_menu_prompt(&text) {
                 debug!(gateway = %self.gateway_name, target = %target, ip = %ip, "jumpserver menu detected, selecting target");
                 shell.write_line(&ip).await?;
                 shell.clear_pending();
-                selected = true;
+                search_sent = true;
                 continue;
             }
 
-            if selected && shell.pending_has_prompt() {
+            if search_sent && !asset_id_sent {
+                if let Some(asset_id) = select_exact_asset_id(&text, &ip)? {
+                    debug!(
+                        gateway = %self.gateway_name,
+                        target = %target,
+                        ip = %ip,
+                        asset_id = %asset_id,
+                        "jumpserver asset table matched exact IP"
+                    );
+                    shell.write_line(&asset_id).await?;
+                    shell.clear_pending();
+                    asset_id_sent = true;
+                    continue;
+                }
+
+                if contains_page_prompt(&text) {
+                    match parse_page_status(&text) {
+                        Some(status) if status.current < status.total => {
+                            debug!(
+                                gateway = %self.gateway_name,
+                                target = %target,
+                                ip = %ip,
+                                page = %status.current,
+                                total_pages = %status.total,
+                                "jumpserver asset table did not contain exact IP, advancing page"
+                            );
+                            shell.write_line("").await?;
+                            shell.clear_pending();
+                            continue;
+                        }
+                        Some(status) => {
+                            bail!(
+                                "jumpserver asset search for {} did not find an exact IP match after {} page(s)",
+                                ip,
+                                status.total
+                            );
+                        }
+                        None => {
+                            bail!(
+                                "jumpserver asset search for {} showed a paginated table but page status could not be parsed",
+                                ip
+                            );
+                        }
+                    }
+                }
+
+                if contains_menu_prompt(&text) && !parse_asset_rows(&text).is_empty() {
+                    bail!(
+                        "jumpserver asset search for {} returned candidates but no exact IP match",
+                        ip
+                    );
+                }
+            }
+
+            if search_sent && shell.pending_has_prompt() {
                 debug!(gateway = %self.gateway_name, target = %target, "remote shell prompt detected");
                 break;
             }
@@ -370,16 +587,18 @@ impl JumpserverGateway {
 #[async_trait]
 impl Gateway for JumpserverGateway {
     async fn exec(&self, target: &str, request: &ExecRequest) -> Result<i32, GatewayError> {
+        self.validate_exec_request(request)?;
         let mut lease = self.checkout_target_shell(target).await?;
         let stdin_rx = request.stdin_rx.lock().ok().and_then(|mut g| g.take());
+        let shell = self.effective_shell(&request.shell, request.no_shell).await;
 
         let mut conn_request = ConnExecRequest {
             argv: request.argv.clone(),
             sender: request.sender.clone(),
-            pty: request.pty,
+            tty: request.tty,
             cols: request.cols,
             rows: request.rows,
-            shell: request.shell.clone(),
+            shell,
             no_shell: request.no_shell,
             timeout_ms: request.timeout_ms,
             stdin: request.stdin,
@@ -422,12 +641,14 @@ impl Gateway for JumpserverGateway {
         request: &InteractiveRequest,
     ) -> Result<InteractiveHandle, GatewayError> {
         let (lease, shell) = self.open_target_shell_with_retry(target).await?;
+        let effective_shell = self.effective_shell(&request.shell, request.no_shell).await;
         let conn_request = ConnInteractiveRequest {
             argv: request.argv.clone(),
             cols: request.cols,
             rows: request.rows,
             sender: request.sender.clone(),
-            shell: request.shell.clone(),
+            shell: effective_shell,
+            no_shell: request.no_shell,
         };
 
         let mut conn = JumpserverConnection::new(shell);
@@ -488,6 +709,7 @@ impl Gateway for JumpserverGateway {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::mpsc;
 
     fn test_gateway() -> JumpserverGateway {
         JumpserverGateway::new(
@@ -513,6 +735,10 @@ mod tests {
     fn target_key_uses_derived_target_ip() {
         let gateway = test_gateway();
         assert_eq!(
+            gateway.target_key("asset-198-51-100-3"),
+            JumpserverTargetKey("198.51.100.3".to_string())
+        );
+        assert_eq!(
             gateway.target_key("asset-198-51-100-22"),
             JumpserverTargetKey("198.51.100.22".to_string())
         );
@@ -520,6 +746,82 @@ mod tests {
             gateway.target_key("plain-target"),
             JumpserverTargetKey("plain-target".to_string())
         );
+    }
+
+    #[test]
+    fn parses_asset_table_and_selects_exact_ip() {
+        let text = r#"
+  ID    | 主机名                                                                             | IP                                       | 备注
++-------+------------------------------------------------------------------------------------+------------------------------------------+------------------------------------------------+
+  1     | asset-198.51.100.3                                           | 198.51.100.3                             |
+  2     | asset-198.51.100.30                                          | 198.51.100.30                            |
+  3     | asset-198.51.100.31                                          | 198.51.100.31                            |
+页码：1，每页行数：9，总页数：1，总数量：3
+Opt>
+"#;
+
+        assert_eq!(
+            select_exact_asset_id(text, "198.51.100.3").unwrap(),
+            Some("1".to_string())
+        );
+        assert_eq!(select_exact_asset_id(text, "198.51.100.4").unwrap(), None);
+    }
+
+    #[test]
+    fn parses_ansi_paginated_asset_table() {
+        let text = "\u{1b}[H\u{1b}[2J  \u{1b}[1;32mID\u{1b}[0m | \u{1b}[1;32m主机名\u{1b}[0m | \u{1b}[1;32mIP\u{1b}[0m | 备注\n\
+  1  | bei....30 | 198.51.100.30 | \n\
+\u{1b}[32m页码：1，每页行数：1，总页数：3，总数量：3\u{1b}[0m\n\
+上一页：P/p  下一页：Enter|N/n  返回：B/b\n:";
+
+        assert_eq!(
+            select_exact_asset_id(text, "198.51.100.30").unwrap(),
+            Some("1".to_string())
+        );
+        assert_eq!(
+            parse_page_status(text),
+            Some(PageStatus {
+                current: 1,
+                total: 3
+            })
+        );
+        assert!(contains_page_prompt(text));
+    }
+
+    #[test]
+    fn duplicate_exact_asset_ids_are_rejected() {
+        let text = "\
+  1 | host-a | 10.0.0.1 | \n\
+  2 | host-b | 10.0.0.1 | \n\
+页码：1，每页行数：9，总页数：1，总数量：2\n\
+Opt>";
+
+        let error = select_exact_asset_id(text, "10.0.0.1").unwrap_err();
+        assert!(error.to_string().contains("returned 2 exact matches"));
+    }
+
+    #[test]
+    fn explicit_no_tty_is_unsupported_without_connecting() {
+        let gateway = test_gateway();
+        let (sender, _rx) = mpsc::unbounded_channel();
+        let request = ExecRequest {
+            argv: vec!["true".to_string()],
+            sender,
+            tty: false,
+            tty_intent: FlagIntent::Disable,
+            cols: 0,
+            rows: 0,
+            shell: String::new(),
+            no_shell: false,
+            timeout_ms: 0,
+            stdin: false,
+            stdin_intent: FlagIntent::Default,
+            stdin_rx: std::sync::Mutex::new(None),
+        };
+
+        let error = gateway.validate_exec_request(&request).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Unsupported);
+        assert!(error.to_string().contains("--no-tty is not supported"));
     }
 
     #[tokio::test]

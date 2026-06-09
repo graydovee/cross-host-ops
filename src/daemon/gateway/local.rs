@@ -243,7 +243,7 @@ impl Gateway for LocalGateway {
         let mut conn_request = ConnExecRequest {
             argv: request.argv.clone(),
             sender: request.sender.clone(),
-            pty: request.pty,
+            tty: request.tty,
             cols: request.cols,
             rows: request.rows,
             shell: Self::effective_shell(&request.shell, request.no_shell, &resolved),
@@ -320,7 +320,8 @@ impl Gateway for LocalGateway {
             cols: request.cols,
             rows: request.rows,
             sender: request.sender.clone(),
-            shell: Self::effective_shell(&request.shell, false, &resolved),
+            shell: Self::effective_shell(&request.shell, request.no_shell, &resolved),
+            no_shell: request.no_shell,
         };
 
         let handle = match lease.resource_mut().exec_interactive(&conn_request).await {

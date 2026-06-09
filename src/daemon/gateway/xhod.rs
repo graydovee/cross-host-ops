@@ -366,7 +366,7 @@ impl Gateway for XhodGateway {
         let mut conn_request = ConnExecRequest {
             argv: request.argv.clone(),
             sender: request.sender.clone(),
-            pty: request.pty,
+            tty: request.tty,
             cols: request.cols,
             rows: request.rows,
             shell: request.shell.clone(),
@@ -433,6 +433,7 @@ impl Gateway for XhodGateway {
             rows: request.rows,
             sender: request.sender.clone(),
             shell: request.shell.clone(),
+            no_shell: request.no_shell,
         };
 
         let result = conn.exec_interactive(&conn_request).await;

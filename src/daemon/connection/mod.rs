@@ -28,7 +28,7 @@ use crate::types::CopySpec;
 pub(super) struct ExecRequest {
     pub argv: Vec<String>,
     pub sender: mpsc::UnboundedSender<ServerEvent>,
-    pub pty: bool,
+    pub tty: bool,
     pub cols: u32,
     pub rows: u32,
     pub shell: String,
@@ -49,6 +49,7 @@ pub(super) struct InteractiveRequest {
     pub rows: u32,
     pub sender: mpsc::UnboundedSender<ServerEvent>,
     pub shell: String,
+    pub no_shell: bool,
 }
 
 /// Handle for driving an interactive session (Connection-level).

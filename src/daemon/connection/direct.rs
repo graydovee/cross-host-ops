@@ -90,7 +90,7 @@ impl Connection for DirectConnection {
     async fn exec(&mut self, request: &mut ExecRequest) -> Result<i32> {
         let command = build_final_command(&request.argv, &request.shell);
         let mut channel = self.handle.channel_open_session().await?;
-        if request.pty {
+        if request.tty {
             channel
                 .request_pty(
                     true,

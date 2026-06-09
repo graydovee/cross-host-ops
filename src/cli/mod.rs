@@ -19,6 +19,7 @@ pub use output::print_version_json;
 use crate::config::{AppConfig, parse_duration};
 use crate::types::{
     ExecStdinFlags, ExecTtyFlags, effective_stdin_decision, effective_tty_decision,
+    stdin_intent_from_flags, tty_intent_from_flags,
 };
 
 use self::copy::run_copy;
@@ -75,12 +76,16 @@ pub async fn run_cli(cli: ArunCli) -> Result<i32> {
             };
             let resolved_tty = effective_tty_decision(&tty_flags, &config.ssh, stdout_is_tty);
             let resolved_stdin = effective_stdin_decision(&stdin_flags, &config.ssh);
+            let tty_intent = tty_intent_from_flags(&tty_flags);
+            let stdin_intent = stdin_intent_from_flags(&stdin_flags);
 
             run_command(
                 target,
                 argv,
                 resolved_tty,
+                tty_intent,
                 resolved_stdin,
+                stdin_intent,
                 timeout_ms,
                 shell,
                 no_shell,

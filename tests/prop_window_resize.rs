@@ -167,9 +167,10 @@ proptest! {
         let start_req = rpc::StartRequest {
             target: "test-host".to_string(),
             argv: vec!["vim".to_string()],
-            pty: true,
-            no_pty: false,
+            tty: true,
+            tty_intent: rpc::FlagIntent::Enable as i32,
             stdin: false,
+            stdin_intent: rpc::FlagIntent::Default as i32,
             timeout_ms: 0,
             interactive: true,
             term_cols: cols,
@@ -203,7 +204,12 @@ proptest! {
                     "StartRequest term_rows must be preserved"
                 );
                 prop_assert!(start.interactive, "interactive flag must be preserved");
-                prop_assert!(start.pty, "pty flag must be preserved");
+                prop_assert!(start.tty, "tty flag must be preserved");
+                prop_assert_eq!(
+                    start.tty_intent,
+                    rpc::FlagIntent::Enable as i32,
+                    "tty intent must be preserved"
+                );
             }
             other => {
                 prop_assert!(

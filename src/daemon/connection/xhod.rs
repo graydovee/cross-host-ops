@@ -52,9 +52,10 @@ impl Connection for XhodConnection {
             request: Some(rpc::execute_request::Request::Start(rpc::StartRequest {
                 target: self.target_label.clone(),
                 argv: request.argv.clone(),
-                pty: request.pty,
-                no_pty: !request.pty,
+                tty: request.tty,
+                tty_intent: rpc::FlagIntent::Default as i32,
                 stdin: stdin_rx.is_some(),
+                stdin_intent: rpc::FlagIntent::Default as i32,
                 timeout_ms: request.timeout_ms,
                 interactive: false,
                 term_cols: request.cols,
@@ -343,10 +344,15 @@ impl Connection for XhodConnection {
             request: Some(rpc::execute_request::Request::Start(rpc::StartRequest {
                 target: self.target_label.clone(),
                 argv: request.argv.clone(),
-                pty: true,
+                tty: true,
+                tty_intent: rpc::FlagIntent::Enable as i32,
+                stdin: true,
+                stdin_intent: rpc::FlagIntent::Enable as i32,
                 interactive: true,
                 term_cols: request.cols,
                 term_rows: request.rows,
+                shell: request.shell.clone(),
+                no_shell: request.no_shell,
                 ..Default::default()
             })),
         };
@@ -659,7 +665,7 @@ mod tests {
         ExecRequest {
             argv,
             sender,
-            pty: false,
+            tty: false,
             cols: 80,
             rows: 24,
             shell: String::new(),
@@ -693,7 +699,7 @@ mod tests {
         let req = ExecRequest {
             argv,
             sender: event_tx,
-            pty: false,
+            tty: false,
             cols: 80,
             rows: 24,
             shell: String::new(),
@@ -1221,6 +1227,7 @@ mod tests {
                     rows,
                     sender,
                     shell: String::new(),
+                    no_shell: false,
                 };
 
                 let mut conn = XhodConnection::new(client, "tgt".to_string());

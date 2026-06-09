@@ -3,7 +3,7 @@
 //! Feature: interactive-pty-passthrough
 //! Property 7: Interactive/Non-Interactive Mode Mutual Exclusion
 //!
-//! For any ExecRequest, if `interactive == true` then `no_pty` must be `false`,
+//! For any ExecRequest, if `interactive == true` then `tty` must be true,
 //! `term_cols` must be > 0, and `term_rows` must be > 0. The execution path
 //! uses bidirectional byte streaming with client raw mode.
 //!
@@ -12,14 +12,14 @@
 use proptest::prelude::*;
 
 use xho::protocol::ExecRequest;
-use xho::types::should_use_interactive_mode;
+use xho::types::{FlagIntent, should_use_interactive_mode};
 
 /// Simulate the daemon's validation logic for an ExecRequest.
 /// Returns Ok(()) if the request is valid, Err(reason) if it would be rejected.
 fn validate_interactive_request(req: &ExecRequest) -> Result<(), &'static str> {
     if req.interactive {
-        if !req.pty || req.no_pty {
-            return Err("interactive mode requires pty and is incompatible with no_pty");
+        if !req.tty {
+            return Err("interactive mode requires tty");
         }
         if req.term_cols == 0 || req.term_rows == 0 {
             return Err("interactive mode requires term_cols > 0 and term_rows > 0");
@@ -31,25 +31,25 @@ fn validate_interactive_request(req: &ExecRequest) -> Result<(), &'static str> {
 proptest! {
     #![proptest_config(ProptestConfig { cases: 1024, .. ProptestConfig::default() })]
 
-    /// Property: If interactive == true, then no_pty must be false, pty must be
-    /// true, term_cols > 0, and term_rows > 0 for the request to be valid.
+    /// Property: If interactive == true, then tty must be true, term_cols > 0,
+    /// and term_rows > 0 for the request to be valid.
     /// Any violation of these constraints results in rejection.
     ///
     /// **Validates: Requirements 3.3, 7.5**
     #[test]
     fn prop_interactive_requires_pty_and_valid_dimensions(
         interactive in any::<bool>(),
-        pty in any::<bool>(),
-        no_pty in any::<bool>(),
+        tty in any::<bool>(),
         term_cols in 0u32..=300,
         term_rows in 0u32..=200,
     ) {
         let req = ExecRequest {
             target: "test".to_string(),
             argv: vec!["cmd".to_string()],
-            pty,
-            no_pty,
+            tty,
+            tty_intent: FlagIntent::Default,
             stdin: false,
+            stdin_intent: FlagIntent::Default,
             timeout_ms: 0,
             interactive,
             term_cols,
@@ -62,11 +62,10 @@ proptest! {
 
         if interactive {
             // When interactive is true, validation must enforce constraints
-            if !pty || no_pty {
+            if !tty {
                 prop_assert!(
                     result.is_err(),
-                    "interactive=true with pty={}, no_pty={} should be rejected",
-                    pty, no_pty
+                    "interactive=true with tty=false should be rejected",
                 );
             } else if term_cols == 0 || term_rows == 0 {
                 prop_assert!(
@@ -77,7 +76,7 @@ proptest! {
             } else {
                 prop_assert!(
                     result.is_ok(),
-                    "interactive=true with pty=true, no_pty=false, cols={}, rows={} should be valid",
+                    "interactive=true with tty=true, cols={}, rows={} should be valid",
                     term_cols, term_rows
                 );
             }
@@ -90,21 +89,21 @@ proptest! {
         }
     }
 
-    /// Property: interactive == true and no_pty == true is always an invalid
-    /// state — these flags are mutually exclusive.
+    /// Property: interactive == true and tty == false is always invalid.
     ///
     /// **Validates: Requirement 3.3**
     #[test]
-    fn prop_interactive_and_no_pty_mutually_exclusive(
+    fn prop_interactive_requires_tty(
         term_cols in 1u32..=300,
         term_rows in 1u32..=200,
     ) {
         let req = ExecRequest {
             target: "test".to_string(),
             argv: vec!["cmd".to_string()],
-            pty: true,
-            no_pty: true,
+            tty: false,
+            tty_intent: FlagIntent::Disable,
             stdin: false,
+            stdin_intent: FlagIntent::Default,
             timeout_ms: 0,
             interactive: true,
             term_cols,
@@ -116,12 +115,12 @@ proptest! {
         let result = validate_interactive_request(&req);
         prop_assert!(
             result.is_err(),
-            "interactive=true with no_pty=true must always be rejected, got Ok"
+            "interactive=true with tty=false must always be rejected, got Ok"
         );
     }
 
     /// Property: interactive == true with zero terminal dimensions is always
-    /// rejected, even when pty is true and no_pty is false.
+    /// rejected, even when tty is true.
     ///
     /// **Validates: Requirement 7.5**
     #[test]
@@ -140,9 +139,10 @@ proptest! {
         let req = ExecRequest {
             target: "test".to_string(),
             argv: vec!["cmd".to_string()],
-            pty: true,
-            no_pty: false,
+            tty: true,
+            tty_intent: FlagIntent::Enable,
             stdin: false,
+            stdin_intent: FlagIntent::Default,
             timeout_ms: 0,
             interactive: true,
             term_cols,
@@ -166,21 +166,22 @@ proptest! {
     /// **Validates: Requirements 3.3, 7.5**
     #[test]
     fn prop_interactive_mode_detection_implies_valid_request(
-        pty in any::<bool>(),
+        tty in any::<bool>(),
         resolved_stdin in any::<bool>(),
         stdin_is_tty in any::<bool>(),
         stdout_is_tty in any::<bool>(),
         term_cols in 1u32..=300,
         term_rows in 1u32..=200,
     ) {
-        let interactive = should_use_interactive_mode(pty, resolved_stdin, stdin_is_tty, stdout_is_tty);
+        let interactive = should_use_interactive_mode(tty, resolved_stdin, stdin_is_tty, stdout_is_tty);
 
         let req = ExecRequest {
             target: "test".to_string(),
             argv: vec!["cmd".to_string()],
-            pty,
-            no_pty: false,
+            tty,
+            tty_intent: FlagIntent::from_force_pair(tty, false),
             stdin: resolved_stdin,
+            stdin_intent: FlagIntent::Default,
             timeout_ms: 0,
             interactive,
             term_cols,
@@ -191,14 +192,14 @@ proptest! {
 
         let result = validate_interactive_request(&req);
 
-        // When should_use_interactive_mode returns true, pty is guaranteed true,
-        // and with no_pty=false and valid dimensions, the request must be valid.
+        // When should_use_interactive_mode returns true, tty is guaranteed true,
+        // and with valid dimensions, the request must be valid.
         if interactive {
             prop_assert!(
                 result.is_ok(),
                 "when should_use_interactive_mode returns true with valid dimensions, \
-                 the request must pass validation. Got error for pty={}, cols={}, rows={}",
-                pty, term_cols, term_rows
+                 the request must pass validation. Got error for tty={}, cols={}, rows={}",
+                tty, term_cols, term_rows
             );
         }
         // When interactive is false, validation always passes (non-interactive path)

@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::copy_frames::{
@@ -14,7 +14,7 @@ use crate::copy_frames::{
 use crate::protocol::ServerEvent;
 use crate::types::{CopyDirection, CopyFrame, CopySpec};
 
-use super::shared::{PtyShell, build_interactive_shell_command};
+use super::shared::{PtyShell, build_final_command};
 use super::{Connection, ExecRequest, InteractiveHandle, InteractiveRequest};
 
 const EXEC_SENTINEL_PREFIX: &str = "__ARUN_EXEC__";
@@ -59,6 +59,7 @@ impl JumpserverConnection {
         &mut self,
         command: &str,
         sender: &mpsc::UnboundedSender<ServerEvent>,
+        stdin_rx: Option<&mut mpsc::Receiver<Vec<u8>>>,
         marker_prefix: &str,
     ) -> Result<i32> {
         let shell = self.shell_mut()?;
@@ -66,7 +67,9 @@ impl JumpserverConnection {
         let marker = shell.make_marker(marker_prefix);
         let wrapped = shell.wrap_shell_command(command, &marker);
         shell.write_line(&wrapped).await?;
-        let (status, _) = shell.read_until_sentinel(&marker, Some(sender)).await?;
+        let (status, _) = shell
+            .read_until_sentinel_with_stdin(&marker, Some(sender), stdin_rx)
+            .await?;
         shell.finish_roundtrip().await?;
         Ok(status)
     }
@@ -226,12 +229,15 @@ impl JumpserverConnection {
 #[async_trait::async_trait]
 impl Connection for JumpserverConnection {
     async fn exec(&mut self, request: &mut ExecRequest) -> Result<i32> {
-        // Jumpserver connections always operate through an interactive PTY shell.
-        // Build the command using interactive shell formatting (first word unquoted
-        // for alias expansion).
-        let command = build_interactive_shell_command(&request.argv);
-        self.run_shell_command_stream(&command, &request.sender, EXEC_SENTINEL_PREFIX)
-            .await
+        let command = build_final_command(&request.argv, &request.shell);
+        let mut stdin_rx = request.stdin_rx.take();
+        self.run_shell_command_stream(
+            &command,
+            &request.sender,
+            stdin_rx.as_mut(),
+            EXEC_SENTINEL_PREFIX,
+        )
+        .await
     }
 
     async fn copy(&mut self, mut spec: CopySpec) -> Result<()> {
@@ -245,7 +251,7 @@ impl Connection for JumpserverConnection {
         &mut self,
         request: &InteractiveRequest,
     ) -> Result<InteractiveHandle> {
-        let command = build_interactive_shell_command(&request.argv);
+        let command = build_final_command(&request.argv, &request.shell);
         let shell = self
             .shell
             .take()
@@ -273,6 +279,7 @@ impl<'a> BorrowedJumpserverConnection<'a> {
         &mut self,
         command: &str,
         sender: &mpsc::UnboundedSender<ServerEvent>,
+        stdin_rx: Option<&mut mpsc::Receiver<Vec<u8>>>,
         marker_prefix: &str,
     ) -> Result<i32> {
         self.shell.clear_prompt_remainder();
@@ -281,7 +288,7 @@ impl<'a> BorrowedJumpserverConnection<'a> {
         self.shell.write_line(&wrapped).await?;
         let (status, _) = self
             .shell
-            .read_until_sentinel(&marker, Some(sender))
+            .read_until_sentinel_with_stdin(&marker, Some(sender), stdin_rx)
             .await?;
         self.shell.finish_roundtrip().await?;
         Ok(status)
@@ -432,9 +439,15 @@ impl<'a> BorrowedJumpserverConnection<'a> {
 #[async_trait::async_trait]
 impl Connection for BorrowedJumpserverConnection<'_> {
     async fn exec(&mut self, request: &mut ExecRequest) -> Result<i32> {
-        let command = build_interactive_shell_command(&request.argv);
-        self.run_shell_command_stream(&command, &request.sender, EXEC_SENTINEL_PREFIX)
-            .await
+        let command = build_final_command(&request.argv, &request.shell);
+        let mut stdin_rx = request.stdin_rx.take();
+        self.run_shell_command_stream(
+            &command,
+            &request.sender,
+            stdin_rx.as_mut(),
+            EXEC_SENTINEL_PREFIX,
+        )
+        .await
     }
 
     async fn copy(&mut self, mut spec: CopySpec) -> Result<()> {
@@ -446,30 +459,9 @@ impl Connection for BorrowedJumpserverConnection<'_> {
 
     async fn exec_interactive(
         &mut self,
-        request: &InteractiveRequest,
+        _request: &InteractiveRequest,
     ) -> Result<InteractiveHandle> {
-        let command = build_interactive_shell_command(&request.argv);
-        self.shell.clear_prompt_remainder();
-        self.shell.write_line(&command).await?;
-
-        let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(32);
-        let (resize_tx, _resize_rx) = mpsc::channel::<(u32, u32)>(8);
-        let (stdout_tx, stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (exit_tx, exit_rx) = oneshot::channel::<i32>();
-
-        let sender = request.sender.clone();
-        let shell_timeout = self.shell.shell_timeout();
-
-        tokio::spawn(async move {
-            let _ = (stdin_rx, stdout_tx, exit_tx, sender, shell_timeout);
-        });
-
-        Ok(InteractiveHandle {
-            stdin_tx,
-            resize_tx,
-            stdout_rx,
-            exit_rx,
-        })
+        bail!("borrowed jumpserver connection cannot be moved into interactive mode")
     }
 
     fn is_alive(&self) -> bool {

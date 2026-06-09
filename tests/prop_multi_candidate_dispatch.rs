@@ -25,7 +25,7 @@ use xho::daemon::gateway::{
     InteractiveRequest, Route,
 };
 use xho::protocol::ServerListRow;
-use xho::types::CopySpec;
+use xho::types::{CopySpec, FlagIntent};
 
 // ---------------------------------------------------------------------------
 // Mock Gateway that returns configurable results and records call order.
@@ -223,13 +223,15 @@ fn make_exec_request() -> ExecRequest {
     ExecRequest {
         argv: vec!["echo".to_string(), "hello".to_string()],
         sender,
-        pty: false,
+        tty: false,
+        tty_intent: FlagIntent::Default,
         cols: 80,
         rows: 24,
         shell: String::new(),
         no_shell: false,
         timeout_ms: 0,
         stdin: false,
+        stdin_intent: FlagIntent::Default,
         stdin_rx: std::sync::Mutex::new(None),
     }
 }

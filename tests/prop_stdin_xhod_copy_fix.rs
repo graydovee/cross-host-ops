@@ -88,8 +88,9 @@ proptest! {
                     target: "stub-target".to_string(),
                     argv: vec!["cat".to_string()],
                     stdin: true,
+                    stdin_intent: rpc::FlagIntent::Enable as i32,
                     interactive: false,
-                    no_pty: true,
+                    tty: false,
                     timeout_ms: 500,
                     ..Default::default()
                 })),
@@ -177,8 +178,9 @@ proptest! {
                     target: "stub-target".to_string(),
                     argv: argv.clone(),
                     stdin: false,       // no stdin — the preserved path
+                    stdin_intent: rpc::FlagIntent::Default as i32,
                     interactive: false,
-                    no_pty: true,
+                    tty: false,
                     timeout_ms: 500,   // short timeout to fail fast
                     ..Default::default()
                 })),
@@ -232,7 +234,8 @@ proptest! {
                 request: Some(rpc::execute_request::Request::Start(rpc::StartRequest {
                     target: "stub-target".to_string(),
                     argv: argv.clone(),
-                    pty: true,
+                    tty: true,
+                    tty_intent: rpc::FlagIntent::Enable as i32,
                     stdin: false,
                     interactive: false,
                     timeout_ms: 500,

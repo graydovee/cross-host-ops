@@ -26,6 +26,12 @@ message StdinData {
   bytes data = 1;
 }
 
+enum FlagIntent {
+  DEFAULT = 0;
+  ENABLE = 1;
+  DISABLE = 2;
+}
+
 message WindowResize {
   uint32 cols = 1;
   uint32 rows = 2;
@@ -34,8 +40,8 @@ message WindowResize {
 message StartRequest {
   string target = 1;
   repeated string argv = 2;
-  bool pty = 3;
-  bool no_pty = 4;
+  bool tty = 3;
+  FlagIntent tty_intent = 4;
   bool stdin = 5;
   uint64 timeout_ms = 6;
   bool interactive = 7;
@@ -43,6 +49,7 @@ message StartRequest {
   uint32 term_rows = 9;
   string shell = 10;   // --shell value; empty = not specified, daemon resolves from server.toml
   bool no_shell = 11;  // --no-shell flag; true = disable wrapping regardless of config
+  FlagIntent stdin_intent = 12;
 }
 
 message ConfirmRequest {

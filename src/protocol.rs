@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use uuid::Uuid;
 
 use crate::config::{ReviewAction, RiskLevel, ServerEntry};
-use crate::types::{CopyDirection, CopyFrame, CopySpec, ServerListSource};
+use crate::types::{CopyDirection, CopyFrame, CopySpec, FlagIntent, ServerListSource};
 
 pub mod rpc {
     tonic::include_proto!("xho.rpc");
@@ -12,15 +12,36 @@ pub mod rpc {
 pub struct ExecRequest {
     pub target: String,
     pub argv: Vec<String>,
-    pub pty: bool,
-    pub no_pty: bool,
+    pub tty: bool,
+    pub tty_intent: FlagIntent,
     pub stdin: bool,
+    pub stdin_intent: FlagIntent,
     pub timeout_ms: u64,
     pub interactive: bool,
     pub term_cols: u32,
     pub term_rows: u32,
     pub shell: String,
     pub no_shell: bool,
+}
+
+impl From<FlagIntent> for rpc::FlagIntent {
+    fn from(value: FlagIntent) -> Self {
+        match value {
+            FlagIntent::Default => rpc::FlagIntent::Default,
+            FlagIntent::Enable => rpc::FlagIntent::Enable,
+            FlagIntent::Disable => rpc::FlagIntent::Disable,
+        }
+    }
+}
+
+impl From<rpc::FlagIntent> for FlagIntent {
+    fn from(value: rpc::FlagIntent) -> Self {
+        match value {
+            rpc::FlagIntent::Enable => FlagIntent::Enable,
+            rpc::FlagIntent::Disable => FlagIntent::Disable,
+            rpc::FlagIntent::Default => FlagIntent::Default,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -107,6 +128,20 @@ pub fn copy_frame_to_rpc(frame: CopyFrame) -> rpc::CopyFrame {
         CopyFrame::EndOfStream => Frame::EndOfStream(rpc::CopyEndOfStream {}),
     };
     rpc::CopyFrame { frame: Some(frame) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flag_intent_round_trips_through_rpc_enum() {
+        for intent in [FlagIntent::Default, FlagIntent::Enable, FlagIntent::Disable] {
+            let rpc_intent = rpc::FlagIntent::from(intent);
+            let decoded = FlagIntent::from(rpc_intent);
+            assert_eq!(decoded, intent);
+        }
+    }
 }
 
 pub fn copy_frame_from_rpc(frame: rpc::CopyFrame) -> Result<CopyFrame> {

@@ -376,12 +376,40 @@ impl PtyShell {
         marker: &str,
         sender: Option<&tokio::sync::mpsc::UnboundedSender<crate::protocol::ServerEvent>>,
     ) -> Result<(i32, Vec<u8>)> {
+        self.read_until_sentinel_with_stdin(marker, sender, None)
+            .await
+    }
+
+    pub(crate) async fn read_until_sentinel_with_stdin(
+        &mut self,
+        marker: &str,
+        sender: Option<&tokio::sync::mpsc::UnboundedSender<crate::protocol::ServerEvent>>,
+        mut stdin_rx: Option<&mut tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    ) -> Result<(i32, Vec<u8>)> {
         let prefix = marker.as_bytes();
         let mut payload = Vec::new();
         let mut first_output = true;
 
         loop {
-            let chunk = self.read_chunk().await?;
+            let chunk = if let Some(rx) = stdin_rx.as_mut() {
+                tokio::select! {
+                    data = rx.recv() => {
+                        match data {
+                            Some(data) => {
+                                self.write_raw(&data).await?;
+                                continue;
+                            }
+                            None => {
+                                stdin_rx = None;
+                                continue;
+                            }
+                        }
+                    }
+                    chunk = self.read_chunk() => chunk?,
+                }
+            } else {
+                self.read_chunk().await?
+            };
             self.pending.extend_from_slice(&chunk);
             if let Some((code, before, after)) = extract_sentinel(&self.pending, prefix) {
                 let before = if first_output {

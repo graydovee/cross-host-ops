@@ -15,7 +15,7 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 
 use crate::config::GatewayConfig;
 use crate::protocol::{ServerEvent, ServerListRow};
-use crate::types::CopySpec;
+use crate::types::{CopySpec, FlagIntent};
 
 use self::auth::AuthPrompter;
 use self::jumpserver::JumpserverGateway;
@@ -93,13 +93,15 @@ pub struct Route {
 pub struct ExecRequest {
     pub argv: Vec<String>,
     pub sender: mpsc::UnboundedSender<ServerEvent>,
-    pub pty: bool,
+    pub tty: bool,
+    pub tty_intent: FlagIntent,
     pub cols: u32,
     pub rows: u32,
     pub shell: String,
     pub no_shell: bool,
     pub timeout_ms: u64,
     pub stdin: bool,
+    pub stdin_intent: FlagIntent,
     /// Optional stdin receiver for forwarding stdin data to the remote process.
     /// Created by process_execute when the client requests stdin forwarding.
     /// Wrapped in Mutex<Option<...>> so the gateway can take ownership from `&self`.
@@ -114,6 +116,7 @@ pub struct InteractiveRequest {
     pub rows: u32,
     pub sender: mpsc::UnboundedSender<ServerEvent>,
     pub shell: String,
+    pub no_shell: bool,
 }
 
 /// Handle for driving an interactive session.

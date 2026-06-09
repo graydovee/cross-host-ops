@@ -185,6 +185,39 @@ pub struct ExecStdinFlags {
     pub force_no_stdin: bool,
 }
 
+/// Explicit user intent for a boolean execution flag.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FlagIntent {
+    #[default]
+    Default,
+    Enable,
+    Disable,
+}
+
+impl FlagIntent {
+    pub fn from_force_pair(enable: bool, disable: bool) -> Self {
+        if disable {
+            Self::Disable
+        } else if enable {
+            Self::Enable
+        } else {
+            Self::Default
+        }
+    }
+
+    pub fn is_disable(self) -> bool {
+        matches!(self, Self::Disable)
+    }
+}
+
+pub fn tty_intent_from_flags(flags: &ExecTtyFlags) -> FlagIntent {
+    FlagIntent::from_force_pair(flags.force_tty, flags.force_no_tty)
+}
+
+pub fn stdin_intent_from_flags(flags: &ExecStdinFlags) -> FlagIntent {
+    FlagIntent::from_force_pair(flags.force_stdin, flags.force_no_stdin)
+}
+
 /// Compute the effective TTY decision.
 ///
 /// Priority (each step short-circuits):
@@ -243,4 +276,41 @@ pub fn should_use_interactive_mode(
     stdout_is_tty: bool,
 ) -> bool {
     resolved_tty && resolved_stdin && stdin_is_tty && stdout_is_tty
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flag_intent_from_force_pair_matches_cli_precedence() {
+        assert_eq!(
+            FlagIntent::from_force_pair(false, false),
+            FlagIntent::Default
+        );
+        assert_eq!(FlagIntent::from_force_pair(true, false), FlagIntent::Enable);
+        assert_eq!(
+            FlagIntent::from_force_pair(false, true),
+            FlagIntent::Disable
+        );
+        assert_eq!(FlagIntent::from_force_pair(true, true), FlagIntent::Disable);
+    }
+
+    #[test]
+    fn tty_and_stdin_intents_are_derived_from_flags() {
+        assert_eq!(
+            tty_intent_from_flags(&ExecTtyFlags {
+                force_tty: true,
+                force_no_tty: false,
+            }),
+            FlagIntent::Enable
+        );
+        assert_eq!(
+            stdin_intent_from_flags(&ExecStdinFlags {
+                force_stdin: false,
+                force_no_stdin: true,
+            }),
+            FlagIntent::Disable
+        );
+    }
 }
