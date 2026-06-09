@@ -16,6 +16,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
 use crate::config::{AppConfig, DirectAuth};
+use crate::copy_frames::{
+    copy_entry_name, join_relative_path, path_to_string, relative_path_to_string,
+};
 use crate::protocol::ServerEvent;
 use crate::types::{CopyDirection, CopyFrame, CopySpec};
 
@@ -357,7 +360,7 @@ impl DirectConnection {
                     let remote_path = if spec.recursive {
                         join_relative_path(&remote_root, &relative_path)?
                     } else if remote_root_is_dir {
-                        remote_root.join(copy_entry_name(&relative_path, &spec.source_name))
+                        remote_root.join(copy_entry_name(&relative_path, &spec.source_name, "copy"))
                     } else {
                         remote_root.clone()
                     };
@@ -398,7 +401,7 @@ impl DirectConnection {
                     let remote_path = if spec.recursive {
                         join_relative_path(&remote_root, &relative_path)?
                     } else if remote_root_is_dir {
-                        remote_root.join(copy_entry_name(&relative_path, &spec.source_name))
+                        remote_root.join(copy_entry_name(&relative_path, &spec.source_name, "copy"))
                     } else {
                         remote_root.clone()
                     };
@@ -441,7 +444,7 @@ impl DirectConnection {
             }
             send_remote_dir_frames(&sftp, remote, Path::new(""), &tx).await?;
         } else {
-            let relative_path = copy_entry_name("", &remote_source_name(&remote_path));
+            let relative_path = copy_entry_name("", &remote_source_name(&remote_path), "copy");
             send_remote_entry_frame(&sftp, remote, Path::new(&relative_path), &metadata, &tx)
                 .await?;
         }
@@ -549,59 +552,6 @@ fn validate_copy_spec(spec: &CopySpec) -> Result<()> {
         bail!("remote_path must not be empty");
     }
     Ok(())
-}
-
-fn path_to_string(path: &Path) -> Result<String> {
-    path.to_str()
-        .map(str::to_string)
-        .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", path.display()))
-}
-
-fn relative_path_to_string(path: &Path) -> Result<String> {
-    validate_relative_path(path)?;
-    path_to_string(path)
-}
-
-fn validate_relative_path(path: &Path) -> Result<()> {
-    if path.is_absolute() {
-        bail!(
-            "copy frame relative path must not be absolute: {}",
-            path.display()
-        );
-    }
-    for component in path.components() {
-        match component {
-            std::path::Component::ParentDir
-            | std::path::Component::RootDir
-            | std::path::Component::Prefix(_) => {
-                bail!(
-                    "copy frame relative path contains invalid component: {}",
-                    path.display()
-                );
-            }
-            std::path::Component::CurDir | std::path::Component::Normal(_) => {}
-        }
-    }
-    Ok(())
-}
-
-fn join_relative_path(root: &Path, relative_path: &str) -> Result<PathBuf> {
-    if relative_path.is_empty() {
-        return Ok(root.to_path_buf());
-    }
-    let relative = Path::new(relative_path);
-    validate_relative_path(relative)?;
-    Ok(root.join(relative))
-}
-
-fn copy_entry_name(relative_path: &str, source_name: &str) -> String {
-    Path::new(relative_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .or_else(|| (!source_name.trim().is_empty()).then_some(source_name.trim()))
-        .unwrap_or("copy")
-        .to_string()
 }
 
 fn remote_source_name(remote_path: &str) -> String {

@@ -18,6 +18,7 @@
 
 pub mod cli;
 pub mod config;
+pub(crate) mod copy_frames;
 pub mod daemon;
 pub mod exit_codes;
 pub mod logging;

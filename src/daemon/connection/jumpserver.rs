@@ -2,14 +2,15 @@
 // Wraps a PtyShell to execute commands through an interactive jumpserver shell.
 // Implements the Connection trait using sentinel-based exit code extraction.
 
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
+use crate::copy_frames::{
+    collect_single_file_upload, emit_local_path_frames, materialize_frames_to_dir,
+};
 use crate::protocol::ServerEvent;
 use crate::types::{CopyDirection, CopyFrame, CopySpec};
 
@@ -727,217 +728,6 @@ impl Drop for InternalTempDir {
     }
 }
 
-async fn materialize_frames_to_dir(
-    root: &Path,
-    upload_rx: &mut mpsc::Receiver<CopyFrame>,
-) -> Result<()> {
-    let mut current_file: Option<tokio::fs::File> = None;
-    while let Some(frame) = upload_rx.recv().await {
-        match frame {
-            CopyFrame::BeginDirectory {
-                relative_path,
-                mode,
-                ..
-            } => {
-                let path = join_relative_path(root, &relative_path)?;
-                tokio::fs::create_dir_all(&path)
-                    .await
-                    .with_context(|| format!("failed to create {}", path.display()))?;
-                if mode != 0 {
-                    tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
-                        .await
-                        .with_context(|| format!("failed to chmod {}", path.display()))?;
-                }
-            }
-            CopyFrame::BeginFile {
-                relative_path,
-                mode,
-                ..
-            } => {
-                if current_file.is_some() {
-                    bail!("copy stream began a new file before ending the previous file");
-                }
-                let path = join_relative_path(root, &relative_path)?;
-                if let Some(parent) = path.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        tokio::fs::create_dir_all(parent).await?;
-                    }
-                }
-                let file = tokio::fs::File::create(&path)
-                    .await
-                    .with_context(|| format!("failed to create {}", path.display()))?;
-                if mode != 0 {
-                    tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
-                        .await
-                        .with_context(|| format!("failed to chmod {}", path.display()))?;
-                }
-                current_file = Some(file);
-            }
-            CopyFrame::FileData { data } => {
-                let file = current_file
-                    .as_mut()
-                    .ok_or_else(|| anyhow!("copy stream sent file data before BeginFile"))?;
-                file.write_all(&data).await?;
-            }
-            CopyFrame::EndFile => {
-                let mut file = current_file
-                    .take()
-                    .ok_or_else(|| anyhow!("copy stream sent EndFile before BeginFile"))?;
-                file.flush().await?;
-            }
-            CopyFrame::Symlink {
-                relative_path,
-                target,
-            } => {
-                let path = join_relative_path(root, &relative_path)?;
-                if let Some(parent) = path.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        tokio::fs::create_dir_all(parent).await?;
-                    }
-                }
-                let _ = tokio::fs::remove_file(&path).await;
-                std::os::unix::fs::symlink(target, &path)
-                    .with_context(|| format!("failed to create symlink {}", path.display()))?;
-            }
-            CopyFrame::EndOfStream => break,
-        }
-    }
-    if current_file.is_some() {
-        bail!("copy stream ended before EndFile");
-    }
-    Ok(())
-}
-
-async fn collect_single_file_upload(upload_rx: &mut mpsc::Receiver<CopyFrame>) -> Result<Vec<u8>> {
-    let mut data = Vec::new();
-    let mut in_file = false;
-    while let Some(frame) = upload_rx.recv().await {
-        match frame {
-            CopyFrame::BeginFile { .. } if !in_file => {
-                in_file = true;
-            }
-            CopyFrame::FileData { data: chunk } if in_file => {
-                data.extend_from_slice(&chunk);
-            }
-            CopyFrame::EndFile if in_file => {
-                in_file = false;
-            }
-            CopyFrame::EndOfStream => break,
-            CopyFrame::BeginDirectory { .. } => {
-                bail!("non-recursive jumpserver upload received a directory frame");
-            }
-            CopyFrame::Symlink { .. } => {
-                bail!("non-recursive jumpserver symlink upload is not supported");
-            }
-            other => bail!("unexpected copy frame in single-file upload: {:?}", other),
-        }
-    }
-    if in_file {
-        bail!("copy stream ended before EndFile");
-    }
-    Ok(data)
-}
-
-async fn emit_local_path_frames(
-    root: &Path,
-    relative_root: &Path,
-    include_root: bool,
-    tx: &mpsc::Sender<CopyFrame>,
-) -> Result<()> {
-    let metadata = tokio::fs::symlink_metadata(root)
-        .await
-        .with_context(|| format!("failed to inspect {}", root.display()))?;
-    if include_root {
-        send_local_entry_frame(root, relative_root, &metadata, tx).await?;
-    }
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
-        let mut stack = vec![(root.to_path_buf(), relative_root.to_path_buf())];
-        while let Some((dir, rel_dir)) = stack.pop() {
-            let mut entries = tokio::fs::read_dir(&dir)
-                .await
-                .with_context(|| format!("failed to read {}", dir.display()))?;
-            while let Some(entry) = entries.next_entry().await? {
-                let path = entry.path();
-                let rel = rel_dir.join(entry.file_name());
-                let metadata = tokio::fs::symlink_metadata(&path)
-                    .await
-                    .with_context(|| format!("failed to inspect {}", path.display()))?;
-                send_local_entry_frame(&path, &rel, &metadata, tx).await?;
-                if metadata.is_dir() && !metadata.file_type().is_symlink() {
-                    stack.push((path, rel));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn send_local_entry_frame(
-    path: &Path,
-    relative_path: &Path,
-    metadata: &std::fs::Metadata,
-    tx: &mpsc::Sender<CopyFrame>,
-) -> Result<()> {
-    validate_relative_path(relative_path)?;
-    let relative_path = relative_path_to_string(relative_path)?;
-    if metadata.file_type().is_symlink() {
-        let target = tokio::fs::read_link(path)
-            .await
-            .with_context(|| format!("failed to read symlink {}", path.display()))?;
-        tx.send(CopyFrame::Symlink {
-            relative_path,
-            target: target.to_string_lossy().to_string(),
-        })
-        .await
-        .map_err(|_| anyhow!("download copy frame stream closed"))?;
-        return Ok(());
-    }
-    if metadata.is_dir() {
-        tx.send(CopyFrame::BeginDirectory {
-            relative_path,
-            mode: metadata.permissions().mode(),
-            mtime: metadata.mtime(),
-        })
-        .await
-        .map_err(|_| anyhow!("download copy frame stream closed"))?;
-        return Ok(());
-    }
-    if !metadata.is_file() {
-        bail!(
-            "unsupported file type for jumpserver copy: {}",
-            path.display()
-        );
-    }
-    tx.send(CopyFrame::BeginFile {
-        relative_path,
-        mode: metadata.permissions().mode(),
-        size: metadata.len(),
-        mtime: metadata.mtime(),
-    })
-    .await
-    .map_err(|_| anyhow!("download copy frame stream closed"))?;
-
-    let mut file = tokio::fs::File::open(path)
-        .await
-        .with_context(|| format!("failed to open {}", path.display()))?;
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        tx.send(CopyFrame::FileData {
-            data: buf[..n].to_vec(),
-        })
-        .await
-        .map_err(|_| anyhow!("download copy frame stream closed"))?;
-    }
-    tx.send(CopyFrame::EndFile)
-        .await
-        .map_err(|_| anyhow!("download copy frame stream closed"))?;
-    Ok(())
-}
-
 fn extracted_tar_root(temp_dir: &Path, source_name: &str) -> Result<PathBuf> {
     if let Some(name) = shell_path_basename(source_name) {
         let preferred = temp_dir.join(name);
@@ -965,41 +755,4 @@ fn shell_path_basename(value: &str) -> Option<String> {
 
 fn shell_path_basename_or(value: &str, fallback: &str) -> String {
     shell_path_basename(value).unwrap_or_else(|| fallback.to_string())
-}
-
-fn relative_path_to_string(path: &Path) -> Result<String> {
-    validate_relative_path(path)?;
-    path.to_str()
-        .map(str::to_string)
-        .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", path.display()))
-}
-
-fn validate_relative_path(path: &Path) -> Result<()> {
-    if path.is_absolute() {
-        bail!(
-            "copy frame relative path must not be absolute: {}",
-            path.display()
-        );
-    }
-    for component in path.components() {
-        match component {
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                bail!(
-                    "copy frame relative path contains invalid component: {}",
-                    path.display()
-                );
-            }
-            Component::CurDir | Component::Normal(_) => {}
-        }
-    }
-    Ok(())
-}
-
-fn join_relative_path(root: &Path, relative_path: &str) -> Result<PathBuf> {
-    if relative_path.is_empty() {
-        return Ok(root.to_path_buf());
-    }
-    let relative = Path::new(relative_path);
-    validate_relative_path(relative)?;
-    Ok(root.join(relative))
 }
