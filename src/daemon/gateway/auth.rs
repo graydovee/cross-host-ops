@@ -258,6 +258,9 @@ pub(crate) async fn connect_handle(
     config: &AppConfig,
 ) -> Result<Handle<ClientHandler>> {
     let client_config = client::Config {
+        // Keep idle transports (including jumpserver hops) alive with active
+        // keepalive pings rather than letting inactivity_timeout drop them.
+        keepalive_interval: Some(config.ssh.keepalive_interval),
         inactivity_timeout: Some(config.ssh.keepalive_interval * 2),
         ..Default::default()
     };

@@ -267,6 +267,12 @@ async fn connect_handle(
     config: &AppConfig,
 ) -> Result<Handle<ClientHandler>> {
     let client_config = client::Config {
+        // Actively send keepalive pings on an idle connection so an interactive
+        // session (e.g. `exec -it host bash`) is not dropped while the user is
+        // not typing. inactivity_timeout still closes genuinely dead connections,
+        // but keepalive replies reset it; combined with keepalive_max it detects
+        // a hung peer without killing live idle sessions.
+        keepalive_interval: Some(config.ssh.keepalive_interval),
         inactivity_timeout: Some(config.ssh.keepalive_interval * 2),
         ..Default::default()
     };

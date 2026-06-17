@@ -465,7 +465,6 @@ impl PtyShell {
         let PtyShell {
             mut channel,
             mut pending,
-            shell_timeout,
             ..
         } = self;
         let prefix = marker.into_bytes();
@@ -489,11 +488,14 @@ impl PtyShell {
                     Some((cols, rows)) = resize_rx.recv() => {
                         let _ = channel.window_change(cols, rows, 0, 0).await;
                     }
-                    message = timeout(shell_timeout, channel.wait()) => {
+                    // No read timeout here: an interactive session may sit idle
+                    // for long stretches while the user is not typing. Transport
+                    // liveness is handled by SSH keepalives at the client config
+                    // level; the channel closing yields None and breaks the loop.
+                    message = channel.wait() => {
                         let message = match message {
-                            Ok(Some(message)) => message,
-                            Ok(None) => break,
-                            Err(_) => break,
+                            Some(message) => message,
+                            None => break,
                         };
 
                         let chunk = match message {
