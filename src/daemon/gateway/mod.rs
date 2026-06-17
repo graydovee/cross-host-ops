@@ -12,6 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::task::AbortHandle;
 
 use crate::config::GatewayConfig;
 use crate::protocol::{ServerEvent, ServerListRow};
@@ -125,6 +126,7 @@ pub struct InteractiveHandle {
     pub resize_tx: mpsc::Sender<(u32, u32)>,
     pub stdout_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     pub exit_rx: oneshot::Receiver<i32>,
+    pub abort_handles: Vec<AbortHandle>,
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +213,16 @@ impl GatewayError {
             source: source.into(),
         }
     }
+
+    /// Format the error for CLI users.
+    pub fn user_message(&self) -> String {
+        let message = self.to_string();
+        if self.kind == ErrorKind::Transport {
+            format!("{message}; please retry the operation to open a fresh connection")
+        } else {
+            message
+        }
+    }
 }
 
 /// Classify an anyhow::Error as transport or not, by inspecting the error chain.
@@ -244,6 +256,28 @@ pub fn is_transport_error(error: &anyhow::Error) -> bool {
 pub fn is_resolution_error(error: &anyhow::Error) -> bool {
     let msg = error.to_string().to_ascii_lowercase();
     msg.contains("not found") || msg.contains("no match") || msg.contains("unknown target")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_user_message_includes_retry_hint() {
+        let error = GatewayError::transport(anyhow::anyhow!("channel closed"));
+
+        assert_eq!(
+            error.user_message(),
+            "[transport] channel closed; please retry the operation to open a fresh connection"
+        );
+    }
+
+    #[test]
+    fn non_transport_user_message_is_unchanged() {
+        let error = GatewayError::execution(anyhow::anyhow!("command failed"));
+
+        assert_eq!(error.user_message(), "[execution] command failed");
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -374,7 +374,7 @@ impl Connection for XhodConnection {
 
         // Spawn a task that bridges the gRPC bidirectional stream to the
         // InteractiveHandle channels.
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut exit_code: Option<i32> = None;
             loop {
                 tokio::select! {
@@ -443,12 +443,14 @@ impl Connection for XhodConnection {
             }
             let _ = exit_tx.send(exit_code.unwrap_or(255));
         });
+        let abort_handles = vec![task.abort_handle()];
 
         Ok(InteractiveHandle {
             stdin_tx,
             resize_tx,
             stdout_rx,
             exit_rx,
+            abort_handles,
         })
     }
 
@@ -469,6 +471,7 @@ impl Connection for XhodConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::FlagIntent;
     use hyper_util::rt::TokioIo;
     use proptest::prelude::*;
     use std::sync::Arc;
@@ -672,6 +675,7 @@ mod tests {
             no_shell: false,
             timeout_ms: 0,
             stdin: false,
+            stdin_intent: FlagIntent::Default,
             stdin_rx: None,
         }
     }
@@ -706,6 +710,7 @@ mod tests {
             no_shell: false,
             timeout_ms: 0,
             stdin: true,
+            stdin_intent: FlagIntent::Enable,
             stdin_rx: Some(stdin_rx),
         };
         (req, event_rx)

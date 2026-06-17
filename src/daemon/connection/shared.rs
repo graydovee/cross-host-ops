@@ -400,6 +400,7 @@ impl PtyShell {
                                 continue;
                             }
                             None => {
+                                self.write_raw(b"\x04").await?;
                                 stdin_rx = None;
                                 continue;
                             }
@@ -474,7 +475,7 @@ impl PtyShell {
         let (stdout_tx, stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut first_output = true;
             let mut exit_code = 255;
 
@@ -549,12 +550,14 @@ impl PtyShell {
             let _ = channel.close().await;
             let _ = exit_tx.send(exit_code);
         });
+        let abort_handles = vec![task.abort_handle()];
 
         Ok(crate::daemon::connection::InteractiveHandle {
             stdin_tx,
             resize_tx,
             stdout_rx,
             exit_rx,
+            abort_handles,
         })
     }
 }

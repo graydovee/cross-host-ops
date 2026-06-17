@@ -179,7 +179,7 @@ impl<T> SingletonLease<T> {
 }
 
 pub(crate) struct ManagedPool<K, T> {
-    inner: Mutex<HashMap<K, PoolState<T>>>,
+    inner: Arc<Mutex<HashMap<K, PoolState<T>>>>,
     next_generation: Mutex<u64>,
     max_idle: Duration,
     capacity: usize,
@@ -201,11 +201,12 @@ struct PoolEntry<T> {
     permit: OwnedSemaphorePermit,
 }
 
-pub(crate) struct PoolLease<K, T> {
+pub(crate) struct PoolLease<K: Eq + Hash, T> {
     key: K,
     resource: Option<T>,
     generation: u64,
     permit: Option<OwnedSemaphorePermit>,
+    inner: Arc<Mutex<HashMap<K, PoolState<T>>>>,
 }
 
 impl<K, T> ManagedPool<K, T>
@@ -214,7 +215,7 @@ where
 {
     pub(crate) fn new(capacity: usize, max_idle: Duration) -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: Arc::new(Mutex::new(HashMap::new())),
             next_generation: Mutex::new(1),
             max_idle,
             capacity: capacity.max(1),
@@ -252,6 +253,7 @@ where
                                 resource: Some(resource),
                                 generation,
                                 permit: Some(permit),
+                                inner: self.inner.clone(),
                             });
                         }
                         Err(error) => {
@@ -340,9 +342,15 @@ where
         lease.resource.take();
         lease.permit.take();
         let mut inner = self.inner.lock();
-        if let Some(state) = inner.get_mut(&lease.key) {
+        let remove_key = if let Some(state) = inner.get_mut(&lease.key) {
             state.active = state.active.saturating_sub(1);
             state.notify.notify_one();
+            state.active == 0 && state.idle.is_empty()
+        } else {
+            false
+        };
+        if remove_key {
+            inner.remove(&lease.key);
         }
     }
 
@@ -399,6 +407,7 @@ where
             resource: Some(entry.resource),
             generation: entry.generation,
             permit: Some(entry.permit),
+            inner: self.inner.clone(),
         })
     }
 
@@ -454,7 +463,10 @@ impl<T> PoolState<T> {
     }
 }
 
-impl<K, T> PoolLease<K, T> {
+impl<K, T> PoolLease<K, T>
+where
+    K: Eq + Hash,
+{
     pub(crate) fn resource(&self) -> &T {
         self.resource
             .as_ref()
@@ -472,10 +484,28 @@ impl<K, T> PoolLease<K, T> {
     }
 }
 
-impl<K, T> Drop for PoolLease<K, T> {
+impl<K, T> Drop for PoolLease<K, T>
+where
+    K: Eq + Hash,
+{
     fn drop(&mut self) {
-        self.resource.take();
-        self.permit.take();
+        let had_resource = self.resource.take().is_some();
+        let had_permit = self.permit.take().is_some();
+        if !had_resource && !had_permit {
+            return;
+        }
+
+        let mut inner = self.inner.lock();
+        let remove_key = if let Some(state) = inner.get_mut(&self.key) {
+            state.active = state.active.saturating_sub(1);
+            state.notify.notify_one();
+            state.active == 0 && state.idle.is_empty()
+        } else {
+            false
+        };
+        if remove_key {
+            inner.remove(&self.key);
+        }
     }
 }
 
@@ -574,6 +604,80 @@ mod tests {
         let snapshot = manager.status_snapshot_with(|key| key.to_string());
         assert_eq!(snapshot[0].active, 0);
         assert_eq!(snapshot[0].idle, 1);
+    }
+
+    #[tokio::test]
+    async fn managed_pool_drop_active_lease_discards_and_decrements_active() {
+        let manager = ManagedPool::new(1, Duration::from_secs(60));
+        let lease = manager
+            .checkout_or_create_with("a", || async { Ok::<_, ()>(10usize) })
+            .await
+            .unwrap();
+
+        drop(lease);
+
+        let snapshot = manager.status_snapshot_with(|key| key.to_string());
+        assert!(snapshot.is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_pool_drop_active_lease_wakes_waiter_at_capacity() {
+        let manager = Arc::new(ManagedPool::new(1, Duration::from_secs(60)));
+        let lease = manager
+            .checkout_or_create_with("a", || async { Ok::<_, ()>(10usize) })
+            .await
+            .unwrap();
+
+        let creates = Arc::new(AtomicUsize::new(0));
+        let waiter_manager = manager.clone();
+        let waiter_creates = creates.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_manager
+                .checkout_or_create_with("a", || async {
+                    waiter_creates.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, ()>(20usize)
+                })
+                .await
+                .unwrap()
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        drop(lease);
+
+        let lease = waiter.await.unwrap();
+        assert_eq!(*lease.resource.as_ref().unwrap(), 20);
+        assert_eq!(creates.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn managed_pool_returned_lease_drop_is_noop() {
+        let manager = ManagedPool::new(1, Duration::from_secs(60));
+        let lease = manager
+            .checkout_or_create_with("a", || async { Ok::<_, ()>(10usize) })
+            .await
+            .unwrap();
+
+        manager.return_healthy(lease);
+
+        let snapshot = manager.status_snapshot_with(|key| key.to_string());
+        assert_eq!(snapshot[0].active, 0);
+        assert_eq!(snapshot[0].idle, 1);
+    }
+
+    #[tokio::test]
+    async fn managed_pool_discarded_lease_drop_is_noop() {
+        let manager = ManagedPool::new(1, Duration::from_secs(60));
+        let lease = manager
+            .checkout_or_create_with("a", || async { Ok::<_, ()>(10usize) })
+            .await
+            .unwrap();
+
+        manager.discard(lease);
+
+        let snapshot = manager.status_snapshot_with(|key| key.to_string());
+        assert!(snapshot.is_empty());
     }
 
     #[tokio::test]

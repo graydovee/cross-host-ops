@@ -373,6 +373,7 @@ impl Gateway for XhodGateway {
             no_shell: request.no_shell,
             timeout_ms: request.timeout_ms,
             stdin: request.stdin,
+            stdin_intent: request.stdin_intent,
             stdin_rx,
         };
 
@@ -458,6 +459,7 @@ impl Gateway for XhodGateway {
             resize_tx: handle.resize_tx,
             stdout_rx: handle.stdout_rx,
             exit_rx: handle.exit_rx,
+            abort_handles: handle.abort_handles,
         })
     }
 

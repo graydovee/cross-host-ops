@@ -9,9 +9,10 @@ pub mod xhod;
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::AbortHandle;
 
 use crate::protocol::ServerEvent;
-use crate::types::CopySpec;
+use crate::types::{CopySpec, FlagIntent};
 
 // ---------------------------------------------------------------------------
 // Placeholder types for the Connection trait.
@@ -35,6 +36,7 @@ pub(super) struct ExecRequest {
     pub no_shell: bool,
     pub timeout_ms: u64,
     pub stdin: bool,
+    pub stdin_intent: FlagIntent,
     /// Optional stdin receiver. When Some, the connection implementation SHALL
     /// read from this channel and forward bytes to the remote process.
     /// When None, behavior is identical to the pre-fix implementation.
@@ -58,6 +60,7 @@ pub(super) struct InteractiveHandle {
     pub resize_tx: mpsc::Sender<(u32, u32)>,
     pub stdout_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     pub exit_rx: oneshot::Receiver<i32>,
+    pub abort_handles: Vec<AbortHandle>,
 }
 
 // ---------------------------------------------------------------------------

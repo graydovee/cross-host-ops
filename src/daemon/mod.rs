@@ -535,7 +535,13 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                             break;
                         }
                         result = &mut copy_task => {
-                            result?.map_err(|e| anyhow!("{}", e))?;
+                            if let Err(e) = result? {
+                                sender
+                                    .send(Ok(protocol::copy_error_response(e.user_message())))
+                                    .await
+                                    .map_err(|_| anyhow!("copy client stream closed"))?;
+                                break;
+                            }
                             if let Some(relay_task) = download_relay_task.take() {
                                 let _ = relay_task.await;
                             }
@@ -1052,7 +1058,24 @@ async fn process_execute(
     loop {
         tokio::select! {
             Some(event) = event_rx.recv() => {
-                send_execute_event(sender, event).await?;
+                if let Err(error) = send_execute_event(sender, event).await {
+                    debug!(
+                        execution_id = %execution_id,
+                        error = %format!("{error:#}"),
+                        "client receive stream closed; aborting execution"
+                    );
+                    stdin_tx.take();
+                    exec_task.abort();
+                    let _ = (&mut exec_task).await;
+                    return Ok(());
+                }
+            }
+            _ = sender.closed() => {
+                debug!(execution_id = %execution_id, "client receive stream closed; aborting execution");
+                stdin_tx.take();
+                exec_task.abort();
+                let _ = (&mut exec_task).await;
+                return Ok(());
             }
             // Handle inbound client messages (StdinData forwarding).  Disabled
             // once the stream has closed to avoid a busy-loop on Ok(None).
@@ -1110,27 +1133,33 @@ async fn process_execute(
                 }
             } => {
                 warn!(execution_id = %execution_id, timeout_ms, "execution timed out");
+                stdin_tx.take();
                 exec_task.abort();
+                let _ = (&mut exec_task).await;
                 // Drain any remaining events
                 while let Ok(event) = event_rx.try_recv() {
-                    send_execute_event(sender, event).await?;
+                    if send_execute_event(sender, event).await.is_err() {
+                        return Ok(());
+                    }
                 }
-                send_execute_event(sender, ServerEvent::ExitStatus { code: 124 }).await?;
+                let _ = send_execute_event(sender, ServerEvent::ExitStatus { code: 124 }).await;
                 break;
             }
             result = &mut exec_task => {
                 let code = match result? {
                     Ok(c) => c,
                     Err(e) => {
-                        send_execute_event(sender, ServerEvent::Error { message: e.to_string() }).await?;
+                        let _ = send_execute_event(sender, ServerEvent::Error { message: e.user_message() }).await;
                         return Ok(());
                     }
                 };
                 while let Ok(event) = event_rx.try_recv() {
-                    send_execute_event(sender, event).await?;
+                    if send_execute_event(sender, event).await.is_err() {
+                        return Ok(());
+                    }
                 }
                 info!(execution_id = %execution_id, code, "execution finished");
-                send_execute_event(sender, ServerEvent::ExitStatus { code }).await?;
+                let _ = send_execute_event(sender, ServerEvent::ExitStatus { code }).await;
                 break;
             }
         }
@@ -1277,7 +1306,7 @@ async fn process_interactive_execute(
     let mut handle = gateway
         .exec_interactive(&route.end_target, &interactive_request)
         .await
-        .map_err(|e| anyhow!("{}", e))?;
+        .map_err(|e| anyhow!(e.user_message()))?;
 
     info!(execution_id = %execution_id, "interactive session started");
 
@@ -1288,7 +1317,11 @@ async fn process_interactive_execute(
             data = handle.stdout_rx.recv() => {
                 match data {
                     Some(bytes) => {
-                        send_execute_event(sender, ServerEvent::Stdout { data: bytes }).await?;
+                        if send_execute_event(sender, ServerEvent::Stdout { data: bytes }).await.is_err() {
+                            debug!(execution_id = %execution_id, "client receive stream closed (interactive)");
+                            abort_interactive_handles(&handle.abort_handles);
+                            break;
+                        }
                     }
                     None => {
                         debug!(execution_id = %execution_id, "stdout channel closed");
@@ -1319,10 +1352,12 @@ async fn process_interactive_execute(
                     }
                     Ok(None) => {
                         debug!(execution_id = %execution_id, "client disconnected (interactive)");
+                        abort_interactive_handles(&handle.abort_handles);
                         break;
                     }
                     Err(e) => {
                         warn!(execution_id = %execution_id, error = %e, "inbound stream error (interactive)");
+                        abort_interactive_handles(&handle.abort_handles);
                         break;
                     }
                 }
@@ -1333,9 +1368,11 @@ async fn process_interactive_execute(
                 info!(execution_id = %execution_id, code, "interactive session exited");
                 // Drain any remaining stdout
                 while let Ok(bytes) = handle.stdout_rx.try_recv() {
-                    send_execute_event(sender, ServerEvent::Stdout { data: bytes }).await?;
+                    if send_execute_event(sender, ServerEvent::Stdout { data: bytes }).await.is_err() {
+                        return Ok(());
+                    }
                 }
-                send_execute_event(sender, ServerEvent::ExitStatus { code }).await?;
+                let _ = send_execute_event(sender, ServerEvent::ExitStatus { code }).await;
                 break;
             }
         }
@@ -1347,6 +1384,12 @@ async fn process_interactive_execute(
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
+
+fn abort_interactive_handles(handles: &[tokio::task::AbortHandle]) {
+    for handle in handles {
+        handle.abort();
+    }
+}
 
 async fn wait_for_confirmation(
     execution_id: Uuid,

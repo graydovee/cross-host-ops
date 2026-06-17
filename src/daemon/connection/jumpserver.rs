@@ -5,6 +5,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -12,7 +14,7 @@ use crate::copy_frames::{
     collect_single_file_upload, emit_local_path_frames, materialize_frames_to_dir,
 };
 use crate::protocol::ServerEvent;
-use crate::types::{CopyDirection, CopyFrame, CopySpec};
+use crate::types::{CopyDirection, CopyFrame, CopySpec, FlagIntent};
 
 use super::shared::{PtyShell, build_final_command};
 use super::{Connection, ExecRequest, InteractiveHandle, InteractiveRequest};
@@ -20,6 +22,38 @@ use super::{Connection, ExecRequest, InteractiveHandle, InteractiveRequest};
 const EXEC_SENTINEL_PREFIX: &str = "__ARUN_EXEC__";
 const COPY_SENTINEL_PREFIX: &str = "__ARUN_COPY__";
 const COPY_HEREDOC_PREFIX: &str = "ARUN_COPY";
+
+fn build_jumpserver_exec_command(argv: &[String], shell: &str, stdin_intent: FlagIntent) -> String {
+    let command = build_final_command(argv, shell);
+    if stdin_intent == FlagIntent::Disable {
+        format!("{{ {command}; }} </dev/null")
+    } else {
+        command
+    }
+}
+
+fn build_jumpserver_stdin_command(command: &str, stdin_payload: &[u8]) -> Vec<u8> {
+    let encoded = BASE64_STANDARD.encode(stdin_payload);
+    format!(
+        "printf %s {} | base64 -d | {}\n",
+        shell_single_quote(&encoded),
+        command
+    )
+    .into_bytes()
+}
+
+async fn collect_stdin_payload(
+    stdin_rx: Option<&mut mpsc::Receiver<Vec<u8>>>,
+) -> Result<Option<Vec<u8>>> {
+    let Some(stdin_rx) = stdin_rx else {
+        return Ok(None);
+    };
+    let mut payload = Vec::new();
+    while let Some(chunk) = stdin_rx.recv().await {
+        payload.extend_from_slice(&chunk);
+    }
+    Ok(Some(payload))
+}
 
 /// Outcome of a captured shell command (exit code + raw output bytes).
 struct ShellCommandOutcome {
@@ -59,17 +93,20 @@ impl JumpserverConnection {
         &mut self,
         command: &str,
         sender: &mpsc::UnboundedSender<ServerEvent>,
-        stdin_rx: Option<&mut mpsc::Receiver<Vec<u8>>>,
+        stdin_payload: Option<&[u8]>,
         marker_prefix: &str,
     ) -> Result<i32> {
         let shell = self.shell_mut()?;
         shell.clear_prompt_remainder();
         let marker = shell.make_marker(marker_prefix);
         let wrapped = shell.wrap_shell_command(command, &marker);
-        shell.write_line(&wrapped).await?;
-        let (status, _) = shell
-            .read_until_sentinel_with_stdin(&marker, Some(sender), stdin_rx)
-            .await?;
+        if let Some(stdin_payload) = stdin_payload {
+            let payload = build_jumpserver_stdin_command(&wrapped, stdin_payload);
+            shell.write_raw(&payload).await?;
+        } else {
+            shell.write_line(&wrapped).await?;
+        }
+        let (status, _) = shell.read_until_sentinel(&marker, Some(sender)).await?;
         shell.finish_roundtrip().await?;
         Ok(status)
     }
@@ -229,12 +266,14 @@ impl JumpserverConnection {
 #[async_trait::async_trait]
 impl Connection for JumpserverConnection {
     async fn exec(&mut self, request: &mut ExecRequest) -> Result<i32> {
-        let command = build_final_command(&request.argv, &request.shell);
+        let command =
+            build_jumpserver_exec_command(&request.argv, &request.shell, request.stdin_intent);
         let mut stdin_rx = request.stdin_rx.take();
+        let stdin_payload = collect_stdin_payload(stdin_rx.as_mut()).await?;
         self.run_shell_command_stream(
             &command,
             &request.sender,
-            stdin_rx.as_mut(),
+            stdin_payload.as_deref(),
             EXEC_SENTINEL_PREFIX,
         )
         .await
@@ -279,16 +318,21 @@ impl<'a> BorrowedJumpserverConnection<'a> {
         &mut self,
         command: &str,
         sender: &mpsc::UnboundedSender<ServerEvent>,
-        stdin_rx: Option<&mut mpsc::Receiver<Vec<u8>>>,
+        stdin_payload: Option<&[u8]>,
         marker_prefix: &str,
     ) -> Result<i32> {
         self.shell.clear_prompt_remainder();
         let marker = self.shell.make_marker(marker_prefix);
         let wrapped = self.shell.wrap_shell_command(command, &marker);
-        self.shell.write_line(&wrapped).await?;
+        if let Some(stdin_payload) = stdin_payload {
+            let payload = build_jumpserver_stdin_command(&wrapped, stdin_payload);
+            self.shell.write_raw(&payload).await?;
+        } else {
+            self.shell.write_line(&wrapped).await?;
+        }
         let (status, _) = self
             .shell
-            .read_until_sentinel_with_stdin(&marker, Some(sender), stdin_rx)
+            .read_until_sentinel(&marker, Some(sender))
             .await?;
         self.shell.finish_roundtrip().await?;
         Ok(status)
@@ -439,12 +483,14 @@ impl<'a> BorrowedJumpserverConnection<'a> {
 #[async_trait::async_trait]
 impl Connection for BorrowedJumpserverConnection<'_> {
     async fn exec(&mut self, request: &mut ExecRequest) -> Result<i32> {
-        let command = build_final_command(&request.argv, &request.shell);
+        let command =
+            build_jumpserver_exec_command(&request.argv, &request.shell, request.stdin_intent);
         let mut stdin_rx = request.stdin_rx.take();
+        let stdin_payload = collect_stdin_payload(stdin_rx.as_mut()).await?;
         self.run_shell_command_stream(
             &command,
             &request.sender,
-            stdin_rx.as_mut(),
+            stdin_payload.as_deref(),
             EXEC_SENTINEL_PREFIX,
         )
         .await
@@ -747,4 +793,47 @@ fn shell_path_basename(value: &str) -> Option<String> {
 
 fn shell_path_basename_or(value: &str, fallback: &str) -> String {
     shell_path_basename(value).unwrap_or_else(|| fallback.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jumpserver_exec_command_disables_stdin_when_not_requested() {
+        let argv = vec!["cat".to_string()];
+
+        assert_eq!(
+            build_jumpserver_exec_command(&argv, "", FlagIntent::Disable),
+            "{ 'cat'; } </dev/null"
+        );
+    }
+
+    #[test]
+    fn jumpserver_exec_command_keeps_stdin_when_requested() {
+        let argv = vec!["cat".to_string()];
+
+        assert_eq!(
+            build_jumpserver_exec_command(&argv, "", FlagIntent::Enable),
+            "'cat'"
+        );
+    }
+
+    #[test]
+    fn jumpserver_exec_command_keeps_stdin_when_default() {
+        let argv = vec!["cat".to_string()];
+
+        assert_eq!(
+            build_jumpserver_exec_command(&argv, "", FlagIntent::Default),
+            "'cat'"
+        );
+    }
+
+    #[test]
+    fn jumpserver_stdin_command_pipes_base64_decoded_payload() {
+        let payload = build_jumpserver_stdin_command("'cat'", b"hello\n");
+        let text = String::from_utf8(payload).unwrap();
+
+        assert_eq!(text, "printf %s 'aGVsbG8K' | base64 -d | 'cat'\n");
+    }
 }

@@ -602,6 +602,7 @@ impl Gateway for JumpserverGateway {
             no_shell: request.no_shell,
             timeout_ms: request.timeout_ms,
             stdin: request.stdin,
+            stdin_intent: request.stdin_intent,
             stdin_rx,
         };
 
@@ -666,19 +667,22 @@ impl Gateway for JumpserverGateway {
             resize_tx,
             stdout_rx,
             exit_rx,
+            mut abort_handles,
         } = handle;
         let (gateway_exit_tx, gateway_exit_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
+        let wrapper_task = tokio::spawn(async move {
             let exit_code = exit_rx.await.unwrap_or(255);
             drop(lease);
             let _ = gateway_exit_tx.send(exit_code);
         });
+        abort_handles.push(wrapper_task.abort_handle());
 
         Ok(InteractiveHandle {
             stdin_tx,
             resize_tx,
             stdout_rx,
             exit_rx: gateway_exit_rx,
+            abort_handles,
         })
     }
 

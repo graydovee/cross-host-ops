@@ -203,7 +203,7 @@ impl Connection for DirectConnection {
         let (exit_tx, exit_rx) = oneshot::channel::<i32>();
 
         // Spawn channel I/O task
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut exit_code: Option<i32> = None;
             loop {
                 tokio::select! {
@@ -239,12 +239,14 @@ impl Connection for DirectConnection {
                 }
             }
         });
+        let abort_handles = vec![task.abort_handle()];
 
         Ok(InteractiveHandle {
             stdin_tx,
             resize_tx,
             stdout_rx,
             exit_rx,
+            abort_handles,
         })
     }
 
