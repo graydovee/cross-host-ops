@@ -22,7 +22,7 @@
 set -euo pipefail
 
 REPO="graydovee/cross-host-ops"
-IMAGE="ghcr.io/${REPO}"
+REGISTRY="ghcr.io"   # default registry; override with --registry (e.g. a ghcr mirror)
 
 usage() {
   cat <<'EOF'
@@ -40,6 +40,9 @@ Remote xhod method (--method, default docker):
 Options:
   --method <m>      docker | systemd | bare (remote only; default docker)
   --version <tag>   Release / image tag (default: latest, resolved via GitHub API)
+  --registry <host> Image registry, default ghcr.io. Use a ghcr mirror when the
+                    target cannot reach ghcr.io (e.g. ghcr.nju.edu.cn). The image
+                    ref becomes <host>/graydovee/cross-host-ops:<tag>. docker only.
   --target <triple> Rust target for systemd/bare/local downloads (default: auto)
   --prefix <dir>    Binary dir for systemd/bare (default: /usr/local/bin)
   --config <path>   Daemon config path (default: /etc/xho/config.toml remote,
@@ -61,6 +64,7 @@ MODE=""            # "local" | "remote"
 REMOTE=""
 METHOD="docker"
 VERSION=""
+REGISTRY=""        # override ghcr.io via --registry (mirror)
 TARGET=""
 PREFIX_OVERRIDE=""
 CONFIG_OVERRIDE=""
@@ -85,6 +89,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --method)  METHOD="$2"; shift 2 ;;
     --version) VERSION="$2"; shift 2 ;;
+    --registry) REGISTRY="$2"; shift 2 ;;
     --target)  TARGET="$2"; shift 2 ;;
     --prefix)  PREFIX_OVERRIDE="$2"; shift 2 ;;
     --config)  CONFIG_OVERRIDE="$2"; shift 2 ;;
@@ -104,13 +109,23 @@ esac
 # --- Resolve release version (latest if not pinned) -------------------------
 if [[ -z "$VERSION" ]]; then
   echo "==> Resolving latest release for ${REPO}"
-  VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+  # Fetch the body first, then grep: piping curl directly into `grep -m1` breaks
+  # under `set -o pipefail` because grep closes the pipe early and curl exits 23.
+  release_json="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest")"
+  VERSION="$(printf '%s\n' "$release_json" \
     | grep -m1 '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')"
   if [[ -z "$VERSION" ]]; then
     echo "error: could not resolve latest release tag" >&2; exit 1
   fi
 fi
 echo "==> Version: ${VERSION} (method: ${MODE}$([[ "$MODE" == remote ]] && echo "/${METHOD}"))"
+
+# Resolve the image registry (default ghcr.io; --registry for a mirror).
+REGISTRY="${REGISTRY:-ghcr.io}"
+IMAGE="${REGISTRY}/${REPO}"
+if [[ "$REGISTRY" != "ghcr.io" ]]; then
+  echo "==> Using registry mirror: ${REGISTRY}"
+fi
 
 # --- SSH/SCP transport ------------------------------------------------------
 # Key auth by default. For password login, pass --password (or set SSHPASS);

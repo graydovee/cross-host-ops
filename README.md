@@ -1,75 +1,77 @@
+**English** | [中文](README.zh-CN.md)
+
 # Cross Host Ops
 
-远程命令执行与文件复制工具。通过本地 daemon 管理 SSH 连接池，支持直连、跳板机、远程 xhod 三种路由方式到达目标服务器。
+Remote command execution and file copy tool. Manages SSH connection pools through a local daemon, supporting three routing methods to reach target servers: direct connection, jump host, and remote xhod.
 
-## 特性
+## Features
 
-- **交互式 PTY** — 运行 vim、htop 等全屏程序，体验与原生 SSH 一致
-- **连接池** — 按目标 IP 复用 SSH 连接，避免重复握手
-- **多种跳板** — 直连 SSH、企业 jumpserver（MFA）、远程 xhod daemon
-- **统一目标解析** — server.toml 别名、显式路由、IP 推导、fallback 链
-- **命令审查** — 可选 LLM 安全审查，本地白名单 + AI 语义分析
-- **文件复制** — `xho cp` 对齐 scp 语义，支持递归和 mode 保留
-- **零配置可用** — 只要有 `~/.ssh/config`，无需任何配置文件
+- **Interactive PTY** — Run full-screen programs like vim, htop, with an experience identical to native SSH
+- **Connection Pool** — Reuse SSH connections by target IP, avoiding repeated handshakes
+- **Multiple Gateways** — Direct SSH, enterprise jumpserver (MFA), remote xhod daemon
+- **Unified Target Resolution** — server.toml aliases, explicit routing, IP derivation, fallback chain
+- **Command Review** — Optional LLM security review, local allowlist + AI semantic analysis
+- **File Copy** — `xho cp` aligns with scp semantics, supports recursion and mode preservation
+- **Zero Configuration** — Works with just `~/.ssh/config`, no configuration files required
 
-## 快速开始
+## Quick Start
 
 ```bash
-# 构建
+# Build
 cargo build --release
 
-# 执行远程命令（daemon 自动启动）
+# Execute remote command (daemon starts automatically)
 xho exec web1 -- hostname
 
-# 交互模式（自动检测）
-xho exec --pty host1 -- vim README.md
+# Interactive mode (auto-detected)
+xho exec --tty host1 -- vim README.md
 
-# 文件复制
+# File copy
 xho cp local.txt host1:/tmp/
 
-# 查看所有可达服务器
+# List all reachable servers
 xho ls
 ```
 
-## 架构概览
+## Architecture Overview
 
 ```
-xho (CLI) ──Unix socket──▶ xhod (Daemon) ──Jump Hosts──▶ End Target
+xho (CLI) ──Unix socket──▶ xhod (Daemon) ──Gateways──▶ End Target
 ```
 
-- CLI 通过 gRPC over Unix socket 与本地 daemon 通信
-- Daemon 管理连接池、目标解析、命令审查
-- 三种 Jump Host 类型完全互换：direct、jumpserver、xhod
+- CLI communicates with the local daemon via gRPC over Unix socket
+- Daemon manages connection pool, target resolution, command review
+- Three Gateway types are fully interchangeable: direct, jumpserver, xhod
 
-详细架构设计见 [docs/architecture.md](docs/architecture.md)。
+See [architecture](docs/en/architecture.md) for detailed architecture design.
 
-## 使用
+## Usage
 
 ```bash
-# 基本执行
+# Basic execution
 xho exec <target> -- <command> [args...]
 
-# PTY 模式（颜色输出、交互程序）
-xho exec --pty <target> -- ls --color
+# PTY mode (color output, interactive programs)
+xho exec --tty <target> -- ls --color
 
-# 显式指定跳板路由
+# Explicitly specify gateway route
 xho exec prod:web1 -- hostname
 
-# Daemon 管理
+# Daemon management
 xho status
 xho daemon start --config ~/.xho/config.toml
 xho daemon restart
 
-# Jump Host 管理
+# Gateway management
 xho host add prod xho@bastion.example.com:2222
 xho host list
 ```
 
-完整使用说明见 [docs/usage.md](docs/usage.md)。
+See [usage](docs/en/usage.md) for complete usage instructions.
 
-## 配置
+## Configuration
 
-程序无需配置文件即可运行。需要自定义时，创建 `~/.xho/config.toml`：
+The program runs without any configuration files. When customization is needed, create `~/.xho/config.toml`:
 
 ```toml
 [ssh]
@@ -85,21 +87,21 @@ identity_file = "~/.ssh/id_ed25519"
 known_hosts_path = "~/.xho/known_hosts"
 ```
 
-完整配置示例见 [config.example.toml](config.example.toml)。
+See [config.example.toml](config.example.toml) for a complete configuration example.
 
-## 部署
+## Deployment
 
-### 本地使用
+### Local Usage
 
 ```bash
 cargo build --release
-# 二进制：target/release/xho, target/release/xhod
+# Binaries: target/release/xho, target/release/xhod
 ```
 
-### 远程 xhod
+### Remote xhod
 
 ```bash
-# 使用部署脚本
+# Use deployment script
 cargo build --release --bin xhod
 scp target/release/xhod root@your-server.com:/usr/local/bin/xhod
 ```
@@ -118,27 +120,27 @@ docker run --rm -p 2222:2222 -v /etc/xho:/etc/xho xhod:latest
 
 ### GitHub Release
 
-推送 `v*` tag 自动发布多平台二进制和 Docker 镜像。
+Pushing a `v*` tag automatically publishes multi-platform binaries and Docker images.
 
-## 开发
+## Development
 
 ```bash
-# 构建
+# Build
 cargo build
 
-# 测试
+# Test
 cargo test
 
-# 格式化
+# Format
 cargo fmt --all
 ```
 
-## 文档
+## Documentation
 
-- [架构文档](docs/architecture.md) — 系统设计、组件交互、数据流
-- [使用文档](docs/usage.md) — 安装、配置、命令参考、故障排查
-- [配置示例](config.example.toml) — 完整配置项说明
-- [服务器清单示例](server.example.toml) — server.toml 格式
+- [architecture](docs/en/architecture.md) — System design, component interaction, data flow
+- [usage](docs/en/usage.md) — Installation, configuration, command reference, troubleshooting
+- [config.example.toml](config.example.toml) — Complete configuration reference
+- [server.example.toml](server.example.toml) — server.toml format
 
 ## License
 

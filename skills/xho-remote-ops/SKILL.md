@@ -26,6 +26,9 @@ bash scripts/deploy.sh root@bastion.example.com --version v0.2.0
 # xhod.service unit, enables & starts the service.
 bash scripts/deploy.sh root@bastion.example.com --method systemd
 
+# Target can't reach ghcr.io? Pull through a ghcr mirror instead:
+bash scripts/deploy.sh root@bastion.example.com --registry ghcr.nju.edu.cn
+
 # Host uses password login instead of keys (needs sshpass locally):
 bash scripts/deploy.sh root@bastion.example.com --password 's3cret'
 #   equivalent: SSHPASS='s3cret' bash scripts/deploy.sh root@bastion.example.com
@@ -38,6 +41,7 @@ bash scripts/deploy.sh --local
 |--------|---------|-------|
 | `--method` | `docker` | `docker` \| `systemd` \| `bare` (remote only) |
 | `--version` | latest (GitHub API) | Release / image tag, e.g. `v0.2.0` |
+| `--registry` | `ghcr.io` | Image registry host. Set to a ghcr mirror when the target can't reach ghcr.io directly (e.g. `ghcr.nju.edu.cn`); the ref becomes `<host>/graydovee/cross-host-ops:<tag>`. Docker only |
 | `--target` | auto (`uname -m`/`-s`) | Rust triple for systemd/bare/local: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `*-apple-darwin` |
 | `--prefix` | `/usr/local/bin` (remote), `~/.bin` (local) | Binary dir for systemd/bare |
 | `--config` | `/etc/xho/config.toml` (remote), `~/.xho/config.toml` (local) | Daemon config path. For docker, its parent dir is mounted into the container at `/etc/xho` |

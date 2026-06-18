@@ -63,6 +63,18 @@ xho exec web1 -- uname -a
 
 ## 命令参考
 
+### 全局选项
+
+以下选项可用于所有子命令（放在子命令名之前）：
+
+- `--output text|json` — 输出格式，默认 `text`；`json` 输出 NDJSON（每行一个 JSON 对象，便于脚本解析）
+- `--non-interactive` — 禁用所有交互提示（认证、命令确认），需要输入时直接失败而非等待
+
+```bash
+xho --output json ls
+xho --non-interactive exec web1 -- hostname
+```
+
 ### 执行远程命令
 
 ```bash
@@ -70,10 +82,10 @@ xho exec web1 -- uname -a
 xho exec <target> -- <command> [args...]
 
 # 分配 PTY（颜色输出、交互程序）
-xho exec --pty <target> -- vim README.md
+xho exec --tty <target> -- vim README.md
 
 # 禁用 PTY
-xho exec --no-pty <target> -- cat /etc/hosts
+xho exec --no-tty <target> -- cat /etc/hosts
 
 # 转发 stdin
 xho exec --stdin <target> -- bash < script.sh
@@ -81,22 +93,28 @@ xho exec --stdin <target> -- bash < script.sh
 # 设置超时
 xho exec --timeout 30s <target> -- long-running-task
 
-# 显式指定 jump host
+# 用指定 shell 包装命令（加载远程 rc / alias）
+xho exec --shell zsh <target> -- ll
+
+# 禁用 shell 包装
+xho exec --no-shell <target> -- /bin/ls
+
+# 显式指定 gateway 路由
 xho exec remote-xhod:web1 -- hostname
 ```
 
 ### 交互模式
 
 当满足以下条件时自动激活：
-- `--pty` 已设置
+- `--tty` 已设置
 - stdin 是 TTY
 - stdout 是 TTY
 
 ```bash
 # 自动进入交互模式
-xho exec --pty host1 -- vim README.md
-xho exec --pty host1 -- htop
-xho exec --pty host1 -- bash
+xho exec --tty host1 -- vim README.md
+xho exec --tty host1 -- htop
+xho exec --tty host1 -- bash
 ```
 
 交互模式特性：
@@ -116,6 +134,12 @@ xho cp host1:/etc/hosts ./hosts
 
 # 递归复制目录
 xho cp -r ./project host1:/opt/
+
+# 静默模式（隐藏进度条与非错误信息）
+xho cp -q local.txt host1:/tmp/
+
+# 设置超时
+xho cp --timeout 60s -r ./project host1:/opt/
 ```
 
 ### 服务器列表
@@ -153,6 +177,15 @@ xho host add prod xho@bastion.example.com:2222
 
 # 添加时指定 identity file
 xho host add prod xho@bastion.example.com:2222 --identity-file ~/.ssh/id_ed25519
+
+# 指定 known_hosts 文件
+xho host add prod xho@bastion.example.com:2222 --known-hosts ~/.xho/known_hosts
+
+# 自动接受首次连接的未知主机 key（与 --fingerprint 互斥）
+xho host add prod xho@bastion.example.com:2222 --accept-new-host-key
+
+# 或显式校验指定指纹（与 --accept-new-host-key 互斥）
+xho host add prod xho@bastion.example.com:2222 --fingerprint SHA256:abcdef...
 
 # 列出已配置的 jump hosts
 xho host list
@@ -419,7 +452,7 @@ tail -50 ~/.xho/xhod.log
 xho status
 
 # 检查目标解析
-xho exec --no-pty <target> -- echo ok
+xho exec --no-tty <target> -- echo ok
 
 # 检查远程 daemon
 ssh root@server "/root/xho/xho status"
@@ -428,5 +461,5 @@ ssh root@server "/root/xho/xho status"
 ### 交互模式问题
 
 - 终端没恢复：`reset` 命令可手动恢复
-- 不进入交互模式：确认 `--pty` 已设置且 stdin/stdout 都是 TTY
+- 不进入交互模式：确认 `--tty` 已设置且 stdin/stdout 都是 TTY
 - 通过管道使用时自动降级为非交互模式
