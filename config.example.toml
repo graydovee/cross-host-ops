@@ -53,6 +53,37 @@
 # [copy]
 # preserve_mode = true
 
+# --- Secrets ---
+#
+# Credentials in this file and in server.toml (passwords, TOTP secrets, API
+# keys) are stored as *references* rather than inline plaintext. A reference is
+# a string with one of these prefixes:
+#   "env:NAME"   — read from environment variable NAME
+#   "file:/path" — read from a file (systemd LoadCredential, docker secret, ...)
+#   "vault:name" — decrypt from the local encrypted vault (~/.xho/secrets)
+# A bare string with no prefix is treated as legacy inline plaintext and emits a
+# warning when used. Run `xho secret encrypt` to migrate all inline plaintext in
+# config.toml + server.toml into the vault in one step.
+#
+# The vault is encrypted with a key *derived* from an SSH private key (HKDF over
+# the parsed key material), so no separate key file is stored. The key source is
+# [secret].key_source, defaulting to the daemon's own host key
+# ([server.remote].host_key_path) when remote is enabled — so vault works with
+# no extra config on a standard xhod. The key must be unencrypted (no passphrase).
+#
+# Vault commands (local file operations; nothing goes over the daemon). Default
+# config is ~/.xho/config.toml; for an /etc/xho deployment, pass --config:
+#   xho secret --config /etc/xho/config.toml set <name>
+#   xho secret --config /etc/xho/config.toml list
+#   xho secret --config /etc/xho/config.toml encrypt [--dry-run]
+#   xho secret --config /etc/xho/config.toml rekey --old <k> --new <k>
+#
+# [secret]
+# vault_path defaults to <config_dir>/secrets (e.g. /etc/xho/secrets when the
+# config is /etc/xho/config.toml); only set it to override.
+# key_source defaults to [server.remote].host_key_path when remote is enabled;
+# set only to override (e.g. point at a dedicated key).
+
 # --- Gateways ---
 #
 # Gateways define how the local daemon reaches end targets that are not
@@ -71,7 +102,7 @@
 # port = 20221
 # user = "user@example.com"
 # identity_file = "~/.ssh/id_rsa"
-# totp_secret_base32 = "REPLACE_ME"
+# totp_secret_base32 = "vault:corp-jump.totp"
 # totp_digits = 6
 # totp_period = 30
 
@@ -95,11 +126,12 @@
 # Enable this only when you want LLM command review before execution.
 # If api_key is omitted, xho will try XHO_REVIEW_API_KEY first, then OPENAI_API_KEY.
 # endpoint, model, prompts, policy, and semantic_whitelist all have code defaults.
+# api_key accepts a secret reference (env:/file:/vault:) or a literal.
 # [review]
 # enable = true
 # endpoint = "https://api.openai.com/v1/chat/completions"
 # model = "gpt-4.1-mini"
-# api_key = "REPLACE_ME"
+# api_key = "vault:review.api_key"
 # timeout = "10s"
 # failure_action = "deny"
 
@@ -108,7 +140,7 @@
 # commands = ["ls", "ls *", "cat *", "grep *", "kubectl get *"]
 
 # [review.headers]
-# Authorization = "Bearer REPLACE_ME"
+# Authorization = "vault:review.header.Authorization"
 
 # [review.prompts]
 # system = "You are a command safety reviewer. Return JSON only."

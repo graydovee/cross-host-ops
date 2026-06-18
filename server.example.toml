@@ -6,6 +6,13 @@
 #
 # Authentication priority per entry:
 #   password > identity_file > defaults.identity_file
+#
+# The `password` field is a secret *reference*, not necessarily plaintext:
+#   "env:NAME"   — read from environment variable NAME
+#   "file:/path" — read from a file (e.g. systemd LoadCredential, docker secret)
+#   "vault:name" — decrypt from the local encrypted vault (~/.xho/secrets)
+#   "literal"    — inline plaintext (discouraged; emits a warning at runtime)
+# Run `xho secret encrypt` to migrate any inline plaintext into the vault.
 
 [defaults]
 identity_file = "~/.ssh/id_rsa"
@@ -23,4 +30,5 @@ identity_file = "~/.ssh/id_ed25519"
 [servers.db]
 host = "192.0.2.20"
 user = "dba"
-password = "REPLACE_ME"
+# After `xho secret set server.db.password` (or `xho secret encrypt`):
+password = "vault:server.db.password"

@@ -4,6 +4,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use super::ssh::FallbackEntry;
+use super::secret::Secret;
 
 /// Names reserved by the system that cannot be assigned to any gateway entry.
 /// Currently only `"local"` is reserved (it names the local daemon's own
@@ -215,5 +216,5 @@ pub struct DirectGatewayConfig {
     #[serde(default)]
     pub identity_file: String,
     #[serde(default)]
-    pub password: Option<String>,
+    pub password: Option<Secret>,
 }

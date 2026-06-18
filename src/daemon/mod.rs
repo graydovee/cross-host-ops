@@ -918,6 +918,7 @@ async fn process_execute(
         .reviewer
         .review(
             &config.review,
+            &config.secret_resolver(None),
             &route.end_target,
             &request.argv,
             &review_command,
@@ -1202,6 +1203,7 @@ async fn process_interactive_execute(
         .reviewer
         .review(
             &config.review,
+            &config.secret_resolver(None),
             &route.end_target,
             &request.argv,
             &review_command,

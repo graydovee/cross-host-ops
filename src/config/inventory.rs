@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use super::path::expand_tilde;
+use super::secret::{Secret, SecretResolver};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -28,7 +29,7 @@ pub struct ServerHostConfig {
     pub port: Option<u16>,
     pub user: String,
     pub identity_file: Option<String>,
-    pub password: Option<String>,
+    pub password: Option<Secret>,
     pub shell: Option<String>,
 }
 
@@ -160,18 +161,35 @@ fn validate_server_config(config: &ServerConfigFile) -> Result<()> {
                 alias
             );
         }
-        resolve_server_entry(alias, server, &config.defaults)?;
+        // Validate auth shape without resolving secrets (no env/file/vault
+        // access at load time).
+        resolve_server_entry(alias, server, &config.defaults, None)?;
     }
     Ok(())
 }
 
+/// Resolve a server entry to host/port/user/auth.
+///
+/// When `resolver` is `Some`, a `password` secret is resolved to plaintext (the
+/// connection path). When `None`, password entries yield a placeholder so that
+/// listing and validation never touch env vars, files, or the vault — only the
+/// auth *kind* is meaningful in that case.
 pub fn resolve_server_entry(
     alias: &str,
     server: &ServerHostConfig,
     defaults: &ServerDefaults,
+    resolver: Option<&SecretResolver>,
 ) -> Result<ServerEntry> {
-    let auth = if let Some(password) = server.password.clone() {
-        DirectAuth::Password { password }
+    let auth = if let Some(password) = &server.password {
+        let plaintext = match resolver {
+            Some(resolver) => password.resolve(resolver).with_context(|| {
+                format!("failed to resolve password for server entry {alias}")
+            })?,
+            None => Default::default(),
+        };
+        DirectAuth::Password {
+            password: plaintext.to_string(),
+        }
     } else if let Some(identity_file) = server.identity_file.clone() {
         DirectAuth::Key { identity_file }
     } else if let Some(identity_file) = defaults.identity_file.clone() {
@@ -197,7 +215,7 @@ pub fn list_server_entries(path: &Path) -> Result<Vec<ServerEntry>> {
     let mut entries = config
         .servers
         .iter()
-        .map(|(alias, server)| resolve_server_entry(alias, server, &config.defaults))
+        .map(|(alias, server)| resolve_server_entry(alias, server, &config.defaults, None))
         .collect::<Result<Vec<_>>>()?;
     entries.sort_by(|a, b| a.alias.cmp(&b.alias));
     Ok(entries)

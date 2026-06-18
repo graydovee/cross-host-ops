@@ -24,4 +24,5 @@ pub mod exit_codes;
 pub mod logging;
 pub mod output;
 pub mod protocol;
+pub mod secret;
 pub mod types;

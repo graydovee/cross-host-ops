@@ -194,6 +194,21 @@ xho host list
 xho host remove prod
 ```
 
+### 密钥管理
+
+```bash
+# 一键加密 config.toml + server.toml 中的明文密钥（详见「密钥管理」一节）
+xho secret encrypt
+
+# 预览改动
+xho secret encrypt --dry-run
+
+# 录入 / 列出 / 轮换
+xho secret set server.db1.password
+xho secret list
+xho secret rekey --old ~/.ssh/id_ed25519 --new ~/.ssh/id_new
+```
+
 ## 配置
 
 ### 配置文件位置
@@ -276,10 +291,76 @@ user = "deploy"
 [servers.db1]
 host = "10.0.1.20"
 user = "dba"
-password = "secret"
+password = "vault:server.db1.password"   # 密钥引用，而非明文
 ```
 
 认证优先级：`password > identity_file > defaults.identity_file`
+
+`password` 既可以是明文，也可以是密钥引用（见下节「密钥管理」），推荐用后者。
+
+## 密钥管理
+
+密码、TOTP 密钥、API key 等敏感信息不必以明文存放在配置文件里。所有密钥字段都可以写成一个**引用**，daemon 在真正用到时才解析成明文。
+
+### 引用语法
+
+| 前缀 | 示例 | 含义 |
+|------|------|------|
+| `env:` | `env:DB_PASSWORD` | 从环境变量读取 |
+| `file:` | `file:/run/secrets/db` | 从文件读取（适配 systemd LoadCredential、docker/k8s secrets） |
+| `vault:` | `vault:server.db1.password` | 从本地加密库解密（默认 `<config 目录>/secrets`） |
+| 无前缀 | `secret` | 视为明文（兼容旧配置），使用时会打告警 |
+
+支持引用的字段：`server.toml` 的 `servers.*.password`；`config.toml` 的 jumpserver `totp_secret_base32`、direct gateway `password`、`review.api_key` 及 `review.headers.*`。
+
+### 加密库（vault）
+
+vault 把密文存在 config 文件**同目录下的 `secrets`**（权限 0600），用 XChaCha20-Poly1305 加密。加密密钥**不单独保存**，而是从一个 SSH 私钥经 HKDF-SHA256 派生而来：
+
+- vault 默认位置 = config 文件所在目录 + `secrets`。本地用户 config 在 `~/.xho/config.toml`，则 vault 在 `~/.xho/secrets`；docker / systemd 用 `--config /etc/xho/config.toml` 启动，则 vault 自动落在 `/etc/xho/secrets`，随挂载目录一起持久化。可用 `[secret].vault_path` 显式覆盖。
+- 使用的私钥由 `[secret].key_source` 指定；未设置时默认用 daemon 自己的 SSH 主机密钥 `[server.remote].host_key_path`（开了 remote 就必然存在、未加密、daemon 自己持有，所以**绝大多数部署零配置即可用 vault**）；remote 未开时才回退到 `server.toml` 的 `[defaults].identity_file`。
+- 该私钥必须是**未加密的**（无 passphrase），否则 daemon 无法无人值守地加载它。
+- vault 文件头记录所用私钥的指纹，换了私钥会明确报错并提示 `rekey`。
+
+```toml
+# config.toml（均可选；remote 启用时通常整段都不用写）
+[secret]
+# vault_path 不写则用 <config 目录>/secrets
+# vault_path = "/etc/xho/secrets"
+# key_source 不写则默认用 [server.remote].host_key_path；此处仅作显式覆盖
+# key_source = "/etc/xho/host_key"
+```
+
+### 命令
+
+所有 `xho secret` 操作都是**本地文件操作**，不经过 daemon。要管理哪台机器的配置，就在那台机器上执行（本地直接跑，远程则 SSH 上去跑）。
+
+默认操作 `~/.xho/config.toml`。docker / systemd 部署在 `/etc/xho` 时，用 `--config` 指向那份配置（vault 会随之落在 `/etc/xho/secrets`）：
+
+```bash
+# 一键把 config.toml + server.toml 中所有明文密钥加密进 vault，
+# 并就地替换为 vault: 引用（保留注释与格式，先备份 .bak）
+xho secret encrypt
+
+# 预览将要做的改动，不写文件
+xho secret encrypt --dry-run
+
+# 交互式录入单条密钥（输入不回显）
+xho secret set server.db1.password
+
+# 列出 vault 中的条目名（不显示明文）
+xho secret list
+
+# 更换派生私钥时，把整个 vault 重新加密一遍
+xho secret rekey --old ~/.ssh/id_ed25519 --new ~/.ssh/id_new
+
+# 管理非默认位置的配置（docker / systemd / root 部署）
+xho secret --config /etc/xho/config.toml encrypt
+```
+
+### 安全边界
+
+vault 把密钥从配置文件里移除，可防止误提交进 git、被备份带走、被人随手 `cat`。但派生密钥所用的私钥与密文在**同一台机器**上——能读取该私钥的人即可解密，这与「能读私钥者本就能直接 SSH 登录」属同一等级，不会放大风险。若需要更强的隔离，应改用外部 KMS 或密钥托管服务。
 
 ## 目标解析
 

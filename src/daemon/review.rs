@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{ReviewAction, ReviewConfig, RiskLevel};
+use crate::config::{ReviewAction, ReviewConfig, RiskLevel, Secret, SecretResolver};
 
 #[derive(Clone)]
 pub struct CommandReviewer {
@@ -20,6 +20,7 @@ impl CommandReviewer {
     pub async fn review(
         &self,
         config: &ReviewConfig,
+        resolver: &SecretResolver,
         target: &str,
         argv: &[String],
         shell_command: &str,
@@ -36,13 +37,16 @@ impl CommandReviewer {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         if let Some(api_key) = &config.api_key {
+            let api_key = Secret::from_reference(api_key)
+                .resolve(resolver)
+                .context("failed to resolve review api key")?;
             headers.insert(
                 AUTHORIZATION,
-                HeaderValue::from_str(&format!("Bearer {}", api_key))
+                HeaderValue::from_str(&format!("Bearer {}", &*api_key))
                     .context("invalid review api key header")?,
             );
         }
-        apply_extra_headers(&mut headers, &config.headers)?;
+        apply_extra_headers(&mut headers, resolver, &config.headers)?;
 
         let whitelist = if config.semantic_whitelist.is_empty() {
             "None.".to_string()
@@ -203,12 +207,19 @@ fn glob_match_inner(pattern: &[char], text: &[char], pi: usize, ti: usize) -> bo
     }
 }
 
-fn apply_extra_headers(headers: &mut HeaderMap, extras: &HashMap<String, String>) -> Result<()> {
+fn apply_extra_headers(
+    headers: &mut HeaderMap,
+    resolver: &SecretResolver,
+    extras: &HashMap<String, String>,
+) -> Result<()> {
     for (key, value) in extras {
+        let value = Secret::from_reference(value)
+            .resolve(resolver)
+            .with_context(|| format!("failed to resolve review header value for {}", key))?;
         headers.insert(
             HeaderName::from_bytes(key.as_bytes())
                 .with_context(|| format!("invalid review header {}", key))?,
-            HeaderValue::from_str(value)
+            HeaderValue::from_str(&value)
                 .with_context(|| format!("invalid review header value for {}", key))?,
         );
     }

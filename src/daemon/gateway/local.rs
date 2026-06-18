@@ -116,7 +116,7 @@ impl LocalGateway {
 
     /// Resolve a target string to host, port, user, and auth credentials
     /// by looking it up in the server.toml configuration.
-    fn resolve_target(&self, target: &str) -> Result<ResolvedTarget, GatewayError> {
+    async fn resolve_target(&self, target: &str) -> Result<ResolvedTarget, GatewayError> {
         let path = Path::new(&self.server_config_path);
         let server_config = load_server_config(path).map_err(|e| {
             GatewayError::resolution(anyhow!("failed to load server config: {}", e))
@@ -127,10 +127,21 @@ impl LocalGateway {
             .get(target)
             .ok_or_else(|| GatewayError::resolution(anyhow!("target '{}' not found", target)))?;
 
-        let entry = resolve_server_entry(target, server_host_config, &server_config.defaults)
-            .map_err(|e| {
-                GatewayError::resolution(anyhow!("failed to resolve target '{}': {}", target, e))
-            })?;
+        // Build a secret resolver so a `vault:`/`env:`/`file:` password can be
+        // resolved at connect time. The vault key source falls back to
+        // server.toml's [defaults].identity_file when [secret].key_source is
+        // unset.
+        let resolver = self
+            .config
+            .read()
+            .await
+            .secret_resolver(server_config.defaults.identity_file.as_deref());
+
+        let entry =
+            resolve_server_entry(target, server_host_config, &server_config.defaults, Some(&resolver))
+                .map_err(|e| {
+                    GatewayError::resolution(anyhow!("failed to resolve target '{}': {}", target, e))
+                })?;
 
         Ok(ResolvedTarget {
             host: entry.host,
@@ -232,7 +243,7 @@ impl LocalGateway {
 #[async_trait]
 impl Gateway for LocalGateway {
     async fn exec(&self, target: &str, request: &ExecRequest) -> Result<i32, GatewayError> {
-        let resolved = self.resolve_target(target)?;
+        let resolved = self.resolve_target(target).await?;
         let mut lease = self.get_connection(&resolved).await?;
 
         // Take stdin_rx from the gateway request (consuming it so the channel
@@ -280,7 +291,7 @@ impl Gateway for LocalGateway {
     }
 
     async fn copy(&self, target: &str, spec: CopySpec) -> Result<(), GatewayError> {
-        let resolved = self.resolve_target(target)?;
+        let resolved = self.resolve_target(target).await?;
         let mut lease = self.get_connection(&resolved).await?;
 
         let result = lease.resource_mut().copy(spec).await;
@@ -313,7 +324,7 @@ impl Gateway for LocalGateway {
         target: &str,
         request: &InteractiveRequest,
     ) -> Result<InteractiveHandle, GatewayError> {
-        let resolved = self.resolve_target(target)?;
+        let resolved = self.resolve_target(target).await?;
         let mut lease = self.get_connection(&resolved).await?;
 
         let conn_request = ConnInteractiveRequest {

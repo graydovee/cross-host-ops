@@ -7,6 +7,7 @@ mod host;
 mod output;
 mod progress;
 mod prompt;
+mod secret;
 
 use std::io::IsTerminal;
 
@@ -27,6 +28,7 @@ use self::daemon::run_daemon_command;
 use self::exec::{detect_double_dash_separator, run_command};
 use self::host::run_host_command;
 use self::output::{list_servers, status};
+use self::secret::run_secret_command;
 
 pub async fn run_cli(cli: ArunCli) -> Result<i32> {
     match cli.command {
@@ -109,6 +111,9 @@ pub async fn run_cli(cli: ArunCli) -> Result<i32> {
         ArunCommand::Ls { refresh } => list_servers(refresh).await,
         ArunCommand::Host { command } => run_host_command(command).await,
         ArunCommand::Daemon { command } => run_daemon_command(command).await,
+        ArunCommand::Secret { config, command } => {
+            run_secret_command(config.as_deref(), command)
+        }
     }
 }
 

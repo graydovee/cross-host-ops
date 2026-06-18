@@ -106,6 +106,47 @@ pub enum ArunCommand {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    #[command(about = "Manage encrypted secrets in the local vault")]
+    Secret {
+        /// Daemon config file to operate on. Defaults to ~/.xho/config.toml.
+        /// The vault is looked up next to this config (<config_dir>/secrets)
+        /// unless [secret].vault_path overrides it.
+        #[arg(long = "config", value_name = "FILE", global = true)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        command: SecretCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SecretCommand {
+    /// Encrypt all plaintext secrets in config.toml and server.toml,
+    /// replacing them in place with `vault:` references.
+    #[command(about = "Encrypt plaintext secrets in config files into the vault")]
+    Encrypt {
+        /// Show what would change without modifying any files.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
+    /// Store a single secret in the vault (value read interactively, hidden).
+    #[command(about = "Store a secret in the vault under <NAME>")]
+    Set {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// List entry names stored in the vault (values are never shown).
+    #[command(about = "List secret names stored in the vault")]
+    List,
+    /// Re-encrypt the vault under a different identity file.
+    #[command(about = "Re-encrypt the vault under a new identity file")]
+    Rekey {
+        /// Identity file the vault is currently encrypted under.
+        #[arg(long = "old", value_name = "FILE")]
+        old: String,
+        /// Identity file to re-encrypt the vault under.
+        #[arg(long = "new", value_name = "FILE")]
+        new: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

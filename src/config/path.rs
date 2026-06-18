@@ -23,6 +23,13 @@ pub fn default_known_hosts_path() -> PathBuf {
     default_root_dir().join("known_hosts")
 }
 
+/// Path to the local encrypted secret vault when the config directory is
+/// unknown (`~/.xho/secrets`). In practice the vault follows the config file
+/// (`<config_dir>/secrets`); this is only the fallback for zero-config runs.
+pub fn default_vault_path() -> PathBuf {
+    default_root_dir().join("secrets")
+}
+
 /// Smart default for the local daemon control-socket path.
 ///
 /// Follows the Docker / systemd convention for root daemons (`/var/run/<name>`),

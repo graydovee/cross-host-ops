@@ -5,6 +5,7 @@ mod gateway;
 mod inventory;
 mod path;
 mod review;
+mod secret;
 mod server;
 mod ssh;
 
@@ -28,7 +29,7 @@ pub use self::inventory::{
 };
 pub use self::path::{
     default_client_config_path, default_config_path, default_known_hosts_path, default_root_dir,
-    expand_tilde,
+    default_vault_path, expand_tilde,
 };
 pub use self::review::{
     FastAllowlistConfig, MfaConfig, ReviewAction, ReviewConfig, ReviewPolicy, ReviewPrompts,
@@ -36,6 +37,7 @@ pub use self::review::{
     default_review_model, default_review_system_prompt, default_review_template,
     default_semantic_whitelist,
 };
+pub use self::secret::{Secret, SecretConfig, SecretResolver, SecretSource};
 pub use self::server::{LocalServerConfig, RemoteServerConfig, ServerConfig};
 pub use self::ssh::FallbackEntry;
 pub use self::ssh::SshConfig;
@@ -48,7 +50,14 @@ pub struct AppConfig {
     pub copy: CopyConfig,
     pub review: ReviewConfig,
     #[serde(default)]
+    pub secret: SecretConfig,
+    #[serde(default)]
     pub gateways: Vec<GatewayConfig>,
+    /// Directory the config was loaded from (not serialized). The vault lives
+    /// here by default so it follows the config file — e.g. `/etc/xho/secrets`
+    /// when loaded from `/etc/xho/config.toml`.
+    #[serde(skip)]
+    pub config_dir: Option<PathBuf>,
 }
 
 impl Default for AppConfig {
@@ -58,7 +67,9 @@ impl Default for AppConfig {
             ssh: SshConfig::default(),
             copy: CopyConfig::default(),
             review: ReviewConfig::default(),
+            secret: SecretConfig::default(),
             gateways: Vec::new(),
+            config_dir: None,
         }
     }
 }
@@ -68,6 +79,7 @@ impl AppConfig {
         let path = path.map(PathBuf::from).unwrap_or_else(default_config_path);
         if !path.exists() {
             let mut config = Self::default();
+            config.config_dir = path.parent().map(PathBuf::from);
             config.expand_paths()?;
             config.validate()?;
             return Ok(config);
@@ -76,6 +88,7 @@ impl AppConfig {
             .with_context(|| format!("failed to read config {}", path.display()))?;
         let mut config: AppConfig =
             toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
+        config.config_dir = path.parent().map(PathBuf::from);
         config.expand_paths()?;
         config.validate()?;
         Ok(config)
@@ -91,6 +104,12 @@ impl AppConfig {
             expand_tilde(&self.server.remote.authorized_keys_path)?;
         self.ssh.ssh_config_path = expand_tilde(&self.ssh.ssh_config_path)?;
         self.ssh.server_config_path = expand_tilde(&self.ssh.server_config_path)?;
+        if let Some(vault_path) = &self.secret.vault_path {
+            self.secret.vault_path = Some(expand_tilde(vault_path)?);
+        }
+        if let Some(key_source) = &self.secret.key_source {
+            self.secret.key_source = Some(expand_tilde(key_source)?);
+        }
 
         for gw in &mut self.gateways {
             match gw {
@@ -114,6 +133,48 @@ impl AppConfig {
         validate_gateways(&self.gateways)?;
         validate_fallback_references(&self.ssh.fallback, &self.gateways)?;
         Ok(())
+    }
+
+    /// Build a [`SecretResolver`] for resolving `vault:` secrets.
+    ///
+    /// Key source precedence:
+    /// 1. `[secret].key_source` (explicit)
+    /// 2. the daemon's own SSH host key (`[server.remote].host_key_path`) when
+    ///    remote is enabled — it always exists, is unencrypted, and is
+    ///    daemon-owned, so vault works with zero extra configuration
+    /// 3. `fallback_identity` (typically `server.toml`'s `[defaults]
+    ///    .identity_file`) for local-only setups with no host key
+    ///
+    /// Paths are expected to be already expanded.
+    pub fn secret_resolver(&self, fallback_identity: Option<&str>) -> SecretResolver {
+        let vault_path = self.vault_path();
+        let key_source = self
+            .secret
+            .key_source
+            .clone()
+            .or_else(|| {
+                if self.server.remote.enable {
+                    Some(self.server.remote.host_key_path.clone())
+                } else {
+                    None
+                }
+            })
+            .or_else(|| fallback_identity.map(str::to_string));
+        SecretResolver::new(Some(vault_path), key_source)
+    }
+
+    /// Resolve the vault file path. Uses `[secret].vault_path` if set, else
+    /// defaults to `<config_dir>/secrets` so the vault follows the config file
+    /// (e.g. `/etc/xho/secrets` for `/etc/xho/config.toml`), falling back to
+    /// `~/.xho/secrets` when the config directory is unknown.
+    pub fn vault_path(&self) -> PathBuf {
+        if let Some(vault_path) = &self.secret.vault_path {
+            return PathBuf::from(vault_path);
+        }
+        if let Some(dir) = &self.config_dir {
+            return dir.join("secrets");
+        }
+        crate::config::path::default_vault_path()
     }
 }
 

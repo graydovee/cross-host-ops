@@ -194,6 +194,21 @@ xho host list
 xho host remove prod
 ```
 
+### Secret Management
+
+```bash
+# Encrypt all plaintext secrets in config.toml + server.toml (see "Secret Management")
+xho secret encrypt
+
+# Preview the changes without writing files
+xho secret encrypt --dry-run
+
+# Store a single secret interactively (hidden input)
+xho secret set server.db1.password
+xho secret list
+xho secret rekey --old ~/.ssh/id_ed25519 --new ~/.ssh/id_new
+```
+
 ## Configuration
 
 ### Configuration File Locations
@@ -276,10 +291,103 @@ user = "deploy"
 [servers.db1]
 host = "10.0.1.20"
 user = "dba"
-password = "secret"
+# A password can be a plaintext string or a secret reference (see "Secret
+# Management" below). The reference form is recommended.
+password = "vault:server.db1.password"
 ```
 
 Authentication priority: `password > identity_file > defaults.identity_file`
+
+## Secret Management
+
+Sensitive values (passwords, TOTP secrets, API keys) need not be stored as
+plaintext in config files. Every secret field may be written as a *reference*
+that the daemon resolves to plaintext only at the moment it is needed.
+
+### Reference Syntax
+
+| Prefix | Example | Meaning |
+|--------|---------|---------|
+| `env:` | `env:DB_PASSWORD` | Read from an environment variable |
+| `file:` | `file:/run/secrets/db` | Read from a file (systemd LoadCredential, docker/k8s secrets) |
+| `vault:` | `vault:server.db1.password` | Decrypt from the local encrypted vault (default `<config_dir>/secrets`) |
+| no prefix | `secret` | Treated as legacy plaintext; emits a warning when used |
+
+Fields that accept references: `servers.*.password` in `server.toml`; and in
+`config.toml` the jumpserver `totp_secret_base32`, direct gateway `password`,
+`review.api_key`, and `review.headers.*`.
+
+### The Vault
+
+The vault stores ciphertext next to the **config file** (mode 0600), encrypted
+with XChaCha20-Poly1305. The encryption key is **not stored separately** — it is
+derived from an SSH private key via HKDF-SHA256:
+
+- The vault lives at `<config_dir>/secrets` by default, so it follows the config
+  file: a local user's `~/.xho/config.toml` puts it at `~/.xho/secrets`, while a
+  docker / systemd deployment started with `--config /etc/xho/config.toml` puts
+  it at `/etc/xho/secrets` — which is inside the mounted dir and persists across
+  restarts. Override with `[secret].vault_path`.
+- The key is chosen by `[secret].key_source`; when unset, it defaults to the
+  daemon's own SSH host key (`[server.remote].host_key_path`) — which always
+  exists, is unencrypted, and is daemon-owned whenever remote is enabled, so
+  **most deployments need zero configuration** to use the vault. Only when
+  remote is disabled does it fall back to `server.toml`'s `[defaults]
+  .identity_file`.
+- That private key must be **unencrypted** (no passphrase), so the daemon can
+  load it unattended.
+- The vault header records the key's fingerprint; using a different identity
+  fails with a clear error and a hint to `rekey`.
+
+```toml
+# config.toml (all optional; with remote enabled you usually omit the whole section)
+[secret]
+# vault_path defaults to <config_dir>/secrets
+# vault_path = "/etc/xho/secrets"
+# key_source defaults to [server.remote].host_key_path; set only to override
+# key_source = "/etc/xho/host_key"
+```
+
+### Commands
+
+All `xho secret` operations are **local file operations** — they never go
+through the daemon. Run them on whichever host owns the config you are managing
+(locally, or over SSH for a remote host).
+
+They default to `~/.xho/config.toml`. For a docker / systemd deployment whose
+config lives under `/etc/xho`, point at it with `--config` (the vault then
+resolves to `/etc/xho/secrets`):
+
+```bash
+# Encrypt every plaintext secret in config.toml + server.toml into the vault
+# and replace them in place with vault: references (comments/formatting are
+# preserved; a .bak backup is written first).
+xho secret encrypt
+
+# Preview the changes without writing any files.
+xho secret encrypt --dry-run
+
+# Store a single secret interactively (input is hidden).
+xho secret set server.db1.password
+
+# List entry names in the vault (values are never shown).
+xho secret list
+
+# Re-encrypt the whole vault under a different derivation key.
+xho secret rekey --old ~/.ssh/id_ed25519 --new ~/.ssh/id_new
+
+# Manage a config in a non-default location (docker / systemd / root install).
+xho secret --config /etc/xho/config.toml encrypt
+```
+
+### Security Boundary
+
+The vault keeps secrets out of config files, protecting against accidental git
+commits, backups, and shoulder-surfing. But the private key used for derivation
+and the ciphertext live on the **same host** — anyone who can read that key can
+decrypt the vault. This is the same level of trust as "anyone who can read the
+key can already SSH in directly," so it does not widen the attack surface. For
+stronger isolation, use an external KMS or secret manager.
 
 ## Target Resolution
 

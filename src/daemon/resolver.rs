@@ -293,7 +293,7 @@ impl<'a> Resolver<'a> {
     /// Look up a server alias in the local `ServerConfigFile` by alias name.
     fn lookup_local_server(&self, alias: &str) -> Option<Route> {
         let server = self.server_config.servers.get(alias)?;
-        let entry = resolve_server_entry(alias, server, &self.server_config.defaults).ok()?;
+        let entry = resolve_server_entry(alias, server, &self.server_config.defaults, None).ok()?;
         Some(Route {
             gateway_name: "local".to_string(),
             end_target: entry.alias,
@@ -307,7 +307,7 @@ impl<'a> Resolver<'a> {
             .servers
             .iter()
             .find(|(_, s)| s.host == host)?;
-        let entry = resolve_server_entry(alias, server, &self.server_config.defaults).ok()?;
+        let entry = resolve_server_entry(alias, server, &self.server_config.defaults, None).ok()?;
         Some(Route {
             gateway_name: "local".to_string(),
             end_target: entry.alias,

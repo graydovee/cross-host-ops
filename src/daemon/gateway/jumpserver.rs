@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::{debug, info};
@@ -216,6 +216,28 @@ impl JumpserverGateway {
         }
     }
 
+    /// Resolve the configured TOTP secret to its plaintext base32 value.
+    ///
+    /// An empty configured value means "no static MFA secret" and short-circuits
+    /// to empty without consulting any secret backend. Otherwise the value is
+    /// treated as a [`Secret`] reference (`vault:`/`env:`/`file:`/literal) and
+    /// resolved. The vault key source falls back to the jumpserver's own
+    /// identity file when `[secret].key_source` is unset.
+    async fn resolve_totp_secret(&self) -> Result<String> {
+        if self.fields.totp_secret_base32.is_empty() {
+            return Ok(String::new());
+        }
+        let resolver = self
+            .config
+            .read()
+            .await
+            .secret_resolver(Some(&self.fields.identity_file));
+        let value = crate::config::Secret::from_reference(&self.fields.totp_secret_base32)
+            .resolve(&resolver)
+            .context("failed to resolve jumpserver TOTP secret")?;
+        Ok(value.to_string())
+    }
+
     async fn ensure_transport(&self) -> Result<SingletonLease<JumpserverTransport>, GatewayError> {
         for attempt in 0..=1 {
             let result = self
@@ -252,8 +274,9 @@ impl JumpserverGateway {
         let app_config = self.config.read().await.clone();
         let mut handle = connect_handle(&self.fields.host, self.fields.port, &app_config).await?;
 
+        let totp_secret = self.resolve_totp_secret().await?;
         let mfa_config = MfaConfig {
-            totp_secret_base32: self.fields.totp_secret_base32.clone(),
+            totp_secret_base32: totp_secret,
             digits: self.fields.totp_digits,
             period: self.fields.totp_period,
             ..MfaConfig::default()
@@ -484,9 +507,10 @@ impl JumpserverGateway {
             let text = shell.pending_text();
 
             if !mfa_sent && strip_ansi(&text).contains(MFA_PROMPT_CONTAINS) {
-                let code = if !self.fields.totp_secret_base32.is_empty() {
+                let totp_secret = self.resolve_totp_secret().await?;
+                let code = if !totp_secret.is_empty() {
                     let mfa_config = MfaConfig {
-                        totp_secret_base32: self.fields.totp_secret_base32.clone(),
+                        totp_secret_base32: totp_secret,
                         digits: self.fields.totp_digits,
                         period: self.fields.totp_period,
                         ..MfaConfig::default()
