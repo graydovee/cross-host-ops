@@ -72,7 +72,7 @@ impl Default for LocalServerConfig {
     fn default() -> Self {
         Self {
             enable: true,
-            socket_path: "~/.xho/xhod.sock".to_string(),
+            socket_path: crate::config::path::default_socket_path(),
         }
     }
 }

@@ -124,6 +124,7 @@ mod tests {
         default_config_path, default_known_hosts_path, glob_match, parse_duration,
         resolve_ssh_host,
     };
+    use crate::config::path::default_socket_path;
     use proptest::prelude::*;
     use serde::{Deserialize, Serialize};
 
@@ -168,7 +169,7 @@ mod tests {
         assert!(default_client_config_path().ends_with(".xho/client.toml"));
         assert!(default_known_hosts_path().ends_with(".xho/known_hosts"));
         let config = AppConfig::default();
-        assert_eq!(config.server.local.socket_path, "~/.xho/xhod.sock");
+        assert_eq!(config.server.local.socket_path, default_socket_path());
         assert_eq!(config.server.remote.host_key_path, "~/.xho/host_key");
         assert_eq!(
             config.server.remote.authorized_keys_path,
@@ -176,7 +177,7 @@ mod tests {
         );
         assert!(config.copy.preserve_mode);
         let client = ClientConfig::default();
-        assert_eq!(client.local.socket_path, "~/.xho/xhod.sock");
+        assert_eq!(client.local.socket_path, default_socket_path());
     }
 
     #[test]

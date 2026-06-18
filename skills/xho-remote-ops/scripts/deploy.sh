@@ -217,15 +217,18 @@ docker pull "${IMAGE}:${IMAGE_TAG}"
 echo "==> Removing any existing container '${CONTAINER_NAME}'"
 docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
 
-echo "==> Mounting host config dir ${data_dir} -> /etc/xho, exposing :2222"
-mkdir -p "$data_dir"
+echo "==> Mounting host config dir ${data_dir} -> /etc/xho, socket /var/run/xho, exposing :2222"
+mkdir -p "$data_dir" /var/run/xho
 
-# Default CMD runs `xhod --config /etc/xho/config.toml --origin external`.
+# The container runs as root, so default_socket_path() resolves to
+# /var/run/xho/xhod.sock.  By bind-mounting the directory the host CLI
+# (also root) finds the control socket at the same path automatically.
 docker run -d \
   --name "${CONTAINER_NAME}" \
   --restart unless-stopped \
   -p 2222:2222 \
   -v "${data_dir}:/etc/xho" \
+  -v /var/run/xho:/var/run/xho \
   "${IMAGE}:${IMAGE_TAG}"
 
 sleep 2
@@ -240,9 +243,9 @@ build_locally() {
   local project_root target
   project_root="$(git rev-parse --show-toplevel)"
   target="${TARGET:-x86_64-unknown-linux-musl}"
-  echo "==> Building release binaries (target ${target})"
+  echo "==> Building release binaries (target ${target})" >&2
   cargo build --release --target "$target" --bin xho --bin xhod \
-    --manifest-path "$project_root/Cargo.toml"
+    --manifest-path "$project_root/Cargo.toml" >&2
   echo "$project_root/target/$target/release"
 }
 
@@ -276,9 +279,12 @@ elif [[ "$METHOD" == "systemd" ]]; then
   CONFIG_PATH="${CONFIG_OVERRIDE:-/etc/xho/config.toml}"
   if [[ "$BUILD" == true ]]; then
     bindir="$(build_locally)"
+    project_root="$(git rev-parse --show-toplevel)"
     echo "==> Uploading built binaries to ${REMOTE}:${PREFIX}"
     "${SSH[@]}" "$REMOTE" "systemctl stop xhod 2>/dev/null || true; pkill -x xhod 2>/dev/null || true; mkdir -p '${PREFIX}'"
     "${SCP[@]}" "$bindir/xho" "$bindir/xhod" "${REMOTE}:${PREFIX}/"
+    echo "==> Installing xhod.service unit"
+    "${SCP[@]}" "$project_root/packaging/systemd/xhod.service" "${REMOTE}:/etc/systemd/system/xhod.service"
   else
     "${SSH[@]}" "$REMOTE" \
       "VERSION='$VERSION' PREFIX='$PREFIX' CONFIG_PATH='$CONFIG_PATH' REPO='$REPO' TARGET='$TARGET' bash -s" \

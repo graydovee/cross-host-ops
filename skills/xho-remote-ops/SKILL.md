@@ -58,6 +58,11 @@ config references them by paths inside that dir (e.g. `host_key_path =
 See [references/config-and-usage.md](references/config-and-usage.md) for the full
 config format.
 
+The control socket is at `/var/run/xho/xhod.sock` (root daemon default, matching
+the Docker / systemd convention). The deploy script mount keeps this directory
+shared between host and container, so tools like `xho status` and `xho exec`
+work from the host without additional client configuration.
+
 Release asset pattern (for systemd/bare/local; target is auto-detected):
 ```
 https://github.com/graydovee/cross-host-ops/releases/download/<tag>/cross-host-ops-<tag>-<target>.tar.gz

@@ -2,7 +2,9 @@
 #
 # The program can run without any config file.
 # Default behavior with no config:
-# - local daemon socket enabled: ~/.xho/xhod.sock
+# - local daemon socket enabled, path depends on the effective uid:
+#     root → /var/run/xho/xhod.sock
+#     non-root → ~/.xho/xhod.sock
 # - remote daemon listener disabled
 # - target resolution: derive IP from the first CLI argument
 # - direct SSH only: the derived IP must match a Host entry in ~/.ssh/config
@@ -19,7 +21,10 @@
 
 # [server.local]
 # enable = true
-# socket_path = "~/.xho/xhod.sock"
+# socket_path — auto-chosen by euid when unset:
+#   root → "/var/run/xho/xhod.sock"  (docker / systemd convention)
+#   non-root → "~/.xho/xhod.sock"    (per-user directory)
+# socket_path = "/var/run/xho/xhod.sock"
 
 # [server.remote]
 # enable = true

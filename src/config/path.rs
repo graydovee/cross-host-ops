@@ -23,6 +23,19 @@ pub fn default_known_hosts_path() -> PathBuf {
     default_root_dir().join("known_hosts")
 }
 
+/// Smart default for the local daemon control-socket path.
+///
+/// Follows the Docker / systemd convention for root daemons (`/var/run/<name>`),
+/// while keeping non-root (local dev) usage under `~/.xho` where the user has
+/// write access.
+pub fn default_socket_path() -> String {
+    if unsafe { libc::geteuid() } == 0 {
+        "/var/run/xho/xhod.sock".to_string()
+    } else {
+        "~/.xho/xhod.sock".to_string()
+    }
+}
+
 pub fn expand_tilde(value: &str) -> Result<String> {
     if value == "~" {
         return Ok(home_dir()

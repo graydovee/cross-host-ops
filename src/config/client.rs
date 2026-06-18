@@ -67,7 +67,7 @@ pub struct LocalClientConfig {
 impl Default for LocalClientConfig {
     fn default() -> Self {
         Self {
-            socket_path: "~/.xho/xhod.sock".to_string(),
+            socket_path: crate::config::path::default_socket_path(),
             auto_start: true,
         }
     }
