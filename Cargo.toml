@@ -1,6 +1,6 @@
 [package]
 name = "cross-host-ops"
-version = "0.1.0"
+version = "0.2.2"
 edition = "2024"
 
 [lib]
@@ -40,6 +40,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha1 = "0.10"
 sha2 = "0.10"
+subtle = "2"
 terminal_size = "0.4"
 thiserror = "1.0"
 tokio = { version = "1.48", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }

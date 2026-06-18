@@ -1,4 +1,5 @@
 mod args;
+mod bootstrap;
 mod client;
 mod copy;
 mod daemon;
@@ -8,12 +9,13 @@ mod output;
 mod progress;
 mod prompt;
 mod secret;
+mod token;
 
 use std::io::IsTerminal;
 
 use anyhow::Result;
 
-pub use args::{ArunCli, ArunCommand, DaemonCommand, HostCommand, OutputFormat};
+pub use args::{ArunCli, ArunCommand, DaemonCommand, HostCommand, OutputFormat, TokenCommand};
 pub use exec::{RawModeGuard, set_raw_mode};
 pub use output::print_version_json;
 
@@ -29,6 +31,7 @@ use self::exec::{detect_double_dash_separator, run_command};
 use self::host::run_host_command;
 use self::output::{list_servers, status};
 use self::secret::run_secret_command;
+use self::token::run_token_command;
 
 pub async fn run_cli(cli: ArunCli) -> Result<i32> {
     match cli.command {
@@ -111,6 +114,7 @@ pub async fn run_cli(cli: ArunCli) -> Result<i32> {
         ArunCommand::Ls { refresh } => list_servers(refresh).await,
         ArunCommand::Host { command } => run_host_command(command).await,
         ArunCommand::Daemon { command } => run_daemon_command(command).await,
+        ArunCommand::Token { command } => run_token_command(command).await,
         ArunCommand::Secret { config, command } => {
             run_secret_command(config.as_deref(), command)
         }

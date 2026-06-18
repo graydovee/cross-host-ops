@@ -38,6 +38,11 @@ listen_addr = "0.0.0.0:2222"
 user = "xho"
 host_key_path = "~/.xho/host_key"
 authorized_keys_path = "~/.xho/authorized_keys"
+# Optional long-lived token accepted by SSH password auth as a fallback
+# when no dynamic token from `xho token gen` matches. Accepts plaintext or
+# any secret reference (vault:NAME, env:VAR, file:PATH). Leave unset to
+# only accept short-lived tokens issued via `xho token gen`.
+bootstrap_token = "vault:bootstrap_token"
 
 [ssh]
 ssh_config_path = "~/.ssh/config"
@@ -205,9 +210,55 @@ xho exec --no-tty <target> -- echo ok  # Minimal connectivity test
 |-------|-------|-----|
 | "text file busy" | Daemon running during binary update | `xho daemon stop` first |
 | "target not found" | Server not in any source | Add to server.toml or check fallback |
-| "auth failure" | Wrong key or missing authorized_keys entry | Check key paths |
+| "auth failure" | Wrong key or missing authorized_keys entry | Run `xho host login --token <T>` or add key manually |
 | "host key rejected" | Missing or mismatched known_hosts | `xho host add` or update known_hosts |
 | "transport error" | SSH connection dropped | Auto-retries; check network |
+| "token rejected" | Token expired, already consumed, or unknown | Run `xho token gen` for a fresh token |
+
+## Token-based bootstrap
+
+`xho host add` and `xho host login` can auto-append the client's public key
+to the remote xhod's `authorized_keys` by presenting a short-lived token
+issued on the remote host. This avoids editing `authorized_keys` by hand.
+
+### Workflow
+
+```bash
+# 1. On the remote host (where xhod runs): generate a token.
+xho token gen                       # 5m, single-use (default)
+xho token gen --ttl 1h --reusable --label ci
+
+# 2. On the client: add or re-login with the token.
+xho host add prod-xhod xho@bastion:2222 --token <TOKEN>
+xho host login prod-xhod --token <TOKEN>
+```
+
+`xho host add` without a token (or with empty prompt input) skips bootstrap
+and falls back to the legacy flow (trust host key, persist config). The
+client must then have its key added to `authorized_keys` by other means.
+`xho host login` always requires a token.
+
+### Managing tokens
+
+```bash
+xho token list                       # prefix | expires_at | once | consumed | label
+xho token invalid <prefix-or-full>   # invalidate
+```
+
+Tokens are in-memory only and vanish on daemon restart.
+
+### Fixed bootstrap token
+
+A long-lived fallback can be set in the daemon's config:
+
+```toml
+[server.remote]
+bootstrap_token = "vault:bootstrap_token"   # or plaintext, env:VAR, file:PATH
+```
+
+Store it in the vault first via `xho secret set bootstrap_token`. If the
+field is unset or empty, only dynamic tokens issued by `xho token gen` are
+accepted by SSH password auth.
 
 ### Terminal not restored after interactive session
 

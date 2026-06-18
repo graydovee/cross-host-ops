@@ -584,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "cross-host-ops"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -612,6 +612,7 @@ dependencies = [
  "serde_json",
  "sha1 0.10.6",
  "sha2 0.10.9",
+ "subtle",
  "tempfile",
  "terminal_size",
  "thiserror 1.0.69",

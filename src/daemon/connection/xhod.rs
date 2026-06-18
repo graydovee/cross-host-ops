@@ -612,6 +612,30 @@ mod tests {
         ) -> Result<Response<crate::protocol::rpc::ListGatewaysResponse>, Status> {
             Ok(Response::new(Default::default()))
         }
+        async fn token_gen(
+            &self,
+            _: Request<crate::protocol::rpc::TokenGenRequest>,
+        ) -> Result<Response<crate::protocol::rpc::TokenGenResponse>, Status> {
+            Ok(Response::new(Default::default()))
+        }
+        async fn token_list(
+            &self,
+            _: Request<crate::protocol::rpc::TokenListRequest>,
+        ) -> Result<Response<crate::protocol::rpc::TokenListResponse>, Status> {
+            Ok(Response::new(Default::default()))
+        }
+        async fn token_invalidate(
+            &self,
+            _: Request<crate::protocol::rpc::TokenInvalidateRequest>,
+        ) -> Result<Response<crate::protocol::rpc::TokenInvalidateResponse>, Status> {
+            Ok(Response::new(Default::default()))
+        }
+        async fn bootstrap_authorize(
+            &self,
+            _: Request<crate::protocol::rpc::BootstrapAuthorizeRequest>,
+        ) -> Result<Response<crate::protocol::rpc::BootstrapAuthorizeResponse>, Status> {
+            Ok(Response::new(Default::default()))
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -948,6 +972,10 @@ mod tests {
                     async fn shutdown(&self, _: tonic::Request<crate::protocol::rpc::ShutdownRequest>) -> Result<tonic::Response<crate::protocol::rpc::InfoResponse>, tonic::Status> { Ok(tonic::Response::new(Default::default())) }
                     async fn update_config(&self, _: tonic::Request<crate::protocol::rpc::UpdateConfigRequest>) -> Result<tonic::Response<crate::protocol::rpc::UpdateConfigResponse>, tonic::Status> { Ok(tonic::Response::new(Default::default())) }
                     async fn list_gateways(&self, _: tonic::Request<crate::protocol::rpc::ListGatewaysRequest>) -> Result<tonic::Response<crate::protocol::rpc::ListGatewaysResponse>, tonic::Status> { Ok(tonic::Response::new(Default::default())) }
+                    async fn token_gen(&self, _: tonic::Request<crate::protocol::rpc::TokenGenRequest>) -> Result<tonic::Response<crate::protocol::rpc::TokenGenResponse>, tonic::Status> { Ok(tonic::Response::new(Default::default())) }
+                    async fn token_list(&self, _: tonic::Request<crate::protocol::rpc::TokenListRequest>) -> Result<tonic::Response<crate::protocol::rpc::TokenListResponse>, tonic::Status> { Ok(tonic::Response::new(Default::default())) }
+                    async fn token_invalidate(&self, _: tonic::Request<crate::protocol::rpc::TokenInvalidateRequest>) -> Result<tonic::Response<crate::protocol::rpc::TokenInvalidateResponse>, tonic::Status> { Ok(tonic::Response::new(Default::default())) }
+                    async fn bootstrap_authorize(&self, _: tonic::Request<crate::protocol::rpc::BootstrapAuthorizeRequest>) -> Result<tonic::Response<crate::protocol::rpc::BootstrapAuthorizeResponse>, tonic::Status> { Ok(tonic::Response::new(Default::default())) }
                 }
 
                 let server = DownloadMock { content: content_for_mock };
@@ -1063,6 +1091,10 @@ mod tests {
                     async fn shutdown(&self, _: tonic::Request<crate::protocol::rpc::ShutdownRequest>) -> Result<tonic::Response<crate::protocol::rpc::InfoResponse>, tonic::Status> { Ok(tonic::Response::new(Default::default())) }
                     async fn update_config(&self, _: tonic::Request<crate::protocol::rpc::UpdateConfigRequest>) -> Result<tonic::Response<crate::protocol::rpc::UpdateConfigResponse>, tonic::Status> { Ok(tonic::Response::new(Default::default())) }
                     async fn list_gateways(&self, _: tonic::Request<crate::protocol::rpc::ListGatewaysRequest>) -> Result<tonic::Response<crate::protocol::rpc::ListGatewaysResponse>, tonic::Status> { Ok(tonic::Response::new(Default::default())) }
+                    async fn token_gen(&self, _: tonic::Request<crate::protocol::rpc::TokenGenRequest>) -> Result<tonic::Response<crate::protocol::rpc::TokenGenResponse>, tonic::Status> { Ok(tonic::Response::new(Default::default())) }
+                    async fn token_list(&self, _: tonic::Request<crate::protocol::rpc::TokenListRequest>) -> Result<tonic::Response<crate::protocol::rpc::TokenListResponse>, tonic::Status> { Ok(tonic::Response::new(Default::default())) }
+                    async fn token_invalidate(&self, _: tonic::Request<crate::protocol::rpc::TokenInvalidateRequest>) -> Result<tonic::Response<crate::protocol::rpc::TokenInvalidateResponse>, tonic::Status> { Ok(tonic::Response::new(Default::default())) }
+                    async fn bootstrap_authorize(&self, _: tonic::Request<crate::protocol::rpc::BootstrapAuthorizeRequest>) -> Result<tonic::Response<crate::protocol::rpc::BootstrapAuthorizeResponse>, tonic::Status> { Ok(tonic::Response::new(Default::default())) }
                 }
 
                 let server = StdoutErrMock { stdout: captured_stdout.clone(), stderr: captured_stderr.clone(), exit: captured_exit };
@@ -1155,6 +1187,10 @@ mod tests {
                     async fn shutdown(&self, _: tonic::Request<crate::protocol::rpc::ShutdownRequest>) -> Result<tonic::Response<crate::protocol::rpc::InfoResponse>, tonic::Status> { Ok(tonic::Response::new(Default::default())) }
                     async fn update_config(&self, _: tonic::Request<crate::protocol::rpc::UpdateConfigRequest>) -> Result<tonic::Response<crate::protocol::rpc::UpdateConfigResponse>, tonic::Status> { Ok(tonic::Response::new(Default::default())) }
                     async fn list_gateways(&self, _: tonic::Request<crate::protocol::rpc::ListGatewaysRequest>) -> Result<tonic::Response<crate::protocol::rpc::ListGatewaysResponse>, tonic::Status> { Ok(tonic::Response::new(Default::default())) }
+                    async fn token_gen(&self, _: tonic::Request<crate::protocol::rpc::TokenGenRequest>) -> Result<tonic::Response<crate::protocol::rpc::TokenGenResponse>, tonic::Status> { Ok(tonic::Response::new(Default::default())) }
+                    async fn token_list(&self, _: tonic::Request<crate::protocol::rpc::TokenListRequest>) -> Result<tonic::Response<crate::protocol::rpc::TokenListResponse>, tonic::Status> { Ok(tonic::Response::new(Default::default())) }
+                    async fn token_invalidate(&self, _: tonic::Request<crate::protocol::rpc::TokenInvalidateRequest>) -> Result<tonic::Response<crate::protocol::rpc::TokenInvalidateResponse>, tonic::Status> { Ok(tonic::Response::new(Default::default())) }
+                    async fn bootstrap_authorize(&self, _: tonic::Request<crate::protocol::rpc::BootstrapAuthorizeRequest>) -> Result<tonic::Response<crate::protocol::rpc::BootstrapAuthorizeResponse>, tonic::Status> { Ok(tonic::Response::new(Default::default())) }
                 }
 
                 let server = ControlEventsMock { exit: exit_code };

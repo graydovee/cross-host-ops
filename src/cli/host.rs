@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::{Context, Result, bail};
 
 use crate::config::{
@@ -10,7 +12,8 @@ use crate::daemon::gateway::auth::{
 };
 
 use super::args::HostCommand;
-use super::prompt::prompt_for_confirmation;
+use super::bootstrap::bootstrap_authorize;
+use super::prompt::{prompt_for_auth_input, prompt_for_confirmation};
 use crate::types::{AddressDefaults, RemoteAddress};
 
 pub(crate) async fn run_host_command(command: HostCommand) -> Result<i32> {
@@ -22,6 +25,7 @@ pub(crate) async fn run_host_command(command: HostCommand) -> Result<i32> {
             known_hosts,
             accept_new_host_key,
             fingerprint,
+            token,
         } => {
             remote_connect(
                 name,
@@ -30,11 +34,37 @@ pub(crate) async fn run_host_command(command: HostCommand) -> Result<i32> {
                 known_hosts,
                 accept_new_host_key,
                 fingerprint,
+                token,
             )
             .await
         }
+        HostCommand::Login { name, token } => remote_login(name, token).await,
         HostCommand::Remove { name } => remote_remove(name).await,
         HostCommand::List => remote_list(),
+    }
+}
+
+/// Resolve a token: use `--token` if given, otherwise prompt interactively.
+/// Empty / whitespace-only input maps to `None` (skip bootstrap).
+fn resolve_token(token_arg: Option<String>, prompt_label: &str) -> Result<Option<String>> {
+    match token_arg {
+        Some(t) => {
+            let trimmed = t.trim().to_string();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed))
+            }
+        }
+        None => {
+            let raw = prompt_for_auth_input(prompt_label, true)?;
+            let trimmed = raw.trim().to_string();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed))
+            }
+        }
     }
 }
 
@@ -45,6 +75,7 @@ async fn remote_connect(
     known_hosts_override: Option<String>,
     _accept_new_host_key: bool,
     _fingerprint: Option<String>,
+    token_arg: Option<String>,
 ) -> Result<i32> {
     // --- Step 1: Validate <name> against RESERVED_NAMES ---
     if RESERVED_NAMES.contains(&name.as_str()) {
@@ -129,7 +160,24 @@ async fn remote_connect(
         }
     }
 
-    // --- Step 5: Persist the new entry to the config file ---
+    // --- Step 5: Bootstrap (auto-append the local public key) ---
+    // The bootstrap happens BEFORE we persist the gateway so a failed token
+    // leaves the local config untouched (no half-configured entry).
+    let token = resolve_token(
+        token_arg,
+        "token for remote xhod (empty to skip bootstrap)",
+    )?;
+    if let Some(token) = token {
+        bootstrap_authorize(&remote_addr.format(), &token, Path::new(&identity_file)).await?;
+    } else {
+        eprintln!(
+            "warning: no token provided; skipping authorized_keys bootstrap. \
+             Future `xho exec`/`xho ls` calls will be rejected until the key is \
+             added manually or via `xho host login`."
+        );
+    }
+
+    // --- Step 6: Persist the new entry to the config file ---
     let new_entry = GatewayConfig::Xhod(XhodGatewayConfig {
         name: name.clone(),
         address: remote_addr.format(),
@@ -155,6 +203,40 @@ async fn remote_connect(
         name,
         target.address()
     );
+    Ok(0)
+}
+
+/// `xho host login <name>` — re-run the bootstrap against an existing gateway.
+/// Reads the gateway's address/identity_file from config, prompts for a token
+/// (or accepts `--token`), and calls `bootstrap_authorize`. Does not modify
+/// the config file.
+async fn remote_login(name: String, token_arg: Option<String>) -> Result<i32> {
+    let config_path = default_config_path();
+    let config = AppConfig::load(Some(&config_path)).unwrap_or_default();
+    let entry = config.gateways.iter().find(|g| g.name() == name);
+    let Some(entry) = entry else {
+        eprintln!("error: no gateway named '{name}'");
+        return Ok(127);
+    };
+    if entry.gateway_kind() != GatewayKind::Xhod {
+        eprintln!(
+            "error: '{}' is a {:?} gateway; login only supports xhod",
+            name,
+            entry.gateway_kind()
+        );
+        return Ok(1);
+    }
+    let GatewayConfig::Xhod(c) = entry else {
+        unreachable!("gateway_kind == Xhod implies Xhod variant");
+    };
+    let address = c.address.clone();
+    let identity_file = c.identity_file.clone();
+    let token = resolve_token(token_arg, "token for remote xhod")?;
+    let Some(token) = token else {
+        eprintln!("error: a token is required for `host login` (empty input aborted)");
+        return Ok(1);
+    };
+    bootstrap_authorize(&address, &token, Path::new(&identity_file)).await?;
     Ok(0)
 }
 

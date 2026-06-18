@@ -68,6 +68,64 @@ Release asset pattern (for systemd/bare/local; target is auto-detected):
 https://github.com/graydovee/cross-host-ops/releases/download/<tag>/cross-host-ops-<tag>-<target>.tar.gz
 ```
 
+## Token-based bootstrap
+
+When adding a gateway, `xho host add` can auto-append the client's public key
+to the remote daemon's `authorized_keys` if you present a valid token. This
+avoids the manual `cat >> /etc/xho/authorized_keys` step.
+
+**Generate a token on the remote host** (where xhod lives):
+
+```bash
+# Default: 5-minute, single-use (recommended)
+xho token gen
+
+# 1 hour, reusable, tagged for CI
+xho token gen --ttl 1h --reusable --label ci-runner
+
+xho token list                 # see active tokens (prefix, expiry, once, consumed)
+xho token invalid <prefix>     # invalidate by 8-char prefix or full token
+```
+
+Tokens live in memory only and are lost on daemon restart — keep TTL short.
+
+**Add a gateway with auto-bootstrap** (run on the client):
+
+```bash
+# Pass --token, or omit it and enter at the prompt.
+xho host add prod-xhod xho@bastion.example.com --token <TOKEN>
+
+# Empty input at the prompt skips bootstrap (legacy behavior).
+xho host add prod-xhod xho@bastion.example.com
+```
+
+**Re-register the public key on an already-configured gateway** (e.g. after
+authorized_keys was wiped, or the client key changed):
+
+```bash
+xho host login prod-xhod --token <TOKEN>
+xho host login prod-xhod        # will prompt
+```
+
+`host login` does not modify config; it only runs the bootstrap RPC.
+
+**Fixed bootstrap token** (optional, long-lived fallback). Set
+`[server.remote] bootstrap_token` in the daemon's config to accept a fixed
+token. The value can be plaintext or any secret reference (`vault:NAME`,
+`env:VAR`, `file:PATH`); prefer `vault:` so the plaintext never lands in the
+config file:
+
+```bash
+# On the daemon host:
+xho secret set bootstrap_token    # prompts for the value, stores it in the vault
+# Then in config.toml:
+#   [server.remote]
+#   bootstrap_token = "vault:bootstrap_token"
+```
+
+If `bootstrap_token` is unset or empty, only dynamic tokens issued by
+`xho token gen` are accepted.
+
 ## Quick Reference
 
 ```bash

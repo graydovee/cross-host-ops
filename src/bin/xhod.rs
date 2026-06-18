@@ -8,7 +8,10 @@ use xho::daemon::{CliStartOptions, DaemonOrigin};
 
 #[derive(Debug, Parser)]
 #[command(name = "xhod")]
-#[command(about = "xho daemon", version)]
+#[command(
+    about = "xho daemon",
+    version = option_env!("XHO_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
+)]
 struct XhodCli {
     #[arg(short = 'c', long = "config", value_name = "FILE")]
     config: Option<PathBuf>,

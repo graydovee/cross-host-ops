@@ -1,4 +1,6 @@
 #[allow(dead_code)]
+pub mod authorized_keys;
+#[allow(dead_code)]
 pub mod connection;
 #[allow(dead_code)]
 pub mod connection_manager;
@@ -12,6 +14,8 @@ pub mod review;
 pub mod rpc;
 #[allow(dead_code)]
 pub mod ssh_server;
+#[allow(dead_code)]
+pub mod token_store;
 
 use std::io;
 #[cfg(unix)]
@@ -93,6 +97,10 @@ pub struct DaemonState {
     pub shutdown_tx: mpsc::Sender<()>,
     pub origin: DaemonOrigin,
     pub cli_start_options: CliStartOptions,
+    /// Short-lived tokens issued by `xho token gen`, accepted by `auth_password`.
+    pub token_store: token_store::TokenStore,
+    /// Serializes authorized_keys appends from concurrent bootstrap RPCs.
+    pub authorized_keys_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl DaemonState {
@@ -223,6 +231,8 @@ pub async fn run_with_overrides(
         shutdown_tx,
         origin,
         cli_start_options,
+        token_store: token_store::TokenStore::new(),
+        authorized_keys_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     let local_socket_path = if state.config.read().await.server.local.enable {
@@ -848,6 +858,103 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
             })
             .collect();
         Ok(Response::new(proto_rpc::ListGatewaysResponse { gateways }))
+    }
+
+    async fn token_gen(
+        &self,
+        request: Request<proto_rpc::TokenGenRequest>,
+    ) -> Result<Response<proto_rpc::TokenGenResponse>, Status> {
+        let req = request.into_inner();
+        let ttl = if req.ttl_secs == 0 {
+            Duration::from_secs(300)
+        } else {
+            Duration::from_secs(req.ttl_secs)
+        };
+        let label = req.label.filter(|s| !s.trim().is_empty()).map(|s| s.trim().to_string());
+        let token = self
+            .state
+            .token_store
+            .generate(ttl, req.once, label)
+            .await;
+        let expires_at = std::time::SystemTime::now() + ttl;
+        let expires_at_str = token_store::format_rfc3339_utc(expires_at);
+        info!(once = req.once, ttl_secs = req.ttl_secs, "issued bootstrap token");
+        Ok(Response::new(proto_rpc::TokenGenResponse {
+            token,
+            expires_at: expires_at_str,
+            once: req.once,
+        }))
+    }
+
+    async fn token_list(
+        &self,
+        _request: Request<proto_rpc::TokenListRequest>,
+    ) -> Result<Response<proto_rpc::TokenListResponse>, Status> {
+        let entries = self.state.token_store.list().await;
+        let tokens = entries
+            .into_iter()
+            .map(|e| {
+                let expires_at = e.expires_at_rfc3339();
+                let created_at = e.created_at_rfc3339();
+                proto_rpc::TokenInfo {
+                    prefix: e.prefix,
+                    expires_at,
+                    once: e.once,
+                    consumed: e.consumed,
+                    created_at,
+                    label: e.label,
+                }
+            })
+            .collect();
+        Ok(Response::new(proto_rpc::TokenListResponse { tokens }))
+    }
+
+    async fn token_invalidate(
+        &self,
+        request: Request<proto_rpc::TokenInvalidateRequest>,
+    ) -> Result<Response<proto_rpc::TokenInvalidateResponse>, Status> {
+        let req = request.into_inner();
+        let invalidated = self
+            .state
+            .token_store
+            .invalidate(&req.token_or_prefix)
+            .await;
+        if invalidated {
+            info!(prefix = req.token_or_prefix, "invalidated bootstrap token");
+        }
+        Ok(Response::new(proto_rpc::TokenInvalidateResponse { invalidated }))
+    }
+
+    async fn bootstrap_authorize(
+        &self,
+        request: Request<proto_rpc::BootstrapAuthorizeRequest>,
+    ) -> Result<Response<proto_rpc::BootstrapAuthorizeResponse>, Status> {
+        let req = request.into_inner();
+        let key = russh::keys::ssh_key::PublicKey::from_openssh(req.public_key.trim())
+            .map_err(|e| Status::invalid_argument(format!("invalid public key: {e}")))?;
+        let fingerprint = key.fingerprint(russh::keys::ssh_key::HashAlg::Sha256).to_string();
+        let path_str = {
+            let config = self.state.config.read().await;
+            config.server.remote.authorized_keys_path.clone()
+        };
+        let path = PathBuf::from(path_str);
+        // Serialize concurrent bootstraps so two RPCs racing for the same key
+        // can't both write (the dedup check inside is_authorized_key is
+        // non-atomic with the append otherwise).
+        let _guard = self.state.authorized_keys_lock.lock().await;
+        let (appended, already_present) = authorized_keys::append_authorized_key(&path, &key)
+            .await
+            .map_err(|e| Status::internal(format!("failed to append authorized_keys: {e}")))?;
+        info!(
+            fingerprint = %fingerprint,
+            appended, already_present,
+            "bootstrap_authorize completed"
+        );
+        Ok(Response::new(proto_rpc::BootstrapAuthorizeResponse {
+            appended,
+            already_present,
+            fingerprint,
+        }))
     }
 }
 
@@ -1571,6 +1678,8 @@ pub mod test_support {
             shutdown_tx,
             origin: DaemonOrigin::External,
             cli_start_options: CliStartOptions::default(),
+            token_store: token_store::TokenStore::new(),
+            authorized_keys_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         proto_rpc::xho_rpc_server::XhoRpcServer::new(XhoRpcService { state })
     }

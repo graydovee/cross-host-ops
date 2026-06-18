@@ -13,10 +13,13 @@ use anyhow::{Result, anyhow};
 use russh::keys::ssh_key::{self, HashAlg};
 use russh::server::{self, Auth, Msg};
 use russh::{Channel, ChannelId};
+use subtle::ConstantTimeEq;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tonic::transport::server::Connected;
+use tracing::{info, warn};
 
+use crate::config::Secret;
 use super::DaemonState;
 
 // ---------------------------------------------------------------------------
@@ -73,6 +76,10 @@ pub(super) struct RemoteSshHandler {
     peer_addr: Option<SocketAddr>,
     accepted_user: Option<String>,
     accepted_fingerprint: Option<String>,
+    /// True when auth succeeded via a bootstrap token (password auth) rather
+    /// than an authorized public key. Used only for audit logging — token-
+    /// authed sessions have the same RPC permissions as pubkey-authed ones.
+    authed_via_token: bool,
     channels: HashMap<ChannelId, Channel<Msg>>,
 }
 
@@ -161,6 +168,7 @@ impl server::Server for RemoteSshServer {
             peer_addr,
             accepted_user: None,
             accepted_fingerprint: None,
+            authed_via_token: false,
             channels: HashMap::new(),
         }
     }
@@ -185,7 +193,10 @@ impl server::Handler for RemoteSshHandler {
                 partial_success: false,
             });
         }
-        if !is_authorized_key(Path::new(&config.server.remote.authorized_keys_path), key)? {
+        if !super::authorized_keys::is_authorized_key(
+            Path::new(&config.server.remote.authorized_keys_path),
+            key,
+        )? {
             return Ok(Auth::Reject {
                 proceed_with_methods: None,
                 partial_success: false,
@@ -194,6 +205,60 @@ impl server::Handler for RemoteSshHandler {
         self.accepted_user = Some(user.to_string());
         self.accepted_fingerprint = Some(key.fingerprint(HashAlg::Sha256).to_string());
         Ok(Auth::Accept)
+    }
+
+    /// Token-based bootstrap auth. The client passes a short-lived token
+    /// (issued by `xho token gen`) or matches the configured `bootstrap_token`
+    /// as the SSH password. Accepting here lets the client open a gRPC channel
+    /// and call `BootstrapAuthorize` to register its public key.
+    async fn auth_password(
+        &mut self,
+        user: &str,
+        password: &str,
+    ) -> Result<Auth, Self::Error> {
+        let config = self.state.config.read().await.clone();
+        if user != config.server.remote.user {
+            return Ok(Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            });
+        }
+        // Dynamic tokens issued by `xho token gen` (also sweeps expired ones).
+        if self.state.token_store.validate(password).await {
+            self.authed_via_token = true;
+            self.accepted_user = Some(user.to_string());
+            self.accepted_fingerprint = Some("token".to_string());
+            info!(peer = ?self.peer_addr, user = %user, "SSH auth via dynamic token");
+            return Ok(Auth::Accept);
+        }
+        // Fixed bootstrap_token from config — supports plaintext + vault:/env:/file:.
+        if let Some(ref bt) = config.server.remote.bootstrap_token {
+            let resolver = config.secret_resolver(None);
+            let secret = Secret::from_reference(bt);
+            match secret.resolve(&resolver) {
+                Ok(resolved) if !resolved.is_empty() => {
+                    let ok: bool = password
+                        .as_bytes()
+                        .ct_eq(resolved.as_bytes())
+                        .into();
+                    if ok {
+                        self.authed_via_token = true;
+                        self.accepted_user = Some(user.to_string());
+                        self.accepted_fingerprint = Some("bootstrap-token".to_string());
+                        info!(peer = ?self.peer_addr, user = %user, "SSH auth via bootstrap_token");
+                        return Ok(Auth::Accept);
+                    }
+                }
+                Ok(_) => {} // empty resolved value, treat as no match
+                Err(e) => {
+                    warn!(peer = ?self.peer_addr, error = %e, "failed to resolve bootstrap_token");
+                }
+            }
+        }
+        Ok(Auth::Reject {
+            proceed_with_methods: None,
+            partial_success: false,
+        })
     }
 
     async fn channel_open_session(
@@ -277,40 +342,6 @@ impl server::Handler for RemoteSshHandler {
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
-
-/// Check if a candidate public key is present in an authorized_keys file.
-fn is_authorized_key(path: &Path, candidate: &ssh_key::PublicKey) -> Result<bool> {
-    use anyhow::{Context, bail};
-
-    if !path.exists() {
-        return Ok(false);
-    }
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    for (idx, raw_line) in content.lines().enumerate() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let first = line
-            .split_whitespace()
-            .next()
-            .ok_or_else(|| anyhow!("invalid authorized_keys line {}", idx + 1))?;
-        if first.contains('=') || first.contains(',') {
-            bail!(
-                "authorized_keys options are not supported in {} line {}",
-                path.display(),
-                idx + 1
-            );
-        }
-        let parsed = ssh_key::PublicKey::from_openssh(line)
-            .with_context(|| format!("failed to parse {} line {}", path.display(), idx + 1))?;
-        if parsed.key_data() == candidate.key_data() {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
 
 /// Load host keys from the specified file path.
 pub(super) fn load_host_keys(path: &Path) -> Result<Vec<ssh_key::PrivateKey>> {

@@ -85,6 +85,11 @@ pub struct RemoteServerConfig {
     pub user: String,
     pub host_key_path: String,
     pub authorized_keys_path: String,
+    /// Optional long-lived token accepted by `auth_password` as a fallback
+    /// when no dynamic token matches. Accepts plaintext or any reference
+    /// supported by the secret resolver (`vault:NAME`, `env:VAR`, `file:PATH`).
+    /// Storing plaintext here is a security risk — prefer `vault:` references.
+    pub bootstrap_token: Option<String>,
 }
 
 impl Default for RemoteServerConfig {
@@ -95,6 +100,7 @@ impl Default for RemoteServerConfig {
             user: "xho".to_string(),
             host_key_path: "~/.xho/host_key".to_string(),
             authorized_keys_path: "~/.xho/authorized_keys".to_string(),
+            bootstrap_token: None,
         }
     }
 }

@@ -15,7 +15,7 @@ pub enum OutputFormat {
 #[command(name = "xho")]
 #[command(
     about = "Cross Host Ops command runner with a local or remote daemon",
-    version
+    version = option_env!("XHO_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
 )]
 pub struct ArunCli {
     /// Output format: text (default) or json (NDJSON).
@@ -106,6 +106,11 @@ pub enum ArunCommand {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    #[command(about = "Manage short-lived bootstrap tokens on the local daemon")]
+    Token {
+        #[command(subcommand)]
+        command: TokenCommand,
+    },
     #[command(about = "Manage encrypted secrets in the local vault")]
     Secret {
         /// Daemon config file to operate on. Defaults to ~/.xho/config.toml.
@@ -185,6 +190,21 @@ pub enum HostCommand {
             conflicts_with = "accept_new_host_key"
         )]
         fingerprint: Option<String>,
+        /// Bootstrap token for auto-appending the local public key to the
+        /// remote daemon's authorized_keys. If omitted, prompts interactively;
+        /// an empty response skips the bootstrap step.
+        #[arg(long = "token", value_name = "TOKEN")]
+        token: Option<String>,
+    },
+    /// Re-run the bootstrap (register the local public key) against an
+    /// already-configured gateway, e.g. after the remote authorized_keys was
+    /// wiped or the client key changed. Does not modify config.
+    #[command(about = "Re-register the local public key with an existing gateway")]
+    Login {
+        #[arg(value_name = "HOST_NAME")]
+        name: String,
+        #[arg(long = "token", value_name = "TOKEN")]
+        token: Option<String>,
     },
     /// Remove a jump host entry.
     #[command(about = "Remove a jump host entry")]
@@ -195,6 +215,32 @@ pub enum HostCommand {
     /// List all configured jump hosts.
     #[command(about = "List all configured jump hosts")]
     List,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TokenCommand {
+    /// Generate a short-lived token on the local daemon (default: 5 minutes,
+    /// single-use). Run this on the remote host where xhod lives.
+    #[command(about = "Generate a short-lived bootstrap token")]
+    Gen {
+        #[arg(long = "ttl", value_name = "DURATION", help = "e.g. 5m, 1h, 30s (default: 5m)")]
+        ttl: Option<String>,
+        /// Allow the token to be used multiple times within its TTL (default:
+        /// consumed on first use).
+        #[arg(long = "reusable")]
+        reusable: bool,
+        #[arg(long = "label", value_name = "TEXT")]
+        label: Option<String>,
+    },
+    /// List all currently-valid tokens on the local daemon.
+    #[command(about = "List active bootstrap tokens")]
+    List,
+    /// Invalidate a token by its full value or 8-char prefix.
+    #[command(about = "Invalidate a token (by full value or prefix)")]
+    Invalidate {
+        #[arg(value_name = "TOKEN_OR_PREFIX")]
+        token: String,
+    },
 }
 
 #[cfg(test)]

@@ -10,6 +10,10 @@ service XhoRpc {
   rpc Shutdown(ShutdownRequest) returns (InfoResponse);
   rpc UpdateConfig(UpdateConfigRequest) returns (UpdateConfigResponse);
   rpc ListGateways(ListGatewaysRequest) returns (ListGatewaysResponse);
+  rpc TokenGen(TokenGenRequest) returns (TokenGenResponse);
+  rpc TokenList(TokenListRequest) returns (TokenListResponse);
+  rpc TokenInvalidate(TokenInvalidateRequest) returns (TokenInvalidateResponse);
+  rpc BootstrapAuthorize(BootstrapAuthorizeRequest) returns (BootstrapAuthorizeResponse);
 }
 
 message ExecuteRequest {
@@ -273,4 +277,49 @@ message ListGatewaysRequest {}
 
 message ListGatewaysResponse {
   repeated GatewayStatus gateways = 1;
+}
+
+message TokenGenRequest {
+  uint64 ttl_secs = 1;
+  bool once = 2;
+  optional string label = 3;
+}
+
+message TokenGenResponse {
+  string token = 1;
+  string expires_at = 2;
+  bool once = 3;
+}
+
+message TokenInfo {
+  string prefix = 1;
+  string expires_at = 2;
+  bool once = 3;
+  bool consumed = 4;
+  string created_at = 5;
+  optional string label = 6;
+}
+
+message TokenListRequest {}
+
+message TokenListResponse {
+  repeated TokenInfo tokens = 1;
+}
+
+message TokenInvalidateRequest {
+  string token_or_prefix = 1;
+}
+
+message TokenInvalidateResponse {
+  bool invalidated = 1;
+}
+
+message BootstrapAuthorizeRequest {
+  string public_key = 1;
+}
+
+message BootstrapAuthorizeResponse {
+  bool appended = 1;
+  bool already_present = 2;
+  string fingerprint = 3;
 }
