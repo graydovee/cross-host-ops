@@ -774,7 +774,7 @@ Opt>
     #[test]
     fn parses_ansi_paginated_asset_table() {
         let text = "\u{1b}[H\u{1b}[2J  \u{1b}[1;32mID\u{1b}[0m | \u{1b}[1;32m主机名\u{1b}[0m | \u{1b}[1;32mIP\u{1b}[0m | 备注\n\
-  1  | bei....30 | 198.51.100.30 | \n\
+  1  | ass....30 | 198.51.100.30 | \n\
 \u{1b}[32m页码：1，每页行数：1，总页数：3，总数量：3\u{1b}[0m\n\
 上一页：P/p  下一页：Enter|N/n  返回：B/b\n:";
 

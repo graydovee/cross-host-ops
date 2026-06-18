@@ -137,8 +137,8 @@ mod tests {
     #[test]
     fn matches_glob() {
         assert!(glob_match("192.0.2.*", "192.0.2.163"));
-        assert!(glob_match("192.0.2.?.163", "192.0.2.163"));
-        assert!(!glob_match("192.0.2.?.163", "192.0.2.163"));
+        assert!(glob_match("192.0.2.16?", "192.0.2.163"));
+        assert!(!glob_match("192.0.2.16?", "192.0.2.16"));
     }
 
     #[test]

@@ -21,6 +21,6 @@ user = "ops"
 identity_file = "~/.ssh/id_ed25519"
 
 [servers.db]
-host = "192.0.2.200"
+host = "192.0.2.20"
 user = "dba"
 password = "REPLACE_ME"
