@@ -32,6 +32,11 @@
 # user = "xho"
 # host_key_path = "~/.xho/host_key"
 # authorized_keys_path = "~/.xho/authorized_keys"
+# Optional long-lived token accepted by SSH password auth as a fallback when
+# no dynamic token from `xho token gen` matches. Accepts plaintext or any
+# secret reference (vault:NAME, env:VAR, file:PATH). Leave unset to only
+# accept short-lived tokens issued via `xho token gen` on this host.
+# bootstrap_token = "vault:bootstrap_token"
 
 # [ssh]
 # ssh_config_path = "~/.ssh/config"

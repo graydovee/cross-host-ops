@@ -253,7 +253,9 @@ Centralized connection pool/singleton management, reused by each Gateway:
 xhod can act as an SSH server to accept connections from remote xhod instances.
 
 - **Listen**: `TCP:2222` (configurable via `server.remote.listen_addr`).
-- **Authentication**: `auth_publickey()` validates against `~/.xho/authorized_keys`.
+- **Authentication**: two paths are accepted —
+  - `auth_publickey()` validates against `~/.xho/authorized_keys` (the normal path)
+  - `auth_password()` validates a dynamic token (issued by `xho token gen`, in-memory) or the configured `bootstrap_token` (resolved via SecretResolver, supports `vault:`/`env:`/`file:`). After token auth the client can call the `BootstrapAuthorize` RPC on the same SSH session to have the daemon auto-append its public key to `authorized_keys`, avoiding manual key distribution.
 - **Only accepted operation**: `subsystem_request("xho-rpc")` — treats the SSH channel's byte stream as a gRPC connection and passes it to the tonic Server (the same `XhoRpcService`).
 - **Rejected operations**: `shell_request`, `exec_request`, `tcpip_forward` / `streamlocal_forward` (no shell login, direct exec, or port forwarding allowed).
 

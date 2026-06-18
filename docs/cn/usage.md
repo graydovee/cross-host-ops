@@ -194,6 +194,43 @@ xho host list
 xho host remove prod
 ```
 
+### Token 管理
+
+`xho token` 子命令管理远端 daemon 接受的短期 token。**必须在 xhod 所在的那台机器上运行**（走本地 socket）：
+
+```bash
+# 生成 token（默认 5 分钟、一次性消费）
+xho token gen
+
+# 自定义 TTL、可重复使用、打标签
+xho token gen --ttl 1h --reusable --label ci-runner
+
+# 列出所有有效 token（前缀、过期时间、是否一次性、是否已消费、标签）
+xho token list
+
+# 按 8 字符前缀或完整 token 失效
+xho token invalid <prefix>
+```
+
+token 仅保存在 daemon 内存中，重启即失效；`[server.remote].bootstrap_token` 是长期兜底（推荐用 `xho secret set bootstrap_token` 存进 vault 后写 `bootstrap_token = "vault:bootstrap_token"` 引用）。
+
+#### 自动注册公钥到远端 daemon
+
+`xho host add --token <T>` / `xho host login --token <T>` 会用 token 作为 SSH password 登入远端 daemon，然后调 `BootstrapAuthorize` RPC 让 daemon 把本地 `<identity_file>.pub` 追加进 `authorized_keys` —— 免去手动 `cat >> authorized_keys`。
+
+```bash
+# 1. 在 xhod 所在主机生成 token
+xho token gen --ttl 5m
+
+# 2. 客户端：带 token 添加 gateway，自动完成公钥注册
+xho host add prod xho@bastion.example.com:2222 --token <TOKEN>
+# 不带 --token 则交互提示；空输入跳过 bootstrap（仅信任 host key 并写入 config）
+
+# 3. authorized_keys 被清空、或换客户端机器后，对已配置的 gateway 重新注册
+xho host login prod --token <TOKEN>
+xho host login prod                   # 交互提示输入 token
+```
+
 ### 密钥管理
 
 ```bash
@@ -230,6 +267,9 @@ listen_addr = "0.0.0.0:2222"
 user = "xho"
 host_key_path = "~/.xho/host_key"
 authorized_keys_path = "~/.xho/authorized_keys"
+# 可选：长期 token，SSH password auth 兜底接受（动态 token 不命中时）
+# 支持明文或 vault:/env:/file: 引用；不写则只接受 `xho token gen` 签发的短期 token
+# bootstrap_token = "vault:bootstrap_token"
 
 [ssh]
 server_config_path = "~/.xho/server.toml"
@@ -412,7 +452,9 @@ authorized_keys_path = "~/.xho/authorized_keys"
 server_config_path = "~/.xho/server.toml"
 ```
 
-3. 将客户端公钥添加到 `~/.xho/authorized_keys`
+3. **注册客户端公钥** —— 两种方式二选一：
+   - **手动**：把客户端 `~/.ssh/id_ed25519.pub` 追加到 `~/.xho/authorized_keys`
+   - **自动（推荐）**：本机运行 `xho token gen`，客户端用 `xho host add prod xho@your-server:2222 --token <T>` 添加 gateway 时会自动注册（详见「Token 自动注册公钥」）
 4. 创建 `~/.xho/server.toml` 定义可达目标
 5. 启动：`xho daemon start --config ~/.xho/config.toml`
 

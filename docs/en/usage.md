@@ -194,6 +194,54 @@ xho host list
 xho host remove prod
 ```
 
+### Token Management
+
+The `xho token` subcommand manages short-lived tokens accepted by the remote
+daemon. **Must be run on the host where xhod lives** (uses the local socket):
+
+```bash
+# Generate a token (default: 5 minutes, single-use)
+xho token gen
+
+# Custom TTL, reusable, labeled
+xho token gen --ttl 1h --reusable --label ci-runner
+
+# List active tokens (prefix, expiry, once, consumed, label)
+xho token list
+
+# Invalidate by 8-char prefix or full token
+xho token invalid <prefix>
+```
+
+Tokens live in daemon memory only and are lost on restart; the config field
+`[server.remote].bootstrap_token` is the long-lived fallback (prefer storing
+it in the vault via `xho secret set bootstrap_token`, then referencing it as
+`bootstrap_token = "vault:bootstrap_token"`).
+
+#### Auto-registering the public key with the remote daemon
+
+`xho host add --token <T>` / `xho host login --token <T>` use the token as
+the SSH password to log into the remote daemon, then call the
+`BootstrapAuthorize` RPC to have the daemon append the local
+`<identity_file>.pub` to `authorized_keys` — no manual
+`cat >> authorized_keys` needed.
+
+```bash
+# 1. On the host where xhod runs: generate a token
+xho token gen --ttl 5m
+
+# 2. On the client: add the gateway with the token; the public key is
+#    appended automatically
+xho host add prod xho@bastion.example.com:2222 --token <TOKEN>
+# Without --token the CLI prompts interactively; empty input skips bootstrap
+# (only trusts the host key and writes the config).
+
+# 3. After authorized_keys is wiped, or when switching client machines,
+#    re-register the key on an already-configured gateway
+xho host login prod --token <TOKEN>
+xho host login prod                   # prompts for the token
+```
+
 ### Secret Management
 
 ```bash
@@ -230,6 +278,11 @@ listen_addr = "0.0.0.0:2222"
 user = "xho"
 host_key_path = "~/.xho/host_key"
 authorized_keys_path = "~/.xho/authorized_keys"
+# Optional: long-lived token accepted by SSH password auth as a fallback
+# when no dynamic token from `xho token gen` matches. Accepts plaintext or
+# any secret reference (vault:NAME, env:VAR, file:PATH). Leave unset to
+# only accept short-lived tokens issued via `xho token gen` on this host.
+# bootstrap_token = "vault:bootstrap_token"
 
 [ssh]
 server_config_path = "~/.xho/server.toml"
@@ -439,7 +492,9 @@ authorized_keys_path = "~/.xho/authorized_keys"
 server_config_path = "~/.xho/server.toml"
 ```
 
-3. Add the client public key to `~/.xho/authorized_keys`
+3. **Register the client public key** — pick one of:
+   - **Manual**: append the client's `~/.ssh/id_ed25519.pub` to `~/.xho/authorized_keys`
+   - **Automatic (recommended)**: run `xho token gen` here, then from the client use `xho host add prod xho@your-server:2222 --token <T>` to auto-register during gateway add (see "Auto-registering the public key")
 4. Create `~/.xho/server.toml` to define reachable targets
 5. Start: `xho daemon start --config ~/.xho/config.toml`
 

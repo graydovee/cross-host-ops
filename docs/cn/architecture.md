@@ -253,7 +253,9 @@ pub(super) trait Connection: Send {
 xhod 可作为 SSH 服务端接受远程 xhod 的连接。
 
 - **监听**：`TCP:2222`（`server.remote.listen_addr` 可配置）。
-- **认证**：`auth_publickey()` 校验 `~/.xho/authorized_keys`。
+- **认证**：两条路径都接受 ——
+  - `auth_publickey()` 校验 `~/.xho/authorized_keys`（常规路径）
+  - `auth_password()` 校验动态 token（`xho token gen` 签发，in-memory）或配置里的 `bootstrap_token`（走 SecretResolver，支持 `vault:`/`env:`/`file:`）。token 校验通过后客户端可在同一 SSH 会话上调用 `BootstrapAuthorize` RPC，让 daemon 自动把它的公钥追加进 `authorized_keys`，免手动分发。
 - **唯一接受的操作**：`subsystem_request("xho-rpc")` — 把 SSH channel 的字节流当作 gRPC 连接交给 tonic Server（同一个 `XhoRpcService`）。
 - **拒绝的操作**：`shell_request`、`exec_request`、`tcpip_forward` / `streamlocal_forward`（不允许 shell 登录、直接 exec、端口转发）。
 
