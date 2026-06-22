@@ -115,9 +115,7 @@ pub async fn run_cli(cli: ArunCli) -> Result<i32> {
         ArunCommand::Host { command } => run_host_command(command).await,
         ArunCommand::Daemon { command } => run_daemon_command(command).await,
         ArunCommand::Token { command } => run_token_command(command).await,
-        ArunCommand::Secret { config, command } => {
-            run_secret_command(config.as_deref(), command)
-        }
+        ArunCommand::Secret { config, command } => run_secret_command(config.as_deref(), command),
     }
 }
 

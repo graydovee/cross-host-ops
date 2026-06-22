@@ -61,12 +61,7 @@ impl TokenStore {
 
     /// Generate a fresh token, store its hash + metadata, and return the raw
     /// token exactly once.
-    pub async fn generate(
-        &self,
-        ttl: Duration,
-        once: bool,
-        label: Option<String>,
-    ) -> String {
+    pub async fn generate(&self, ttl: Duration, once: bool, label: Option<String>) -> String {
         let mut bytes = [0u8; TOKEN_BYTES];
         rand::thread_rng().fill_bytes(&mut bytes);
         let token = URL_SAFE_NO_PAD.encode(bytes);
@@ -122,7 +117,13 @@ impl TokenStore {
         // Fall back to prefix match.
         let to_remove: Vec<String> = map
             .iter()
-            .filter_map(|(k, v)| if v.prefix == needle { Some(k.clone()) } else { None })
+            .filter_map(|(k, v)| {
+                if v.prefix == needle {
+                    Some(k.clone())
+                } else {
+                    None
+                }
+            })
             .collect();
         let removed = !to_remove.is_empty();
         for k in to_remove {
@@ -136,7 +137,13 @@ impl TokenStore {
         let mut map = self.0.write().await;
         let expired: Vec<String> = map
             .iter()
-            .filter_map(|(k, v)| if v.is_expired() { Some(k.clone()) } else { None })
+            .filter_map(|(k, v)| {
+                if v.is_expired() {
+                    Some(k.clone())
+                } else {
+                    None
+                }
+            })
             .collect();
         for k in expired {
             map.remove(&k);

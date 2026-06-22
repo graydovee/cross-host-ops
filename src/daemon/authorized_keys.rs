@@ -52,9 +52,7 @@ pub(super) async fn append_authorized_key(
     if is_authorized_key(path, key)? {
         return Ok((false, true));
     }
-    let line = key
-        .to_openssh()
-        .context("failed to serialize public key")?;
+    let line = key.to_openssh().context("failed to serialize public key")?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             tokio::fs::create_dir_all(parent)

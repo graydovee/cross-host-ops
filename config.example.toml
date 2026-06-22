@@ -37,6 +37,10 @@
 # secret reference (vault:NAME, env:VAR, file:PATH). Leave unset to only
 # accept short-lived tokens issued via `xho token gen` on this host.
 # bootstrap_token = "vault:bootstrap_token"
+# When true, accept reverse proxy connections (xho-reverse subsystem) from
+# nodes without public IPs. Nodes authenticate via the same authorized_keys
+# and register as dynamic gateways. Requires enable = true.
+# reverse_proxy_enable = true
 
 # [ssh]
 # ssh_config_path = "~/.ssh/config"
@@ -127,6 +131,35 @@
 # port = 22
 # user = "admin"
 # identity_file = "~/.ssh/id_rsa"
+
+# --- Reverse Proxy ---
+#
+# When enabled, this xhod connects (as an SSH client) to a server xhod with
+# a public IP and registers itself as a dynamic gateway. This allows xho
+# clients on other machines to reach this node through the server.
+#
+# The connection reuses the server xhod's existing SSH port (e.g. 2222) and
+# authenticates via the same authorized_keys mechanism.
+#
+# Example topology:
+#   xho client → local xhod → server xhod (公网IP) → node xhod (本机, 无公网IP)
+#
+# After registration, targets on this node are reachable as:
+#   xho exec server-gw:node-name:server-alias <cmd>
+#
+# If allow_host_access = true, you can also operate this machine directly:
+#   xho exec server-gw:node-name <cmd>
+
+# [reverse_proxy]
+# enable = true
+# server_address = "xho@public-server.example.com:2222"
+# identity_file = "~/.ssh/id_ed25519"
+# known_hosts_path = "~/.xho/known_hosts"
+# node_name = "node-1"
+# allow_host_access = true
+# reconnect_delay = "10s"
+# keepalive_interval = "30s"
+# max_idle_time = "10m"
 
 # Enable this only when you want LLM command review before execution.
 # If api_key is omitted, xho will try XHO_REVIEW_API_KEY first, then OPENAI_API_KEY.

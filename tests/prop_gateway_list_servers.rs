@@ -1,8 +1,8 @@
-//! Property-based test: LocalGateway list_servers reads config only.
+//! Property-based test: DirectGateway list_servers reads config only.
 //!
-//! Feature: gateway-refactor, Property 3: LocalGateway list_servers reads config only
+//! Feature: gateway-refactor, Property 3: DirectGateway list_servers reads config only
 //!
-//! For any LocalGateway instance, calling `list_servers()` SHALL return server
+//! For any DirectGateway instance, calling `list_servers()` SHALL return server
 //! entries derived solely from the server.toml configuration file, without
 //! establishing any SSH connection or performing any network I/O.
 //!
@@ -18,7 +18,7 @@ use tempfile::NamedTempFile;
 use xho::config::AppConfig;
 use xho::daemon::gateway::Gateway;
 use xho::daemon::gateway::auth::{AuthPrompt, AuthPrompter};
-use xho::daemon::gateway::local::LocalGateway;
+use xho::daemon::gateway::direct::DirectGateway;
 use xho::types::ServerListSource;
 
 // ---------------------------------------------------------------------------
@@ -122,7 +122,7 @@ proptest! {
     /// **Validates: Requirements 3.5, 6.3**
     ///
     /// For any random server.toml configuration (0–20 entries), constructing
-    /// a LocalGateway and calling list_servers() SHALL:
+    /// a DirectGateway and calling list_servers() SHALL:
     /// 1. Return entries derived solely from the config file
     /// 2. Not establish any SSH connection (verified by panic-on-call auth prompter
     ///    and absence of real network targets)
@@ -139,10 +139,10 @@ proptest! {
             // Build a minimal AppConfig (needed for the RwLock)
             let config = Arc::new(tokio::sync::RwLock::new(AppConfig::default()));
 
-            // Construct LocalGateway with a panic auth prompter
+            // Construct DirectGateway with a panic auth prompter
             // If any network I/O were attempted, it would fail since
             // the hosts are random IPs and the auth prompter panics.
-            let gateway = LocalGateway::new(
+            let gateway = DirectGateway::new(
                 "local".to_string(),
                 config,
                 tmp_file.path().to_string_lossy().to_string(),
@@ -166,12 +166,12 @@ proptest! {
                 entries.len()
             );
 
-            // Property 6: All rows from LocalGateway must have source == Local
+            // Property 6: All rows from DirectGateway must have source == Local
             for row in &server_rows {
                 prop_assert_eq!(
                     &row.source,
                     &ServerListSource::Local,
-                    "LocalGateway row should have source == Local, got {:?}",
+                    "DirectGateway row should have source == Local, got {:?}",
                     row.source
                 );
             }

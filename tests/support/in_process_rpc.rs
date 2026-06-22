@@ -363,6 +363,9 @@ fn build_server_toml(servers: &[ServerEntry]) -> String {
             DirectAuth::Password { .. } => {
                 toml.push_str("auth = \"password\"\n");
             }
+            DirectAuth::None => {
+                toml.push_str("auth = \"none\"\n");
+            }
         }
         toml.push('\n');
     }

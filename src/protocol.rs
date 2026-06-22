@@ -405,6 +405,7 @@ pub fn server_entry_from_rpc(entry: rpc::ServerEntry) -> ServerEntry {
             "password" => DirectAuth::Password {
                 password: String::new(),
             },
+            "none" => DirectAuth::None,
             _ => DirectAuth::Key {
                 identity_file: String::new(),
             },

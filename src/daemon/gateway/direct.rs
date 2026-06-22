@@ -1,4 +1,4 @@
-// LocalGateway implementation.
+// DirectGateway implementation.
 // Manages direct SSH connections with per-address connection pooling.
 
 use std::path::Path;
@@ -60,6 +60,7 @@ impl DirectPoolKey {
         let (auth_kind, auth_fingerprint) = match &resolved.auth {
             DirectAuth::Key { identity_file } => ("key", format!("key:{identity_file}")),
             DirectAuth::Password { password } => ("password", format!("password:{password}")),
+            DirectAuth::None => ("none", "none".to_string()),
         };
         Self {
             host: resolved.host.clone(),
@@ -79,10 +80,10 @@ impl DirectPoolKey {
 }
 
 // ---------------------------------------------------------------------------
-// LocalGateway
+// DirectGateway
 // ---------------------------------------------------------------------------
 
-pub struct LocalGateway {
+pub struct DirectGateway {
     gateway_name: String,
     config: Arc<RwLock<AppConfig>>,
     server_config_path: String,
@@ -94,8 +95,8 @@ pub struct LocalGateway {
     max_connections_per_address: usize,
 }
 
-impl LocalGateway {
-    /// Construct a new LocalGateway. No connections are established.
+impl DirectGateway {
+    /// Construct a new DirectGateway. No connections are established.
     pub fn new(
         gateway_name: String,
         config: Arc<RwLock<AppConfig>>,
@@ -137,11 +138,15 @@ impl LocalGateway {
             .await
             .secret_resolver(server_config.defaults.identity_file.as_deref());
 
-        let entry =
-            resolve_server_entry(target, server_host_config, &server_config.defaults, Some(&resolver))
-                .map_err(|e| {
-                    GatewayError::resolution(anyhow!("failed to resolve target '{}': {}", target, e))
-                })?;
+        let entry = resolve_server_entry(
+            target,
+            server_host_config,
+            &server_config.defaults,
+            Some(&resolver),
+        )
+        .map_err(|e| {
+            GatewayError::resolution(anyhow!("failed to resolve target '{}': {}", target, e))
+        })?;
 
         Ok(ResolvedTarget {
             host: entry.host,
@@ -241,7 +246,7 @@ impl LocalGateway {
 // ---------------------------------------------------------------------------
 
 #[async_trait]
-impl Gateway for LocalGateway {
+impl Gateway for DirectGateway {
     async fn exec(&self, target: &str, request: &ExecRequest) -> Result<i32, GatewayError> {
         let resolved = self.resolve_target(target).await?;
         let mut lease = self.get_connection(&resolved).await?;
@@ -431,15 +436,15 @@ mod tests {
         resolved.shell = Some("zsh".to_string());
         resolved.defaults_shell = "bash".to_string();
 
-        assert_eq!(LocalGateway::effective_shell("", false, &resolved), "zsh");
+        assert_eq!(DirectGateway::effective_shell("", false, &resolved), "zsh");
         assert_eq!(
-            LocalGateway::effective_shell("fish", false, &resolved),
+            DirectGateway::effective_shell("fish", false, &resolved),
             "fish"
         );
-        assert_eq!(LocalGateway::effective_shell("", true, &resolved), "");
+        assert_eq!(DirectGateway::effective_shell("", true, &resolved), "");
 
         resolved.shell = None;
-        assert_eq!(LocalGateway::effective_shell("", false, &resolved), "bash");
+        assert_eq!(DirectGateway::effective_shell("", false, &resolved), "bash");
     }
 
     #[test]
@@ -483,7 +488,7 @@ mod tests {
     async fn real_gateway_pool_starts_empty_with_configured_capacity() {
         let config = Arc::new(RwLock::new(AppConfig::default()));
         let auth_prompter: Arc<AuthPrompter> = Arc::new(|_| Box::pin(async { Ok(String::new()) }));
-        let gateway = LocalGateway::new(
+        let gateway = DirectGateway::new(
             "test".to_string(),
             config,
             "/nonexistent/server.toml".to_string(),

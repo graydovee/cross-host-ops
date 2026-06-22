@@ -82,6 +82,31 @@ pub(crate) async fn status() -> Result<i32> {
         }
     }
 
+    // Reverse proxy server info.
+    if response.reverse_proxy_server_enabled {
+        println!("reverse_proxy_server:");
+        println!("  enabled: true");
+        if !response.reverse_proxy_nodes.is_empty() {
+            println!("  nodes:");
+            for node in &response.reverse_proxy_nodes {
+                println!("    - name: {}", node.name);
+                if !node.peer_addr.is_empty() {
+                    println!("      peer: {}", node.peer_addr);
+                }
+                if !node.fingerprint.is_empty() {
+                    println!("      key: {}", node.fingerprint);
+                }
+            }
+        }
+    }
+
+    // Reverse proxy client info.
+    if response.reverse_proxy_client_enabled {
+        println!("reverse_proxy_client:");
+        println!("  target: {}", response.reverse_proxy_client_target);
+        println!("  status: {}", response.reverse_proxy_client_status);
+    }
+
     if !response.pools.is_empty() {
         println!("pools:");
         for pool in response.pools {
@@ -113,14 +138,23 @@ pub(crate) async fn list_servers(refresh: bool) -> Result<i32> {
 }
 
 fn print_merged_server_list(merged: &rpc::MergedServerList) {
-    // Compute column widths from source-tagged rows.
+    // Compute the display name for a row: local entries show bare alias,
+    // gateway entries show <source>:<alias>.
+    let display_name = |source: &str, alias: &str| -> String {
+        if source == "local" {
+            alias.to_string()
+        } else {
+            format!("{}:{}", source, alias)
+        }
+    };
+
+    // Compute column widths from display names.
     let name_width = merged
         .rows
         .iter()
         .map(|row| {
-            let source = &row.source;
             let alias = row.server.as_ref().map(|s| s.alias.as_str()).unwrap_or("");
-            format!("{}:{}", source, alias).len()
+            display_name(&row.source, alias).len()
         })
         .max()
         .unwrap_or(4)
@@ -174,13 +208,13 @@ fn print_merged_server_list(merged: &rpc::MergedServerList) {
         auth_width = auth_width,
     );
 
-    // Print rows tagged as <source>:<alias>.
+    // Print rows — local entries show bare alias, gateway entries show <source>:<alias>.
     for row in &merged.rows {
         let server = match row.server.as_ref() {
             Some(s) => s,
             None => continue,
         };
-        let tagged_name = format!("{}:{}", row.source, server.alias);
+        let tagged_name = display_name(&row.source, &server.alias);
         println!(
             "{:<name_width$}  {:<host_width$}  {:<port_width$}  {:<user_width$}  {:<auth_width$}",
             tagged_name,
@@ -196,25 +230,8 @@ fn print_merged_server_list(merged: &rpc::MergedServerList) {
         );
     }
 
-    // Print one line per non-Ok source describing its status.
-    let non_ok_sources: Vec<&rpc::SourceStatus> = merged
-        .source_status
-        .iter()
-        .filter(|s| s.status != "ok")
-        .collect();
-    if !non_ok_sources.is_empty() {
-        println!();
-        for source_status in non_ok_sources {
-            if source_status.detail.is_empty() {
-                println!("{}: {}", source_status.source, source_status.status);
-            } else {
-                println!(
-                    "{}: {} [{}]",
-                    source_status.source, source_status.status, source_status.detail
-                );
-            }
-        }
-    }
+    // Skip non-Ok source status output — unsupported gateways (e.g. jumpserver)
+    // are expected and don't need to clutter the listing.
 }
 
 fn print_flat_server_list(servers: &[rpc::ServerEntry]) {

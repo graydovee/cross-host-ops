@@ -9,6 +9,10 @@ pub mod gateway;
 #[allow(dead_code)]
 pub mod resolver;
 #[allow(dead_code)]
+pub mod reverse_client;
+#[allow(dead_code)]
+pub mod reverse_proxy;
+#[allow(dead_code)]
 pub mod review;
 #[allow(dead_code)]
 pub mod rpc;
@@ -49,6 +53,7 @@ use crate::types::{CopyDirection, CopyFrame, CopySpec};
 
 use self::gateway::Gateway;
 use self::gateway::auth::AuthPrompter;
+use self::gateway::Route;
 use self::resolver::{ResolveResult, Resolver};
 use self::review::CommandReviewer;
 
@@ -101,6 +106,8 @@ pub struct DaemonState {
     pub token_store: token_store::TokenStore,
     /// Serializes authorized_keys appends from concurrent bootstrap RPCs.
     pub authorized_keys_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Dynamic gateways from reverse proxy connections.
+    pub reverse_proxy_registry: Arc<reverse_proxy::ReverseProxyRegistry>,
 }
 
 impl DaemonState {
@@ -150,27 +157,72 @@ impl DaemonState {
             .find(|(n, _)| n == name)
             .map(|(_, gw)| gw)
     }
+
+    /// Find a gateway by name, checking both static config gateways and
+    /// dynamic reverse proxy gateways.
+    pub async fn find_gateway_any(&self, name: &str) -> Option<Arc<dyn Gateway>> {
+        if let Some((_, gw)) = self.gateways.iter().find(|(n, _)| n == name) {
+            return Some(gw.clone());
+        }
+        self.reverse_proxy_registry.get(name).await
+    }
+
+    /// Collect all gateway names: static + dynamic reverse proxy.
+    pub async fn all_gateway_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.gateways.iter().map(|(n, _)| n.clone()).collect();
+        names.extend(self.reverse_proxy_registry.list_names().await);
+        names
+    }
 }
 
 async fn resolve_target_with_merged_view(
     state: &DaemonState,
     target: &str,
 ) -> Result<ResolveResult> {
+    // Fast path: dynamic gateway names and _self don't need list_servers.
+    let dynamic_names = state.reverse_proxy_registry.list_names().await;
+    let all_static_names: Vec<String> = state.gateways.iter().map(|(n, _)| n.clone()).collect();
+    let is_gateway_name = all_static_names.iter().any(|n| n == target)
+        || dynamic_names.iter().any(|n| n == target);
+
+    if is_gateway_name && target != "local" {
+        return Ok(ResolveResult {
+            routes: vec![Route {
+                gateway_name: target.to_string(),
+                end_target: "_self".to_string(),
+            }],
+            warning: None,
+        });
+    }
+
     let config = state.config.read().await.clone();
     let server_config = load_server_config(std::path::Path::new(&config.ssh.server_config_path))
         .unwrap_or_default();
-    let (tagged_entries, source_status) = rpc::process_list_servers(state).await;
+
+    // Fast path for explicitly qualified targets (gateway:server):
+    // skip the expensive list_servers aggregation that would recurse
+    // through reverse proxy connections.
+    if target.contains(':') && !target.starts_with('[') {
+        let resolver = Resolver::new(&config, &server_config, &config.gateways)
+            .with_dynamic_gateways(&dynamic_names);
+        return resolver.resolve_with_warning(target);
+    }
+
+    // Full path with merged view for bare alias disambiguation.
+    let (tagged_entries, source_status) = rpc::process_list_servers(state, false).await;
     let merged_rows = tagged_entries
         .into_iter()
         .map(|(server, source)| protocol::ServerListRow { source, server })
         .collect::<Vec<_>>();
+    let dynamic_names = state.reverse_proxy_registry.list_names().await;
     let resolver = Resolver::with_merged_view(
         &config,
         &server_config,
         &config.gateways,
         &merged_rows,
         &source_status,
-    );
+    )
+    .with_dynamic_gateways(&dynamic_names);
     resolver.resolve_with_warning(target)
 }
 
@@ -216,12 +268,21 @@ pub async fn run_with_overrides(
 
     // Build all gateways from the configuration.
     let auth_prompter: Arc<AuthPrompter> = Arc::new(|_req| Box::pin(async { Ok(String::new()) }));
-    let gateways = gateway::build_gateways(
+    let mut gateways = gateway::build_gateways(
         config.clone(),
         &loaded.ssh.server_config_path,
         &loaded.gateways,
         auth_prompter,
     );
+
+    // Register LocalhostGateway (_self) when allow_host_access is enabled.
+    if loaded.reverse_proxy.enable && loaded.reverse_proxy.allow_host_access {
+        gateways.push((
+            gateway::localhost::SELF_GATEWAY_NAME.to_string(),
+            Arc::new(gateway::localhost::LocalhostGateway::new()),
+        ));
+        info!("host access enabled: _self gateway registered");
+    }
 
     let state = DaemonState {
         config_path,
@@ -233,6 +294,7 @@ pub async fn run_with_overrides(
         cli_start_options,
         token_store: token_store::TokenStore::new(),
         authorized_keys_lock: Arc::new(tokio::sync::Mutex::new(())),
+        reverse_proxy_registry: Arc::new(reverse_proxy::ReverseProxyRegistry::new()),
     };
 
     let local_socket_path = if state.config.read().await.server.local.enable {
@@ -323,6 +385,21 @@ pub async fn run_with_overrides(
         }
     });
 
+    // Spawn reverse proxy client if enabled.
+    // The shutdown sender is held in _rp_shutdown until the tonic server
+    // future completes (end of function), then drops to signal shutdown.
+    let _rp_shutdown = if loaded.reverse_proxy.enable {
+        let rp_config = loaded.reverse_proxy.clone();
+        let rp_state = state.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            reverse_client::run_reverse_proxy_client(rp_config, rp_state, rx).await;
+        });
+        Some(tx)
+    } else {
+        None
+    };
+
     // Spawn SIGHUP handler for config reload + log reopen.
     let sighup_state = state.clone();
     tokio::spawn(async move {
@@ -340,7 +417,10 @@ pub async fn run_with_overrides(
         }
     });
 
-    let incoming = ReceiverStream::new(receiver_map_incoming(incoming_rx));
+    let incoming = ReceiverStream::new(receiver_map_incoming(
+        incoming_rx,
+        state.reverse_proxy_registry.clone(),
+    ));
     Server::builder()
         .add_service(proto_rpc::xho_rpc_server::XhoRpcServer::new(
             XhoRpcService {
@@ -458,7 +538,8 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                 );
 
                 let gateway = state
-                    .find_gateway(&route.gateway_name)
+                    .find_gateway_any(&route.gateway_name)
+                    .await
                     .ok_or_else(|| anyhow!("gateway '{}' not found", route.gateway_name))?;
 
                 let mut download_relay_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -612,6 +693,20 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                 }
             })
             .collect();
+        let rp_nodes = self
+            .state
+            .reverse_proxy_registry
+            .list_nodes()
+            .await
+            .into_iter()
+            .map(|n| proto_rpc::ReverseProxyNodeStatus {
+                name: n.name,
+                peer_addr: n.peer_addr,
+                fingerprint: n.fingerprint,
+                connected_at: n.connected_at,
+            })
+            .collect();
+
         let response = proto_rpc::StatusResponse {
             daemon_running: true,
             local_socket_path: socket_path,
@@ -643,18 +738,38 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
             } else {
                 String::new()
             },
+            reverse_proxy_server_enabled: config.server.remote.reverse_proxy_enable,
+            reverse_proxy_nodes: rp_nodes,
+            reverse_proxy_client_enabled: config.reverse_proxy.enable,
+            reverse_proxy_client_target: if config.reverse_proxy.enable {
+                config.reverse_proxy.server_address.clone()
+            } else {
+                String::new()
+            },
+            reverse_proxy_client_status: if config.reverse_proxy.enable {
+                "active".to_string()
+            } else {
+                "disabled".to_string()
+            },
         };
         Ok(Response::new(response))
     }
 
     async fn list_servers(
         &self,
-        _request: Request<proto_rpc::ServerListRequest>,
+        request: Request<proto_rpc::ServerListRequest>,
     ) -> Result<Response<proto_rpc::ServerListResponse>, Status> {
         let config = self.state.config.read().await.clone();
         let path = PathBuf::from(&config.ssh.server_config_path);
 
-        let (tagged_entries, source_status) = rpc::process_list_servers(&self.state).await;
+        // When called from another xhod (forward gateway or reverse proxy),
+        // skip reverse proxy gateways to prevent recursive list_servers loops.
+        let no_recurse = request
+            .metadata()
+            .get("xho-no-recurse")
+            .is_some();
+        let (tagged_entries, source_status) =
+            rpc::process_list_servers(&self.state, no_recurse).await;
 
         // Convert entries to RPC format (flat list without source).
         let servers: Vec<proto_rpc::ServerEntry> = tagged_entries
@@ -870,15 +985,18 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
         } else {
             Duration::from_secs(req.ttl_secs)
         };
-        let label = req.label.filter(|s| !s.trim().is_empty()).map(|s| s.trim().to_string());
-        let token = self
-            .state
-            .token_store
-            .generate(ttl, req.once, label)
-            .await;
+        let label = req
+            .label
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string());
+        let token = self.state.token_store.generate(ttl, req.once, label).await;
         let expires_at = std::time::SystemTime::now() + ttl;
         let expires_at_str = token_store::format_rfc3339_utc(expires_at);
-        info!(once = req.once, ttl_secs = req.ttl_secs, "issued bootstrap token");
+        info!(
+            once = req.once,
+            ttl_secs = req.ttl_secs,
+            "issued bootstrap token"
+        );
         Ok(Response::new(proto_rpc::TokenGenResponse {
             token,
             expires_at: expires_at_str,
@@ -922,7 +1040,9 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
         if invalidated {
             info!(prefix = req.token_or_prefix, "invalidated bootstrap token");
         }
-        Ok(Response::new(proto_rpc::TokenInvalidateResponse { invalidated }))
+        Ok(Response::new(proto_rpc::TokenInvalidateResponse {
+            invalidated,
+        }))
     }
 
     async fn bootstrap_authorize(
@@ -932,7 +1052,9 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
         let req = request.into_inner();
         let key = russh::keys::ssh_key::PublicKey::from_openssh(req.public_key.trim())
             .map_err(|e| Status::invalid_argument(format!("invalid public key: {e}")))?;
-        let fingerprint = key.fingerprint(russh::keys::ssh_key::HashAlg::Sha256).to_string();
+        let fingerprint = key
+            .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
+            .to_string();
         let path_str = {
             let config = self.state.config.read().await;
             config.server.remote.authorized_keys_path.clone()
@@ -1114,7 +1236,8 @@ async fn process_execute(
 
     // Execute via gateway
     let gateway = state
-        .find_gateway(&route.gateway_name)
+        .find_gateway_any(&route.gateway_name)
+        .await
         .ok_or_else(|| anyhow!("gateway '{}' not found", route.gateway_name))?;
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -1399,7 +1522,8 @@ async fn process_interactive_execute(
 
     // Open interactive session via gateway
     let gateway = state
-        .find_gateway(&route.gateway_name)
+        .find_gateway_any(&route.gateway_name)
+        .await
         .ok_or_else(|| anyhow!("gateway '{}' not found", route.gateway_name))?;
 
     let (event_tx, mut _event_rx) = mpsc::unbounded_channel();
@@ -1561,13 +1685,28 @@ async fn shutdown_daemon(state: &DaemonState) -> Result<()> {
 
 fn receiver_map_incoming(
     receiver: mpsc::Receiver<IncomingConn>,
+    reverse_proxy_registry: Arc<reverse_proxy::ReverseProxyRegistry>,
 ) -> mpsc::Receiver<Result<IncomingConn, io::Error>> {
     let (tx, rx) = mpsc::channel(32);
     tokio::spawn(async move {
         let mut receiver = receiver;
         while let Some(conn) = receiver.recv().await {
-            if tx.send(Ok(conn)).await.is_err() {
-                break;
+            match conn {
+                IncomingConn::ReverseProxy(handshake) => {
+                    let registry = reverse_proxy_registry.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            reverse_proxy::process_reverse_handshake(&registry, handshake).await
+                        {
+                            warn!(error = %format!("{e:#}"), "reverse proxy handshake failed");
+                        }
+                    });
+                }
+                other => {
+                    if tx.send(Ok(other)).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -1680,6 +1819,7 @@ pub mod test_support {
             cli_start_options: CliStartOptions::default(),
             token_store: token_store::TokenStore::new(),
             authorized_keys_lock: Arc::new(tokio::sync::Mutex::new(())),
+            reverse_proxy_registry: Arc::new(reverse_proxy::ReverseProxyRegistry::new()),
         };
         proto_rpc::xho_rpc_server::XhoRpcServer::new(XhoRpcService { state })
     }

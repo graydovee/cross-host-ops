@@ -19,18 +19,24 @@ use tokio::sync::mpsc;
 use tonic::transport::server::Connected;
 use tracing::{info, warn};
 
-use crate::config::Secret;
 use super::DaemonState;
+use crate::config::Secret;
 
 // ---------------------------------------------------------------------------
 // Subsystem name constant
 // ---------------------------------------------------------------------------
 
 const REMOTE_SUBSYSTEM_NAME: &str = "xho-rpc";
+const REVERSE_PROXY_SUBSYSTEM_NAME: &str = "xho-reverse";
 
 /// Returns the SSH subsystem name used for xho gRPC-over-SSH connections.
 pub(crate) fn remote_subsystem_name() -> &'static str {
     REMOTE_SUBSYSTEM_NAME
+}
+
+/// Returns the SSH subsystem name used for reverse proxy connections.
+pub(crate) fn reverse_proxy_subsystem_name() -> &'static str {
+    REVERSE_PROXY_SUBSYSTEM_NAME
 }
 
 // Note: DaemonState is now the gateway-based state struct from super (daemon/mod.rs).
@@ -44,6 +50,14 @@ pub(crate) fn remote_subsystem_name() -> &'static str {
 pub(super) enum IncomingConn {
     Local(UnixStream),
     Remote(RemoteChannelStream),
+    ReverseProxy(ReverseProxyHandshake),
+}
+
+/// A reverse proxy handshake: an SSH channel stream that will be used to
+/// establish a gRPC client back to the connecting node.
+pub(super) struct ReverseProxyHandshake {
+    pub stream: russh::ChannelStream<russh::server::Msg>,
+    pub info: RemoteConnectInfo,
 }
 
 /// Metadata about a remote SSH connection (peer address, user, key fingerprint).
@@ -94,6 +108,8 @@ impl Connected for IncomingConn {
         match self {
             Self::Local(_) => None,
             Self::Remote(stream) => Some(stream.info.clone()),
+            // Reverse proxy connections are intercepted before reaching tonic.
+            Self::ReverseProxy(_) => None,
         }
     }
 }
@@ -113,6 +129,9 @@ impl tokio::io::AsyncRead for IncomingConn {
             IncomingConn::Remote(stream) => {
                 std::pin::Pin::new(&mut stream.stream).poll_read(cx, buf)
             }
+            IncomingConn::ReverseProxy(_) => {
+                panic!("reverse proxy connection should not reach tonic transport")
+            }
         }
     }
 }
@@ -128,6 +147,9 @@ impl tokio::io::AsyncWrite for IncomingConn {
             IncomingConn::Remote(stream) => {
                 std::pin::Pin::new(&mut stream.stream).poll_write(cx, buf)
             }
+            IncomingConn::ReverseProxy(_) => {
+                panic!("reverse proxy connection should not reach tonic transport")
+            }
         }
     }
 
@@ -138,6 +160,9 @@ impl tokio::io::AsyncWrite for IncomingConn {
         match &mut *self {
             IncomingConn::Local(stream) => std::pin::Pin::new(stream).poll_flush(cx),
             IncomingConn::Remote(stream) => std::pin::Pin::new(&mut stream.stream).poll_flush(cx),
+            IncomingConn::ReverseProxy(_) => {
+                panic!("reverse proxy connection should not reach tonic transport")
+            }
         }
     }
 
@@ -149,6 +174,9 @@ impl tokio::io::AsyncWrite for IncomingConn {
             IncomingConn::Local(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
             IncomingConn::Remote(stream) => {
                 std::pin::Pin::new(&mut stream.stream).poll_shutdown(cx)
+            }
+            IncomingConn::ReverseProxy(_) => {
+                panic!("reverse proxy connection should not reach tonic transport")
             }
         }
     }
@@ -211,11 +239,7 @@ impl server::Handler for RemoteSshHandler {
     /// (issued by `xho token gen`) or matches the configured `bootstrap_token`
     /// as the SSH password. Accepting here lets the client open a gRPC channel
     /// and call `BootstrapAuthorize` to register its public key.
-    async fn auth_password(
-        &mut self,
-        user: &str,
-        password: &str,
-    ) -> Result<Auth, Self::Error> {
+    async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
         let config = self.state.config.read().await.clone();
         if user != config.server.remote.user {
             return Ok(Auth::Reject {
@@ -237,10 +261,7 @@ impl server::Handler for RemoteSshHandler {
             let secret = Secret::from_reference(bt);
             match secret.resolve(&resolver) {
                 Ok(resolved) if !resolved.is_empty() => {
-                    let ok: bool = password
-                        .as_bytes()
-                        .ct_eq(resolved.as_bytes())
-                        .into();
+                    let ok: bool = password.as_bytes().ct_eq(resolved.as_bytes()).into();
                     if ok {
                         self.authed_via_token = true;
                         self.accepted_user = Some(user.to_string());
@@ -295,7 +316,14 @@ impl server::Handler for RemoteSshHandler {
         name: &str,
         session: &mut server::Session,
     ) -> Result<(), Self::Error> {
-        if name != remote_subsystem_name() {
+        // Determine if this is a reverse proxy subsystem request.
+        let reverse_enabled = {
+            let config = self.state.config.read().await;
+            config.server.remote.reverse_proxy_enable
+        };
+        let is_reverse = name == reverse_proxy_subsystem_name();
+
+        if name != remote_subsystem_name() && !(is_reverse && reverse_enabled) {
             session.channel_failure(channel)?;
             return Ok(());
         }
@@ -311,13 +339,26 @@ impl server::Handler for RemoteSshHandler {
             public_key_fingerprint: self.accepted_fingerprint.clone().unwrap_or_default(),
         };
         session.channel_success(channel)?;
-        self.accepted_tx
-            .send(IncomingConn::Remote(RemoteChannelStream {
-                stream: channel_stream.into_stream(),
-                info,
-            }))
-            .await
-            .map_err(|_| anyhow!("remote incoming queue closed"))?;
+
+        if is_reverse {
+            self.accepted_tx
+                .send(IncomingConn::ReverseProxy(
+                    super::ssh_server::ReverseProxyHandshake {
+                        stream: channel_stream.into_stream(),
+                        info,
+                    },
+                ))
+                .await
+                .map_err(|_| anyhow!("reverse proxy incoming queue closed"))?;
+        } else {
+            self.accepted_tx
+                .send(IncomingConn::Remote(RemoteChannelStream {
+                    stream: channel_stream.into_stream(),
+                    info,
+                }))
+                .await
+                .map_err(|_| anyhow!("remote incoming queue closed"))?;
+        }
         Ok(())
     }
 

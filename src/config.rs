@@ -4,6 +4,7 @@ mod duration;
 mod gateway;
 mod inventory;
 mod path;
+mod reverse_proxy;
 mod review;
 mod secret;
 mod server;
@@ -31,6 +32,7 @@ pub use self::path::{
     default_client_config_path, default_config_path, default_known_hosts_path, default_root_dir,
     default_vault_path, expand_tilde,
 };
+pub use self::reverse_proxy::ReverseProxyClientConfig;
 pub use self::review::{
     FastAllowlistConfig, MfaConfig, ReviewAction, ReviewConfig, ReviewPolicy, ReviewPrompts,
     RiskLevel, SemanticWhitelistEntry, default_review_api_key, default_review_endpoint,
@@ -53,6 +55,8 @@ pub struct AppConfig {
     pub secret: SecretConfig,
     #[serde(default)]
     pub gateways: Vec<GatewayConfig>,
+    #[serde(default)]
+    pub reverse_proxy: ReverseProxyClientConfig,
     /// Directory the config was loaded from (not serialized). The vault lives
     /// here by default so it follows the config file — e.g. `/etc/xho/secrets`
     /// when loaded from `/etc/xho/config.toml`.
@@ -69,6 +73,7 @@ impl Default for AppConfig {
             review: ReviewConfig::default(),
             secret: SecretConfig::default(),
             gateways: Vec::new(),
+            reverse_proxy: ReverseProxyClientConfig::default(),
             config_dir: None,
         }
     }
@@ -125,6 +130,9 @@ impl AppConfig {
                 }
             }
         }
+
+        self.reverse_proxy.identity_file = expand_tilde(&self.reverse_proxy.identity_file)?;
+        self.reverse_proxy.known_hosts_path = expand_tilde(&self.reverse_proxy.known_hosts_path)?;
         Ok(())
     }
 
@@ -132,6 +140,7 @@ impl AppConfig {
         self.server.validate()?;
         validate_gateways(&self.gateways)?;
         validate_fallback_references(&self.ssh.fallback, &self.gateways)?;
+        self.reverse_proxy.validate()?;
         Ok(())
     }
 

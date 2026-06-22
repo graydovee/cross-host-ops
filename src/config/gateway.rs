@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use super::ssh::FallbackEntry;
 use super::secret::Secret;
+use super::ssh::FallbackEntry;
 
 /// Names reserved by the system that cannot be assigned to any gateway entry.
 /// Currently only `"local"` is reserved (it names the local daemon's own

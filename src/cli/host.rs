@@ -163,10 +163,7 @@ async fn remote_connect(
     // --- Step 5: Bootstrap (auto-append the local public key) ---
     // The bootstrap happens BEFORE we persist the gateway so a failed token
     // leaves the local config untouched (no half-configured entry).
-    let token = resolve_token(
-        token_arg,
-        "token for remote xhod (empty to skip bootstrap)",
-    )?;
+    let token = resolve_token(token_arg, "token for remote xhod (empty to skip bootstrap)")?;
     if let Some(token) = token {
         bootstrap_authorize(&remote_addr.format(), &token, Path::new(&identity_file)).await?;
     } else {

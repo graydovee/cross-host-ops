@@ -126,10 +126,11 @@ impl Secret {
                 Ok(Zeroizing::new(value))
             }
             SecretSource::File(path) => {
-                let raw = fs::read_to_string(path).with_context(|| {
-                    format!("failed to read secret file {}", path.display())
-                })?;
-                Ok(Zeroizing::new(raw.trim_end_matches(['\n', '\r']).to_string()))
+                let raw = fs::read_to_string(path)
+                    .with_context(|| format!("failed to read secret file {}", path.display()))?;
+                Ok(Zeroizing::new(
+                    raw.trim_end_matches(['\n', '\r']).to_string(),
+                ))
             }
             SecretSource::Vault(name) => resolver.resolve_vault(name),
         }

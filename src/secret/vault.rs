@@ -277,8 +277,7 @@ fn write_file_secure(path: &Path, bytes: &[u8]) -> Result<()> {
     ));
     fs::write(&tmp, bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
     set_owner_only(&tmp)?;
-    fs::rename(&tmp, path)
-        .with_context(|| format!("failed to replace {}", path.display()))?;
+    fs::rename(&tmp, path).with_context(|| format!("failed to replace {}", path.display()))?;
     Ok(())
 }
 

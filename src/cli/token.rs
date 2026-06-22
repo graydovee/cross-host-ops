@@ -57,7 +57,11 @@ async fn generate(
     println!("expires_at:   {}", response.expires_at);
     println!(
         "reusable:     {}",
-        if response.once { "no (single-use)" } else { "yes" }
+        if response.once {
+            "no (single-use)"
+        } else {
+            "yes"
+        }
     );
     eprintln!();
     eprintln!("warning: this token is shown only once; copy it now.");

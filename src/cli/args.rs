@@ -223,7 +223,11 @@ pub enum TokenCommand {
     /// single-use). Run this on the remote host where xhod lives.
     #[command(about = "Generate a short-lived bootstrap token")]
     Gen {
-        #[arg(long = "ttl", value_name = "DURATION", help = "e.g. 5m, 1h, 30s (default: 5m)")]
+        #[arg(
+            long = "ttl",
+            value_name = "DURATION",
+            help = "e.g. 5m, 1h, 30s (default: 5m)"
+        )]
         ttl: Option<String>,
         /// Allow the token to be used multiple times within its TTL (default:
         /// consumed on first use).

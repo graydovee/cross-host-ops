@@ -18,7 +18,10 @@ use crate::secret::Vault;
 use super::args::SecretCommand;
 use super::prompt::prompt_for_auth_input;
 
-pub(crate) fn run_secret_command(config_path: Option<&Path>, command: SecretCommand) -> Result<i32> {
+pub(crate) fn run_secret_command(
+    config_path: Option<&Path>,
+    command: SecretCommand,
+) -> Result<i32> {
     match command {
         SecretCommand::Encrypt { dry_run } => encrypt(config_path, dry_run),
         SecretCommand::Set { name } => set(config_path, &name),
@@ -206,8 +209,8 @@ fn read_doc(path: &Path) -> Result<Option<DocumentMut>> {
     if !path.exists() {
         return Ok(None);
     }
-    let raw =
-        std::fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
     let doc = raw
         .parse::<DocumentMut>()
         .with_context(|| format!("failed to parse {}", path.display()))?;
@@ -329,7 +332,10 @@ fn rewrite_config_secrets(doc: &mut DocumentMut) {
         }
     }
 
-    if let Some(gateways) = doc.get_mut("gateways").and_then(Item::as_array_of_tables_mut) {
+    if let Some(gateways) = doc
+        .get_mut("gateways")
+        .and_then(Item::as_array_of_tables_mut)
+    {
         for gw in gateways.iter_mut() {
             let name = gw
                 .get("name")
@@ -384,20 +390,26 @@ fn backup_and_write(path: &Path, contents: &str) -> Result<()> {
             .map(|e| format!("{e}."))
             .unwrap_or_default()
     ));
-    std::fs::copy(path, &backup)
-        .with_context(|| format!("failed to back up {} to {}", path.display(), backup.display()))?;
+    std::fs::copy(path, &backup).with_context(|| {
+        format!(
+            "failed to back up {} to {}",
+            path.display(),
+            backup.display()
+        )
+    })?;
 
     let dir = path
         .parent()
         .ok_or_else(|| anyhow!("config path has no parent directory"))?;
     let tmp = dir.join(format!(
         ".{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("config")
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("config")
     ));
     std::fs::write(&tmp, contents).with_context(|| format!("failed to write {}", tmp.display()))?;
     copy_permissions(path, &tmp);
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("failed to replace {}", path.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("failed to replace {}", path.display()))?;
     println!("backed up {} -> {}", path.display(), backup.display());
     Ok(())
 }

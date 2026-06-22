@@ -4,9 +4,7 @@
 
 use std::path::Path;
 
-use xho::config::{
-    Secret, SecretResolver, ServerDefaults, ServerHostConfig, resolve_server_entry,
-};
+use xho::config::{Secret, SecretResolver, ServerDefaults, ServerHostConfig, resolve_server_entry};
 use xho::secret::Vault;
 
 /// Write a fresh unencrypted Ed25519 identity to `dir/name`, returning its path.

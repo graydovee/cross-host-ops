@@ -56,6 +56,9 @@ impl ServerConfig {
             if self.remote.authorized_keys_path.trim().is_empty() {
                 bail!("server.remote.authorized_keys_path must not be empty");
             }
+            if self.remote.reverse_proxy_enable {
+                // reverse_proxy_enable requires remote.enable, already checked above.
+            }
         }
         Ok(())
     }
@@ -90,6 +93,11 @@ pub struct RemoteServerConfig {
     /// supported by the secret resolver (`vault:NAME`, `env:VAR`, `file:PATH`).
     /// Storing plaintext here is a security risk — prefer `vault:` references.
     pub bootstrap_token: Option<String>,
+    /// When `true`, accept reverse proxy connections (the `xho-reverse` SSH
+    /// subsystem) from nodes without public IPs. Nodes authenticate via the
+    /// same `authorized_keys_path` and register as dynamic gateways.
+    /// Requires `enable = true`.
+    pub reverse_proxy_enable: bool,
 }
 
 impl Default for RemoteServerConfig {
@@ -101,6 +109,7 @@ impl Default for RemoteServerConfig {
             host_key_path: "~/.xho/host_key".to_string(),
             authorized_keys_path: "~/.xho/authorized_keys".to_string(),
             bootstrap_token: None,
+            reverse_proxy_enable: false,
         }
     }
 }

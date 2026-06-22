@@ -38,6 +38,7 @@ pub struct ServerHostConfig {
 pub enum DirectAuth {
     Key { identity_file: String },
     Password { password: String },
+    None,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,6 +55,7 @@ impl ServerEntry {
         match self.auth {
             DirectAuth::Key { .. } => "key",
             DirectAuth::Password { .. } => "password",
+            DirectAuth::None => "none",
         }
     }
 }
@@ -182,9 +184,9 @@ pub fn resolve_server_entry(
 ) -> Result<ServerEntry> {
     let auth = if let Some(password) = &server.password {
         let plaintext = match resolver {
-            Some(resolver) => password.resolve(resolver).with_context(|| {
-                format!("failed to resolve password for server entry {alias}")
-            })?,
+            Some(resolver) => password
+                .resolve(resolver)
+                .with_context(|| format!("failed to resolve password for server entry {alias}"))?,
             None => Default::default(),
         };
         DirectAuth::Password {

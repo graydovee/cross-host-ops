@@ -83,8 +83,7 @@ fn tmp_authorized_keys_path(label: &str) -> PathBuf {
 
 fn random_keypair_openssh() -> String {
     let mut rng = rand_core::UnwrapErr(getrandom::SysRng);
-    let key =
-        ssh_key::PrivateKey::random(&mut rng, ssh_key::Algorithm::Ed25519).expect("gen key");
+    let key = ssh_key::PrivateKey::random(&mut rng, ssh_key::Algorithm::Ed25519).expect("gen key");
     key.public_key().to_openssh().expect("serialize pubkey")
 }
 
@@ -94,7 +93,10 @@ async fn token_gen_list_invalidate_roundtrip() -> Result<()> {
     let mut client = spawn_service_with_authorized_keys(ak_path).await;
 
     // Initially empty.
-    let list = client.token_list(rpc::TokenListRequest {}).await?.into_inner();
+    let list = client
+        .token_list(rpc::TokenListRequest {})
+        .await?
+        .into_inner();
     assert!(list.tokens.is_empty());
 
     // Generate a once token with 60s TTL.
@@ -112,7 +114,10 @@ async fn token_gen_list_invalidate_roundtrip() -> Result<()> {
     let prefix: String = generated.token.chars().take(8).collect();
 
     // List reflects it.
-    let list = client.token_list(rpc::TokenListRequest {}).await?.into_inner();
+    let list = client
+        .token_list(rpc::TokenListRequest {})
+        .await?
+        .into_inner();
     assert_eq!(list.tokens.len(), 1);
     assert_eq!(list.tokens[0].prefix, prefix);
     assert!(list.tokens[0].once);
@@ -129,7 +134,10 @@ async fn token_gen_list_invalidate_roundtrip() -> Result<()> {
     assert!(inv.invalidated);
 
     // List now empty.
-    let list = client.token_list(rpc::TokenListRequest {}).await?.into_inner();
+    let list = client
+        .token_list(rpc::TokenListRequest {})
+        .await?
+        .into_inner();
     assert!(list.tokens.is_empty());
     Ok(())
 }

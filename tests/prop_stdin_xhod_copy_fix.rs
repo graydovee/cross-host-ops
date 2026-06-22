@@ -63,12 +63,12 @@ proptest! {
 
     /// **Validates: Requirements 1.1**
     ///
-    /// Property 1, Bug Condition A: LocalGateway exec with stdin never
+    /// Property 1, Bug Condition A: DirectGateway exec with stdin never
     /// forwards data to the SSH channel.
     ///
     /// When daemon receives Execute(stdin=true) + StdinData, it creates
     /// `stdin_rx` and passes it in `gateway::ExecRequest`. However,
-    /// `LocalGateway::exec` builds `ConnExecRequest` WITHOUT `stdin_rx`
+    /// `DirectGateway::exec` builds `ConnExecRequest` WITHOUT `stdin_rx`
     /// (the field doesn't exist in ConnExecRequest), so stdin is silently
     /// discarded. The remote process never sees the input.
     ///

@@ -21,6 +21,12 @@ use super::gateway::Route;
 /// The reserved alias representing the local daemon's own `server.toml`.
 const LOCAL_SOURCE_ALIAS: &str = "local";
 
+/// The reserved target for executing on the gateway's own host.
+const SELF_TARGET: &str = "_self";
+
+/// Reserved gateway name for local host access via LocalhostGateway.
+const SELF_GATEWAY_NAME: &str = "_self";
+
 /// Resolved route candidates plus an optional user-facing warning.
 #[derive(Clone, Debug)]
 pub struct ResolveResult {
@@ -41,6 +47,8 @@ pub struct Resolver<'a> {
     /// exists in sources that successfully reported a list.
     merged_rows: &'a [ServerListRow],
     source_status: &'a [(ServerListSource, ServerListSourceStatus)],
+    /// Names of dynamically registered gateways (reverse proxy nodes, `_self`).
+    dynamic_gateway_names: &'a [String],
 }
 
 impl<'a> Resolver<'a> {
@@ -55,6 +63,7 @@ impl<'a> Resolver<'a> {
             gateways,
             merged_rows: &[],
             source_status: &[],
+            dynamic_gateway_names: &[],
         }
     }
 
@@ -73,7 +82,20 @@ impl<'a> Resolver<'a> {
             gateways,
             merged_rows,
             source_status,
+            dynamic_gateway_names: &[],
         }
+    }
+
+    /// Set the dynamic gateway names (reverse proxy nodes, `_self`).
+    pub fn with_dynamic_gateways(mut self, names: &'a [String]) -> Self {
+        self.dynamic_gateway_names = names;
+        self
+    }
+
+    /// Check if a name matches any gateway (static config or dynamic).
+    fn is_any_gateway_name(&self, name: &str) -> bool {
+        self.gateways.iter().any(|gc| gc.name() == name)
+            || self.dynamic_gateway_names.contains(&name.to_string())
     }
 
     /// Resolve a CLI target string into candidate `Route`s.
@@ -92,10 +114,38 @@ impl<'a> Resolver<'a> {
     }
 
     pub fn resolve_with_warning(&self, input: &str) -> Result<ResolveResult> {
+        // Handle _self target → route to _self gateway (LocalhostGateway).
+        if input == SELF_TARGET {
+            if self.is_any_gateway_name(SELF_GATEWAY_NAME) {
+                return Ok(ResolveResult {
+                    routes: vec![Route {
+                        gateway_name: SELF_GATEWAY_NAME.to_string(),
+                        end_target: SELF_TARGET.to_string(),
+                    }],
+                    warning: None,
+                });
+            }
+            // _self gateway not registered; fall through to error.
+            bail!("'_self' target is not available on this daemon");
+        }
+
         // Try explicit `<jump_name>:<server_alias>` form first.
         if let Some((jump_name, server_alias)) = parse_explicit_qualified(input) {
             return Ok(ResolveResult {
                 routes: self.resolve_explicit(jump_name, server_alias)?,
+                warning: None,
+            });
+        }
+
+        // Handle bare gateway name → route to gateway with _self end_target.
+        // This enables `xho exec node-1:node-2 cmd` where "node-2" is a
+        // reverse proxy gateway name (no further colon-separated sub-target).
+        if self.is_any_gateway_name(input) && input != LOCAL_SOURCE_ALIAS {
+            return Ok(ResolveResult {
+                routes: vec![Route {
+                    gateway_name: input.to_string(),
+                    end_target: SELF_TARGET.to_string(),
+                }],
                 warning: None,
             });
         }
@@ -153,12 +203,22 @@ impl<'a> Resolver<'a> {
             );
         }
 
-        // Look up the gateway by name.
-        let gc = self
-            .gateways
-            .iter()
-            .find(|gc| gc.name() == jump_name)
-            .ok_or_else(|| anyhow!("gateway name '{}' not found", jump_name))?;
+        // Look up the gateway by name in static config.
+        let gc = self.gateways.iter().find(|gc| gc.name() == jump_name);
+
+        // If not in static config, check dynamic gateways.
+        if gc.is_none() {
+            if self.dynamic_gateway_names.contains(&jump_name.to_string()) {
+                // Dynamic gateway — create route directly.
+                return Ok(vec![Route {
+                    gateway_name: jump_name.to_string(),
+                    end_target: server_alias.to_string(),
+                }]);
+            }
+            return Err(anyhow!("gateway name '{}' not found", jump_name));
+        }
+
+        let gc = gc.unwrap();
 
         // Validate explicit targets only when the relevant source successfully
         // reported a list. An empty successful list proves absence; an
@@ -218,12 +278,14 @@ impl<'a> Resolver<'a> {
             let also_found = matches
                 .iter()
                 .skip(1)
-                .map(|(display_name, _)| display_name.as_str())
+                .map(|(display_name, _)| user_friendly_target_name(display_name))
                 .collect::<Vec<_>>()
                 .join(", ");
             Some(format!(
                 "warning: target '{}' matched multiple sources; using {}; also found {}",
-                alias, chosen.0, also_found
+                alias,
+                user_friendly_target_name(&chosen.0),
+                also_found
             ))
         } else {
             None
@@ -372,6 +434,16 @@ fn full_target_name(source: &ServerListSource, alias: &str) -> String {
         ServerListSource::Local => format!("{}:{}", LOCAL_SOURCE_ALIAS, alias),
         ServerListSource::Gateway(path) => format!("{}:{}", path, alias),
     }
+}
+
+/// Strip the `local:` prefix for user-facing display.
+/// Used in ambiguity warnings so users see bare aliases for local entries.
+fn user_friendly_target_name(full_name: &str) -> String {
+    full_target_name_strip_local(full_name)
+}
+
+fn full_target_name_strip_local(name: &str) -> String {
+    name.strip_prefix("local:").unwrap_or(name).to_string()
 }
 
 fn route_from_source(source: &ServerListSource, alias: &str) -> Result<Route> {
@@ -928,7 +1000,7 @@ mod tests {
         assert_eq!(result.routes[0].end_target, "shared");
         let warning = result.warning.expect("ambiguous match should warn");
         assert!(
-            warning.contains("using local:shared"),
+            warning.contains("using shared"),
             "warning should mention chosen target: {}",
             warning
         );
@@ -1080,9 +1152,7 @@ mod tests {
             &source_status,
         );
 
-        let routes = resolver
-            .resolve("corp-jump:asset-198-51-100-22")
-            .unwrap();
+        let routes = resolver.resolve("corp-jump:asset-198-51-100-22").unwrap();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].gateway_name, "corp-jump");
         assert_eq!(routes[0].end_target, "asset-198-51-100-22");

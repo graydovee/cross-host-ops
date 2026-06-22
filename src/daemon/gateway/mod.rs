@@ -2,8 +2,9 @@
 // Will contain the Gateway trait, GatewayKind, Route, GatewayError, and build_gateways factory.
 
 pub mod auth;
+pub mod direct;
 pub mod jumpserver;
-pub mod local;
+pub mod localhost;
 pub mod xhod;
 
 use std::fmt;
@@ -19,8 +20,8 @@ use crate::protocol::{ServerEvent, ServerListRow};
 use crate::types::{CopySpec, FlagIntent};
 
 use self::auth::AuthPrompter;
+use self::direct::DirectGateway;
 use self::jumpserver::JumpserverGateway;
-use self::local::LocalGateway;
 use self::xhod::XhodGateway;
 
 // ---------------------------------------------------------------------------
@@ -69,6 +70,8 @@ pub enum GatewayKind {
     Xhod,
     Jumpserver,
     Direct,
+    ReverseProxy,
+    Localhost,
 }
 
 impl std::fmt::Display for GatewayKind {
@@ -77,6 +80,8 @@ impl std::fmt::Display for GatewayKind {
             GatewayKind::Direct => write!(f, "direct"),
             GatewayKind::Jumpserver => write!(f, "jumpserver"),
             GatewayKind::Xhod => write!(f, "xhod"),
+            GatewayKind::ReverseProxy => write!(f, "reverse_proxy"),
+            GatewayKind::Localhost => write!(f, "localhost"),
         }
     }
 }
@@ -285,7 +290,7 @@ mod tests {
 // ---------------------------------------------------------------------------
 
 /// Construct all Gateways from the loaded configuration.
-/// Always creates one LocalGateway named "local".
+/// Always creates one DirectGateway named "local".
 /// Creates one XhodGateway or JumpserverGateway per `[[gateways]]` entry.
 /// No network connections are established during construction.
 pub fn build_gateways(
@@ -313,7 +318,7 @@ pub fn build_gateways(
     // Always create the "local" gateway first.
     gateways.push((
         "local".to_string(),
-        Arc::new(LocalGateway::new(
+        Arc::new(DirectGateway::new(
             "local".to_string(),
             config.clone(),
             server_config_path.to_string(),
@@ -342,10 +347,10 @@ pub fn build_gateways(
                 max_idle_time,
             )),
             GatewayConfig::Direct(c) => {
-                // Direct gateways are treated as a LocalGateway with their own name.
+                // Direct gateways are treated as a DirectGateway with their own name.
                 // They use the same server.toml resolution as "local" but route
                 // through the named gateway for resolver distinction.
-                Arc::new(LocalGateway::new(
+                Arc::new(DirectGateway::new(
                     c.name.clone(),
                     config.clone(),
                     server_config_path.to_string(),

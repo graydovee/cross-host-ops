@@ -283,6 +283,8 @@ impl TestHarness {
             GatewayKind::Direct => end_alias.to_string(),
             GatewayKind::Jumpserver => end_alias.to_string(),
             GatewayKind::Xhod => format!("xhod:{}", end_alias),
+            GatewayKind::ReverseProxy => format!("reverse_proxy:{}", end_alias),
+            GatewayKind::Localhost => format!("_self:{}", end_alias),
         }
     }
 
@@ -394,6 +396,9 @@ fn build_server_toml(servers: &[ServerEntry]) -> String {
             }
             DirectAuth::Password { .. } => {
                 toml.push_str("auth = \"password\"\n");
+            }
+            DirectAuth::None => {
+                toml.push_str("auth = \"none\"\n");
             }
         }
         toml.push('\n');

@@ -30,8 +30,8 @@ pub(crate) async fn bootstrap_authorize(
     token: &str,
     identity_file: &Path,
 ) -> Result<()> {
-    let target = parse_remote_target(addr)
-        .with_context(|| format!("failed to parse address {addr}"))?;
+    let target =
+        parse_remote_target(addr).with_context(|| format!("failed to parse address {addr}"))?;
     let pubkey = read_pubkey_sidecar(identity_file)?;
     let pubkey_line = pubkey
         .to_openssh()
@@ -98,13 +98,9 @@ async fn open_rpc_stream(
     token: &str,
 ) -> Result<russh::ChannelStream<client::Msg>> {
     let client_config = client::Config::default();
-    let mut handle = client::connect(
-        Arc::new(client_config),
-        (host, port),
-        ClientHandler,
-    )
-    .await
-    .map_err(|e| anyhow!("SSH connection to {host}:{port} failed: {e}"))?;
+    let mut handle = client::connect(Arc::new(client_config), (host, port), ClientHandler)
+        .await
+        .map_err(|e| anyhow!("SSH connection to {host}:{port} failed: {e}"))?;
 
     authenticate_with_password(&mut handle, user, token)
         .await

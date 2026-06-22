@@ -212,6 +212,18 @@ message StatusResponse {
   bool remote_listening = 14;
   string remote_addr = 15;
   string remote_ssh_user = 16;
+  bool reverse_proxy_server_enabled = 17;
+  repeated ReverseProxyNodeStatus reverse_proxy_nodes = 18;
+  bool reverse_proxy_client_enabled = 19;
+  string reverse_proxy_client_target = 20;
+  string reverse_proxy_client_status = 21;
+}
+
+message ReverseProxyNodeStatus {
+  string name = 1;
+  string peer_addr = 2;
+  string fingerprint = 3;
+  uint64 connected_at = 4;
 }
 
 message ServerListResponse {

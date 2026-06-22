@@ -77,6 +77,9 @@ impl DirectConnection {
             DirectAuth::Password { password } => {
                 authenticate_with_password(&mut handle, user, password).await?;
             }
+            DirectAuth::None => {
+                anyhow::bail!("DirectAuth::None is not valid for SSH connections");
+            }
         }
         // Probe: open and immediately close a session channel to verify
         // the connection is fully established.

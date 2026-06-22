@@ -309,8 +309,14 @@ impl XhodGateway {
         &self,
         mut client: rpc::xho_rpc_client::XhoRpcClient<Channel>,
     ) -> Result<Vec<ServerListRow>, GatewayError> {
+        let mut request = tonic::Request::new(rpc::ServerListRequest {});
+        // Prevent recursive list_servers through reverse proxy loops.
+        request
+            .metadata_mut()
+            .insert("xho-no-recurse", "true".parse().unwrap());
+
         let response = client
-            .list_servers(rpc::ServerListRequest {})
+            .list_servers(request)
             .await
             .map_err(|e| GatewayError::transport(anyhow!("list_servers RPC failed: {}", e)))?
             .into_inner();

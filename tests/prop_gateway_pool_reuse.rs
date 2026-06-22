@@ -1,21 +1,21 @@
-//! Property-based test for LocalGateway pool reuse invariant.
+//! Property-based test for DirectGateway pool reuse invariant.
 //!
-//! Feature: gateway-refactor, Property 4: LocalGateway pool reuse invariant
+//! Feature: gateway-refactor, Property 4: DirectGateway pool reuse invariant
 //!
 //! **Validates: Requirements 3.1, 3.2, 3.4, 14.2**
 //!
-//! For any sequence of exec calls to a LocalGateway targeting the same
+//! For any sequence of exec calls to a DirectGateway targeting the same
 //! host:port address, the gateway SHALL reuse idle connections from the pool
 //! before creating new ones, and the number of pooled connections per address
 //! SHALL never exceed max_connections_per_ip.
 //!
-//! NOTE: Since LocalGateway's internal pool methods are private and require
+//! NOTE: Since DirectGateway's internal pool methods are private and require
 //! real SSH connections, the core property tests live in
 //! `src/daemon/gateway/local.rs` as a `#[cfg(test)] mod tests` block which
 //! has private access.
 //!
 //! This integration test exercises the pool invariants at a higher level using
-//! a simulation model that mirrors the exact same logic as LocalGateway's pool
+//! a simulation model that mirrors the exact same logic as DirectGateway's pool
 //! (acquire → reuse idle → create new → return → enforce capacity).
 
 use proptest::prelude::*;
@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------
-// Pool simulation model — mirrors LocalGateway's internal pool semantics.
+// Pool simulation model — mirrors DirectGateway's internal pool semantics.
 // ---------------------------------------------------------------------------
 
 /// Simulated pooled connection for property testing.
@@ -50,7 +50,7 @@ impl SimConnection {
     }
 }
 
-/// Pool simulator matching LocalGateway's acquire/return/discard semantics.
+/// Pool simulator matching DirectGateway's acquire/return/discard semantics.
 struct PoolSim {
     slots: Vec<Arc<SimConnection>>,
     max_connections: usize,
@@ -66,7 +66,7 @@ impl PoolSim {
         }
     }
 
-    /// Acquire an idle connection. Mirrors LocalGateway::acquire_connection:
+    /// Acquire an idle connection. Mirrors DirectGateway::acquire_connection:
     /// pops from the vec, checks is_alive, discards dead ones.
     fn acquire(&mut self) -> Option<Arc<SimConnection>> {
         while let Some(slot) = self.slots.pop() {
@@ -77,13 +77,13 @@ impl PoolSim {
         None
     }
 
-    /// Create a new connection. Mirrors LocalGateway::create_connection.
+    /// Create a new connection. Mirrors DirectGateway::create_connection.
     fn create(&self) -> Arc<SimConnection> {
         self.total_created.fetch_add(1, Ordering::Relaxed);
         SimConnection::new()
     }
 
-    /// Return a connection. Mirrors LocalGateway::return_connection:
+    /// Return a connection. Mirrors DirectGateway::return_connection:
     /// only pushes if slots.len() < max_connections.
     fn return_connection(&mut self, conn: Arc<SimConnection>) {
         if self.slots.len() < self.max_connections {
