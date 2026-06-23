@@ -52,8 +52,8 @@ use crate::protocol::{self, ExecRequest, ServerEvent, rpc as proto_rpc};
 use crate::types::{CopyDirection, CopyFrame, CopySpec};
 
 use self::gateway::Gateway;
-use self::gateway::auth::AuthPrompter;
 use self::gateway::Route;
+use self::gateway::auth::AuthPrompter;
 use self::resolver::{ResolveResult, Resolver};
 use self::review::CommandReviewer;
 
@@ -182,8 +182,8 @@ async fn resolve_target_with_merged_view(
     // Fast path: dynamic gateway names and _self don't need list_servers.
     let dynamic_names = state.reverse_proxy_registry.list_names().await;
     let all_static_names: Vec<String> = state.gateways.iter().map(|(n, _)| n.clone()).collect();
-    let is_gateway_name = all_static_names.iter().any(|n| n == target)
-        || dynamic_names.iter().any(|n| n == target);
+    let is_gateway_name =
+        all_static_names.iter().any(|n| n == target) || dynamic_names.iter().any(|n| n == target);
 
     if is_gateway_name && target != "local" {
         return Ok(ResolveResult {
@@ -764,10 +764,7 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
 
         // When called from another xhod (forward gateway or reverse proxy),
         // skip reverse proxy gateways to prevent recursive list_servers loops.
-        let no_recurse = request
-            .metadata()
-            .get("xho-no-recurse")
-            .is_some();
+        let no_recurse = request.metadata().get("xho-no-recurse").is_some();
         let (tagged_entries, source_status) =
             rpc::process_list_servers(&self.state, no_recurse).await;
 

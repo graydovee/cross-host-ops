@@ -143,8 +143,10 @@ pub async fn process_list_servers(
             }
             Err(_) => {
                 warn!(gateway = name.as_str(), "list_servers timed out");
-                source_status
-                    .push((source_tag, ServerListSourceStatus::Error("timeout".to_string())));
+                source_status.push((
+                    source_tag,
+                    ServerListSourceStatus::Error("timeout".to_string()),
+                ));
             }
         }
     }
@@ -179,13 +181,17 @@ pub async fn process_list_servers(
                 }
                 Ok(Err(e)) => {
                     warn!(gateway = name.as_str(), error = %e, "reverse proxy list_servers failed");
-                    source_status
-                        .push((source_tag, ServerListSourceStatus::Error(e.to_string())));
+                    source_status.push((source_tag, ServerListSourceStatus::Error(e.to_string())));
                 }
                 Err(_) => {
-                    warn!(gateway = name.as_str(), "reverse proxy list_servers timed out");
-                    source_status
-                        .push((source_tag, ServerListSourceStatus::Error("timeout".to_string())));
+                    warn!(
+                        gateway = name.as_str(),
+                        "reverse proxy list_servers timed out"
+                    );
+                    source_status.push((
+                        source_tag,
+                        ServerListSourceStatus::Error("timeout".to_string()),
+                    ));
                 }
             }
         } else {
