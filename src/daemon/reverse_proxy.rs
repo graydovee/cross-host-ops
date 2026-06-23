@@ -14,8 +14,7 @@ use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
 use russh::ChannelStream;
-use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tokio::sync::RwLock;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
@@ -54,8 +53,6 @@ pub struct ReverseProxyNodeInfo {
 struct RegisteredNode {
     gateway: Arc<dyn Gateway>,
     info: ReverseProxyNodeInfo,
-    /// When dropped, signals the keepalive task to stop.
-    _keepalive_handle: Option<tokio::task::AbortHandle>,
 }
 
 /// Snapshot of a node's status for RPC responses.
@@ -137,14 +134,7 @@ impl ReverseProxyRegistry {
             );
         }
         info!(node = %name, "registered reverse proxy node");
-        map.insert(
-            name.to_string(),
-            RegisteredNode {
-                gateway,
-                info,
-                _keepalive_handle: None,
-            },
-        );
+        map.insert(name.to_string(), RegisteredNode { gateway, info });
         Ok(())
     }
 
@@ -172,28 +162,10 @@ impl Default for ReverseProxyRegistry {
 // Handshake processing
 // ---------------------------------------------------------------------------
 
-/// JSON registration message sent by the node before gRPC starts.
-/// ```json
-/// {"name": "node-2"}
-/// ```
-fn parse_registration(json_line: &str) -> Result<String> {
-    let value: Value = serde_json::from_str(json_line)
-        .map_err(|e| anyhow!("failed to parse registration JSON: {}", e))?;
-    let name = value
-        .get("name")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("registration JSON missing 'name' field"))?
-        .to_string();
-    if name.is_empty() {
-        bail!("registration 'name' must not be empty");
-    }
-    Ok(name)
-}
-
-/// Process a reverse proxy handshake on the server side.
+/// Process a reverse proxy connection on the server side.
 ///
-/// 1. Read the registration line (`{"name":"..."}\n`).
-/// 2. Check for name conflict.
+/// The node name is parsed from the SSH subsystem name (`xho-reverse:<name>`).
+/// The channel stream goes directly to gRPC — no text handshake.
 /// 3. Send ack (`{"status":"ok"}\n` or error).
 /// 4. Create a gRPC client over the channel.
 /// 5. Register the node in the registry.
@@ -205,60 +177,31 @@ pub(super) async fn process_reverse_handshake(
     registry: &Arc<ReverseProxyRegistry>,
     handshake: ReverseProxyHandshake,
 ) -> Result<()> {
-    let ReverseProxyHandshake { stream, info } = handshake;
+    let ReverseProxyHandshake {
+        stream,
+        node_name,
+        info,
+    } = handshake;
 
-    // Wrap in BufReader for line-based reading.
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .await
-        .map_err(|e| anyhow!("failed to read registration line: {}", e))?;
-
-    let node_name = match parse_registration(&line) {
-        Ok(name) => name,
-        Err(e) => {
-            let msg = format!(r#"{{"status":"error","message":"{e}"}}"#);
-            let _ = reader.get_mut().write_all(msg.as_bytes()).await;
-            let _ = reader.get_mut().write_all(b"\n").await;
-            return Err(e);
-        }
-    };
+    // Node name was parsed from the subsystem name: "xho-reverse:<name>".
+    if node_name.is_empty() {
+        bail!("reverse proxy node name is empty (subsystem must be xho-reverse:<name>)");
+    }
 
     // Check for name conflict before proceeding.
     if registry.contains(&node_name).await {
-        let msg = format!(
-            r#"{{"status":"error","message":"name '{}' is already registered"}}"#,
+        bail!(
+            "reverse proxy node name '{}' is already registered; refusing new connection",
             node_name
         );
-        let _ = reader.get_mut().write_all(msg.as_bytes()).await;
-        let _ = reader.get_mut().write_all(b"\n").await;
-        bail!("reverse proxy node name '{}' already registered", node_name);
     }
 
-    // Send success ack.
-    let ack = r#"{"status":"ok"}"#;
-    reader
-        .get_mut()
-        .write_all(ack.as_bytes())
-        .await
-        .map_err(|e| anyhow!("failed to send ack: {}", e))?;
-    reader
-        .get_mut()
-        .write_all(b"\n")
-        .await
-        .map_err(|e| anyhow!("failed to send ack newline: {}", e))?;
-    reader
-        .get_mut()
-        .flush()
-        .await
-        .map_err(|e| anyhow!("failed to flush ack: {}", e))?;
+    info!(node = %node_name, "reverse proxy handshake accepted");
 
-    // Recover the raw stream for tonic gRPC client.
-    let channel_stream = reader.into_inner();
+    // Stream goes directly to gRPC — no text handshake, no BufReader.
 
-    // Create a tonic gRPC client over the SSH channel stream.
-    let client = create_grpc_client_over_stream(channel_stream).await?;
+    // Create a tonic gRPC client over the SSH channel stream (lazy connection).
+    let client = create_grpc_client_over_stream(stream);
 
     // Clone for health monitoring (tonic Channel is cheaply cloneable).
     let health_client = client.clone();
@@ -311,38 +254,29 @@ pub(super) async fn process_reverse_handshake(
 }
 
 /// Create a tonic gRPC client (`XhoRpcClient<Channel>`) over an SSH channel
-/// stream. The stream is consumed once; if it breaks, the client becomes
-/// invalid.
-async fn create_grpc_client_over_stream(
+/// stream. Uses `connect_with_connector_lazy` so the HTTP/2 handshake is
+/// deferred to the first RPC — avoids timing issues where the client-side
+/// tonic server hasn't started yet.
+fn create_grpc_client_over_stream(
     stream: ChannelStream<russh::server::Msg>,
-) -> Result<rpc::xho_rpc_client::XhoRpcClient<Channel>> {
+) -> rpc::xho_rpc_client::XhoRpcClient<Channel> {
     let io = TokioIo::new(stream);
 
-    // Use a oneshot cell so the connector can only be called once.
     let cell = Arc::new(tokio::sync::Mutex::new(Some(io)));
     let endpoint = Endpoint::from_static("http://[::]:50051");
-    let channel = endpoint
-        .connect_with_connector(service_fn(move |_: Uri| {
-            let cell = cell.clone();
-            async move {
-                match cell.lock().await.take() {
-                    Some(io) => Ok(io),
-                    None => Err(std::io::Error::new(
-                        std::io::ErrorKind::NotConnected,
-                        "reverse proxy stream already consumed",
-                    )),
-                }
+    let channel = endpoint.connect_with_connector_lazy(service_fn(move |_: Uri| {
+        let cell = cell.clone();
+        async move {
+            match cell.lock().await.take() {
+                Some(io) => Ok(io),
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "reverse proxy stream already consumed",
+                )),
             }
-        }))
-        .await
-        .map_err(|e| {
-            anyhow!(
-                "failed to create gRPC channel over reverse proxy stream: {}",
-                e
-            )
-        })?;
-
-    Ok(rpc::xho_rpc_client::XhoRpcClient::new(channel))
+        }
+    }));
+    rpc::xho_rpc_client::XhoRpcClient::new(channel)
 }
 
 // ---------------------------------------------------------------------------

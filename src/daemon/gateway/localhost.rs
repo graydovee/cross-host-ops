@@ -4,7 +4,6 @@
 // read/write handles so concurrent stdin/stdout never contend on a mutex.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
@@ -386,8 +385,10 @@ async fn exec_pipes(
     let exit_code = wait_child(&mut child, request).await?;
     let _ = stdout_task.await;
     let _ = stderr_task.await;
+    // Abort stdin task — awaiting it would deadlock because the sender
+    // is held by process_execute until this function returns.
     if let Some(t) = stdin_task {
-        let _ = t.await;
+        t.abort();
     }
     Ok(exit_code)
 }

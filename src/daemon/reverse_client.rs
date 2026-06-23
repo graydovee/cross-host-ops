@@ -1,22 +1,12 @@
 // Reverse proxy client — connects a node xhod (without a public IP) to a
 // server xhod (with a public IP) and serves gRPC over the SSH channel.
-//
-// The node registers itself as a dynamic gateway on the server, allowing
-// xho clients on other machines to reach this node through the server.
 
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
-use russh::ChannelStream;
 use russh::client;
 use russh::keys::{PrivateKeyWithHashAlg, load_secret_key};
-use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc;
 use tokio::time::sleep;
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::Server;
-use tonic::transport::server::Connected;
 use tracing::{info, warn};
 
 use crate::config::ReverseProxyClientConfig;
@@ -25,54 +15,7 @@ use crate::protocol::rpc as proto_rpc;
 
 use super::{DaemonState, XhoRpcService};
 
-/// Newtype wrapper around an SSH channel stream that adds `Connected` for
-/// tonic's server transport. `ChannelStream` already implements tokio's
-/// `AsyncRead` + `AsyncWrite`; we just delegate.
-struct ReverseProxyServerIo(ChannelStream<client::Msg>);
-
-impl Connected for ReverseProxyServerIo {
-    type ConnectInfo = ();
-    fn connect_info(&self) -> Self::ConnectInfo {}
-}
-
-impl tokio::io::AsyncRead for ReverseProxyServerIo {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
-    }
-}
-
-impl tokio::io::AsyncWrite for ReverseProxyServerIo {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.0).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
-    }
-}
-
 /// Run the reverse proxy client loop: connect → serve → reconnect.
-///
-/// This function blocks until `shutdown_rx` fires. On connection errors,
-/// it waits `reconnect_delay` and retries.
 pub async fn run_reverse_proxy_client(
     config: ReverseProxyClientConfig,
     state: DaemonState,
@@ -95,7 +38,6 @@ pub async fn run_reverse_proxy_client(
             ),
         }
 
-        // Wait before reconnecting, unless we're shutting down.
         tokio::select! {
             _ = sleep(reconnect_delay) => {}
             _ = &mut shutdown_rx => {
@@ -106,17 +48,11 @@ pub async fn run_reverse_proxy_client(
     }
 }
 
-/// Connect to the server xhod, complete the handshake, and serve gRPC
-/// until the connection drops.
+/// Connect to the server xhod, request reverse proxy subsystem, and serve
+/// gRPC until the connection drops.
 async fn connect_and_serve(config: &ReverseProxyClientConfig, state: &DaemonState) -> Result<()> {
-    // Parse the server address.
-    let target = parse_remote_target(&config.server_address).map_err(|e| {
-        anyhow!(
-            "failed to parse server_address {:?}: {}",
-            config.server_address,
-            e
-        )
-    })?;
+    let target = parse_remote_target(&config.server_address)
+        .map_err(|e| anyhow!("failed to parse server_address: {}", e))?;
 
     let (identity_file, _known_hosts_path) =
         normalize_paths(Some(&config.identity_file), Some(&config.known_hosts_path))
@@ -138,14 +74,7 @@ async fn connect_and_serve(config: &ReverseProxyClientConfig, state: &DaemonStat
         ClientHandler,
     )
     .await
-    .map_err(|e| {
-        anyhow!(
-            "SSH connection to {}:{} failed: {}",
-            target.host,
-            target.port,
-            e
-        )
-    })?;
+    .map_err(|e| anyhow!("SSH connection failed: {}", e))?;
 
     // Authenticate with public key.
     let key = load_secret_key(&identity_file, None)
@@ -167,91 +96,63 @@ async fn connect_and_serve(config: &ReverseProxyClientConfig, state: &DaemonStat
         );
     }
 
-    // Open session channel and request xho-reverse subsystem.
+    // Open session channel and request xho-reverse:<node_name> subsystem.
     let channel = handle
         .channel_open_session()
         .await
         .map_err(|e| anyhow!("failed to open session channel: {}", e))?;
 
+    let subsystem = format!(
+        "{}:{}",
+        super::reverse_proxy::REVERSE_SUBSYSTEM_NAME,
+        config.node_name
+    );
     channel
-        .request_subsystem(true, super::reverse_proxy::REVERSE_SUBSYSTEM_NAME)
+        .request_subsystem(true, &subsystem)
         .await
         .map_err(|e| anyhow!("failed to start xho-reverse subsystem: {}", e))?;
 
-    let mut stream = channel.into_stream();
+    let mut ssh_stream = channel.into_stream();
 
-    // --- Registration handshake ---
-    // Send: {"name":"node-2"}\n
-    let reg = format!(r#"{{"name":"{}"}}"#, config.node_name);
-    stream
-        .write_all(reg.as_bytes())
-        .await
-        .map_err(|e| anyhow!("failed to send registration: {}", e))?;
-    stream
-        .write_all(b"\n")
-        .await
-        .map_err(|e| anyhow!("failed to send registration newline: {}", e))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| anyhow!("failed to flush registration: {}", e))?;
+    info!(node = %config.node_name, "reverse proxy subsystem accepted");
 
-    // Read ack: {"status":"ok"}\n or {"status":"error","message":"..."}\n
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .await
-        .map_err(|e| anyhow!("failed to read ack: {}", e))?;
+    // Bridge the SSH channel to a tokio duplex pipe.
+    let (mut bridge_io, server_io) = tokio::io::duplex(64 * 1024);
+    let mut ssh_for_bridge = ssh_stream;
+    let bridge = tokio::spawn(async move {
+        let _ = tokio::io::copy_bidirectional(&mut ssh_for_bridge, &mut bridge_io).await;
+    });
 
-    let value: Value =
-        serde_json::from_str(&line).map_err(|e| anyhow!("failed to parse ack JSON: {}", e))?;
-    let status = value
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("error");
+    // Use mpsc channel (not once) so the stream stays alive while the
+    // HTTP/2 handler waits for the client preface. The server-side tonic
+    // client connects lazily on first RPC (15s health check), so the
+    // preface arrives late. With `once`, tonic returns before that.
+    let (stream_tx, stream_rx) = tokio::sync::mpsc::channel::<std::io::Result<_>>(1);
+    let _ = stream_tx.send(Ok(server_io)).await;
+    let incoming = tokio_stream::wrappers::ReceiverStream::new(stream_rx);
 
-    if status != "ok" {
-        let message = value
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown error");
-        bail!("reverse proxy registration rejected: {}", message);
-    }
-
-    info!(node = %config.node_name, "reverse proxy registration accepted");
-
-    // Recover the stream from BufReader for gRPC.
-    let stream = reader.into_inner();
-    let io = ReverseProxyServerIo(stream);
-
-    // Start tonic gRPC server over the single SSH channel.
-    // We keep incoming_tx alive so tonic doesn't see the stream end.
-    // When the SSH channel breaks, the IO will error, tonic will close
-    // the connection, and serve_with_incoming will return.
-    let (incoming_tx, incoming_rx) = mpsc::channel::<std::io::Result<ReverseProxyServerIo>>(1);
-    let _ = incoming_tx.send(Ok(io)).await;
-    // Do NOT drop incoming_tx — it must stay alive to prevent the
-    // ReceiverStream from returning None, which would cause tonic to
-    // initiate graceful shutdown prematurely.
-
-    let incoming = ReceiverStream::new(incoming_rx);
-    let service = XhoRpcService {
+    let svc = proto_rpc::xho_rpc_server::XhoRpcServer::new(XhoRpcService {
         state: state.clone(),
-    };
+    });
 
-    // Keep the SSH handle alive to maintain the session.
     let _handle = handle;
 
-    Server::builder()
-        .add_service(proto_rpc::xho_rpc_server::XhoRpcServer::new(service))
-        .serve_with_incoming_shutdown(incoming, std::future::pending::<()>())
-        .await
-        .map_err(|e| {
-            warn!(node = %config.node_name, error = %e, "gRPC server exited with error");
-            anyhow!("gRPC server over reverse proxy failed: {}", e)
-        })?;
+    let server_task = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(incoming)
+            .await
+    });
 
-    info!(node = %config.node_name, "gRPC server exited normally");
+    // Wait for SSH to break, then end the stream so tonic can exit.
+    let _ = bridge.await;
+    drop(stream_tx); // stream ends → serve_with_incoming returns
+
+    server_task
+        .await
+        .map_err(|e| anyhow!("server task panicked: {}", e))?
+        .map_err(|e| anyhow!("gRPC server: {}", e))?;
+
+    info!(node = %config.node_name, "gRPC connection closed");
     Ok(())
 }

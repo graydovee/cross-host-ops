@@ -53,10 +53,11 @@ pub(super) enum IncomingConn {
     ReverseProxy(ReverseProxyHandshake),
 }
 
-/// A reverse proxy handshake: an SSH channel stream that will be used to
-/// establish a gRPC client back to the connecting node.
+/// A reverse proxy handshake: an SSH channel stream + node name (parsed
+/// from the subsystem name) + connection metadata.
 pub(super) struct ReverseProxyHandshake {
     pub stream: russh::ChannelStream<russh::server::Msg>,
+    pub node_name: String,
     pub info: RemoteConnectInfo,
 }
 
@@ -321,7 +322,15 @@ impl server::Handler for RemoteSshHandler {
             let config = self.state.config.read().await;
             config.server.remote.reverse_proxy_enable
         };
-        let is_reverse = name == reverse_proxy_subsystem_name();
+        // Check for reverse proxy subsystem: "xho-reverse" or "xho-reverse:<node_name>"
+        let reverse_prefix = format!("{}:", reverse_proxy_subsystem_name());
+        let (is_reverse, rp_node_name) = if name == reverse_proxy_subsystem_name() {
+            (true, String::new())
+        } else if name.starts_with(&reverse_prefix) {
+            (true, name[reverse_prefix.len()..].to_string())
+        } else {
+            (false, String::new())
+        };
 
         if name != remote_subsystem_name() && !(is_reverse && reverse_enabled) {
             session.channel_failure(channel)?;
@@ -345,6 +354,7 @@ impl server::Handler for RemoteSshHandler {
                 .send(IncomingConn::ReverseProxy(
                     super::ssh_server::ReverseProxyHandshake {
                         stream: channel_stream.into_stream(),
+                        node_name: rp_node_name,
                         info,
                     },
                 ))
