@@ -13,10 +13,11 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 
+use crate::config::DirectAuth;
 use crate::copy_frames;
 use crate::daemon::connection::shared::build_final_command;
 use crate::protocol::{ServerEvent, ServerListRow};
-use crate::types::{CopyDirection, CopyFrame, CopySpec};
+use crate::types::{CopyDirection, CopyFrame, CopySpec, ServerListSource};
 
 use super::{
     ExecRequest, Gateway, GatewayError, GatewayKind, InteractiveHandle, InteractiveRequest,
@@ -102,11 +103,38 @@ fn spawn_on_pty(
 // LocalhostGateway
 // ---------------------------------------------------------------------------
 
-pub struct LocalhostGateway;
+pub struct LocalhostGateway {
+    /// Default shell for TTY mode (from config or $SHELL).
+    shell: String,
+    /// Execution user (from config or $USER).
+    user: String,
+    /// This machine's hostname.
+    hostname: String,
+}
 
 impl LocalhostGateway {
-    pub fn new() -> Self {
-        Self
+    pub fn new(shell: Option<String>, user: Option<String>) -> Self {
+        Self {
+            shell: shell
+                .or_else(|| std::env::var("SHELL").ok())
+                .unwrap_or_else(|| "/bin/sh".to_string()),
+            user: user
+                .or_else(|| std::env::var("USER").ok())
+                .or_else(|| std::env::var("LOGNAME").ok())
+                .unwrap_or_else(|| "unknown".to_string()),
+            hostname: get_hostname(),
+        }
+    }
+}
+
+fn get_hostname() -> String {
+    let mut buf = [0u8; 256];
+    let ret = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if ret == 0 {
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..len]).to_string()
+    } else {
+        "localhost".to_string()
     }
 }
 
@@ -127,7 +155,14 @@ impl Gateway for LocalhostGateway {
         if argv.is_empty() {
             return Err(GatewayError::execution(anyhow!("empty argv")));
         }
-        let (program, args) = build_program_args(argv, &request.shell, request.no_shell);
+        // Use request.shell if set (CLI --shell), otherwise fall back to
+        // the configured default shell.
+        let effective_shell = if request.shell.is_empty() {
+            self.shell.as_str()
+        } else {
+            request.shell.as_str()
+        };
+        let (program, args) = build_program_args(argv, effective_shell, request.no_shell);
         debug!(cmd = ?argv, tty = request.tty, "host exec");
 
         if request.tty {
@@ -187,8 +222,12 @@ impl Gateway for LocalhostGateway {
         if argv.is_empty() {
             return Err(GatewayError::execution(anyhow!("empty argv")));
         }
-        let shell = "/bin/sh";
-        let (program, args) = build_program_args(argv, shell, false);
+        let effective_shell = if request.shell.is_empty() {
+            self.shell.as_str()
+        } else {
+            request.shell.as_str()
+        };
+        let (program, args) = build_program_args(argv, effective_shell, request.no_shell);
         debug!(cmd = ?argv, "host interactive (PTY)");
 
         // Create PTY pair.
@@ -273,7 +312,16 @@ impl Gateway for LocalhostGateway {
     }
 
     async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError> {
-        Ok(Vec::new())
+        Ok(vec![ServerListRow {
+            source: ServerListSource::Local,
+            server: crate::config::ServerEntry {
+                alias: SELF_GATEWAY_NAME.to_string(),
+                host: self.hostname.clone(),
+                port: 0,
+                user: self.user.clone(),
+                auth: DirectAuth::None,
+            },
+        }])
     }
 
     fn kind(&self) -> GatewayKind {

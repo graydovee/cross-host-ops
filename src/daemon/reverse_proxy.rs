@@ -47,6 +47,10 @@ pub struct ReverseProxyNodeInfo {
     pub peer_addr: Option<SocketAddr>,
     pub fingerprint: String,
     pub connected_at: SystemTime,
+    /// Hostname reported by the node (from list_servers).
+    pub hostname: String,
+    /// Execution user reported by the node.
+    pub user: String,
 }
 
 /// A registered reverse proxy node: its gateway + metadata.
@@ -62,6 +66,8 @@ pub struct ReverseProxyNodeStatus {
     pub peer_addr: String,
     pub fingerprint: String,
     pub connected_at: u64,
+    pub hostname: String,
+    pub user: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +121,8 @@ impl ReverseProxyRegistry {
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0),
+                hostname: n.info.hostname.clone(),
+                user: n.info.user.clone(),
             })
             .collect()
     }
@@ -143,6 +151,18 @@ impl ReverseProxyRegistry {
         let mut map = self.inner.write().await;
         if map.remove(name).is_some() {
             info!(node = %name, "unregistered reverse proxy node");
+        }
+    }
+
+    /// Update a node's hostname and user from health check data.
+    pub async fn update_node_info(&self, name: &str, hostname: String, user: String) {
+        if let Some(node) = self.inner.write().await.get_mut(name) {
+            if !hostname.is_empty() {
+                node.info.hostname = hostname;
+            }
+            if !user.is_empty() {
+                node.info.user = user;
+            }
         }
     }
 
@@ -218,35 +238,57 @@ pub(super) async fn process_reverse_handshake(
         peer_addr: info.peer_addr,
         fingerprint: info.public_key_fingerprint,
         connected_at: SystemTime::now(),
+        hostname: String::new(),
+        user: String::new(),
     };
 
     // Register the node.
     registry.register(&node_name, gateway, node_info).await?;
 
     // Health monitoring: periodically poll the node. When the SSH channel
-    // breaks, the RPC will fail and we deregister the node. This also
-    // keeps this task alive (and thus the SSH channel alive).
+    // breaks, the RPC will fail and we deregister the node. The first poll
+    // also collects the node's hostname and user from list_servers.
     let monitor_registry = registry.clone();
     let monitor_name = node_name.clone();
+    let mut first_check = true;
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        if !first_check {
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        }
+        first_check = false;
         if !monitor_registry.contains(&monitor_name).await {
-            // Node was unregistered externally (e.g. CLI disconnect).
             break;
         }
-        // Lightweight health check with xho-no-recurse to prevent loops.
         let mut hc_request = tonic::Request::new(rpc::ServerListRequest {});
         hc_request
             .metadata_mut()
             .insert("xho-no-recurse", "true".parse().unwrap());
         let result = health_client.clone().list_servers(hc_request).await;
-        if result.is_err() {
-            info!(
-                node = %monitor_name,
-                "reverse proxy health check failed; deregistering"
-            );
-            monitor_registry.unregister(&monitor_name).await;
-            break;
+        match result {
+            Ok(resp) => {
+                // Parse node info from the _self entry in the response.
+                if let Some(ref merged) = resp.into_inner().merged {
+                    if let Some(row) = merged
+                        .rows
+                        .iter()
+                        .find(|r| r.server.as_ref().is_some_and(|s| s.alias == "_self"))
+                    {
+                        if let Some(srv) = &row.server {
+                            monitor_registry
+                                .update_node_info(&monitor_name, srv.host.clone(), srv.user.clone())
+                                .await;
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                info!(
+                    node = %monitor_name,
+                    "reverse proxy health check failed; deregistering"
+                );
+                monitor_registry.unregister(&monitor_name).await;
+                break;
+            }
         }
     }
 

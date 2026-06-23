@@ -279,7 +279,10 @@ pub async fn run_with_overrides(
     if loaded.reverse_proxy.enable && loaded.reverse_proxy.allow_host_access {
         gateways.push((
             gateway::localhost::SELF_GATEWAY_NAME.to_string(),
-            Arc::new(gateway::localhost::LocalhostGateway::new()),
+            Arc::new(gateway::localhost::LocalhostGateway::new(
+                loaded.reverse_proxy.shell.clone(),
+                loaded.reverse_proxy.user.clone(),
+            )),
         ));
         info!("host access enabled: _self gateway registered");
     }
@@ -769,9 +772,17 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
             rpc::process_list_servers(&self.state, no_recurse).await;
 
         // Convert entries to RPC format (flat list without source).
+        // Mark reverse proxy entries with auth_kind = "reverse_proxy".
+        let rp_names = self.state.reverse_proxy_registry.list_names().await;
         let servers: Vec<proto_rpc::ServerEntry> = tagged_entries
             .iter()
-            .map(|(entry, _source)| protocol::server_entry_to_rpc(entry.clone()))
+            .map(|(entry, _source)| {
+                let mut rpc_entry = protocol::server_entry_to_rpc(entry.clone());
+                if rp_names.contains(&entry.alias) {
+                    rpc_entry.auth_kind = "reverse_proxy".to_string();
+                }
+                rpc_entry
+            })
             .collect();
 
         // Build merged RPC representation with correct source tags.

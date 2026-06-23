@@ -39,6 +39,7 @@ pub enum DirectAuth {
     Key { identity_file: String },
     Password { password: String },
     None,
+    ReverseProxy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +57,7 @@ impl ServerEntry {
             DirectAuth::Key { .. } => "key",
             DirectAuth::Password { .. } => "password",
             DirectAuth::None => "none",
+            DirectAuth::ReverseProxy => "reverse_proxy",
         }
     }
 }

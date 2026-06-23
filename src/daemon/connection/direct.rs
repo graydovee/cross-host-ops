@@ -80,6 +80,9 @@ impl DirectConnection {
             DirectAuth::None => {
                 anyhow::bail!("DirectAuth::None is not valid for SSH connections");
             }
+            DirectAuth::ReverseProxy => {
+                anyhow::bail!("DirectAuth::ReverseProxy is not valid for SSH connections");
+            }
         }
         // Probe: open and immediately close a session channel to verify
         // the connection is fully established.

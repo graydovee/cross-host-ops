@@ -209,11 +209,15 @@ fn print_merged_server_list(merged: &rpc::MergedServerList) {
     );
 
     // Print rows — local entries show bare alias, gateway entries show <source>:<alias>.
+    // Skip _self entries (internal, not for display).
     for row in &merged.rows {
         let server = match row.server.as_ref() {
             Some(s) => s,
             None => continue,
         };
+        if server.alias == "_self" {
+            continue;
+        }
         let tagged_name = display_name(&row.source, &server.alias);
         println!(
             "{:<name_width$}  {:<host_width$}  {:<port_width$}  {:<user_width$}  {:<auth_width$}",

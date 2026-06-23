@@ -35,11 +35,17 @@ pub struct ReverseProxyClientConfig {
     pub node_name: String,
 
     /// Whether upstream clients may operate this machine directly.
-    ///
-    /// When `true`, `xho exec node-1:node-2 <cmd>` executes on node-2's host.
-    /// When `false`, only deeper targets (e.g. `node-1:node-2:node-3`) are
-    /// reachable; direct host access returns an error.
     pub allow_host_access: bool,
+
+    /// Default shell for `-tty` interactive mode on this node.
+    /// When `None`, auto-detects from `$SHELL` environment variable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+
+    /// Execution user for commands on this node.
+    /// When `None`, auto-detects from `$USER` environment variable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 
     #[serde(
         deserialize_with = "deserialize_duration",
@@ -69,6 +75,8 @@ impl Default for ReverseProxyClientConfig {
             known_hosts_path: "~/.xho/known_hosts".to_string(),
             node_name: String::new(),
             allow_host_access: false,
+            shell: None,
+            user: None,
             reconnect_delay: Duration::from_secs(10),
             keepalive_interval: Duration::from_secs(30),
             max_idle_time: Duration::from_secs(600),

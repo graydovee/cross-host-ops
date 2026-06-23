@@ -152,26 +152,27 @@ pub async fn process_list_servers(
     }
 
     // Iterate dynamic reverse proxy gateways (always — they propagate no_recurse).
-    let rp_names = state.reverse_proxy_registry.list_names().await;
-    for name in &rp_names {
-        let source_tag = ServerListSource::Gateway(name.clone());
+    let rp_nodes = state.reverse_proxy_registry.list_nodes().await;
+    for node in &rp_nodes {
+        let source_tag = ServerListSource::Gateway(node.name.clone());
 
-        // Synthetic entry: the node itself, visible with HOST = <None>.
+        // Synthetic entry with real node info (hostname, user from health check).
         results.push((
             ServerEntry {
-                alias: name.clone(),
-                host: "<None>".to_string(),
+                alias: node.name.clone(),
+                host: if node.hostname.is_empty() {
+                    node.name.clone()
+                } else {
+                    node.hostname.clone()
+                },
                 port: 0,
-                user: String::new(),
-                auth: DirectAuth::None,
+                user: node.user.clone(),
+                auth: DirectAuth::ReverseProxy,
             },
-            // Use Local source so the XhodGateway prefix yields just
-            // "ali-xhod" (not "ali-xhod:dev-local"), giving display
-            // name "ali-xhod:dev-local" instead of doubled.
             ServerListSource::Local,
         ));
 
-        if let Some(gateway) = state.reverse_proxy_registry.get(name).await {
+        if let Some(gateway) = state.reverse_proxy_registry.get(&node.name).await {
             match tokio::time::timeout(LIST_SERVERS_TIMEOUT, gateway.list_servers()).await {
                 Ok(Ok(rows)) => {
                     for row in rows {
@@ -180,12 +181,12 @@ pub async fn process_list_servers(
                     source_status.push((source_tag, ServerListSourceStatus::Ok));
                 }
                 Ok(Err(e)) => {
-                    warn!(gateway = name.as_str(), error = %e, "reverse proxy list_servers failed");
+                    warn!(gateway = node.name.as_str(), error = %e, "reverse proxy list_servers failed");
                     source_status.push((source_tag, ServerListSourceStatus::Error(e.to_string())));
                 }
                 Err(_) => {
                     warn!(
-                        gateway = name.as_str(),
+                        gateway = node.name.as_str(),
                         "reverse proxy list_servers timed out"
                     );
                     source_status.push((

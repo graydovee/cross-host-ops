@@ -366,6 +366,9 @@ fn build_server_toml(servers: &[ServerEntry]) -> String {
             DirectAuth::None => {
                 toml.push_str("auth = \"none\"\n");
             }
+            DirectAuth::ReverseProxy => {
+                toml.push_str("auth = \"reverse_proxy\"\n");
+            }
         }
         toml.push('\n');
     }

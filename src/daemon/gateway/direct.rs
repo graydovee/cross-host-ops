@@ -61,6 +61,7 @@ impl DirectPoolKey {
             DirectAuth::Key { identity_file } => ("key", format!("key:{identity_file}")),
             DirectAuth::Password { password } => ("password", format!("password:{password}")),
             DirectAuth::None => ("none", "none".to_string()),
+            DirectAuth::ReverseProxy => ("reverse_proxy", "none".to_string()),
         };
         Self {
             host: resolved.host.clone(),
