@@ -653,10 +653,19 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                 };
                 tokio::pin!(copy_timeout);
 
-                let copy_task = {
+                let use_legacy = gateway.kind() == self::gateway::GatewayKind::Jumpserver;
+                let copy_task: tokio::task::JoinHandle<Result<(), anyhow::Error>> = if use_legacy {
                     let gw = gateway.clone();
                     let end_target = route.end_target.clone();
-                    tokio::spawn(async move { gw.copy(&end_target, spec).await })
+                    tokio::spawn(async move {
+                        gw.copy(&end_target, spec)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("{}", e.user_message()))
+                    })
+                } else {
+                    let state = state.clone();
+                    let route = route.clone();
+                    tokio::spawn(async move { session::copy_via_session(&state, &route, spec).await })
                 };
                 tokio::pin!(copy_task);
 
@@ -680,7 +689,7 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                         result = &mut copy_task => {
                             if let Err(e) = result? {
                                 sender
-                                    .send(Ok(protocol::copy_error_response(e.user_message())))
+                                    .send(Ok(protocol::copy_error_response(e.to_string())))
                                     .await
                                     .map_err(|_| anyhow!("copy client stream closed"))?;
                                 break;

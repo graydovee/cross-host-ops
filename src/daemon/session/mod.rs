@@ -17,6 +17,7 @@
 
 pub mod direct;
 pub mod local;
+pub mod sftp_copy;
 pub mod tunnel;
 
 use anyhow::Result;
@@ -100,11 +101,23 @@ use anyhow::anyhow;
 use crate::config::{AppConfig, DirectAuth, load_server_config, resolve_server_entry};
 use crate::daemon::connection::shared::{build_final_command, build_remote_command, resolve_shell};
 use crate::protocol::ServerEvent;
+use crate::types::CopySpec;
 
 use super::DaemonState;
 use super::gateway::{GatewayKind, InteractiveHandle, Route};
 
-/// Open a unified [`TargetSession`] for a resolved route.
+/// Run a copy (`xho cp`) over the unified `TargetSession`: open the session,
+/// start its sftp subsystem, and upload/download via SFTP. Jumpserver targets
+/// return `unsupported` (they stay on the legacy gateway path).
+pub async fn copy_via_session(
+    state: &DaemonState,
+    route: &Route,
+    spec: CopySpec,
+) -> Result<()> {
+    let sess = open_target_session(state, route).await?;
+    let sftp = sftp_copy::open_sftp(sess).await?;
+    sftp_copy::run(&sftp, spec).await
+}
 ///
 /// This is the single entry point every consumer (the transparent proxy, the
 /// `OpenSession` tunnel, and — after migration — the Execute/Copy RPCs) uses to
