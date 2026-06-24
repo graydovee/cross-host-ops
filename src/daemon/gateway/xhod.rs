@@ -469,6 +469,13 @@ impl Gateway for XhodGateway {
         })
     }
 
+    async fn rpc_client(&self) -> Option<XhoRpcClient> {
+        self.ensure_client()
+            .await
+            .ok()
+            .map(|lease| (*lease.resource()).clone())
+    }
+
     async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError> {
         let lease = self.ensure_client().await?;
         let client = (*lease.resource()).clone();

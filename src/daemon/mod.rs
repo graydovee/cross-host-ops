@@ -3,11 +3,15 @@ pub mod authorized_keys;
 #[allow(dead_code)]
 pub mod connection;
 #[allow(dead_code)]
+pub mod proxy_server;
+#[allow(dead_code)]
 pub mod connection_manager;
 #[allow(dead_code)]
 pub mod gateway;
 #[allow(dead_code)]
 pub mod resolver;
+#[allow(dead_code)]
+pub mod session;
 #[allow(dead_code)]
 pub mod reverse_client;
 #[allow(dead_code)]
@@ -275,8 +279,12 @@ pub async fn run_with_overrides(
         auth_prompter,
     );
 
-    // Register LocalhostGateway (_self) when allow_host_access is enabled.
-    if loaded.reverse_proxy.enable && loaded.reverse_proxy.allow_host_access {
+    // Register LocalhostGateway (_self) when host access is reachable: via the
+    // reverse-proxy allow_host_access flag, or whenever the transparent proxy
+    // is enabled (so `ssh _self@<xhod>` resolves).
+    if (loaded.reverse_proxy.enable && loaded.reverse_proxy.allow_host_access)
+        || loaded.server.proxy.enable
+    {
         gateways.push((
             gateway::localhost::SELF_GATEWAY_NAME.to_string(),
             Arc::new(gateway::localhost::LocalhostGateway::new(
@@ -284,7 +292,7 @@ pub async fn run_with_overrides(
                 loaded.reverse_proxy.user.clone(),
             )),
         ));
-        info!("host access enabled: _self gateway registered");
+        info!("_self (localhost) gateway registered");
     }
 
     let state = DaemonState {
@@ -375,6 +383,46 @@ pub async fn run_with_overrides(
         });
     }
 
+    // Transparent SSH proxy listener (human-facing `ssh node@xhod`, default 2222).
+    if state.config.read().await.server.proxy.enable {
+        let proxy_config = state.config.read().await.server.proxy.clone();
+        match TcpListener::bind(&proxy_config.listen_addr).await {
+            Ok(listener) => match load_host_keys(Path::new(&proxy_config.host_key_path)) {
+                Ok(host_keys) => {
+                    let mut server = proxy_server::ProxySshServer {
+                        state: state.clone(),
+                        authorized_keys_path: proxy_config.authorized_keys_path.clone(),
+                    };
+                    let config = Arc::new(server::Config {
+                        auth_rejection_time: Duration::from_secs(1),
+                        auth_rejection_time_initial: Some(Duration::from_secs(0)),
+                        keys: host_keys,
+                        inactivity_timeout: Some(Duration::from_secs(600)),
+                        ..Default::default()
+                    });
+                    info!(
+                        listen_addr = %proxy_config.listen_addr,
+                        "listening on transparent proxy SSH"
+                    );
+                    tokio::spawn(async move {
+                        if let Err(error) = server.run_on_socket(config, &listener).await {
+                            error!(error = %error, "proxy SSH listener stopped");
+                        }
+                    });
+                }
+                Err(error) => warn!(
+                    error = %error,
+                    "proxy: failed to load host key; proxy listener disabled"
+                ),
+            },
+            Err(error) => warn!(
+                error = %error,
+                addr = %proxy_config.listen_addr,
+                "proxy: failed to bind; proxy listener disabled"
+            ),
+        }
+    }
+
     // Spawn idle reaper for all gateways.
     let reaper_state = state.clone();
     tokio::spawn(async move {
@@ -450,6 +498,7 @@ pub async fn run_with_overrides(
 impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
     type ExecuteStream = ReceiverStream<Result<proto_rpc::ExecuteResponse, Status>>;
     type CopyStream = ReceiverStream<Result<proto_rpc::CopyResponse, Status>>;
+    type OpenSessionStream = ReceiverStream<Result<proto_rpc::SessionResponse, Status>>;
 
     async fn execute(
         &self,
@@ -540,11 +589,6 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                     "copy request"
                 );
 
-                let gateway = state
-                    .find_gateway_any(&route.gateway_name)
-                    .await
-                    .ok_or_else(|| anyhow!("gateway '{}' not found", route.gateway_name))?;
-
                 let mut download_relay_task: Option<tokio::task::JoinHandle<()>> = None;
                 match spec.direction {
                     CopyDirection::Upload => {
@@ -604,10 +648,10 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                 };
                 tokio::pin!(copy_timeout);
 
-                let copy_task = {
-                    let gw = gateway.clone();
-                    let end_target = route.end_target.clone();
-                    tokio::spawn(async move { gw.copy(&end_target, spec).await })
+                let copy_task: tokio::task::JoinHandle<Result<(), anyhow::Error>> = {
+                    let state = state.clone();
+                    let route = route.clone();
+                    tokio::spawn(async move { session::copy_via_session(&state, &route, spec).await })
                 };
                 tokio::pin!(copy_task);
 
@@ -631,7 +675,7 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                         result = &mut copy_task => {
                             if let Err(e) = result? {
                                 sender
-                                    .send(Ok(protocol::copy_error_response(e.user_message())))
+                                    .send(Ok(protocol::copy_error_response(e.to_string())))
                                     .await
                                     .map_err(|_| anyhow!("copy client stream closed"))?;
                                 break;
@@ -804,6 +848,112 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
             servers,
             merged: Some(merged_rpc),
         }))
+    }
+
+    async fn open_session(
+        &self,
+        request: Request<Streaming<proto_rpc::SessionRequest>>,
+    ) -> Result<Response<Self::OpenSessionStream>, Status> {
+        let mut inbound = request.into_inner();
+        let state = self.state.clone();
+        let (sender, receiver) = mpsc::channel(64);
+
+        tokio::spawn(async move {
+            let result = async {
+                // First message must be SessionOpen{target}.
+                let first = inbound
+                    .message()
+                    .await?
+                    .ok_or_else(|| anyhow!("open_session: missing open request"))?;
+                let target = match first.msg {
+                    Some(proto_rpc::session_request::Msg::Open(open)) => open.target,
+                    _ => bail!("open_session: first message must be SessionOpen"),
+                };
+
+                let resolved = resolve_target_with_merged_view(&state, &target).await?;
+                let route = resolved
+                    .routes
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow!("no route for target '{target}'"))?;
+                let mut sess = session::open_target_session(&state, &route).await?;
+
+                // Acknowledge the open. Exec/shell/subsystem arrive as later
+                // requests and drive the session start.
+                sender
+                    .send(Ok(proto_rpc::SessionResponse {
+                        msg: Some(proto_rpc::session_response::Msg::Started(
+                            proto_rpc::SessionStarted {},
+                        )),
+                    }))
+                    .await
+                    .map_err(|_| anyhow!("open_session: client stream closed"))?;
+
+                loop {
+                    tokio::select! {
+                        req = inbound.message() => match req {
+                            Ok(Some(r)) => match r.msg {
+                                Some(proto_rpc::session_request::Msg::Pty(p)) => { let _ = sess.request_pty(&p.term, p.cols, p.rows, &[]).await; }
+                                Some(proto_rpc::session_request::Msg::Env(e)) => { let _ = sess.set_env(&e.key, &e.value).await; }
+                                Some(proto_rpc::session_request::Msg::Exec(e)) => { if let Err(er) = sess.exec(&e.command).await {
+                                    let _ = sender.send(Ok(proto_rpc::SessionResponse { msg: Some(proto_rpc::session_response::Msg::Error(proto_rpc::SessionError { message: er.to_string() })) })).await;
+                                }}
+                                Some(proto_rpc::session_request::Msg::Shell(_)) => { if let Err(er) = sess.shell().await {
+                                    let _ = sender.send(Ok(proto_rpc::SessionResponse { msg: Some(proto_rpc::session_response::Msg::Error(proto_rpc::SessionError { message: er.to_string() })) })).await;
+                                }}
+                                Some(proto_rpc::session_request::Msg::Subsystem(s)) => { if let Err(er) = sess.subsystem(&s.name).await {
+                                    let _ = sender.send(Ok(proto_rpc::SessionResponse { msg: Some(proto_rpc::session_response::Msg::Error(proto_rpc::SessionError { message: er.to_string() })) })).await;
+                                }}
+                                Some(proto_rpc::session_request::Msg::Resize(r)) => { let _ = sess.window_change(r.cols, r.rows).await; }
+                                Some(proto_rpc::session_request::Msg::Signal(s)) => { let _ = sess.signal(&s.signal).await; }
+                                Some(proto_rpc::session_request::Msg::Data(d)) => { let _ = sess.write_stdin(&d.data).await; }
+                                Some(proto_rpc::session_request::Msg::Eof(_)) => { let _ = sess.eof().await; }
+                                Some(proto_rpc::session_request::Msg::Open(_)) | None => break,
+                            },
+                            Ok(None) => break,
+                            Err(_) => break,
+                        },
+                        ev = sess.next_event() => match ev {
+                            Some(session::SessionEvent::Stdout(d)) => {
+                                if send_session_msg(&sender, proto_rpc::session_response::Msg::Data(proto_rpc::SessionData { data: d })).await { break; }
+                            }
+                            Some(session::SessionEvent::Stderr(d)) => {
+                                if send_session_msg(&sender, proto_rpc::session_response::Msg::Stderr(proto_rpc::SessionExtendedData { data: d })).await { break; }
+                            }
+                            Some(session::SessionEvent::ExitStatus(c)) => {
+                                let _ = send_session_msg(&sender, proto_rpc::session_response::Msg::ExitStatus(proto_rpc::SessionExitStatus { code: c })).await;
+                                let _ = send_session_msg(&sender, proto_rpc::session_response::Msg::Eof(proto_rpc::SessionEofIndication {})).await;
+                                break;
+                            }
+                            Some(session::SessionEvent::ExitSignal(s)) => {
+                                let _ = send_session_msg(&sender, proto_rpc::session_response::Msg::ExitSignal(proto_rpc::SessionExitSignal { signal: s })).await;
+                                break;
+                            }
+                            Some(session::SessionEvent::Eof) | None => {
+                                let _ = send_session_msg(&sender, proto_rpc::session_response::Msg::Eof(proto_rpc::SessionEofIndication {})).await;
+                                break;
+                            }
+                        },
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = result {
+                error!(error = %format!("{error:#}"), "open_session stream failed");
+                let _ = sender
+                    .send(Ok(proto_rpc::SessionResponse {
+                        msg: Some(proto_rpc::session_response::Msg::Error(
+                            proto_rpc::SessionError {
+                                message: error.to_string(),
+                            },
+                        )),
+                    }))
+                    .await;
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(receiver)))
     }
 
     async fn shutdown(
@@ -1242,12 +1392,8 @@ async fn process_execute(
         }
     }
 
-    // Execute via gateway
-    let gateway = state
-        .find_gateway_any(&route.gateway_name)
-        .await
-        .ok_or_else(|| anyhow!("gateway '{}' not found", route.gateway_name))?;
-
+    // Execute via the unified TargetSession abstraction (all gateway kinds,
+    // including jumpserver via JumpserverSession).
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
     // Create stdin forwarding channel when the client requests stdin.
@@ -1258,26 +1404,24 @@ async fn process_execute(
         (None, None)
     };
 
-    let gw_request = gateway::ExecRequest {
-        argv: request.argv.clone(),
-        sender: event_tx,
-        tty: request.tty,
-        tty_intent: request.tty_intent,
-        cols: request.term_cols,
-        rows: request.term_rows,
-        shell: request.shell.clone(),
-        no_shell: request.no_shell,
-        timeout_ms: request.timeout_ms,
-        stdin: request.stdin,
-        stdin_intent: request.stdin_intent,
-        stdin_rx: std::sync::Mutex::new(stdin_rx),
-    };
-
     let timeout_ms = request.timeout_ms;
     let stdin_enabled = request.stdin;
-    let gw = gateway.clone();
-    let end_target = route.end_target.clone();
-    let exec_task = tokio::spawn(async move { gw.exec(&end_target, &gw_request).await });
+
+    let exec_task: tokio::task::JoinHandle<Result<i32, anyhow::Error>> = {
+        let state = state.clone();
+        let route = route.clone();
+        let argv = request.argv.clone();
+        let cli_shell = request.shell.clone();
+        let no_shell = request.no_shell;
+        let tty = request.tty;
+        let cols = request.term_cols;
+        let rows = request.term_rows;
+        tokio::spawn(async move {
+            let (sess, command) =
+                session::open_exec_session(&state, &route, &argv, &cli_shell, no_shell).await?;
+            session::drive_exec(sess, command, tty, cols, rows, event_tx, stdin_rx).await
+        })
+    };
     tokio::pin!(exec_task);
 
     // If timeout is specified, create a deadline future.
@@ -1388,7 +1532,7 @@ async fn process_execute(
                 let code = match result? {
                     Ok(c) => c,
                     Err(e) => {
-                        let _ = send_execute_event(sender, ServerEvent::Error { message: e.user_message() }).await;
+                        let _ = send_execute_event(sender, ServerEvent::Error { message: e.to_string() }).await;
                         return Ok(());
                     }
                 };
@@ -1528,26 +1672,23 @@ async fn process_interactive_execute(
         }
     }
 
-    // Open interactive session via gateway
-    let gateway = state
-        .find_gateway_any(&route.gateway_name)
-        .await
-        .ok_or_else(|| anyhow!("gateway '{}' not found", route.gateway_name))?;
-
-    let (event_tx, mut _event_rx) = mpsc::unbounded_channel();
-    let interactive_request = gateway::InteractiveRequest {
-        argv: request.argv.clone(),
-        cols: request.term_cols,
-        rows: request.term_rows,
-        sender: event_tx,
-        shell: request.shell.clone(),
-        no_shell: request.no_shell,
+    // Open interactive session via the unified TargetSession abstraction.
+    let mut handle: gateway::InteractiveHandle = {
+        let (sess, command) = session::open_exec_session(
+            state,
+            route,
+            &request.argv,
+            &request.shell,
+            request.no_shell,
+        )
+        .await?;
+        let exec_command = if request.argv.is_empty() {
+            None
+        } else {
+            Some(command)
+        };
+        session::drive_interactive(sess, exec_command, request.term_cols, request.term_rows).await?
     };
-
-    let mut handle = gateway
-        .exec_interactive(&route.end_target, &interactive_request)
-        .await
-        .map_err(|e| anyhow!(e.user_message()))?;
 
     info!(execution_id = %execution_id, "interactive session started");
 
@@ -1673,6 +1814,18 @@ async fn send_execute_event(
         .await
         .map_err(|_| anyhow!("client receive stream closed"))?;
     Ok(())
+}
+
+/// Send a `SessionResponse` over an OpenSession stream. Returns `true` when the
+/// receiver has been dropped (caller should stop driving the session).
+async fn send_session_msg(
+    sender: &mpsc::Sender<Result<proto_rpc::SessionResponse, Status>>,
+    msg: proto_rpc::session_response::Msg,
+) -> bool {
+    sender
+        .send(Ok(proto_rpc::SessionResponse { msg: Some(msg) }))
+        .await
+        .is_err()
 }
 
 async fn ensure_socket_parent(socket_path: &Path) -> Result<()> {
