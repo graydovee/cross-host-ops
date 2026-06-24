@@ -23,7 +23,6 @@ use crate::daemon::connection_manager::{ManagedSingleton, SingletonLease};
 use crate::daemon::rpc::prefix_source;
 use crate::daemon::ssh_server::remote_subsystem_name;
 use crate::protocol::{self, ServerListRow, rpc};
-use crate::types::CopySpec;
 use crate::types::ServerListSource;
 
 use super::auth::{AuthPrompter, ClientHandler, normalize_paths, parse_remote_target};
@@ -402,29 +401,6 @@ impl Gateway for XhodGateway {
         }
     }
 
-    async fn copy(&self, target: &str, spec: CopySpec) -> Result<(), GatewayError> {
-        let lease = self.ensure_client().await?;
-
-        let mut conn = XhodConnection::new((*lease.resource()).clone(), target.to_string());
-
-        let result = conn.copy(spec).await;
-
-        match result {
-            Ok(()) => Ok(()),
-            Err(e) if is_transport_error(&e) => {
-                debug!(
-                    gateway = %self.gateway_name,
-                    target = %target,
-                    generation = %lease.generation(),
-                    "transport error on xhod copy; discarding client without replay: {}",
-                    e
-                );
-                self.invalidate_client(lease.generation()).await;
-                Err(GatewayError::transport(e))
-            }
-            Err(e) => Err(GatewayError::execution(e)),
-        }
-    }
 
     async fn exec_interactive(
         &self,

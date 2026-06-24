@@ -14,7 +14,7 @@ use crate::config::{
     AppConfig, DirectAuth, list_server_entries, load_server_config, resolve_server_entry,
 };
 use crate::protocol::ServerListRow;
-use crate::types::{CopySpec, ServerListSource};
+use crate::types::ServerListSource;
 
 use super::auth::AuthPrompter;
 use super::{
@@ -296,34 +296,6 @@ impl Gateway for DirectGateway {
         }
     }
 
-    async fn copy(&self, target: &str, spec: CopySpec) -> Result<(), GatewayError> {
-        let resolved = self.resolve_target(target).await?;
-        let mut lease = self.get_connection(&resolved).await?;
-
-        let result = lease.resource_mut().copy(spec).await;
-
-        match result {
-            Ok(()) => {
-                self.pool.return_healthy(lease);
-                Ok(())
-            }
-            Err(e) if is_transport_error(&e) => {
-                debug!(
-                    gateway = %self.gateway_name,
-                    target = %target,
-                    generation = %lease.generation(),
-                    "transport error on direct copy after checkout; discarding connection: {}",
-                    e
-                );
-                self.pool.discard(lease);
-                Err(GatewayError::transport(e))
-            }
-            Err(e) => {
-                self.pool.return_healthy(lease);
-                Err(GatewayError::execution(e))
-            }
-        }
-    }
 
     async fn exec_interactive(
         &self,

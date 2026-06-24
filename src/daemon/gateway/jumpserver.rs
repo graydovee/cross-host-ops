@@ -20,7 +20,7 @@ use crate::daemon::connection::{
 use crate::daemon::connection_manager::{ManagedPool, ManagedSingleton, PoolLease, SingletonLease};
 use crate::daemon::resolver::derive_target_ip;
 use crate::protocol::ServerListRow;
-use crate::types::{CopySpec, FlagIntent};
+use crate::types::FlagIntent;
 
 use super::auth::{AuthPrompt, AuthPrompter, ClientHandler, authenticate_with_key, connect_handle};
 use super::{
@@ -644,21 +644,6 @@ impl Gateway for JumpserverGateway {
         }
     }
 
-    async fn copy(&self, target: &str, spec: CopySpec) -> Result<(), GatewayError> {
-        let mut lease = self.checkout_target_shell(target).await?;
-        let result = {
-            let mut conn = JumpserverConnection::new_borrowed(&mut lease.resource_mut().shell);
-            conn.copy(spec).await
-        };
-
-        match result {
-            Ok(()) => {
-                self.return_target_shell_if_current(lease).await;
-                Ok(())
-            }
-            Err(e) => Err(self.classify_cached_shell_error(e, lease).await),
-        }
-    }
 
     async fn exec_interactive(
         &self,

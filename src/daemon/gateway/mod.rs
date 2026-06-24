@@ -17,7 +17,7 @@ use tokio::task::AbortHandle;
 
 use crate::config::GatewayConfig;
 use crate::protocol::{ServerEvent, ServerListRow};
-use crate::types::{CopySpec, FlagIntent};
+use crate::types::FlagIntent;
 
 use self::auth::AuthPrompter;
 use self::direct::DirectGateway;
@@ -35,9 +35,6 @@ use self::xhod::XhodGateway;
 pub trait Gateway: Send + Sync {
     /// Execute a command on the specified end target.
     async fn exec(&self, target: &str, request: &ExecRequest) -> Result<i32, GatewayError>;
-
-    /// Copy files to/from the specified end target.
-    async fn copy(&self, target: &str, spec: CopySpec) -> Result<(), GatewayError>;
 
     /// Open an interactive PTY session to the specified end target.
     async fn exec_interactive(

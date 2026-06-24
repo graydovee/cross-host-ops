@@ -4,7 +4,6 @@
 // read/write handles so concurrent stdin/stdout never contend on a mutex.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::path::Path;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -14,10 +13,9 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 
 use crate::config::DirectAuth;
-use crate::copy_frames;
 use crate::daemon::connection::shared::build_final_command;
 use crate::protocol::{ServerEvent, ServerListRow};
-use crate::types::{CopyDirection, CopyFrame, CopySpec, ServerListSource};
+use crate::types::ServerListSource;
 
 use super::{
     ExecRequest, Gateway, GatewayError, GatewayKind, InteractiveHandle, InteractiveRequest,
@@ -172,46 +170,6 @@ impl Gateway for LocalhostGateway {
         }
     }
 
-    async fn copy(&self, _target: &str, mut spec: CopySpec) -> Result<(), GatewayError> {
-        let remote_path = Path::new(&spec.remote_path);
-        match spec.direction {
-            CopyDirection::Upload => {
-                let mut upload_rx = spec
-                    .upload_rx
-                    .take()
-                    .ok_or_else(|| GatewayError::execution(anyhow!("missing upload stream")))?;
-                if spec.recursive {
-                    tokio::fs::create_dir_all(remote_path).await.ok();
-                    copy_frames::materialize_frames_to_dir(remote_path, &mut upload_rx)
-                        .await
-                        .map_err(GatewayError::execution)?;
-                } else {
-                    let data = copy_frames::collect_single_file_upload(&mut upload_rx)
-                        .await
-                        .map_err(GatewayError::execution)?;
-                    if let Some(parent) = remote_path.parent() {
-                        if !parent.as_os_str().is_empty() {
-                            tokio::fs::create_dir_all(parent).await.ok();
-                        }
-                    }
-                    tokio::fs::write(remote_path, data).await.map_err(|e| {
-                        GatewayError::execution(anyhow!("write {}: {}", remote_path.display(), e))
-                    })?;
-                }
-            }
-            CopyDirection::Download => {
-                let download_tx = spec
-                    .download_tx
-                    .take()
-                    .ok_or_else(|| GatewayError::execution(anyhow!("missing download stream")))?;
-                copy_frames::emit_local_path_frames(remote_path, Path::new(""), true, &download_tx)
-                    .await
-                    .map_err(GatewayError::execution)?;
-                let _ = download_tx.send(CopyFrame::EndOfStream).await;
-            }
-        }
-        Ok(())
-    }
 
     async fn exec_interactive(
         &self,

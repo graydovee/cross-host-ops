@@ -165,7 +165,7 @@ fn spawn_bridge(
             return;
         }
 
-        let mut channel = entry.channel;
+        let channel = entry.channel;
         let mut msg_rx = rx;
         loop {
             tokio::select! {

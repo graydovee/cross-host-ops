@@ -112,7 +112,7 @@ async fn connect_and_serve(config: &ReverseProxyClientConfig, state: &DaemonStat
         .await
         .map_err(|e| anyhow!("failed to start xho-reverse subsystem: {}", e))?;
 
-    let mut ssh_stream = channel.into_stream();
+    let ssh_stream = channel.into_stream();
 
     info!(node = %config.node_name, "reverse proxy subsystem accepted");
 

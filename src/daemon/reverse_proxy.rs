@@ -14,7 +14,6 @@ use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
 use russh::ChannelStream;
-use tokio::io::AsyncReadExt;
 use tokio::sync::RwLock;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
@@ -31,7 +30,7 @@ use crate::daemon::gateway::{
 use crate::daemon::rpc::prefix_source;
 use crate::daemon::ssh_server::ReverseProxyHandshake;
 use crate::protocol::{self, ServerListRow, rpc};
-use crate::types::{CopySpec, ServerListSource};
+use crate::types::ServerListSource;
 
 /// Subsystem name for reverse proxy connections.
 pub const REVERSE_SUBSYSTEM_NAME: &str = "xho-reverse";
@@ -400,25 +399,6 @@ impl Gateway for ReverseProxyGateway {
         }
     }
 
-    async fn copy(&self, target: &str, spec: CopySpec) -> Result<(), GatewayError> {
-        let client = {
-            let guard = self.client.lock().await;
-            (*guard).clone()
-        };
-
-        let mut conn = XhodConnection::new(client, target.to_string());
-
-        let result = conn.copy(spec).await;
-
-        match result {
-            Ok(()) => Ok(()),
-            Err(e) if is_transport_error(&e) => {
-                self.handle_transport_error().await;
-                Err(GatewayError::transport(e))
-            }
-            Err(e) => Err(GatewayError::execution(e)),
-        }
-    }
 
     async fn exec_interactive(
         &self,

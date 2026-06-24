@@ -355,7 +355,7 @@ pub async fn drive_interactive(
     rows: u32,
 ) -> Result<InteractiveHandle> {
     use tokio::sync::{mpsc, oneshot};
-    use tokio::task::AbortHandle;
+    
 
     sess.request_pty("xterm-256color", cols, rows, &[]).await?;
     match exec_command {

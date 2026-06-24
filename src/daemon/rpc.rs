@@ -1,19 +1,18 @@
 // Daemon RPC handler module.
-// Contains process_execute, process_copy, and process_list_servers functions
-// that dispatch to the Gateway-based architecture.
+// Contains process_list_servers (the gateway list aggregator). The old
+// route-dispatch process_execute/process_copy were removed once Execute/Copy
+// RPC handlers drove the unified TargetSession abstraction directly.
 
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
 use tracing::warn;
 
-use crate::config::{DirectAuth, ServerEntry, load_server_config};
+use crate::config::{DirectAuth, ServerEntry};
 use crate::protocol::ServerListSourceStatus;
-use crate::types::{CopySpec, ServerListSource};
+use crate::types::ServerListSource;
 
 use super::DaemonState;
-use super::gateway::{ErrorKind, ExecRequest, GatewayKind};
-use super::resolver::Resolver;
+use super::gateway::{ErrorKind, GatewayKind};
 
 /// Timeout for each gateway's list_servers call.
 const LIST_SERVERS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -25,72 +24,6 @@ pub fn prefix_source(gateway_name: &str, remote_source: &str) -> ServerListSourc
     } else {
         ServerListSource::Gateway(format!("{}:{}", gateway_name, remote_source))
     }
-}
-
-/// Process an execute request by resolving routes and iterating candidates.
-pub async fn process_execute(
-    state: &DaemonState,
-    target: &str,
-    request: &ExecRequest,
-) -> Result<i32> {
-    let config = state.config.read().await.clone();
-    let server_config = load_server_config(std::path::Path::new(&config.ssh.server_config_path))
-        .unwrap_or_default();
-    let dynamic_names = state.reverse_proxy_registry.list_names().await;
-    let resolver = Resolver::new(&config, &server_config, &config.gateways)
-        .with_dynamic_gateways(&dynamic_names);
-    let routes = resolver.resolve(target)?;
-
-    let mut last_error: Option<anyhow::Error> = None;
-
-    for route in &routes {
-        let gateway = state
-            .find_gateway_any(&route.gateway_name)
-            .await
-            .ok_or_else(|| anyhow!("gateway '{}' not found", route.gateway_name))?;
-
-        match gateway.exec(&route.end_target, request).await {
-            Ok(code) => return Ok(code),
-            Err(e) if e.kind == ErrorKind::Resolution => {
-                last_error = Some(e.into());
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| anyhow!("no routes for target '{}'", target)))
-}
-
-/// Process a copy request by resolving routes and iterating candidates.
-pub async fn process_copy(state: &DaemonState, target: &str, spec: CopySpec) -> Result<()> {
-    let config = state.config.read().await.clone();
-    let server_config = load_server_config(std::path::Path::new(&config.ssh.server_config_path))
-        .unwrap_or_default();
-    let dynamic_names = state.reverse_proxy_registry.list_names().await;
-    let resolver = Resolver::new(&config, &server_config, &config.gateways)
-        .with_dynamic_gateways(&dynamic_names);
-    let routes = resolver.resolve(target)?;
-
-    let mut last_error: Option<anyhow::Error> = None;
-
-    for route in &routes {
-        let gateway = state
-            .find_gateway_any(&route.gateway_name)
-            .await
-            .ok_or_else(|| anyhow!("gateway '{}' not found", route.gateway_name))?;
-
-        match gateway.copy(&route.end_target, spec.clone()).await {
-            Ok(()) => return Ok(()),
-            Err(e) if e.kind == ErrorKind::Resolution => {
-                last_error = Some(e.into());
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| anyhow!("no routes for target '{}'", target)))
 }
 
 /// Process a list_servers request by iterating all gateways, merging results.
