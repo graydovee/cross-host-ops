@@ -16,6 +16,7 @@
 // `Unsupported` errors for methods they cannot realize.
 
 pub mod direct;
+pub mod jumpserver;
 pub mod local;
 pub mod sftp_copy;
 pub mod tunnel;
@@ -163,7 +164,8 @@ pub async fn open_target_session(
                 as Box<dyn TargetSession>)
         }
         GatewayKind::Jumpserver => {
-            Err(unsupported("jumpserver session (menu-driven; pending)"))
+            Ok(Box::new(jumpserver::JumpserverSession::new(gateway, route.end_target.clone()))
+                as Box<dyn TargetSession>)
         }
     }
 }
@@ -268,7 +270,14 @@ pub async fn open_exec_session(
                 command,
             ))
         }
-        GatewayKind::Jumpserver => Err(unsupported("jumpserver exec (handled by legacy path)")),
+        GatewayKind::Jumpserver => {
+            let command = build_remote_command(argv);
+            Ok((
+                Box::new(jumpserver::JumpserverSession::new(gateway.clone(), route.end_target.clone()))
+                    as Box<dyn TargetSession>,
+                command,
+            ))
+        }
     }
 }
 
@@ -336,7 +345,6 @@ pub async fn drive_interactive(
     rows: u32,
 ) -> Result<InteractiveHandle> {
     use tokio::sync::{mpsc, oneshot};
-    use tokio::task::AbortHandle;
 
     sess.request_pty("xterm-256color", cols, rows, &[]).await?;
     match exec_command {
