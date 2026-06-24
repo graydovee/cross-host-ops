@@ -589,6 +589,11 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                     "copy request"
                 );
 
+                let gateway = state
+                    .find_gateway_any(&route.gateway_name)
+                    .await
+                    .ok_or_else(|| anyhow!("gateway '{}' not found", route.gateway_name))?;
+
                 let mut download_relay_task: Option<tokio::task::JoinHandle<()>> = None;
                 match spec.direction {
                     CopyDirection::Upload => {
@@ -648,7 +653,16 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                 };
                 tokio::pin!(copy_timeout);
 
-                let copy_task: tokio::task::JoinHandle<Result<(), anyhow::Error>> = {
+                let use_legacy = gateway.kind() == self::gateway::GatewayKind::Jumpserver;
+                let copy_task: tokio::task::JoinHandle<Result<(), anyhow::Error>> = if use_legacy {
+                    let gw = gateway.clone();
+                    let end_target = route.end_target.clone();
+                    tokio::spawn(async move {
+                        gw.copy(&end_target, spec)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("{}", e.user_message()))
+                    })
+                } else {
                     let state = state.clone();
                     let route = route.clone();
                     tokio::spawn(async move { session::copy_via_session(&state, &route, spec).await })
@@ -1392,8 +1406,13 @@ async fn process_execute(
         }
     }
 
-    // Execute via the unified TargetSession abstraction (all gateway kinds,
-    // including jumpserver via JumpserverSession).
+    // Execute via the unified TargetSession abstraction. Jumpserver keeps the
+    // legacy gateway path (its menu-driven model is not session-shaped).
+    let gateway = state
+        .find_gateway_any(&route.gateway_name)
+        .await
+        .ok_or_else(|| anyhow!("gateway '{}' not found", route.gateway_name))?;
+
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
     // Create stdin forwarding channel when the client requests stdin.
@@ -1406,8 +1425,31 @@ async fn process_execute(
 
     let timeout_ms = request.timeout_ms;
     let stdin_enabled = request.stdin;
+    let use_legacy = gateway.kind() == self::gateway::GatewayKind::Jumpserver;
 
-    let exec_task: tokio::task::JoinHandle<Result<i32, anyhow::Error>> = {
+    let exec_task: tokio::task::JoinHandle<Result<i32, anyhow::Error>> = if use_legacy {
+        let gw_request = gateway::ExecRequest {
+            argv: request.argv.clone(),
+            sender: event_tx,
+            tty: request.tty,
+            tty_intent: request.tty_intent,
+            cols: request.term_cols,
+            rows: request.term_rows,
+            shell: request.shell.clone(),
+            no_shell: request.no_shell,
+            timeout_ms: request.timeout_ms,
+            stdin: request.stdin,
+            stdin_intent: request.stdin_intent,
+            stdin_rx: std::sync::Mutex::new(stdin_rx),
+        };
+        let gw = gateway.clone();
+        let end_target = route.end_target.clone();
+        tokio::spawn(async move {
+            gw.exec(&end_target, &gw_request)
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e.user_message()))
+        })
+    } else {
         let state = state.clone();
         let route = route.clone();
         let argv = request.argv.clone();
@@ -1672,8 +1714,29 @@ async fn process_interactive_execute(
         }
     }
 
-    // Open interactive session via the unified TargetSession abstraction.
-    let mut handle: gateway::InteractiveHandle = {
+    // Open interactive session. Jumpserver keeps the legacy gateway path; all
+    // other kinds go through the unified TargetSession abstraction.
+    let gateway = state
+        .find_gateway_any(&route.gateway_name)
+        .await
+        .ok_or_else(|| anyhow!("gateway '{}' not found", route.gateway_name))?;
+
+    let use_legacy = gateway.kind() == self::gateway::GatewayKind::Jumpserver;
+    let mut handle: gateway::InteractiveHandle = if use_legacy {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let interactive_request = gateway::InteractiveRequest {
+            argv: request.argv.clone(),
+            cols: request.term_cols,
+            rows: request.term_rows,
+            sender: event_tx,
+            shell: request.shell.clone(),
+            no_shell: request.no_shell,
+        };
+        gateway
+            .exec_interactive(&route.end_target, &interactive_request)
+            .await
+            .map_err(|e| anyhow!("{}", e.user_message()))?
+    } else {
         let (sess, command) = session::open_exec_session(
             state,
             route,
