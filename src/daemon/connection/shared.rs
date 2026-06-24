@@ -151,6 +151,18 @@ pub(crate) fn looks_like_prompt(buffer: &[u8], suffixes: &[String]) -> bool {
     suffixes.iter().any(|suffix| tail.ends_with(suffix))
 }
 
+/// If `buffer` ends with a shell prompt, return the index where the prompt
+/// begins — i.e. the command output is `buffer[..split]` and the prompt is
+/// `buffer[split..]`. Returns `None` when no prompt is present yet.
+pub(crate) fn prompt_output_split(buffer: &[u8], suffixes: &[String]) -> Option<usize> {
+    if !looks_like_prompt(buffer, suffixes) {
+        return None;
+    }
+    // The prompt is the last line; output is everything up to it.
+    let last_nl = buffer.iter().rposition(|&b| b == b'\n');
+    Some(last_nl.map(|p| p + 1).unwrap_or(0))
+}
+
 /// Extract a sentinel marker from a byte buffer.
 /// Returns (exit_status, bytes_before_sentinel, bytes_after_sentinel).
 pub(crate) fn extract_sentinel<'a>(
@@ -447,6 +459,54 @@ impl PtyShell {
                     } else {
                         payload.extend_from_slice(&chunk);
                     }
+                }
+            }
+        }
+    }
+
+    /// Sentinel-free command execution: write the command, then stream its
+    /// stdout to `sender` until the shell prompt reappears (command finished),
+    /// stripping the prompt itself. No exit code is captured — this replaces the
+    /// `echo $?`+marker sentinel. Returns `Ok(())` when the command is done.
+    pub(crate) async fn run_command_plain(
+        &mut self,
+        command: &str,
+        sender: &tokio::sync::mpsc::UnboundedSender<crate::protocol::ServerEvent>,
+    ) -> Result<()> {
+        self.clear_prompt_remainder();
+        self.write_line(command).await?;
+        let mut first_output = true;
+        loop {
+            let chunk = self.read_chunk().await?;
+            self.pending.extend_from_slice(&chunk);
+            // Prompt reappeared → command finished. Stream everything before it
+            // and KEEP the prompt in `pending` so the caller's `finish_roundtrip`
+            // (wait_for_prompt + clear) resolves immediately instead of blocking.
+            if let Some(split) = prompt_output_split(&self.pending, &self.prompt_suffixes) {
+                let out = if first_output {
+                    strip_leading_shell_noise(&self.pending[..split])
+                } else {
+                    &self.pending[..split]
+                };
+                if !out.is_empty() {
+                    let _ = sender.send(crate::protocol::ServerEvent::Stdout { data: out.to_vec() });
+                }
+                self.pending.drain(..split);
+                return Ok(());
+            }
+            // Otherwise stream the safe prefix, retaining a tail for matching.
+            let keep = 64;
+            if self.pending.len() > keep {
+                let safe_len = self.pending.len() - keep;
+                let data = if first_output {
+                    first_output = false;
+                    strip_leading_shell_noise(&self.pending[..safe_len]).to_vec()
+                } else {
+                    self.pending[..safe_len].to_vec()
+                };
+                self.pending.drain(..safe_len);
+                if !data.is_empty() {
+                    let _ = sender.send(crate::protocol::ServerEvent::Stdout { data });
                 }
             }
         }

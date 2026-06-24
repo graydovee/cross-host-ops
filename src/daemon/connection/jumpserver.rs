@@ -93,22 +93,16 @@ impl JumpserverConnection {
         &mut self,
         command: &str,
         sender: &mpsc::UnboundedSender<ServerEvent>,
-        stdin_payload: Option<&[u8]>,
-        marker_prefix: &str,
+        _stdin_payload: Option<&[u8]>,
+        _marker_prefix: &str,
     ) -> Result<i32> {
+        // Sentinel-free: stream stdout until the prompt reappears; no exit code
+        // is captured (returns 0). stdin forwarding for jumpserver exec is not
+        // supported on this path.
         let shell = self.shell_mut()?;
-        shell.clear_prompt_remainder();
-        let marker = shell.make_marker(marker_prefix);
-        let wrapped = shell.wrap_shell_command(command, &marker);
-        if let Some(stdin_payload) = stdin_payload {
-            let payload = build_jumpserver_stdin_command(&wrapped, stdin_payload);
-            shell.write_raw(&payload).await?;
-        } else {
-            shell.write_line(&wrapped).await?;
-        }
-        let (status, _) = shell.read_until_sentinel(&marker, Some(sender)).await?;
+        shell.run_command_plain(command, sender).await?;
         shell.finish_roundtrip().await?;
-        Ok(status)
+        Ok(0)
     }
 
     /// Execute a command, capturing stdout into a buffer, and return exit code + output.
@@ -313,29 +307,18 @@ impl Connection for JumpserverConnection {
 // ---------------------------------------------------------------------------
 
 impl<'a> BorrowedJumpserverConnection<'a> {
-    /// Execute a command, streaming stdout to the sender, and return the exit code.
+    /// Execute a command, streaming stdout to the sender. Sentinel-free: streams
+    /// until the prompt reappears; no exit code is captured (returns 0).
     async fn run_shell_command_stream(
         &mut self,
         command: &str,
         sender: &mpsc::UnboundedSender<ServerEvent>,
-        stdin_payload: Option<&[u8]>,
-        marker_prefix: &str,
+        _stdin_payload: Option<&[u8]>,
+        _marker_prefix: &str,
     ) -> Result<i32> {
-        self.shell.clear_prompt_remainder();
-        let marker = self.shell.make_marker(marker_prefix);
-        let wrapped = self.shell.wrap_shell_command(command, &marker);
-        if let Some(stdin_payload) = stdin_payload {
-            let payload = build_jumpserver_stdin_command(&wrapped, stdin_payload);
-            self.shell.write_raw(&payload).await?;
-        } else {
-            self.shell.write_line(&wrapped).await?;
-        }
-        let (status, _) = self
-            .shell
-            .read_until_sentinel(&marker, Some(sender))
-            .await?;
+        self.shell.run_command_plain(command, sender).await?;
         self.shell.finish_roundtrip().await?;
-        Ok(status)
+        Ok(0)
     }
 
     /// Execute a command, capturing stdout into a buffer, and return exit code + output.
