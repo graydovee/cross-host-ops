@@ -16,6 +16,7 @@
 // `Unsupported` errors for methods they cannot realize.
 
 pub mod direct;
+pub mod jumpserver;
 pub mod local;
 pub mod sftp_copy;
 pub mod tunnel;
@@ -163,7 +164,13 @@ pub async fn open_target_session(
                 as Box<dyn TargetSession>)
         }
         GatewayKind::Jumpserver => {
-            Err(unsupported("jumpserver session (menu-driven; pending)"))
+            // No argv here (proxy/tunnel path); JumpserverSession.exec(command)
+            // uses [command] when argv is empty.
+            Ok(Box::new(jumpserver::JumpserverSession::new(
+                gateway,
+                route.end_target.clone(),
+                Vec::new(),
+            )) as Box<dyn TargetSession>)
         }
     }
 }
@@ -268,7 +275,19 @@ pub async fn open_exec_session(
                 command,
             ))
         }
-        GatewayKind::Jumpserver => Err(unsupported("jumpserver exec (handled by legacy path)")),
+        GatewayKind::Jumpserver => {
+            // JumpserverSession stores the raw argv (preserves multi-arg quoting);
+            // the returned command is unused (drive_exec passes it but the session
+            // uses its stored argv).
+            Ok((
+                Box::new(jumpserver::JumpserverSession::new(
+                    gateway.clone(),
+                    route.end_target.clone(),
+                    argv.to_vec(),
+                )) as Box<dyn TargetSession>,
+                String::new(),
+            ))
+        }
     }
 }
 
