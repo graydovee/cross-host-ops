@@ -507,6 +507,14 @@ mod tests {
     impl crate::protocol::rpc::xho_rpc_server::XhoRpc for MockXhoServer {
         type ExecuteStream = ReceiverStream<Result<crate::protocol::rpc::ExecuteResponse, Status>>;
         type CopyStream = ReceiverStream<Result<crate::protocol::rpc::CopyResponse, Status>>;
+        type OpenSessionStream =
+            ReceiverStream<Result<crate::protocol::rpc::SessionResponse, Status>>;
+        async fn open_session(
+            &self,
+            _request: tonic::Request<tonic::Streaming<crate::protocol::rpc::SessionRequest>>,
+        ) -> Result<tonic::Response<Self::OpenSessionStream>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
 
         async fn execute(
             &self,
@@ -934,6 +942,14 @@ mod tests {
                 impl crate::protocol::rpc::xho_rpc_server::XhoRpc for DownloadMock {
                     type ExecuteStream = ReceiverStream<Result<crate::protocol::rpc::ExecuteResponse, tonic::Status>>;
                     type CopyStream = ReceiverStream<Result<crate::protocol::rpc::CopyResponse, tonic::Status>>;
+                    type OpenSessionStream =
+                        ReceiverStream<Result<crate::protocol::rpc::SessionResponse, tonic::Status>>;
+                    async fn open_session(
+                        &self,
+                        _request: tonic::Request<tonic::Streaming<crate::protocol::rpc::SessionRequest>>,
+                    ) -> Result<tonic::Response<Self::OpenSessionStream>, tonic::Status> {
+                        Err(tonic::Status::unimplemented("mock"))
+                    }
 
                     async fn execute(&self, _: tonic::Request<tonic::Streaming<crate::protocol::rpc::ExecuteRequest>>) -> Result<tonic::Response<Self::ExecuteStream>, tonic::Status> {
                         let (t, r) = tokio::sync::mpsc::channel(1);
@@ -1064,6 +1080,14 @@ mod tests {
                 impl crate::protocol::rpc::xho_rpc_server::XhoRpc for StdoutErrMock {
                     type ExecuteStream = ReceiverStream<Result<crate::protocol::rpc::ExecuteResponse, tonic::Status>>;
                     type CopyStream = ReceiverStream<Result<crate::protocol::rpc::CopyResponse, tonic::Status>>;
+                    type OpenSessionStream =
+                        ReceiverStream<Result<crate::protocol::rpc::SessionResponse, tonic::Status>>;
+                    async fn open_session(
+                        &self,
+                        _request: tonic::Request<tonic::Streaming<crate::protocol::rpc::SessionRequest>>,
+                    ) -> Result<tonic::Response<Self::OpenSessionStream>, tonic::Status> {
+                        Err(tonic::Status::unimplemented("mock"))
+                    }
 
                     async fn execute(&self, req: tonic::Request<tonic::Streaming<crate::protocol::rpc::ExecuteRequest>>) -> Result<tonic::Response<Self::ExecuteStream>, tonic::Status> {
                         let (resp_tx, resp_rx) = tokio::sync::mpsc::channel(8);
@@ -1161,6 +1185,14 @@ mod tests {
                 impl crate::protocol::rpc::xho_rpc_server::XhoRpc for ControlEventsMock {
                     type ExecuteStream = ReceiverStream<Result<crate::protocol::rpc::ExecuteResponse, tonic::Status>>;
                     type CopyStream = ReceiverStream<Result<crate::protocol::rpc::CopyResponse, tonic::Status>>;
+                    type OpenSessionStream =
+                        ReceiverStream<Result<crate::protocol::rpc::SessionResponse, tonic::Status>>;
+                    async fn open_session(
+                        &self,
+                        _request: tonic::Request<tonic::Streaming<crate::protocol::rpc::SessionRequest>>,
+                    ) -> Result<tonic::Response<Self::OpenSessionStream>, tonic::Status> {
+                        Err(tonic::Status::unimplemented("mock"))
+                    }
 
                     async fn execute(&self, _: tonic::Request<tonic::Streaming<crate::protocol::rpc::ExecuteRequest>>) -> Result<tonic::Response<Self::ExecuteStream>, tonic::Status> {
                         let exit = self.exit;

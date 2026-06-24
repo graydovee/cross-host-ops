@@ -40,7 +40,7 @@ pub use self::review::{
     default_semantic_whitelist,
 };
 pub use self::secret::{Secret, SecretConfig, SecretResolver, SecretSource};
-pub use self::server::{LocalServerConfig, RemoteServerConfig, ServerConfig};
+pub use self::server::{LocalServerConfig, ProxyServerConfig, RemoteServerConfig, ServerConfig};
 pub use self::ssh::FallbackEntry;
 pub use self::ssh::SshConfig;
 
@@ -107,6 +107,12 @@ impl AppConfig {
         self.server.remote.host_key_path = expand_tilde(&self.server.remote.host_key_path)?;
         self.server.remote.authorized_keys_path =
             expand_tilde(&self.server.remote.authorized_keys_path)?;
+        self.server.proxy.host_key_path = expand_tilde(&self.server.proxy.host_key_path)?;
+        self.server.proxy.authorized_keys_path =
+            expand_tilde(&self.server.proxy.authorized_keys_path)?;
+        if let Some(p) = &self.server.proxy.sftp_server_path {
+            self.server.proxy.sftp_server_path = Some(expand_tilde(p)?);
+        }
         self.ssh.ssh_config_path = expand_tilde(&self.ssh.ssh_config_path)?;
         self.ssh.server_config_path = expand_tilde(&self.ssh.server_config_path)?;
         if let Some(vault_path) = &self.secret.vault_path {
@@ -255,6 +261,7 @@ mod tests {
         let mut config = AppConfig::default();
         config.server.local.enable = false;
         config.server.remote.enable = false;
+        config.server.proxy.enable = false;
         assert!(config.validate().is_err());
     }
 

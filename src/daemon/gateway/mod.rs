@@ -49,6 +49,17 @@ pub trait Gateway: Send + Sync {
     /// List servers reachable through this gateway.
     async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError>;
 
+    /// A cloneable handle to this gateway's control-plane gRPC client, when it
+    /// has one (Xhod / ReverseProxy). Used to open `OpenSession` tunnels so the
+    /// transparent proxy / multi-hop can reach machines behind another xhod.
+    /// Returns `None` for gateways without an RPC client (Direct/Localhost/
+    /// Jumpserver).
+    async fn rpc_client(
+        &self,
+    ) -> Option<crate::protocol::rpc::xho_rpc_client::XhoRpcClient<tonic::transport::Channel>> {
+        None
+    }
+
     /// The concrete kind of this gateway.
     fn kind(&self) -> GatewayKind;
 

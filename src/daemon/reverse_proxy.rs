@@ -458,6 +458,10 @@ impl Gateway for ReverseProxyGateway {
         }
     }
 
+    async fn rpc_client(&self) -> Option<rpc::xho_rpc_client::XhoRpcClient<Channel>> {
+        Some((*self.client.lock().await).clone())
+    }
+
     async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError> {
         let mut client = {
             let guard = self.client.lock().await;

@@ -14,7 +14,59 @@ service XhoRpc {
   rpc TokenList(TokenListRequest) returns (TokenListResponse);
   rpc TokenInvalidate(TokenInvalidateRequest) returns (TokenInvalidateResponse);
   rpc BootstrapAuthorize(BootstrapAuthorizeRequest) returns (BootstrapAuthorizeResponse);
+  // Transparent multi-hop session tunnel. The caller (another xhod's proxy or
+  // tunnel) opens a raw session-channel-shaped stream to an end target resolved
+  // by the receiving xhod, enabling ssh/scp/sftp to reach machines behind it.
+  rpc OpenSession(stream SessionRequest) returns (stream SessionResponse);
 }
+
+// --- OpenSession tunnel messages ---
+
+message SessionRequest {
+  oneof msg {
+    SessionOpen open = 1;
+    SessionPty pty = 2;
+    SessionEnv env = 3;
+    SessionExec exec = 4;
+    SessionShell shell = 5;
+    SessionSubsystem subsystem = 6;
+    SessionResize resize = 7;
+    SessionSignal signal = 8;
+    SessionData data = 9;
+    SessionEof eof = 10;
+  }
+}
+
+message SessionOpen { string target = 1; }
+message SessionPty { string term = 1; uint32 cols = 2; uint32 rows = 3; }
+message SessionEnv { string key = 1; string value = 2; }
+message SessionExec { string command = 1; }
+message SessionShell {}
+message SessionSubsystem { string name = 1; }
+message SessionResize { uint32 cols = 1; uint32 rows = 2; }
+message SessionSignal { string signal = 1; }
+message SessionData { bytes data = 1; }
+message SessionEof {}
+
+message SessionResponse {
+  oneof msg {
+    SessionStarted started = 1;
+    SessionData data = 2;
+    SessionExtendedData stderr = 3;
+    SessionExitStatus exit_status = 4;
+    SessionExitSignal exit_signal = 5;
+    SessionEofIndication eof = 6;
+    SessionError error = 7;
+  }
+}
+
+message SessionStarted {}
+message SessionExtendedData { bytes data = 1; }
+message SessionExitStatus { int32 code = 1; }
+message SessionExitSignal { string signal = 1; }
+message SessionEofIndication {}
+message SessionError { string message = 1; }
+
 
 message ExecuteRequest {
   oneof request {
