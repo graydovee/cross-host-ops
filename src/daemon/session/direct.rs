@@ -130,8 +130,6 @@ async fn authenticate_with_key(
 ) -> Result<()> {
     let key = load_secret_key(identity_file, None)
         .map_err(|e| anyhow::anyhow!("failed to load key {identity_file}: {e}"))?;
-    // best_supported_rsa_hash returns None for non-RSA keys (ed25519, ecdsa)
-    // — that is correct: only RSA keys carry a hash algorithm.
     let hash_alg = handle.best_supported_rsa_hash().await?.flatten();
     let authed = handle
         .authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg))
