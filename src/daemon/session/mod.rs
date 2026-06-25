@@ -150,10 +150,10 @@ pub async fn open_target_session(
         GatewayKind::Direct => {
             let config = state.config.read().await.clone();
             let r = resolve_direct(&config, &route.end_target).await?;
-            let handle =
+            let (handle, exit_code) =
                 direct::connect_authenticated(&r.host, r.port, &r.user, &r.auth, &config).await?;
             let channel = handle.channel_open_session().await?;
-            Ok(Box::new(direct::DirectSshSession::new(channel)) as Box<dyn TargetSession>)
+            Ok(Box::new(direct::DirectSshSession::new(channel, exit_code)) as Box<dyn TargetSession>)
         }
         GatewayKind::Xhod | GatewayKind::ReverseProxy => {
             let client = gateway
@@ -255,11 +255,11 @@ pub async fn open_exec_session(
             )
             .unwrap_or_default();
             let command = build_final_command(argv, &eff);
-            let handle =
+            let (handle, exit_code) =
                 direct::connect_authenticated(&r.host, r.port, &r.user, &r.auth, &config).await?;
             let channel = handle.channel_open_session().await?;
             Ok((
-                Box::new(direct::DirectSshSession::new(channel)) as Box<dyn TargetSession>,
+                Box::new(direct::DirectSshSession::new(channel, exit_code)) as Box<dyn TargetSession>,
                 command,
             ))
         }

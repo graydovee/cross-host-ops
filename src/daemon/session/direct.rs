@@ -11,12 +11,15 @@
 // control message and await the result.
 
 use std::io::Cursor;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use russh::Channel;
+use russh::ChannelId;
 use russh::ChannelMsg;
+use russh::Sig;
 use russh::client::{self};
 use russh::keys::ssh_key::HashAlg;
 use russh::keys::{PrivateKeyWithHashAlg, load_secret_key};
@@ -28,18 +31,24 @@ use crate::config::{AppConfig, DirectAuth};
 
 use super::{SessionEvent, TargetSession};
 
+/// Sentinel value meaning "no exit status captured yet".
+const NO_EXIT: u32 = u32::MAX;
+
 /// Open+authenticate a russh client handle for a direct SSH target.
 ///
-/// Shared by the direct transport so connection pooling can check out a handle
-/// and the session opens a channel from it.
+/// Returns the handle plus a shared exit-code cell that the client
+/// [`ClientHandler`] populates via the `exit_status` callback (a reliable
+/// fallback when `channel.wait()` drops `ExitStatus` due to buffer pressure).
 pub(crate) async fn connect_authenticated(
     host: &str,
     port: u16,
     user: &str,
     auth: &DirectAuth,
     config: &AppConfig,
-) -> Result<client::Handle<ClientHandler>> {
-    let mut handle = connect_handle(host, port, config).await?;
+) -> Result<(client::Handle<ClientHandler>, Arc<AtomicU32>)> {
+    let exit_code = Arc::new(AtomicU32::new(NO_EXIT));
+    let handler = ClientHandler { exit_code: exit_code.clone() };
+    let mut handle = connect_handle(host, port, config, handler).await?;
     match auth {
         DirectAuth::Key { identity_file } => {
             authenticate_with_key(&mut handle, user, identity_file).await?;
@@ -51,13 +60,14 @@ pub(crate) async fn connect_authenticated(
             anyhow::bail!("direct SSH requires key or password auth");
         }
     }
-    Ok(handle)
+    Ok((handle, exit_code))
 }
 
-/// russh client handler that accepts any host key (identity is verified via
-/// known_hosts at a higher layer, matching existing behaviour).
-#[derive(Clone, Default)]
-pub(crate) struct ClientHandler;
+/// russh client handler that accepts any host key and captures the remote
+/// process's exit status in a shared atomic (reliable fallback).
+pub(crate) struct ClientHandler {
+    exit_code: Arc<AtomicU32>,
+}
 
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
@@ -68,12 +78,36 @@ impl client::Handler for ClientHandler {
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }
+
+    async fn exit_status(
+        &mut self,
+        _channel: ChannelId,
+        exit_status: u32,
+        _session: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
+        self.exit_code.store(exit_status, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn exit_signal(
+        &mut self,
+        _channel: ChannelId,
+        _signal_name: Sig,
+        _core_dumped: bool,
+        _error_message: &str,
+        _lang_tag: &str,
+        _session: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
+        self.exit_code.store(255, Ordering::Relaxed);
+        Ok(())
+    }
 }
 
 async fn connect_handle(
     host: &str,
     port: u16,
     config: &AppConfig,
+    handler: ClientHandler,
 ) -> Result<client::Handle<ClientHandler>> {
     let client_config = client::Config {
         keepalive_interval: Some(config.ssh.keepalive_interval),
@@ -82,7 +116,7 @@ async fn connect_handle(
     };
     let handle = timeout(
         config.ssh.connect_timeout,
-        client::connect(Arc::new(client_config), (host, port), ClientHandler),
+        client::connect(Arc::new(client_config), (host, port), handler),
     )
     .await
     .map_err(|_| anyhow::anyhow!("timed out opening SSH connection to {host}:{port}"))??;
@@ -168,12 +202,15 @@ pub(crate) struct DirectSshSession {
 
 impl DirectSshSession {
     /// Wrap an already-opened session channel from an authenticated handle.
-    pub(crate) fn new(channel: Channel<client::Msg>) -> Self {
+    /// `exit_code` is the shared cell populated by the `ClientHandler`'s
+    /// `exit_status` callback — used as a fallback when `channel.wait()` drops
+    /// the ExitStatus message.
+    pub(crate) fn new(channel: Channel<client::Msg>, exit_code: Arc<AtomicU32>) -> Self {
         let (control_tx, control_rx) = mpsc::channel::<Control>(32);
         let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(64);
         let (events_tx, events_rx) = mpsc::unbounded_channel::<SessionEvent>();
 
-        tokio::spawn(driver(channel, control_rx, stdin_rx, events_tx));
+        tokio::spawn(driver(channel, control_rx, stdin_rx, events_tx, exit_code));
 
         Self {
             control_tx,
@@ -188,28 +225,24 @@ async fn driver(
     mut control_rx: mpsc::Receiver<Control>,
     mut stdin_rx: mpsc::Receiver<Vec<u8>>,
     events_tx: mpsc::UnboundedSender<SessionEvent>,
+    exit_code: Arc<AtomicU32>,
 ) {
     let mut stdin_open = true;
+    let mut exit_sent = false;
     loop {
         tokio::select! {
-            // Forward stdin bytes (or close stdin when the sender drops).
             stdin = stdin_rx.recv(), if stdin_open => match stdin {
                 Some(bytes) => {
-                    if channel.data(Cursor::new(bytes)).await.is_err() {
-                        break;
-                    }
+                    if channel.data(Cursor::new(bytes)).await.is_err() { break; }
                 }
                 None => {
                     let _ = channel.eof().await;
                     stdin_open = false;
                 }
             },
-            // Apply a control request.
             ctrl = control_rx.recv() => match ctrl {
                 Some(Control::Pty { term, cols, rows, modes, reply }) => {
-                    let r = channel
-                        .request_pty(true, &term, cols, rows, 0, 0, &modes)
-                        .await;
+                    let r = channel.request_pty(true, &term, cols, rows, 0, 0, &modes).await;
                     let _ = reply.send(r.map_err(Into::into));
                 }
                 Some(Control::Env { key, value, reply }) => {
@@ -239,26 +272,32 @@ async fn driver(
                 }
                 None => break,
             },
-            // Drain channel messages into events.
             msg = channel.wait() => match msg {
                 Some(ChannelMsg::Data { data }) => {
-                    if events_tx.send(SessionEvent::Stdout(data.to_vec())).is_err() {
-                        break;
-                    }
+                    if events_tx.send(SessionEvent::Stdout(data.to_vec())).is_err() { break; }
                 }
                 Some(ChannelMsg::ExtendedData { data, .. }) => {
-                    if events_tx.send(SessionEvent::Stderr(data.to_vec())).is_err() {
-                        break;
-                    }
+                    if events_tx.send(SessionEvent::Stderr(data.to_vec())).is_err() { break; }
                 }
                 Some(ChannelMsg::ExitStatus { exit_status }) => {
+                    exit_sent = true;
                     let _ = events_tx.send(SessionEvent::ExitStatus(exit_status as i32));
                 }
                 Some(ChannelMsg::ExitSignal { signal_name, .. }) => {
+                    exit_sent = true;
                     let _ = events_tx.send(SessionEvent::ExitSignal(format!("{signal_name:?}")));
                 }
                 Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
-                    let _ = events_tx.send(SessionEvent::Eof);
+                    // ExitStatus may have been dropped by russh's bounded channel
+                    // receiver. Fall back to the Handler callback's captured code.
+                    if !exit_sent {
+                        let code = exit_code.load(Ordering::Relaxed);
+                        if code != NO_EXIT {
+                            let _ = events_tx.send(SessionEvent::ExitStatus(code as i32));
+                        } else {
+                            let _ = events_tx.send(SessionEvent::Eof);
+                        }
+                    }
                     break;
                 }
                 _ => {}
