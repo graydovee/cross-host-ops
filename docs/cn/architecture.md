@@ -139,17 +139,20 @@ Reviewer 只审查原始命令（`build_remote_command(argv)`），不看 shell 
 #[async_trait]
 pub trait Gateway: Send + Sync {
     async fn exec(&self, target: &str, request: &ExecRequest) -> Result<i32, GatewayError>;
-    async fn copy(&self, target: &str, spec: CopySpec) -> Result<(), GatewayError>;
     async fn exec_interactive(&self, target: &str, request: &InteractiveRequest)
         -> Result<InteractiveHandle, GatewayError>;
     async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError>;
+    /// 控制面 gRPC 客户端（仅 Xhod/ReverseProxy），用于 OpenSession 隧道
+    async fn rpc_client(&self) -> Option<XhoRpcClient<Channel>> { None }
     fn kind(&self) -> GatewayKind;
     fn name(&self) -> &str;
     async fn prune_idle(&self);
 }
 ```
 
-**`GatewayKind`** 枚举：`Direct` / `Jumpserver` / `Xhod`。
+> **v0.4.0**：`Gateway::copy` 已移除 — 所有 copy 操作统一走 `TargetSession` + SFTP-over-session（`session::sftp_copy`）。`rpc_client` 访问器用于多跳隧道。
+
+**`GatewayKind`** 枚举：`Direct` / `Jumpserver` / `Xhod` / `ReverseProxy` / `Localhost`。
 
 **`GatewayError`** 携带 `ErrorKind` 分类，驱动错误处理：
 - `Resolution` — 目标未找到（尝试下一个路由候选）
@@ -176,7 +179,69 @@ pub trait Gateway: Send + Sync {
 | **XhodGateway**（`xhod.rs`） | SSH subsystem → gRPC | `ManagedSingleton<XhoRpcClient>`，单个共享客户端 | gRPC `ListServers`（返回远程 daemon 聚合的所有 Gateway） |
 | **JumpserverGateway**（`jumpserver.rs`） | SSH + PTY shell + 菜单 | `ManagedSingleton<JumpserverTransport>`（一条共享 SSH 连接）+ `ManagedPool<target, JumpserverTargetShell>`（每目标缓存的 PTY shell） | 不支持（`Unsupported`），零 I/O |
 
-### 认证（`auth.rs`）
+## 会话层 Session Layer（`src/daemon/session/`）— v0.4.0
+
+**统一 `TargetSession` 抽象**是所有操作的唯一低层契约 — CLI `xho exec`/`cp`、透明 SSH 代理、多跳 `OpenSession` 隧道都通过它驱动。
+
+```rust
+#[async_trait]
+pub trait TargetSession: Send {
+    async fn request_pty(&mut self, term: &str, cols: u32, rows: u32, modes: &[(Pty, u32)]) -> Result<()>;
+    async fn set_env(&mut self, key: &str, value: &str) -> Result<()>;
+    async fn exec(&mut self, command: &str) -> Result<()>;
+    async fn shell(&mut self) -> Result<()>;
+    async fn subsystem(&mut self, name: &str) -> Result<()>;      // "sftp"
+    async fn window_change(&mut self, cols: u32, rows: u32) -> Result<()>;
+    async fn signal(&mut self, signal: &str) -> Result<()>;
+    async fn write_stdin(&mut self, data: &[u8]) -> Result<()>;
+    async fn eof(&mut self) -> Result<()>;
+    async fn next_event(&mut self) -> Option<SessionEvent>;        // Stdout / Stderr / ExitStatus / Eof
+}
+```
+
+四个实现（按传输方式，不按功能）：
+
+| 实现 | 传输方式 | 说明 |
+|---|---|---|
+| `DirectSshSession`（`direct.rs`） | russh 原始客户端通道 | byte-perfect scp/sftp/exec/pty。退出码通过 `Handler::exit_status` 回调获取（russh 会从 `channel.wait()` 丢弃 ExitStatus）。 |
+| `LocalSession`（`local.rs`） | 本地 PTY + spawn `sftp-server` | `_self` 目标的完整 shell/exec/sftp。 |
+| `TunneledSession`（`tunnel.rs`） | 控制面 OpenSession RPC | 多跳：`ssh → 本地代理 → 控制面 → 远程 xhod → 机器`。递归。 |
+| `JumpserverSession`（`jumpserver.rs`） | 封装 `JumpserverGateway` 菜单引擎 | 无 sentinel exec（prompt 检测，退出码=0）；交互 shell 走 `exec_interactive`。 |
+
+**工厂**：`open_target_session(state, route)` → 按 `gateway.kind()` 分发。  
+**Copy**：`copy_via_session(state, route, spec)` → `subsystem("sftp")` + `russh-sftp` 客户端走 duplex 桥接（`sftp_copy.rs`）。
+
+## 透明 SSH 代理（`src/daemon/proxy_server.rs`）— v0.4.0
+
+第二个 russh 服务（`ProxySshServer`），监听端口 **2222**。面向人类：`ssh node@xhod -p 2222`。
+
+- **认证**：publickey，使用独立的 `proxy_authorized_keys`（与控制面的 `authorized_keys` 分开）。SSH 用户名 = 目标节点名。
+- **机制**：`ProxySshHandler` 将入站 SSH 请求（pty/exec/shell/subsystem/data/resize/signal）桥接到 `open_target_session` 获取的 `TargetSession`。会话事件通过入站 `Channel` 的 `data()`/`exit_status()`/`eof()`/`close()` 写回。
+- **全兼容**：scp（sftp 模式 + legacy `-O`）、sftp 子系统、exec、交互 PTY、窗口 resize — 全透明，因为直连目标的载荷从不被解释（原始桥接）。
+
+## OpenSession 多跳隧道 — v0.4.0
+
+`XhoRpc` 新增的双向流式 RPC：
+
+```proto
+rpc OpenSession(stream SessionRequest) returns (stream SessionResponse);
+```
+
+使透明 `ssh`/`scp` 能到达**其他 xhod 后面**的机器：`ssh node@xhod` → 本地代理 → 控制面 `OpenSession` → 远程 xhod → `open_target_session`（递归）。
+
+- **传输**：`TunneledSession` 使用现有的控制面 gRPC 客户端（XhodGateway/ReverseProxyGateway 的 `rpc_client()`）。
+- **服务端 handler**（`daemon/mod.rs`）：解析目标，打开 `TargetSession`，桥接 RPC 流 ↔ 会话事件。
+- **递归**：每个 xhod 都可以服务 `OpenSession`，任意深度跳转统一处理。
+
+## 端口布局（v0.4.0）
+
+| 端口 | 服务 | 认证 | 用途 |
+|------|------|------|------|
+| **2222** | `ProxySshServer` | `proxy_authorized_keys`（人类 pubkey，username=目标） | 透明 `ssh`/`scp`/`sftp` |
+| **12222** | `RemoteSshServer`（控制面） | `authorized_keys`（机器 pubkey，user=xho） | `xho-rpc` + `xho-reverse` 子系统 + `OpenSession` RPC |
+| Unix socket | gRPC | （本地） | CLI ↔ daemon |
+
+## 认证（`auth.rs`）
 
 认证在 Gateway 内部连接建立阶段完成，对 exec/copy 调用方透明。
 

@@ -27,20 +27,25 @@
 # socket_path = "/var/run/xho/xhod.sock"
 
 # [server.remote]
+# Control plane: machine-to-machine RPC + reverse proxy + OpenSession tunnel.
+# v0.4.0: moved from 2222 → 12222 to free port 2222 for the transparent proxy.
 # enable = true
-# listen_addr = "0.0.0.0:2222"
+# listen_addr = "0.0.0.0:12222"
 # user = "xho"
 # host_key_path = "~/.xho/host_key"
 # authorized_keys_path = "~/.xho/authorized_keys"
-# Optional long-lived token accepted by SSH password auth as a fallback when
-# no dynamic token from `xho token gen` matches. Accepts plaintext or any
-# secret reference (vault:NAME, env:VAR, file:PATH). Leave unset to only
-# accept short-lived tokens issued via `xho token gen` on this host.
 # bootstrap_token = "vault:bootstrap_token"
-# When true, accept reverse proxy connections (xho-reverse subsystem) from
-# nodes without public IPs. Nodes authenticate via the same authorized_keys
-# and register as dynamic gateways. Requires enable = true.
 # reverse_proxy_enable = true
+
+# [server.proxy]
+# Transparent SSH proxy: human-facing ssh/scp/sftp. v0.4.0 new feature.
+# SSH username = target node name; auth via separate proxy_authorized_keys.
+# enable = true
+# listen_addr = "0.0.0.0:2222"
+# host_key_path = "~/.xho/host_key"
+# authorized_keys_path = "~/.xho/proxy_authorized_keys"
+# sftp_server_path — explicit path to sftp-server binary; auto-detected when unset.
+# sftp_server_path = "/usr/lib/openssh/sftp-server"
 
 # [ssh]
 # ssh_config_path = "~/.ssh/config"

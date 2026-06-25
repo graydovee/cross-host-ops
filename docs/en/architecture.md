@@ -139,17 +139,20 @@ The sole interface for callers (daemon):
 #[async_trait]
 pub trait Gateway: Send + Sync {
     async fn exec(&self, target: &str, request: &ExecRequest) -> Result<i32, GatewayError>;
-    async fn copy(&self, target: &str, spec: CopySpec) -> Result<(), GatewayError>;
     async fn exec_interactive(&self, target: &str, request: &InteractiveRequest)
         -> Result<InteractiveHandle, GatewayError>;
     async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError>;
+    /// Control-plane gRPC client (Xhod/ReverseProxy only) for OpenSession tunnels.
+    async fn rpc_client(&self) -> Option<XhoRpcClient<Channel>> { None }
     fn kind(&self) -> GatewayKind;
     fn name(&self) -> &str;
     async fn prune_idle(&self);
 }
 ```
 
-**`GatewayKind`** enum: `Direct` / `Jumpserver` / `Xhod`.
+> **v0.4.0**: `Gateway::copy` was removed — all copy operations now flow through `TargetSession` + SFTP-over-session (`session::sftp_copy`). The `rpc_client` accessor enables multi-hop tunnels.
+
+**`GatewayKind`** enum: `Direct` / `Jumpserver` / `Xhod` / `ReverseProxy` / `Localhost`.
 
 **`GatewayError`** carries an `ErrorKind` classification that drives error handling:
 - `Resolution` — Target not found (try the next route candidate)
@@ -177,6 +180,72 @@ Factory function that constructs the Gateway list according to the following rul
 | **JumpserverGateway** (`jumpserver.rs`) | SSH + PTY shell + menu | `ManagedSingleton<JumpserverTransport>` (one shared SSH connection) + `ManagedPool<target, JumpserverTargetShell>` (per-target cached PTY shell) | Not supported (`Unsupported`), zero I/O |
 
 ### Authentication (`auth.rs`)
+
+Authentication is handled during internal connection establishment within each Gateway, transparent to the exec/copy caller.
+
+## Session Layer (`src/daemon/session/`) — v0.4.0
+
+The **unified `TargetSession` abstraction** is the single low-level contract every operation drives through — CLI `xho exec`/`cp`, the transparent SSH proxy, and the multi-hop `OpenSession` tunnel.
+
+```rust
+#[async_trait]
+pub trait TargetSession: Send {
+    async fn request_pty(&mut self, term: &str, cols: u32, rows: u32, modes: &[(Pty, u32)]) -> Result<()>;
+    async fn set_env(&mut self, key: &str, value: &str) -> Result<()>;
+    async fn exec(&mut self, command: &str) -> Result<()>;
+    async fn shell(&mut self) -> Result<()>;
+    async fn subsystem(&mut self, name: &str) -> Result<()>;      // "sftp"
+    async fn window_change(&mut self, cols: u32, rows: u32) -> Result<()>;
+    async fn signal(&mut self, signal: &str) -> Result<()>;
+    async fn write_stdin(&mut self, data: &[u8]) -> Result<()>;
+    async fn eof(&mut self) -> Result<()>;
+    async fn next_event(&mut self) -> Option<SessionEvent>;        // Stdout / Stderr / ExitStatus / Eof
+}
+```
+
+Four implementations (one per transport, not per feature):
+
+| Implementation | Transport | Notes |
+|---|---|---|
+| `DirectSshSession` (`direct.rs`) | Raw russh client channel | Byte-perfect scp/sftp/exec/pty. Exit status via `Handler::exit_status` callback (russh drops it from `channel.wait()`). |
+| `LocalSession` (`local.rs`) | Local PTY + spawned `sftp-server` | Full shell/exec/sftp for `_self` targets. |
+| `TunneledSession` (`tunnel.rs`) | OpenSession RPC over control plane | Multi-hop: `ssh → local proxy → control plane → remote xhod → machine`. Recursive. |
+| `JumpserverSession` (`jumpserver.rs`) | Wraps `JumpserverGateway` menu engine | Sentinel-free exec (prompt-based, exit code = 0); interactive shell via `exec_interactive`. |
+
+**Factory**: `open_target_session(state, route)` → dispatches by `gateway.kind()`.  
+**Copy**: `copy_via_session(state, route, spec)` → `subsystem("sftp")` + `russh-sftp` client over a duplex bridge (`sftp_copy.rs`).
+
+## Transparent SSH Proxy (`src/daemon/proxy_server.rs`) — v0.4.0
+
+A second russh server (`ProxySshServer`) on port **2222**. Human-facing: `ssh node@xhod -p 2222`.
+
+- **Auth**: publickey via `proxy_authorized_keys` (separate from control plane's `authorized_keys`). SSH username = target node name.
+- **Mechanism**: `ProxySshHandler` bridges inbound SSH requests (pty/exec/shell/subsystem/data/resize/signal) ↔ `TargetSession` obtained via `open_target_session`. Session events are written back via the inbound `Channel`'s `data()`/`exit_status()`/`eof()`/`close()` methods.
+- **Full compatibility**: scp (sftp-mode + legacy `-O`), sftp subsystem, exec, interactive PTY, window resize — all transparent because the payload is never interpreted (raw bridge for direct targets).
+
+## OpenSession Multi-hop Tunnel — v0.4.0
+
+New bidirectional streaming RPC added to `XhoRpc`:
+
+```proto
+rpc OpenSession(stream SessionRequest) returns (stream SessionResponse);
+```
+
+Enables transparent `ssh`/`scp` to reach machines **behind another xhod**: `ssh node@xhod` → local proxy → control-plane `OpenSession` → remote xhod → `open_target_session` (recursive).
+
+- **Transport**: `TunneledSession` uses the existing control-plane gRPC client (XhodGateway/ReverseProxyGateway's `rpc_client()`).
+- **Server handler** (`daemon/mod.rs`): resolves the target, opens a `TargetSession`, and bridges the RPC stream ↔ session events.
+- **Recursive**: each xhod can serve `OpenSession`, so arbitrary-depth hops are uniform.
+
+## Port Layout (v0.4.0)
+
+| Port | Service | Auth | Purpose |
+|------|---------|------|---------|
+| **2222** | `ProxySshServer` | `proxy_authorized_keys` (human pubkey, username=target) | Transparent `ssh`/`scp`/`sftp` |
+| **12222** | `RemoteSshServer` (control plane) | `authorized_keys` (machine pubkey, user=xho) | `xho-rpc` + `xho-reverse` subsystems + `OpenSession` RPC |
+| Unix socket | gRPC | (local) | CLI ↔ daemon |
+
+## Authentication (`auth.rs`)
 
 Authentication is handled during internal connection establishment within each Gateway, transparent to the exec/copy caller.
 

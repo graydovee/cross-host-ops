@@ -1,14 +1,16 @@
+[English](README.md) | **中文**
+
 # Cross Host Ops
 
-远程命令执行与文件复制工具。通过本地 daemon 管理 SSH 连接池，支持直连、跳板机、远程 xhod 三种路由方式到达目标服务器。
-
-[English](README.md) | **中文**
+远程命令执行、文件复制和**透明 SSH 代理**工具。通过本地 daemon 以统一的 `TargetSession` 抽象管理 SSH 会话，支持直连、跳板机、远程 xhod，以及原生 `ssh`/`scp`/`sftp` 透明代理。
 
 ## 特性
 
+- **透明 SSH 代理** — `ssh node@xhod -p 2222` 直接连到目标服务器，`scp`/`sftp`/`rsync` 全兼容，客户端无需任何配置
+- **多跳隧道** — `ssh → 本机xhod → 控制面 → 远程xhod → 机器`，穿透其他 xhod 后面的服务器
 - **交互式 PTY** — 运行 vim、htop 等全屏程序，体验与原生 SSH 一致
 - **连接池** — 按目标 IP 复用 SSH 连接，避免重复握手
-- **多种跳板** — 直连 SSH、企业 jumpserver（MFA）、远程 xhod daemon
+- **多种跳板** — 直连 SSH、企业 jumpserver（MFA）、远程 xhod daemon — 统一在 `TargetSession` 抽象下
 - **统一目标解析** — server.toml 别名、显式路由、IP 推导、fallback 链
 - **命令审查** — 可选 LLM 安全审查，本地白名单 + AI 语义分析
 - **文件复制** — `xho cp` 对齐 scp 语义，支持递归和 mode 保留
@@ -29,49 +31,81 @@ xho exec --tty host1 -- vim README.md
 # 文件复制
 xho cp local.txt host1:/tmp/
 
-# 查看所有可达服务器
+# 列出所有可达服务器
 xho ls
+
+# 透明 SSH 代理（需在配置中启用 proxy）
+ssh web1@localhost -p 2222 -- hostname
+scp file.txt web1@localhost:/tmp/ -P 2222
 ```
 
-## 架构概览
+## 架构概览 (v0.4.0)
 
 ```
-xho (CLI) ──Unix socket──▶ xhod (Daemon) ──Gateways──▶ End Target
+ xho CLI（不变）                      ssh/scp/sftp（新）
+   │ gRPC / Unix socket                  │ SSH / TCP 2222
+   ▼                                     ▼
+┌──────────────────── xhod (Daemon) ────────────────────────┐
+│                                                           │
+│  Execute/Copy RPC ──┐          ProxySshServer (端口 2222) │
+│  (CLI 路径)          │          (透明代理路径)              │
+│                     ▼                     │                │
+│              open_target_session(route)   │                │
+│                     │                     │                │
+│              ┌──────┴── TargetSession ────┘                │
+│              │    （统一抽象）                               │
+│              ├── DirectSshSession  (原始 SSH 桥接)          │
+│              ├── LocalSession      (PTY + sftp-server)      │
+│              ├── TunneledSession   (OpenSession RPC 隧道)   │
+│              └── JumpserverSession (菜单式堡垒机)            │
+│                                                           │
+│  控制面 SSH (端口 12222)                                   │
+│  · xho-rpc 子系统 (daemon↔daemon gRPC)                     │
+│  · xho-reverse 子系统 (反向代理注册)                        │
+│  · OpenSession RPC (多跳会话隧道)                           │
+└───────────────────────────────────────────────────────────┘
 ```
 
-- CLI 通过 gRPC over Unix socket 与本地 daemon 通信
-- Daemon 管理连接池、目标解析、命令审查
-- 三种 Gateway 类型完全互换：direct、jumpserver、xhod
+- **双端口**：透明代理 **2222**（人类用 `ssh`/`scp`），控制面 **12222**（机器间 RPC + 反向代理 + OpenSession 隧道）
+- **统一 `TargetSession`**：所有操作 — CLI exec/cp、透明代理、多跳隧道 — 走同一个会话抽象
+- **透明代理**：SSH 用户名 = 目标节点名；xhod 代理凭据
+- **多跳**：`ssh node@xhod` → 本地代理 → 控制面 `OpenSession` → 远程 xhod → 机器
 
-详细架构设计见 [docs/cn/architecture.md](docs/cn/architecture.md)。
+详见 [架构设计](docs/cn/architecture.md)。
 
-## 使用
+## 用法
 
 ```bash
 # 基本执行
 xho exec <target> -- <command> [args...]
 
-# PTY 模式（颜色输出、交互程序）
+# PTY 模式（彩色输出、交互式程序）
 xho exec --tty <target> -- ls --color
 
-# 显式指定跳板路由
+# 显式指定网关路由
 xho exec prod:web1 -- hostname
+
+# 透明 SSH 代理
+ssh <node>@<xhod_host> -p 2222               # 交互 shell
+ssh <node>@<xhod_host> -p 2222 -- <command>   # 执行命令
+scp -P 2222 file.txt <node>@<xhod_host>:/tmp/ # 文件复制
+sftp -P 2222 <node>@<xhod_host>                # sftp 会话
 
 # Daemon 管理
 xho status
 xho daemon start --config ~/.xho/config.toml
 xho daemon restart
 
-# Gateway 管理
-xho host add prod xho@bastion.example.com:2222
+# 网关管理
+xho host add prod xho@bastion.example.com:12222
 xho host list
 ```
 
-完整使用说明见 [docs/cn/usage.md](docs/cn/usage.md)。
+详见 [使用指南](docs/cn/usage.md)。
 
 ## 配置
 
-程序无需配置文件即可运行。需要自定义时，创建 `~/.xho/config.toml`：
+无需任何配置文件即可运行。需要自定义时，创建 `~/.xho/config.toml`：
 
 ```toml
 [ssh]
@@ -79,29 +113,45 @@ server_config_path = "~/.xho/server.toml"
 fallback = ["local", "prod"]
 pty = true
 
+# 控制面：机器间 RPC + 反向代理（默认 12222）
+[server.remote]
+enable = true
+listen_addr = "0.0.0.0:12222"
+user = "xho"
+host_key_path = "~/.xho/host_key"
+authorized_keys_path = "~/.xho/authorized_keys"
+
+# 透明 SSH 代理：人类用 ssh/scp/sftp（默认 2222）
+[server.proxy]
+enable = true
+listen_addr = "0.0.0.0:2222"
+host_key_path = "~/.xho/host_key"
+authorized_keys_path = "~/.xho/proxy_authorized_keys"
+
 [[gateways]]
 name = "prod"
 kind = "xhod"
-address = "xho@bastion.example.com:2222"
+address = "xho@bastion.example.com:12222"
 identity_file = "~/.ssh/id_ed25519"
 known_hosts_path = "~/.xho/known_hosts"
 ```
 
-完整配置示例见 [config.example.toml](config.example.toml)。
+> **端口迁移说明 (v0.4.0)**：控制面从 2222 移到 **12222**，透明代理占用 2222。请把 `[[gateways]]` 的 `address` 和 `reverse_proxy.server_address` 中的 `:2222` 改为 `:12222`。
+
+详见 [config.example.toml](config.example.toml)。
 
 ## 部署
 
-### 本地使用
+### 本机使用
 
 ```bash
 cargo build --release
-# 二进制：target/release/xho, target/release/xhod
+# 二进制: target/release/xho, target/release/xhod
 ```
 
 ### 远程 xhod
 
 ```bash
-# 使用部署脚本
 cargo build --release --bin xhod
 scp target/release/xhod root@your-server.com:/usr/local/bin/xhod
 ```
@@ -115,7 +165,7 @@ sudo systemctl enable --now xhod
 
 # Docker
 docker build -t xhod:latest .
-docker run --rm -p 2222:2222 -v /etc/xho:/etc/xho xhod:latest
+docker run --rm -p 2222:2222 -p 12222:12222 -v /etc/xho:/etc/xho xhod:latest
 ```
 
 ### GitHub Release
@@ -137,10 +187,10 @@ cargo fmt --all
 
 ## 文档
 
-- [架构文档](docs/cn/architecture.md) — 系统设计、组件交互、数据流
-- [使用文档](docs/cn/usage.md) — 安装、配置、命令参考、故障排查
-- [配置示例](config.example.toml) — 完整配置项说明
-- [服务器清单示例](server.example.toml) — server.toml 格式
+- [架构设计](docs/cn/architecture.md) — 系统设计、TargetSession 抽象、透明代理、多跳隧道
+- [使用指南](docs/cn/usage.md) — 安装、配置、命令参考、故障排查
+- [config.example.toml](config.example.toml) — 完整配置参考
+- [server.example.toml](server.example.toml) — server.toml 格式
 
 ## License
 
