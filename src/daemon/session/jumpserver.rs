@@ -36,6 +36,12 @@ pub(crate) struct JumpserverSession {
     exited: bool,
     /// Keeps the bastion transport lease alive for the session's lifetime.
     _transport_guard: Box<dyn Send>,
+    /// Called with the surviving `PtyShell` when `exec` succeeds (the shell is
+    /// still at the asset prompt). The gateway uses this to return the shell to
+    /// the session cache for reuse. `None` after `start_raw` — raw passthrough
+    /// (interactive shell / sftp subsystem) closes the channel, so the shell is
+    /// not reusable.
+    return_shell: Option<Box<dyn FnOnce(PtyShell) + Send>>,
 }
 
 enum Backend {
@@ -57,8 +63,14 @@ enum Backend {
 
 impl JumpserverSession {
     /// Wrap a navigated `shell` (at the asset prompt). `transport_guard` keeps
-    /// the bastion connection alive while this session is in use.
-    pub(crate) fn new(shell: PtyShell, transport_guard: Box<dyn Send>) -> Self {
+    /// the bastion connection alive while this session is in use. `return_shell`
+    /// is invoked with the surviving shell when `exec` completes successfully,
+    /// allowing the gateway to cache it for reuse.
+    pub(crate) fn new(
+        shell: PtyShell,
+        transport_guard: Box<dyn Send>,
+        return_shell: Option<Box<dyn FnOnce(PtyShell) + Send>>,
+    ) -> Self {
         Self {
             shell: Some(shell),
             cols: 80,
@@ -66,6 +78,7 @@ impl JumpserverSession {
             backend: Backend::None,
             exited: false,
             _transport_guard: transport_guard,
+            return_shell,
         }
     }
 
@@ -74,6 +87,10 @@ impl JumpserverSession {
             .shell
             .take()
             .ok_or_else(|| anyhow::anyhow!("jumpserver session already started"))?;
+        // Raw passthrough (interactive shell / sftp subsystem) consumes the
+        // channel — it is closed when passthrough ends. The shell cannot be
+        // returned to the cache.
+        self.return_shell = None;
         let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(64);
         let (stdout_tx, stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (exit_tx, exit_rx) = oneshot::channel::<i32>();
@@ -117,14 +134,21 @@ impl TargetSession for JumpserverSession {
             .shell
             .take()
             .ok_or_else(|| anyhow::anyhow!("jumpserver session already started"))?;
+        let return_fn = self.return_shell.take();
         let command = command.to_string();
         let (stdout_tx, stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (exit_tx, exit_rx) = oneshot::channel::<i32>();
         tokio::spawn(async move {
             // run_command_plain has no native exit code; report 0 on success,
-            // 255 if the bastion PTY errored mid-command.
+            // 255 if the bastion PTY errored mid-command. On success the shell
+            // is still at the asset prompt — return it to the cache for reuse.
             let code = match shell.run_command_plain(&command, &stdout_tx).await {
-                Ok(()) => 0,
+                Ok(()) => {
+                    if let Some(f) = return_fn {
+                        f(shell);
+                    }
+                    0
+                }
                 Err(_) => 255,
             };
             let _ = exit_tx.send(code);
@@ -147,6 +171,9 @@ impl TargetSession for JumpserverSession {
         }
         // Launch sftp-server on the asset in raw mode, then passthrough SFTP.
         if let Some(shell) = self.shell.as_mut() {
+            // Clear any leftover data (e.g. shell prompt from a prior exec on
+            // a cached shell) so it doesn't corrupt the SFTP byte stream.
+            shell.clear_pending();
             shell
                 .write_raw(format!("{SFTP_LAUNCH}\r").as_bytes())
                 .await?;

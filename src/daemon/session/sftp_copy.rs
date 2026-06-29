@@ -23,7 +23,7 @@ use crate::types::{CopyDirection, CopyFrame, CopySpec};
 use super::TargetSession;
 
 /// Open an SFTP client over a `TargetSession`'s sftp subsystem.
-pub(super) async fn open_sftp(mut sess: Box<dyn TargetSession>) -> Result<SftpSession> {
+pub(crate) async fn open_sftp(mut sess: Box<dyn TargetSession>) -> Result<SftpSession> {
     sess.subsystem("sftp").await?;
     let (client, server) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
@@ -58,7 +58,7 @@ pub(super) async fn open_sftp(mut sess: Box<dyn TargetSession>) -> Result<SftpSe
 }
 
 /// Run a copy (upload or download) over an already-open SFTP session.
-pub(super) async fn run(sftp: &SftpSession, mut spec: CopySpec) -> Result<()> {
+pub(crate) async fn run(sftp: &SftpSession, mut spec: CopySpec) -> Result<()> {
     match spec.direction {
         CopyDirection::Upload => upload(sftp, &mut spec).await,
         CopyDirection::Download => download(sftp, &mut spec).await,

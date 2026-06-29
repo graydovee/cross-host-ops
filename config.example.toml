@@ -119,6 +119,10 @@
 # totp_secret_base32 = "vault:corp-jump.totp"
 # totp_digits = 6
 # totp_period = 30
+# Session cache: reuse navigated PTY shells across operations to the same target.
+# Eliminates ~3-5s menu navigation overhead on cache hit.
+# max_cached_sessions = 8          # optional, default: unlimited
+# session_idle_timeout = "5m"      # default: 5 minutes
 
 # Example: a remote xhod daemon reachable over SSH
 # [[gateways]]

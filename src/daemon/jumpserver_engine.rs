@@ -213,7 +213,7 @@ impl PtyShell {
         self.pending.extend_from_slice(chunk);
     }
 
-    fn clear_prompt_remainder(&mut self) {
+    pub(crate) fn clear_prompt_remainder(&mut self) {
         if looks_like_prompt(&self.pending, &self.prompt_suffixes) {
             self.pending.clear();
         }

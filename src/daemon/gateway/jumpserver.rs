@@ -2,23 +2,28 @@
 //
 // A jumpserver is a partial backend: it supports EXEC, COPY (sftp-over-PTY), and
 // PROXY, but not LIST. It reuses one authenticated SSH transport (the expensive
-// MFA handshake is paid once) and, for each operation, opens a fresh PTY channel
-// and navigates the asset menu to the target's shell prompt. The navigated
-// `PtyShell` is then handed to a `JumpserverSession`, which is the unified
-// `TargetSession` every caller drives — there is no jumpserver special-casing
-// outside this module.
+// MFA handshake is paid once) and maintains a session cache of navigated PTY
+// shells keyed by target IP. On a cache hit, the ~3-5s menu navigation is
+// skipped entirely — the cached shell (still at the asset prompt from a prior
+// exec) is handed directly to a new JumpserverSession. Shells are returned to
+// the cache after a successful exec; interactive shell and sftp subsystem
+// consume the shell (raw passthrough closes the channel) and are not cached.
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::{debug, info};
 
 use crate::config::{AppConfig, JumpserverGatewayConfig, MfaConfig, load_server_config};
-use crate::daemon::connection_manager::{ManagedSingleton, SingletonLease};
+use crate::daemon::connection_manager::{
+    ConnectionStatusSnapshot, ManagedSingleton, SingletonLease,
+};
 use crate::daemon::jumpserver_engine::{
     MFA_PROMPT_CONTAINS, PtyShell, SHELL_PROMPT_SUFFIXES, contains_menu_prompt,
     contains_page_prompt, parse_asset_rows, parse_page_status, request_default_pty,
@@ -34,6 +39,132 @@ use super::{Capabilities, ErrorKind, Gateway, GatewayError, GatewayKind, is_tran
 
 type JumpserverTransport = AsyncMutex<JumpserverTransportState>;
 
+// ---------------------------------------------------------------------------
+// Session cache — reuse navigated PTY shells across operations
+// ---------------------------------------------------------------------------
+
+/// BTreeMap key: `(last_used, unique_id)`. Ordered ascending by time, so the
+/// globally oldest shell is at the front for O(log n) LRU eviction. The
+/// `unique_id` tiebreaker guarantees uniqueness when two shells share an
+/// `Instant`.
+type ShellKey = (Instant, u64);
+
+struct CachedShellEntry {
+    ip: String,
+    shell: PtyShell,
+    /// Clone of the transport lease — keeps the SSH transport alive while the
+    /// shell is cached, preventing the singleton from being pruned.
+    _transport_lease: SingletonLease<JumpserverTransport>,
+}
+
+/// LRU cache of navigated PTY shells, keyed by `(Instant, u64)` for global LRU
+/// ordering, with a reverse index (`HashMap<ip, Vec<ShellKey>>`) for O(log n)
+/// checkout by target IP.
+///
+/// All operations are O(log n) or better:
+/// - **checkout**: reverse-index lookup + BTreeMap remove → O(log n)
+/// - **return**: BTreeMap insert (+ evict oldest if at capacity) → O(log n)
+/// - **prune**: sequential `pop_first` of expired entries → O(expired × log n)
+///
+/// Stale keys in the reverse index (from evicted entries) are cleaned up
+/// lazily during checkout and rebuilt periodically during prune.
+struct SessionCache {
+    /// All cached shells, globally ordered by `last_used` (oldest first).
+    shells: BTreeMap<ShellKey, CachedShellEntry>,
+    /// Reverse index: target IP → keys of cached shells for that IP.
+    by_ip: HashMap<String, Vec<ShellKey>>,
+    next_id: u64,
+    max_cached_sessions: Option<usize>,
+}
+
+impl SessionCache {
+    fn new(max_cached_sessions: Option<usize>) -> Self {
+        Self {
+            shells: BTreeMap::new(),
+            by_ip: HashMap::new(),
+            next_id: 0,
+            max_cached_sessions,
+        }
+    }
+
+    /// Total number of cached shells across all IPs.
+    fn len(&self) -> usize {
+        self.shells.len()
+    }
+
+    /// Take any cached shell for `ip`. Stale keys (from evicted entries) are
+    /// skipped lazily. Returns `None` if no live shell is available.
+    fn checkout(&mut self, ip: &str) -> Option<PtyShell> {
+        let keys = self.by_ip.get_mut(ip)?;
+        while let Some(key) = keys.pop() {
+            if let Some(entry) = self.shells.remove(&key) {
+                if keys.is_empty() {
+                    self.by_ip.remove(ip);
+                }
+                return Some(entry.shell);
+            }
+        }
+        self.by_ip.remove(ip);
+        None
+    }
+
+    /// Insert a shell into the cache. If at capacity, evict the globally oldest
+    /// shell first. The evicted entry's key stays stale in the reverse index and
+    /// is cleaned up lazily on checkout or during prune.
+    fn insert(
+        &mut self,
+        ip: String,
+        shell: PtyShell,
+        lease: SingletonLease<JumpserverTransport>,
+    ) {
+        if let Some(max) = self.max_cached_sessions {
+            while self.shells.len() >= max {
+                self.shells.pop_first();
+            }
+        }
+        let now = Instant::now();
+        let id = self.next_id;
+        self.next_id += 1;
+        let key = (now, id);
+        self.shells.insert(
+            key,
+            CachedShellEntry {
+                ip: ip.clone(),
+                shell,
+                _transport_lease: lease,
+            },
+        );
+        self.by_ip.entry(ip).or_default().push(key);
+    }
+
+    /// Remove all cached shells whose `last_used` exceeds `idle_timeout`.
+    /// BTreeMap is ordered by time, so we pop from the front until we hit a
+    /// non-expired entry. Rebuilds the reverse index afterwards.
+    fn prune(&mut self, idle_timeout: Duration) {
+        let mut changed = false;
+        while let Some((&key, _)) = self.shells.first_key_value() {
+            if key.0.elapsed() > idle_timeout {
+                self.shells.pop_first();
+                changed = true;
+            } else {
+                break;
+            }
+        }
+        if changed {
+            self.by_ip.clear();
+            for (&key, entry) in &self.shells {
+                self.by_ip.entry(entry.ip.clone()).or_default().push(key);
+            }
+        }
+    }
+
+    /// Clear the entire cache (used on transport invalidation).
+    fn clear(&mut self) {
+        self.shells.clear();
+        self.by_ip.clear();
+    }
+}
+
 pub struct JumpserverGateway {
     gateway_name: String,
     config: Arc<RwLock<AppConfig>>,
@@ -41,6 +172,8 @@ pub struct JumpserverGateway {
     auth_prompter: Arc<AuthPrompter>,
     transport: ManagedSingleton<JumpserverTransport>,
     max_idle_time: Duration,
+    session_cache: Arc<Mutex<SessionCache>>,
+    session_idle_timeout: Duration,
 }
 
 struct JumpserverTransportState {
@@ -56,6 +189,8 @@ impl JumpserverGateway {
         auth_prompter: Arc<AuthPrompter>,
         max_idle_time: Duration,
     ) -> Self {
+        let session_idle_timeout = fields.session_idle_timeout;
+        let max_cached_sessions = fields.max_cached_sessions;
         Self {
             gateway_name,
             config,
@@ -63,6 +198,8 @@ impl JumpserverGateway {
             auth_prompter,
             transport: ManagedSingleton::new(),
             max_idle_time,
+            session_cache: Arc::new(Mutex::new(SessionCache::new(max_cached_sessions))),
+            session_idle_timeout,
         }
     }
 
@@ -158,6 +295,8 @@ impl JumpserverGateway {
             debug!(gateway = %self.gateway_name, generation = %generation,
                 "discarded jumpserver SSH transport, will reconnect on next use");
         }
+        // All cached shells are on the invalidated transport — discard them.
+        self.session_cache.lock().clear();
     }
 
     /// Open a fresh PTY channel on the shared transport and navigate the asset
@@ -208,23 +347,26 @@ impl JumpserverGateway {
         Ok(shell)
     }
 
-    /// Acquire the transport and navigate to the target, retrying once on a
-    /// transport-level failure (stale handle).
-    async fn open_session_inner(
+    /// Acquire a navigated PtyShell for `target`, using cache if available.
+    /// Returns the shell and its transport lease. On transport error, retries once.
+    async fn acquire_shell(
         &self,
         target: &str,
-    ) -> Result<Box<dyn TargetSession>, GatewayError> {
+    ) -> Result<(PtyShell, SingletonLease<JumpserverTransport>), GatewayError> {
+        let ip = derive_target_ip(target);
         for attempt in 0..=1 {
             let lease = self.ensure_transport().await?;
+
+            // Try cache first (sync lock, no await while held).
+            if let Some(shell) = self.session_cache.lock().checkout(&ip) {
+                debug!(gateway = %self.gateway_name, ip = %ip,
+                    "session cache HIT — reusing navigated shell");
+                return Ok((shell, lease));
+            }
+
+            // Cache miss — open a fresh PTY channel and navigate the menu.
             match self.open_target_shell(&lease, target).await {
-                Ok(shell) => {
-                    // The session holds the transport lease for its lifetime so
-                    // the shared connection is not pruned mid-session.
-                    let guard: Box<dyn Send> = Box::new(lease);
-                    return Ok(
-                        Box::new(JumpserverSession::new(shell, guard)) as Box<dyn TargetSession>
-                    );
-                }
+                Ok(shell) => return Ok((shell, lease)),
                 Err(e) if attempt == 0 && matches!(e.kind, ErrorKind::Transport) => {
                     debug!(gateway = %self.gateway_name, target = %target,
                         generation = %lease.generation(),
@@ -240,6 +382,36 @@ impl JumpserverGateway {
             }
         }
         unreachable!("jumpserver shell preparation loop is bounded")
+    }
+
+    /// Acquire the transport and navigate to the target, retrying once on a
+    /// transport-level failure (stale handle). Checks the session cache first —
+    /// a cache hit skips the ~3-5s menu navigation entirely.
+    async fn open_session_inner(
+        &self,
+        target: &str,
+    ) -> Result<Box<dyn TargetSession>, GatewayError> {
+        let ip = derive_target_ip(target);
+        let (shell, lease) = self.acquire_shell(target).await?;
+        let return_fn = self.make_return_fn(ip, lease.clone());
+        let guard: Box<dyn Send> = Box::new(lease);
+        Ok(Box::new(JumpserverSession::new(shell, guard, Some(return_fn))) as Box<dyn TargetSession>)
+    }
+
+    /// Build the closure invoked by `JumpserverSession::exec` when the command
+    /// completes successfully. The surviving shell (still at the asset prompt)
+    /// is returned to the session cache for future reuse. The cloned lease keeps
+    /// the transport alive while the shell is cached.
+    fn make_return_fn(
+        &self,
+        ip: String,
+        lease: SingletonLease<JumpserverTransport>,
+    ) -> Box<dyn FnOnce(PtyShell) + Send> {
+        let cache = self.session_cache.clone();
+        Box::new(move |shell| {
+            let mut cache = cache.lock();
+            cache.insert(ip, shell, lease);
+        })
     }
 
     async fn effective_shell(&self, cli_shell: &str, no_shell: bool) -> String {
@@ -388,8 +560,45 @@ impl Gateway for JumpserverGateway {
         self.open_session_inner(target).await
     }
 
+    async fn copy(
+        &self,
+        target: &str,
+        mut spec: crate::types::CopySpec,
+    ) -> Result<(), GatewayError> {
+        let ip = derive_target_ip(target);
+        let (mut shell, lease) = self.acquire_shell(target).await?;
+
+        let result = crate::daemon::session::shell_copy::run(&mut shell, &mut spec).await;
+
+        if result.is_ok() {
+            // Shell is still at the prompt after shell-based copy — return it
+            // to the cache for reuse by future operations.
+            let return_fn = self.make_return_fn(ip, lease.clone());
+            return_fn(shell);
+        }
+        // On error the shell is dropped (not cached).
+
+        result.map_err(|e| GatewayError::execution(e))
+    }
+
     async fn prune_idle(&self) {
         let _ = self.transport.prune_idle(self.max_idle_time).await;
+        self.session_cache
+            .lock()
+            .prune(self.session_idle_timeout);
+    }
+
+    async fn pool_status(&self) -> Vec<ConnectionStatusSnapshot> {
+        let generation = self.transport.current_generation().await.unwrap_or(0);
+        let idle = self.session_cache.lock().len();
+        let capacity = self.fields.max_cached_sessions.unwrap_or(0);
+        vec![ConnectionStatusSnapshot {
+            key: format!("{}:sessions", self.gateway_name),
+            generation,
+            active: 0,
+            idle,
+            capacity,
+        }]
     }
 }
 
@@ -412,6 +621,8 @@ mod tests {
                 totp_secret_base32: String::new(),
                 totp_digits: 6,
                 totp_period: 30,
+                max_cached_sessions: None,
+                session_idle_timeout: Duration::from_secs(300),
             },
             Arc::new(|_| Box::pin(async { Ok(String::new()) })),
             Duration::from_secs(60),

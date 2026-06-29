@@ -99,6 +99,8 @@ fn arb_jumpserver_gateway(name: String) -> impl Strategy<Value = GatewayConfig> 
                 totp_secret_base32: String::new(),
                 totp_digits: 6,
                 totp_period: 30,
+                max_cached_sessions: None,
+                session_idle_timeout: std::time::Duration::from_secs(300),
             })
         },
     )

@@ -49,10 +49,19 @@ struct SingletonEntry<T> {
     last_used: Instant,
 }
 
-#[derive(Clone)]
 pub(crate) struct SingletonLease<T> {
     resource: Arc<T>,
     generation: u64,
+}
+
+// Clone does not require `T: Clone` — only the `Arc` is duplicated.
+impl<T> Clone for SingletonLease<T> {
+    fn clone(&self) -> Self {
+        Self {
+            resource: self.resource.clone(),
+            generation: self.generation,
+        }
+    }
 }
 
 impl<T> ManagedSingleton<T> {

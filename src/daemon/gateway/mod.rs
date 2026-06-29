@@ -98,6 +98,26 @@ pub trait Gateway: Send + Sync {
     /// the caller.
     async fn open_session(&self, target: &str) -> Result<Box<dyn TargetSession>, GatewayError>;
 
+    /// Run a file copy operation. Default: open a session, start its sftp
+    /// subsystem, and upload/download via SFTP. Jumpserver overrides this
+    /// with shell-based copy (base64/tar over PTY) to avoid the sftp-server
+    /// dependency and preserve the navigated shell for session cache reuse.
+    ///
+    /// Requires [`Capabilities::COPY`].
+    async fn copy(
+        &self,
+        target: &str,
+        spec: crate::types::CopySpec,
+    ) -> Result<(), GatewayError> {
+        let sess = self.open_session(target).await?;
+        let sftp = crate::daemon::session::sftp_copy::open_sftp(sess)
+            .await
+            .map_err(|e| GatewayError::execution(anyhow!("{}", e)))?;
+        crate::daemon::session::sftp_copy::run(&sftp, spec)
+            .await
+            .map_err(|e| GatewayError::execution(anyhow!("{}", e)))
+    }
+
     /// List servers reachable through this gateway. Default: `Unsupported`.
     async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError> {
         Err(GatewayError::unsupported(anyhow!(

@@ -19,6 +19,7 @@ pub mod direct;
 pub mod jumpserver;
 pub mod local;
 pub mod sftp_copy;
+pub mod shell_copy;
 pub mod tunnel;
 
 use anyhow::Result;
@@ -137,17 +138,16 @@ async fn gateway_with_capability(
     Ok(gateway)
 }
 
-/// Run a copy (`xho cp`) over the unified `TargetSession`: open the session,
-/// start its sftp subsystem, and upload/download via SFTP. Gateways that do not
+/// Run a copy (`xho cp`) over the gateway. Each gateway decides its own copy
+/// strategy: the default uses the sftp subsystem; jumpserver overrides with
+/// shell-based copy (base64/tar over the navigated PTY). Gateways that do not
 /// advertise [`Capabilities::COPY`] return a clear `unsupported` error.
 pub async fn copy_via_session(state: &DaemonState, route: &Route, spec: CopySpec) -> Result<()> {
     let gateway = gateway_with_capability(state, route, Capabilities::COPY).await?;
-    let sess = gateway
-        .open_session(&route.end_target)
+    gateway
+        .copy(&route.end_target, spec)
         .await
-        .map_err(|e| anyhow!("{}", e.user_message()))?;
-    let sftp = sftp_copy::open_sftp(sess).await?;
-    sftp_copy::run(&sftp, spec).await
+        .map_err(|e| anyhow!("{}", e.user_message()))
 }
 
 /// Open a bare [`TargetSession`] to a target. This is the single entry point the

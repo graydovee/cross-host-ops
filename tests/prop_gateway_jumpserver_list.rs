@@ -103,6 +103,8 @@ fn arb_jumpserver_fields() -> impl Strategy<Value = JumpserverGatewayConfig> {
                     totp_secret_base32: mfa.totp_secret_base32,
                     totp_digits: mfa.digits,
                     totp_period: mfa.period,
+                    max_cached_sessions: None,
+                    session_idle_timeout: std::time::Duration::from_secs(300),
                 }
             },
         )

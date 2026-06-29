@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -142,6 +143,10 @@ fn default_totp_period() -> u64 {
     30
 }
 
+fn default_session_idle_timeout() -> Duration {
+    Duration::from_secs(300)
+}
+
 // ---------------------------------------------------------------------------
 // New gateway configuration types (task 2.1)
 // ---------------------------------------------------------------------------
@@ -204,6 +209,17 @@ pub struct JumpserverGatewayConfig {
     pub totp_digits: u32,
     #[serde(default = "default_totp_period")]
     pub totp_period: u64,
+    // Session cache: reuse navigated PTY shells across operations to the same
+    // target IP, eliminating ~3-5s menu navigation overhead on cache hit.
+    /// Maximum number of cached (idle) navigated shells across all targets.
+    /// Each shell is one PTY channel on the bastion. `None` = unlimited.
+    #[serde(default)]
+    pub max_cached_sessions: Option<usize>,
+    /// Per-shell idle timeout. A cached shell unused for this duration is
+    /// pruned by the reaper. The SSH keepalive keeps the connection alive
+    /// while cached. Default: 5 minutes.
+    #[serde(default = "default_session_idle_timeout")]
+    pub session_idle_timeout: Duration,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
