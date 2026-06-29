@@ -11,19 +11,18 @@
 // control message and await the result.
 
 use std::io::Cursor;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use russh::Channel;
 use russh::ChannelId;
 use russh::ChannelMsg;
+use russh::Pty;
 use russh::Sig;
 use russh::client::{self};
-use russh::keys::ssh_key::HashAlg;
 use russh::keys::{PrivateKeyWithHashAlg, load_secret_key};
-use russh::Pty;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
@@ -32,7 +31,7 @@ use crate::config::{AppConfig, DirectAuth};
 use super::{SessionEvent, TargetSession};
 
 /// Sentinel value meaning "no exit status captured yet".
-const NO_EXIT: u32 = u32::MAX;
+pub(crate) const NO_EXIT: u32 = u32::MAX;
 
 /// Open+authenticate a russh client handle for a direct SSH target.
 ///
@@ -47,7 +46,9 @@ pub(crate) async fn connect_authenticated(
     config: &AppConfig,
 ) -> Result<(client::Handle<ClientHandler>, Arc<AtomicU32>)> {
     let exit_code = Arc::new(AtomicU32::new(NO_EXIT));
-    let handler = ClientHandler { exit_code: exit_code.clone() };
+    let handler = ClientHandler {
+        exit_code: exit_code.clone(),
+    };
     let mut handle = connect_handle(host, port, config, handler).await?;
     match auth {
         DirectAuth::Key { identity_file } => {
@@ -199,16 +200,24 @@ pub(crate) struct DirectSshSession {
 }
 
 impl DirectSshSession {
-    /// Wrap an already-opened session channel from an authenticated handle.
-    /// `exit_code` is the shared cell populated by the `ClientHandler`'s
-    /// `exit_status` callback — used as a fallback when `channel.wait()` drops
-    /// the ExitStatus message.
-    pub(crate) fn new(channel: Channel<client::Msg>, exit_code: Arc<AtomicU32>) -> Self {
+    /// Wrap a channel opened on a *pooled* handle. `exit_code` is reset to
+    /// `NO_EXIT` (the handle is reused across execs, so a stale code from a
+    /// prior exec must not leak). `on_done` is invoked after the driver
+    /// terminates — the gateway uses it to return or discard the handle lease.
+    pub(crate) fn new(
+        channel: Channel<client::Msg>,
+        exit_code: Arc<AtomicU32>,
+        on_done: Box<dyn FnOnce() + Send>,
+    ) -> Self {
+        exit_code.store(NO_EXIT, Ordering::Relaxed);
         let (control_tx, control_rx) = mpsc::channel::<Control>(32);
         let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(64);
         let (events_tx, events_rx) = mpsc::unbounded_channel::<SessionEvent>();
 
-        tokio::spawn(driver(channel, control_rx, stdin_rx, events_tx, exit_code));
+        tokio::spawn(async move {
+            driver(channel, control_rx, stdin_rx, events_tx, exit_code).await;
+            on_done();
+        });
 
         Self {
             control_tx,

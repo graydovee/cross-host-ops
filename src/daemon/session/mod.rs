@@ -95,129 +95,78 @@ pub fn unsupported(what: &str) -> anyhow::Error {
     anyhow::anyhow!("unsupported operation for this transport: {what}")
 }
 
-use std::path::Path;
-
 use anyhow::anyhow;
 
-use crate::config::{AppConfig, DirectAuth, load_server_config, resolve_server_entry};
-use crate::daemon::connection::shared::{build_final_command, build_remote_command, resolve_shell};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::AbortHandle;
+
 use crate::protocol::ServerEvent;
 use crate::types::CopySpec;
 
 use super::DaemonState;
-use super::gateway::{GatewayKind, InteractiveHandle, Route};
+use super::gateway::{Capabilities, Route};
 
-/// Run a copy (`xho cp`) over the unified `TargetSession`: open the session,
-/// start its sftp subsystem, and upload/download via SFTP. Jumpserver targets
-/// return `unsupported` (they stay on the legacy gateway path).
-pub async fn copy_via_session(
-    state: &DaemonState,
-    route: &Route,
-    spec: CopySpec,
-) -> Result<()> {
-    let sess = open_target_session(state, route).await?;
-    let sftp = sftp_copy::open_sftp(sess).await?;
-    sftp_copy::run(&sftp, spec).await
+/// Handle for driving an interactive session: stdin/resize in, stdout out, plus
+/// an exit-code oneshot and abort handles for the bridging tasks.
+pub struct InteractiveHandle {
+    pub stdin_tx: mpsc::Sender<Vec<u8>>,
+    pub resize_tx: mpsc::Sender<(u32, u32)>,
+    pub stdout_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    pub exit_rx: oneshot::Receiver<i32>,
+    pub abort_handles: Vec<AbortHandle>,
 }
-///
-/// This is the single entry point every consumer (the transparent proxy, the
-/// `OpenSession` tunnel, and — after migration — the Execute/Copy RPCs) uses to
-/// reach a target. Dispatch is by gateway kind:
-///   - `Direct`     → `DirectSshSession` (raw SSH channel bridge)
-///   - `Localhost`  → `LocalSession` (local PTY + sftp-server)
-///   - `Xhod`/`ReverseProxy` → `TunneledSession` (control-plane `OpenSession`)
-///   - `Jumpserver` → best-effort; unsupported methods error clearly
-pub async fn open_target_session(
+
+/// Resolve a route's gateway and confirm it advertises `needed`. Every consumer
+/// gates generically on the capability flag — there is no per-kind branching.
+async fn gateway_with_capability(
     state: &DaemonState,
     route: &Route,
-) -> Result<Box<dyn TargetSession>> {
+    needed: Capabilities,
+) -> Result<std::sync::Arc<dyn super::gateway::Gateway>> {
     let gateway = state
         .find_gateway_any(&route.gateway_name)
         .await
         .ok_or_else(|| anyhow!("gateway '{}' not found", route.gateway_name))?;
-
-    match gateway.kind() {
-        GatewayKind::Localhost => {
-            let config = state.config.read().await.clone();
-            let shell = config
-                .reverse_proxy
-                .shell
-                .clone()
-                .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()));
-            let sftp = config.server.proxy.sftp_server_path.clone();
-            Ok(Box::new(local::LocalSession::new(shell, sftp)) as Box<dyn TargetSession>)
-        }
-        GatewayKind::Direct => {
-            let config = state.config.read().await.clone();
-            let r = resolve_direct(&config, &route.end_target).await?;
-            let (handle, exit_code) =
-                direct::connect_authenticated(&r.host, r.port, &r.user, &r.auth, &config).await?;
-            let channel = handle.channel_open_session().await?;
-            Ok(Box::new(direct::DirectSshSession::new(channel, exit_code)) as Box<dyn TargetSession>)
-        }
-        GatewayKind::Xhod | GatewayKind::ReverseProxy => {
-            let client = gateway
-                .rpc_client()
-                .await
-                .ok_or_else(|| anyhow!("gateway '{}' has no control-plane RPC client", route.gateway_name))?;
-            Ok(Box::new(tunnel::TunneledSession::new(client, route.end_target.clone()))
-                as Box<dyn TargetSession>)
-        }
-        GatewayKind::Jumpserver => {
-            // No argv here (proxy/tunnel path); JumpserverSession.exec(command)
-            // uses [command] when argv is empty.
-            Ok(Box::new(jumpserver::JumpserverSession::new(
-                gateway,
-                route.end_target.clone(),
-                Vec::new(),
-            )) as Box<dyn TargetSession>)
-        }
+    if !gateway.capabilities().contains(needed) {
+        return Err(unsupported(&format!(
+            "gateway '{}' ({}) does not support this operation",
+            gateway.name(),
+            gateway.kind()
+        )));
     }
+    Ok(gateway)
 }
 
-// -----------------------------------------------------------------------
-// CLI exec path: open a session + build the command (kind-aware)
-// -----------------------------------------------------------------------
-
-/// A resolved direct SSH target, including shell metadata for command building.
-pub(crate) struct ResolvedDirect {
-    pub host: String,
-    pub port: u16,
-    pub user: String,
-    pub auth: DirectAuth,
-    pub server_shell: Option<String>,
-    pub defaults_shell: String,
+/// Run a copy (`xho cp`) over the unified `TargetSession`: open the session,
+/// start its sftp subsystem, and upload/download via SFTP. Gateways that do not
+/// advertise [`Capabilities::COPY`] return a clear `unsupported` error.
+pub async fn copy_via_session(state: &DaemonState, route: &Route, spec: CopySpec) -> Result<()> {
+    let gateway = gateway_with_capability(state, route, Capabilities::COPY).await?;
+    let sess = gateway
+        .open_session(&route.end_target)
+        .await
+        .map_err(|e| anyhow!("{}", e.user_message()))?;
+    let sftp = sftp_copy::open_sftp(sess).await?;
+    sftp_copy::run(&sftp, spec).await
 }
 
-/// Resolve a direct SSH target's connection params + shell from server.toml.
-pub(crate) async fn resolve_direct(
-    config: &AppConfig,
-    target: &str,
-) -> Result<ResolvedDirect> {
-    let server_config = load_server_config(Path::new(&config.ssh.server_config_path))
-        .map_err(|e| anyhow!("failed to load server config: {e}"))?;
-    let host_cfg = server_config
-        .servers
-        .get(target)
-        .ok_or_else(|| anyhow!("target '{}' not found in server config", target))?;
-    let resolver = config.secret_resolver(server_config.defaults.identity_file.as_deref());
-    let entry = resolve_server_entry(target, host_cfg, &server_config.defaults, Some(&resolver))?;
-    Ok(ResolvedDirect {
-        host: entry.host,
-        port: entry.port,
-        user: entry.user,
-        auth: entry.auth,
-        server_shell: host_cfg.shell.clone(),
-        defaults_shell: server_config.defaults.shell.clone(),
-    })
+/// Open a bare [`TargetSession`] to a target. This is the single entry point the
+/// transparent proxy and the `OpenSession` tunnel use; dispatch lives entirely
+/// inside the gateway's `open_session`. Requires [`Capabilities::PROXY`].
+pub async fn open_target_session(
+    state: &DaemonState,
+    route: &Route,
+) -> Result<Box<dyn TargetSession>> {
+    let gateway = gateway_with_capability(state, route, Capabilities::PROXY).await?;
+    gateway
+        .open_session(&route.end_target)
+        .await
+        .map_err(|e| anyhow!("{}", e.user_message()))
 }
 
-/// Open a `TargetSession` for the CLI exec path and produce the command string
-/// to run. Command construction is kind-aware so each hop builds with the shell
-/// it resolves:
-///   - `Direct`/`Localhost`: build locally with the resolved shell.
-///   - `Xhod`/`ReverseProxy`: send raw argv; the remote xhod builds for its own
-///     target via the `OpenSession` tunnel.
+/// Open a `TargetSession` for the CLI exec path plus the command string to run.
+/// Command construction is kind-aware inside each gateway's `open_exec_session`.
+/// Requires [`Capabilities::EXEC`].
 pub async fn open_exec_session(
     state: &DaemonState,
     route: &Route,
@@ -225,70 +174,11 @@ pub async fn open_exec_session(
     cli_shell: &str,
     no_shell: bool,
 ) -> Result<(Box<dyn TargetSession>, String)> {
-    let gateway = state
-        .find_gateway_any(&route.gateway_name)
+    let gateway = gateway_with_capability(state, route, Capabilities::EXEC).await?;
+    gateway
+        .open_exec_session(&route.end_target, argv, cli_shell, no_shell)
         .await
-        .ok_or_else(|| anyhow!("gateway '{}' not found", route.gateway_name))?;
-    let config = state.config.read().await.clone();
-    match gateway.kind() {
-        GatewayKind::Localhost => {
-            let shell = config
-                .reverse_proxy
-                .shell
-                .clone()
-                .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()));
-            let sftp = config.server.proxy.sftp_server_path.clone();
-            let eff = resolve_shell(Some(shell.as_str()), no_shell, None, "").unwrap_or_default();
-            let command = build_final_command(argv, &eff);
-            Ok((
-                Box::new(local::LocalSession::new(shell, sftp)) as Box<dyn TargetSession>,
-                command,
-            ))
-        }
-        GatewayKind::Direct => {
-            let r = resolve_direct(&config, &route.end_target).await?;
-            let eff = resolve_shell(
-                if cli_shell.is_empty() { None } else { Some(cli_shell) },
-                no_shell,
-                r.server_shell.as_deref(),
-                &r.defaults_shell,
-            )
-            .unwrap_or_default();
-            let command = build_final_command(argv, &eff);
-            let (handle, exit_code) =
-                direct::connect_authenticated(&r.host, r.port, &r.user, &r.auth, &config).await?;
-            let channel = handle.channel_open_session().await?;
-            Ok((
-                Box::new(direct::DirectSshSession::new(channel, exit_code)) as Box<dyn TargetSession>,
-                command,
-            ))
-        }
-        GatewayKind::Xhod | GatewayKind::ReverseProxy => {
-            let client = gateway
-                .rpc_client()
-                .await
-                .ok_or_else(|| anyhow!("gateway '{}' has no control-plane RPC client", route.gateway_name))?;
-            let command = build_remote_command(argv);
-            Ok((
-                Box::new(tunnel::TunneledSession::new(client, route.end_target.clone()))
-                    as Box<dyn TargetSession>,
-                command,
-            ))
-        }
-        GatewayKind::Jumpserver => {
-            // JumpserverSession stores the raw argv (preserves multi-arg quoting);
-            // the returned command is unused (drive_exec passes it but the session
-            // uses its stored argv).
-            Ok((
-                Box::new(jumpserver::JumpserverSession::new(
-                    gateway.clone(),
-                    route.end_target.clone(),
-                    argv.to_vec(),
-                )) as Box<dyn TargetSession>,
-                String::new(),
-            ))
-        }
-    }
+        .map_err(|e| anyhow!("{}", e.user_message()))
 }
 
 /// Drive a `TargetSession` for a non-interactive exec: optional PTY, exec,
@@ -355,7 +245,6 @@ pub async fn drive_interactive(
     rows: u32,
 ) -> Result<InteractiveHandle> {
     use tokio::sync::{mpsc, oneshot};
-    
 
     sess.request_pty("xterm-256color", cols, rows, &[]).await?;
     match exec_command {
@@ -401,4 +290,3 @@ pub async fn drive_interactive(
         abort_handles: vec![task.abort_handle()],
     })
 }
-

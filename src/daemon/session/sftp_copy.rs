@@ -93,7 +93,9 @@ async fn upload(sftp: &SftpSession, spec: &mut CopySpec) -> Result<()> {
                 current_file = Some(
                     sftp.create(path_to_string(&remote_path)?)
                         .await
-                        .with_context(|| format!("failed to create remote {}", remote_path.display()))?,
+                        .with_context(|| {
+                            format!("failed to create remote {}", remote_path.display())
+                        })?,
                 );
             }
             CopyFrame::FileData { data } => {
@@ -115,7 +117,10 @@ async fn upload(sftp: &SftpSession, spec: &mut CopySpec) -> Result<()> {
                 let remote_path = join_relative_path(&remote_root, &relative_path)?;
                 create_remote_dirs(sftp, &remote_path).await?;
             }
-            CopyFrame::Symlink { relative_path, target } => {
+            CopyFrame::Symlink {
+                relative_path,
+                target,
+            } => {
                 let remote_path = if spec.recursive {
                     join_relative_path(&remote_root, &relative_path)?
                 } else if remote_root_is_dir {
@@ -129,7 +134,9 @@ async fn upload(sftp: &SftpSession, spec: &mut CopySpec) -> Result<()> {
                 let _ = sftp.remove_file(path_to_string(&remote_path)?).await;
                 sftp.symlink(path_to_string(&remote_path)?, target)
                     .await
-                    .with_context(|| format!("failed to create remote symlink {}", remote_path.display()))?;
+                    .with_context(|| {
+                        format!("failed to create remote symlink {}", remote_path.display())
+                    })?;
             }
             CopyFrame::EndOfStream => break,
         }
@@ -244,7 +251,10 @@ async fn send_remote_entry_frame(
         return Ok(());
     }
     if !metadata.is_regular() {
-        bail!("unsupported remote file type for copy: {}", remote_path.display());
+        bail!(
+            "unsupported remote file type for copy: {}",
+            remote_path.display()
+        );
     }
 
     tx.send(CopyFrame::BeginFile {
@@ -267,9 +277,11 @@ async fn send_remote_entry_frame(
         if n == 0 {
             break;
         }
-        tx.send(CopyFrame::FileData { data: buf[..n].to_vec() })
-            .await
-            .map_err(|_| anyhow!("download copy frame stream closed"))?;
+        tx.send(CopyFrame::FileData {
+            data: buf[..n].to_vec(),
+        })
+        .await
+        .map_err(|_| anyhow!("download copy frame stream closed"))?;
     }
     tx.send(CopyFrame::EndFile)
         .await

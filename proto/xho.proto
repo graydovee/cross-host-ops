@@ -269,6 +269,8 @@ message StatusResponse {
   bool reverse_proxy_client_enabled = 19;
   string reverse_proxy_client_target = 20;
   string reverse_proxy_client_status = 21;
+  bool proxy_listening = 22;
+  string proxy_addr = 23;
 }
 
 message ReverseProxyNodeStatus {

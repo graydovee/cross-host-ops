@@ -6,7 +6,7 @@
 
 use proptest::prelude::*;
 
-use xho::daemon::connection::shared::wrap_in_shell;
+use xho::daemon::shell::wrap_in_shell;
 
 // ---------------------------------------------------------------------------
 // Strategies

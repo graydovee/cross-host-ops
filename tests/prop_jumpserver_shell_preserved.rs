@@ -7,14 +7,14 @@
 //! was removed as part of the config-and-legacy-cleanup spec. The jumpserver
 //! shell navigation is now an internal implementation detail of
 //! `daemon::gateway::jumpserver::JumpserverGateway` and
-//! `daemon::connection::jumpserver`.
+//! `daemon::jumpserver_engine`.
 //!
 //! The shell_quote and build_remote_command functions are still available in
-//! `daemon::connection::shared` and are tested in prop_shell_*.rs tests.
+//! `daemon::shell` and are tested in prop_shell_*.rs tests.
 
 use proptest::prelude::*;
 
-use xho::daemon::connection::shared::{build_remote_command, shell_quote};
+use xho::daemon::shell::{build_remote_command, shell_quote};
 
 // ---------------------------------------------------------------------------
 // Strategy: generate arbitrary command argument vectors

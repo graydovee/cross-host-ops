@@ -133,51 +133,69 @@ Unified abstraction over all ways of reaching targets. Each Gateway manages its 
 
 ### Gateway trait (`mod.rs`)
 
-The sole interface for callers (daemon):
+The sole interface for callers (daemon). All dispatch lives inside each implementation — callers are fully generic. A `Gateway` knows how to open sessions and build kind-aware commands; it advertises which high-level operations it supports via `Capabilities`.
 
 ```rust
+bitflags! {
+    pub struct Capabilities: u32 {
+        const EXEC   = 1 << 0;  // open_exec_session
+        const COPY   = 1 << 1;  // open_session + sftp subsystem
+        const PROXY  = 1 << 2;  // open_session (transparent proxy)
+        const LIST   = 1 << 3;  // list_servers
+    }
+}
+
 #[async_trait]
 pub trait Gateway: Send + Sync {
-    async fn exec(&self, target: &str, request: &ExecRequest) -> Result<i32, GatewayError>;
-    async fn exec_interactive(&self, target: &str, request: &InteractiveRequest)
-        -> Result<InteractiveHandle, GatewayError>;
-    async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError>;
-    /// Control-plane gRPC client (Xhod/ReverseProxy only) for OpenSession tunnels.
-    async fn rpc_client(&self) -> Option<XhoRpcClient<Channel>> { None }
-    fn kind(&self) -> GatewayKind;
     fn name(&self) -> &str;
-    async fn prune_idle(&self);
+    fn kind(&self) -> GatewayKind;
+    fn capabilities(&self) -> Capabilities;
+
+    /// Open a session for the CLI exec path + the kind-aware command string.
+    async fn open_exec_session(&self, target: &str, argv: &[String],
+        shell: &str, no_shell: bool) -> Result<(Box<dyn TargetSession>, String), GatewayError>;
+
+    /// Open a bare session (proxy / multi-hop / copy).
+    async fn open_session(&self, target: &str) -> Result<Box<dyn TargetSession>, GatewayError>;
+
+    async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError> { /* Unsupported default */ }
+    async fn pool_status(&self) -> Vec<ConnectionStatusSnapshot> { Vec::new() }
+    async fn prune_idle(&self) {}
 }
 ```
 
-> **v0.4.0**: `Gateway::copy` was removed — all copy operations now flow through `TargetSession` + SFTP-over-session (`session::sftp_copy`). The `rpc_client` accessor enables multi-hop tunnels.
+Key notes:
+- `open_exec_session` builds the command inside the gateway (each backend resolves its shell differently: Direct resolves from server.toml, Xhod/ReverseProxy sends raw argv, Jumpserver resolves from server.toml defaults).
+- `open_session` is used by the transparent proxy, the `OpenSession` tunnel, and `xho cp` (which then drives the sftp subsystem).
+- Callers gate on `Gateway::capabilities()` — e.g. `capabilities.contains(Capabilities::COPY)` before invoking copy. Partial backends (e.g. Jumpserver without `LIST`) report clear `Unsupported` errors from their trait defaults.
 
 **`GatewayKind`** enum: `Direct` / `Jumpserver` / `Xhod` / `ReverseProxy` / `Localhost`.
 
 **`GatewayError`** carries an `ErrorKind` classification that drives error handling:
-- `Resolution` — Target not found (try the next route candidate)
-- `Transport` — Network failure (Gateway retries connection once internally)
-- `Execution` — Command execution failure (return directly)
-- `Unsupported` — Operation not supported (skip during `list_servers`)
+- `Resolution` — Target not found
+- `Transport` — Network failure (Gateway retries once internally)
+- `Execution` — Command execution failure
+- `Unsupported` — Operation not supported
 
 ### `build_gateways` (`mod.rs`)
 
 Factory function that constructs the Gateway list according to the following rules:
-1. **Always first** `"local"` → `LocalGateway` (reads `server.toml`, direct SSH).
+1. **Always first** `"local"` → `DirectGateway` (reads `server.toml`, direct SSH with pooled handles).
 2. Each `[[gateways]]` entry creates one Gateway in declaration order:
    - `kind = "xhod"` → `XhodGateway`
    - `kind = "jumpserver"` → `JumpserverGateway`
-   - `kind = "direct"` → **`LocalGateway`** (uses the entry's own name, shares `server.toml` resolution logic, only differs for routing purposes)
+   - `kind = "direct"` → **`DirectGateway`** (uses the entry's own name, shares `server.toml` resolution logic)
+3. `_self` (localhost) is registered as `LocalhostGateway` when `server.proxy.enable` or `reverse_proxy.allow_host_access` is set.
 
-> Note: There is no standalone `DirectGateway` type. The `direct` configuration reuses the `LocalGateway` implementation, only participating in Resolver routing under a different name.
+### Five Gateway implementations
 
-### Three Gateway implementations
-
-| Gateway | Connection method | Pool strategy | `list_servers` |
-|---------|------------------|---------------|----------------|
-| **LocalGateway** (`local.rs`) | Direct SSH | `ManagedPool<DirectPoolKey, DirectConnection>`, pooled by host/port/user/auth | Reads `server.toml`, zero I/O |
-| **XhodGateway** (`xhod.rs`) | SSH subsystem → gRPC | `ManagedSingleton<XhoRpcClient>`, single shared client | gRPC `ListServers` (returns all Gateways aggregated by the remote daemon) |
-| **JumpserverGateway** (`jumpserver.rs`) | SSH + PTY shell + menu | `ManagedSingleton<JumpserverTransport>` (one shared SSH connection) + `ManagedPool<target, JumpserverTargetShell>` (per-target cached PTY shell) | Not supported (`Unsupported`), zero I/O |
+| Gateway | Capabilities | Connection method | Pool strategy |
+|---------|-------------|------------------|---------------|
+| **DirectGateway** (`direct.rs`) | EXEC\|COPY\|PROXY\|LIST | Direct SSH | `ManagedPool<key, PooledHandle>` — pools authenticated `client::Handle` by host/port/user/auth; one SSH handshake, many session channels |
+| **LocalhostGateway** (`localhost.rs`) | EXEC\|COPY\|PROXY\|LIST | Local PTY + sftp-server | No pooling (fresh local proc per session) |
+| **XhodGateway** (`xhod.rs`) | EXEC\|COPY\|PROXY\|LIST | SSH subsystem → gRPC | `ManagedSingleton<XhoRpcClient>` — single shared client. `open_session` builds `TunneledSession` |
+| **ReverseProxyGateway** (`reverse_proxy.rs`) | EXEC\|COPY\|PROXY\|LIST | Reverse-proxy gRPC client | Pre-built channel from node-initiated connection. `open_session` builds `TunneledSession` |
+| **JumpserverGateway** (`jumpserver.rs`) | EXEC\|COPY\|PROXY | SSH + PTY shell + menu | `ManagedSingleton<JumpserverTransport>` — navigates to the asset per-session; `open_session` returns `JumpserverSession` |
 
 ### Authentication (`auth.rs`)
 
@@ -212,8 +230,8 @@ Four implementations (one per transport, not per feature):
 | `TunneledSession` (`tunnel.rs`) | OpenSession RPC over control plane | Multi-hop: `ssh → local proxy → control plane → remote xhod → machine`. Recursive. |
 | `JumpserverSession` (`jumpserver.rs`) | Wraps `JumpserverGateway` menu engine | Sentinel-free exec (prompt-based, exit code = 0); interactive shell via `exec_interactive`. |
 
-**Factory**: `open_target_session(state, route)` → dispatches by `gateway.kind()`.  
-**Copy**: `copy_via_session(state, route, spec)` → `subsystem("sftp")` + `russh-sftp` client over a duplex bridge (`sftp_copy.rs`).
+**Factory**: `open_target_session(state, route)` → delegates to `gateway.open_session(end_target)`. All dispatch lives inside the Gateway impl; the free function checks `Capabilities::PROXY` generically.  
+**Copy**: `copy_via_session(state, route, spec)` → checks `Capabilities::COPY`, calls `gateway.open_session()` → `subsystem("sftp")` + `russh-sftp` client over a duplex bridge (`sftp_copy.rs`).
 
 ## Transparent SSH Proxy (`src/daemon/proxy_server.rs`) — v0.4.0
 
@@ -233,7 +251,7 @@ rpc OpenSession(stream SessionRequest) returns (stream SessionResponse);
 
 Enables transparent `ssh`/`scp` to reach machines **behind another xhod**: `ssh node@xhod` → local proxy → control-plane `OpenSession` → remote xhod → `open_target_session` (recursive).
 
-- **Transport**: `TunneledSession` uses the existing control-plane gRPC client (XhodGateway/ReverseProxyGateway's `rpc_client()`).
+- **Transport**: `TunneledSession` is constructed directly by `XhodGateway`/`ReverseProxyGateway` from their pooled gRPC client.
 - **Server handler** (`daemon/mod.rs`): resolves the target, opens a `TargetSession`, and bridges the RPC stream ↔ session events.
 - **Recursive**: each xhod can serve `OpenSession`, so arbitrary-depth hops are uniform.
 
@@ -276,44 +294,24 @@ pub struct AuthPrompt {
 
 `auth.rs` also provides shared utilities: `parse_remote_target()` (parses `[user@]host[:port]`), known_hosts verification, and remote host key retrieval (trust-on-first-use).
 
-## Connection Layer (`src/daemon/connection/`)
+## Backend-agnostic Utilities
 
-Internal implementation detail of Gateways, not visible outside the daemon (`pub(super)`).
+### `shell.rs` (`src/daemon/shell.rs`)
 
-### Connection trait (`mod.rs`)
+Pure command-building utilities, reused by every backend:
+- `shell_quote()` / `build_remote_command()` / `build_final_command()` — argv quoting + shell wrapping
+- `wrap_in_shell()` — Wraps as `<shell> -ic '…'` (bash/zsh) or `<shell> -c '…'` (others)
+- `resolve_shell()` — Shell resolution priority: --no-shell > --shell > server.toml > defaults
 
-```rust
-#[async_trait]
-pub(super) trait Connection: Send {
-    async fn exec(&mut self, request: &mut ExecRequest) -> Result<i32>;
-    async fn copy(&mut self, spec: CopySpec) -> Result<()>;
-    async fn exec_interactive(&mut self, request: &InteractiveRequest)
-        -> Result<InteractiveHandle>;
-    fn is_alive(&self) -> bool;
-}
-```
+### `jumpserver_engine.rs` (`src/daemon/jumpserver_engine.rs`)
 
-### Three implementations
-
-| Connection | Transport | Created by |
-|------------|-----------|------------|
-| **DirectConnection** (`direct.rs`) | SSH channel (session) | LocalGateway |
-| **XhodConnection** (`xhod.rs`) | gRPC Execute/Copy stream | XhodGateway |
-| **JumpserverConnection** (`jumpserver.rs`) | PTY shell command interaction (with sentinel exit code extraction) | JumpserverGateway |
-
-### `shared.rs`
-
-Shared utilities for the connection layer:
-- `shell_quote()` — Single-quote wrapping and `'\''` escaping
-- `build_remote_command()` / `build_final_command()` — argv concatenation + shell configuration wrapping
-- `wrap_in_shell()` — Wraps as `<shell> -ic '...'` (bash/zsh) or `<shell> -c '...'` (sh/fish, etc.)
-- `PtyShell` — PTY management, prompt detection, sentinel exit code parsing
+Jumpserver-specific PTY engine — owns the `PtyShell`, menu navigation, asset table parsing, prompt detection, and sentinel-free streaming. Used only by `JumpserverGateway` and `JumpserverSession`; no other backend sees it.
 
 ## Connection Management (`src/daemon/connection_manager.rs`)
 
 Centralized connection pool/singleton management, reused by each Gateway:
 
-- **`ManagedPool<K, T>`** — Reuses connections by key, with capacity semaphore, idle pruning, and automatic retry on transport errors. Used by LocalGateway (keyed by `DirectPoolKey`) and JumpserverGateway (keyed by target shell).
+- **`ManagedPool<K, T>`** — Reuses connections by key, with capacity semaphore, idle pruning, and automatic retry on transport errors. Used by DirectGateway (keyed by `DirectPoolKey`, pooling authenticated `client::Handle`).
 - **`ManagedSingleton<T>`** — Single shared connection, with generation-based invalidation and maximum lifetime pruning. Used by XhodGateway (shared gRPC client) and JumpserverGateway (shared SSH transport).
 - **`RetryDecision`** — Connection establishment is phased (`Connect` / `Prepare` / `Started`); failures during the first two phases are retryable, failures after `Started` are not.
 
@@ -389,7 +387,7 @@ The CLI puts the terminal into raw mode, forwards stdin byte-by-byte, synchroniz
 
 Optional shell wrapping that executes remote commands within an interactive shell (loading `.bashrc`, aliases, `LS_COLORS`).
 
-**Configuration priority** (resolved on the daemon side, `connection/shared.rs`):
+**Configuration priority** (resolved on the daemon side, `daemon/shell.rs`):
 1. CLI `--shell <name>` / `--no-shell` (highest)
 2. `server.toml` per-server `shell = "zsh"`
 3. `server.toml` `[defaults]` `shell = "bash"` (lowest)
@@ -489,23 +487,27 @@ src/
 │   ├── path.rs  review.rs  server.rs  ssh.rs
 ├── daemon/                 # Daemon business logic
 │   ├── mod.rs              # Startup, listeners, shutdown, DaemonState, XhoRpcService
-│   ├── rpc.rs              # Gateway dispatch, multi-candidate fallback
+│   ├── rpc.rs              # Gateway dispatch, process_list_servers
 │   ├── resolver.rs         # target → Vec<Route>
 │   ├── review.rs           # LLM command review
 │   ├── ssh_server.rs       # RemoteSshServer, IncomingConn
 │   ├── connection_manager.rs  # ManagedPool / ManagedSingleton
 │   ├── gateway/            # Gateway abstraction and implementations
-│   │   ├── mod.rs          # Gateway trait, GatewayKind, Route, GatewayError, build_gateways
-│   │   ├── local.rs        # LocalGateway (direct SSH + ManagedPool)
-│   │   ├── xhod.rs         # XhodGateway (SSH subsystem + gRPC + ManagedSingleton)
-│   │   ├── jumpserver.rs   # JumpserverGateway (PTY shell + menu navigation)
+│   │   ├── mod.rs          # Gateway trait, Capabilities, GatewayKind, Route, GatewayError, build_gateways
+│   │   ├── direct.rs       # DirectGateway (pooled client::Handle + DirectSshSession)
+│   │   ├── localhost.rs    # LocalhostGateway (_self, LocalSession)
+│   │   ├── xhod.rs         # XhodGateway (SSH subsystem + gRPC + ManagedSingleton → TunneledSession)
+│   │   ├── jumpserver.rs   # JumpserverGateway (PTY shell + menu navigation → JumpserverSession)
 │   │   └── auth.rs         # AuthPrompter, AuthPrompt, TOTP, known_hosts
-│   └── connection/         # Connection trait (daemon-internal) and implementations
-│       ├── mod.rs          # Connection trait (pub(super))
-│       ├── direct.rs       # DirectConnection (SSH channel)
-│       ├── xhod.rs         # XhodConnection (gRPC stream)
-│       ├── jumpserver.rs   # JumpserverConnection (PTY shell)
-│       └── shared.rs       # shell_quote, build_command, wrap_in_shell, PtyShell
+│   ├── session/            # TargetSession trait (per-operation SSH channel contract)
+│   │   ├── mod.rs          # TargetSession trait, SessionEvent, drive_exec, drive_interactive, copy_via_session
+│   │   ├── direct.rs       # DirectSshSession (pooled byte-perfect SSH bridge)
+│   │   ├── local.rs        # LocalSession (PTY + sftp-server for _self)
+│   │   ├── tunnel.rs       # TunneledSession (OpenSession RPC multi-hop tunnel)
+│   │   ├── jumpserver.rs   # JumpserverSession (navigated PTY + raw/shell/sftp)
+│   │   └── sftp_copy.rs    # SFTP copy driver over subsystem("sftp")
+│   ├── shell.rs            # Pure shell quoting/building utilities (reused by all backends)
+│   └── jumpserver_engine.rs # Jumpserver-specific PtyShell, menu navigation, prompt detection
 ├── copy_frames.rs          # File copy frame encode/decode (shared library)
 ├── protocol.rs             # gRPC types / internal protocol types (shared library)
 ├── exit_codes.rs           # Exit code handling (shared library)
@@ -529,10 +531,11 @@ CLI
   → Daemon
       → Resolver.resolve("host1") → [Route { gateway:"local", end_target:"host1" }]
       → Reviewer.review("host1", ["ls"], "'ls'") → allow
-      → gateways["local"].exec("host1", ExecRequest { argv:["ls"], shell:"bash", ... })
-          → LocalGateway.resolve_target("host1") → server.toml resolves host/port/user/auth
-          → ManagedPool checkout or new DirectConnection (SSH)
-          → DirectConnection.exec(): channel.exec("bash -ic 'ls'") → streaming stdout/stderr/exit_status
+      → gateways["local"].open_exec_session("host1", ["ls"], "bash", false)
+          → DirectGateway.resolve_target("host1") → server.toml resolves host/port/user/auth
+          → ManagedPool checkout or new PooledHandle (authenticated client::Handle)
+          → channel_open_session() on the handle → DirectSshSession (byte-perfect bridge)
+          → drive_exec(session, "bash -ic 'ls'", ...) → streaming stdout/stderr/exit_status
       → return exit_code
   → CLI displays output
 ```
@@ -542,9 +545,10 @@ CLI
 ```
 CLI → Daemon
   → Resolver.resolve("remote-xhod:db01") → [Route { gateway:"remote-xhod", end_target:"db01" }]
-  → gateways["remote-xhod"].exec("db01", req)
-      → ManagedSingleton checkout shared gRPC client (new SSH subsystem "xho-rpc" connection if necessary)
-      → Remote daemon's XhoRpcService handles Execute (remote Resolver/Gateway resolves "db01")
+  → gateways["remote-xhod"].open_exec_session("db01", ["ls"], "", false)
+      → ManagedSingleton checkout shared gRPC client → build_remote_command(argv)
+      → TunneledSession(client, "db01") → OpenSession RPC to remote daemon
+      → Remote daemon's XhoRpcService opens its own TargetSession (recursive)
       → Results streamed back
 ```
 
@@ -553,20 +557,21 @@ CLI → Daemon
 ```
 CLI → gRPC ListServers → Daemon
   → rpc::process_list_servers(): iterate gateways in declaration order
-      ├─ LocalGateway.list_servers()        → Reads server.toml (zero I/O)
+      ├─ DirectGateway.list_servers()        → Reads server.toml (zero I/O)
       ├─ XhodGateway.list_servers()         → gRPC ListServers (remote aggregation)
       └─ JumpserverGateway.list_servers()   → Err(Unsupported) → skip and mark
   → Merge all ServerListRow, attach source label (local / <gateway-name>)
   → CLI formats and displays
 ```
 
-### Multi-candidate fallback `xho exec <bare-alias> -- ls`
+### `xho ls` (merged view aggregation)
 
 ```
-CLI → Daemon
-  → Resolver.resolve(<alias>) → multiple candidate Routes (in fallback order)
-  → Try each:
-      gateways[r0].exec(...) → Resolution error (target not in this gateway) → continue
-      gateways[r1].exec(...) → Ok(exit_code) → return
-  → If all fail, return the last error
+CLI → gRPC ListServers → Daemon
+  → rpc::process_list_servers(): iterate gateways in declaration order
+      ├─ DirectGateway.list_servers()       → Reads server.toml (zero I/O)
+      ├─ XhodGateway.list_servers()         → gRPC ListServers (remote aggregation)
+      └─ JumpserverGateway.list_servers()   → Err(Unsupported, default trait impl) → mark
+  → Merge all ServerListRow, attach source label (local / <gateway-name>)
+  → CLI formats and displays
 ```

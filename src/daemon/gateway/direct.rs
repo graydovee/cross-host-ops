@@ -1,31 +1,34 @@
 // DirectGateway implementation.
-// Manages direct SSH connections with per-address connection pooling.
+//
+// Manages direct SSH connections with per-endpoint connection pooling. The
+// pooled resource is an authenticated russh `client::Handle` (plus its shared
+// exit-code cell): the expensive TCP + SSH + auth handshake is performed once
+// and reused, while each operation opens a fresh session channel on the handle.
+// This is what makes a second `xho exec` to the same host fast.
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use russh::client::Handle;
 use tokio::sync::RwLock;
 use tracing::debug;
 
 use crate::config::{
     AppConfig, DirectAuth, list_server_entries, load_server_config, resolve_server_entry,
 };
+use crate::daemon::connection_manager::{ConnectionStatusSnapshot, ManagedPool, PoolLease};
+use crate::daemon::session::TargetSession;
+use crate::daemon::session::direct::{ClientHandler, DirectSshSession, connect_authenticated};
+use crate::daemon::shell::{build_final_command, resolve_shell};
 use crate::protocol::ServerListRow;
 use crate::types::ServerListSource;
 
 use super::auth::AuthPrompter;
-use super::{
-    ExecRequest, Gateway, GatewayError, GatewayKind, InteractiveHandle, InteractiveRequest,
-    is_transport_error,
-};
-use crate::daemon::connection::direct::DirectConnection;
-use crate::daemon::connection::{
-    Connection, ExecRequest as ConnExecRequest, InteractiveRequest as ConnInteractiveRequest,
-};
-use crate::daemon::connection_manager::{ManagedPool, PoolLease};
+use super::{Capabilities, Gateway, GatewayError, GatewayKind};
 
 // ---------------------------------------------------------------------------
 // Internal types
@@ -41,11 +44,24 @@ struct ResolvedTarget {
     defaults_shell: String,
 }
 
+/// An authenticated, pooled SSH handle. New session channels are opened on it
+/// for each operation; the handshake is paid once and reused.
+pub(crate) struct PooledHandle {
+    handle: Handle<ClientHandler>,
+    exit_code: Arc<AtomicU32>,
+}
+
+impl PooledHandle {
+    fn is_alive(&self) -> bool {
+        !self.handle.is_closed()
+    }
+}
+
 /// Pool identity for a direct SSH transport.
 ///
-/// The auth fingerprint is intentionally not exposed in labels/logs, but it is
-/// part of equality/hash so different users or credentials never share a
-/// transport by accident.
+/// The auth fingerprint is part of equality/hash so different users or
+/// credentials never share a transport by accident, but it is never surfaced
+/// in labels/logs.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct DirectPoolKey {
     host: String,
@@ -90,9 +106,8 @@ pub struct DirectGateway {
     server_config_path: String,
     #[allow(dead_code)]
     auth_prompter: Arc<AuthPrompter>,
-    /// Direct SSH pool keyed by endpoint, user, and auth identity.
-    pool: Arc<ManagedPool<DirectPoolKey, DirectConnection>>,
-    #[allow(dead_code)]
+    /// Pool of authenticated SSH handles, keyed by endpoint + user + auth.
+    pool: Arc<ManagedPool<DirectPoolKey, PooledHandle>>,
     max_connections_per_address: usize,
 }
 
@@ -116,8 +131,8 @@ impl DirectGateway {
         }
     }
 
-    /// Resolve a target string to host, port, user, and auth credentials
-    /// by looking it up in the server.toml configuration.
+    /// Resolve a target string to host, port, user, and auth credentials by
+    /// looking it up in the server.toml configuration.
     async fn resolve_target(&self, target: &str) -> Result<ResolvedTarget, GatewayError> {
         let path = Path::new(&self.server_config_path);
         let server_config = load_server_config(path).map_err(|e| {
@@ -129,10 +144,6 @@ impl DirectGateway {
             .get(target)
             .ok_or_else(|| GatewayError::resolution(anyhow!("target '{}' not found", target)))?;
 
-        // Build a secret resolver so a `vault:`/`env:`/`file:` password can be
-        // resolved at connect time. The vault key source falls back to
-        // server.toml's [defaults].identity_file when [secret].key_source is
-        // unset.
         let resolver = self
             .config
             .read()
@@ -159,9 +170,9 @@ impl DirectGateway {
         })
     }
 
-    fn effective_shell(request_shell: &str, no_shell: bool, resolved: &ResolvedTarget) -> String {
-        let cli_shell = (!request_shell.is_empty()).then_some(request_shell);
-        crate::daemon::connection::shared::resolve_shell(
+    fn effective_shell(cli_shell: &str, no_shell: bool, resolved: &ResolvedTarget) -> String {
+        let cli_shell = (!cli_shell.is_empty()).then_some(cli_shell);
+        resolve_shell(
             cli_shell,
             no_shell,
             resolved.shell.as_deref(),
@@ -170,75 +181,91 @@ impl DirectGateway {
         .unwrap_or_default()
     }
 
-    /// Create a new DirectConnection to the resolved target.
-    async fn create_connection(&self, resolved: &ResolvedTarget) -> Result<DirectConnection> {
-        let config = self.config.read().await;
-        DirectConnection::connect(
-            &resolved.host,
-            resolved.port,
-            &resolved.user,
-            &resolved.auth,
-            &config,
-            None,
-        )
-        .await
-    }
-
-    /// Acquire or create a connection for the given target.
-    async fn get_connection(
+    /// Acquire (or create) a pooled handle lease for the resolved target,
+    /// discarding a dead handle and retrying once.
+    async fn checkout_handle(
         &self,
         resolved: &ResolvedTarget,
-    ) -> Result<PoolLease<DirectPoolKey, DirectConnection>, GatewayError> {
+    ) -> Result<PoolLease<DirectPoolKey, PooledHandle>, GatewayError> {
         let key = DirectPoolKey::from_resolved(resolved);
         for attempt in 0..=1 {
             let key_for_error = key.clone();
-            let checkout_result = self
+            let lease = self
                 .pool
                 .checkout_or_create_with(key.clone(), || async {
-                    self.create_connection(resolved).await.map_err(|e| {
+                    let (handle, exit_code) = connect_authenticated(
+                        &resolved.host,
+                        resolved.port,
+                        &resolved.user,
+                        &resolved.auth,
+                        &self.config.read().await.clone(),
+                    )
+                    .await
+                    .map_err(|e| {
                         GatewayError::transport(anyhow!(
                             "failed to connect to {}: {}",
                             key_for_error.label(),
                             e
                         ))
-                    })
+                    })?;
+                    Ok::<PooledHandle, GatewayError>(PooledHandle { handle, exit_code })
                 })
                 .await;
 
-            let mut lease = match checkout_result {
+            let lease = match lease {
                 Ok(lease) => lease,
                 Err(e) if attempt == 0 && e.kind == super::ErrorKind::Transport => {
-                    debug!(
-                        gateway = %self.gateway_name,
-                        target = %key.label(),
-                        "transport error creating direct SSH connection, retrying: {}",
-                        e
-                    );
+                    debug!(gateway = %self.gateway_name, target = %key.label(),
+                        "transport error creating direct SSH handle, retrying: {}", e);
                     continue;
                 }
                 Err(e) => return Err(e),
             };
 
-            if lease.resource_mut().is_alive() {
+            if lease.resource().is_alive() {
                 return Ok(lease);
             }
-
-            debug!(
-                gateway = %self.gateway_name,
-                target = %key.label(),
-                generation = %lease.generation(),
-                "discarding stale direct SSH connection"
-            );
+            debug!(gateway = %self.gateway_name, target = %key.label(),
+                generation = %lease.generation(), "discarding stale direct SSH handle");
             self.pool.discard(lease);
-
             if attempt == 1 {
                 return Err(GatewayError::transport(anyhow!(
-                    "direct SSH connection for {} is not alive after refresh",
+                    "direct SSH handle for {} is not alive after refresh",
                     key.label()
                 )));
             }
         }
-        unreachable!("direct pool checkout loop is bounded")
+        unreachable!("direct handle checkout loop is bounded")
+    }
+
+    /// Open a session channel on a pooled handle and wrap it as a
+    /// `DirectSshSession`. The handle lease is returned to the pool (or
+    /// discarded if dead) when the session's driver task terminates.
+    async fn open_pooled_session(
+        &self,
+        resolved: &ResolvedTarget,
+    ) -> Result<Box<dyn TargetSession>, GatewayError> {
+        let lease = self.checkout_handle(resolved).await?;
+        let channel = match lease.resource().handle.channel_open_session().await {
+            Ok(channel) => channel,
+            Err(e) => {
+                self.pool.discard(lease);
+                return Err(GatewayError::transport(anyhow!(
+                    "failed to open direct SSH channel: {}",
+                    e
+                )));
+            }
+        };
+        let exit_code = lease.resource().exit_code.clone();
+        let pool = self.pool.clone();
+        let on_done = Box::new(move || {
+            if lease.resource().is_alive() {
+                pool.return_healthy(lease);
+            } else {
+                pool.discard(lease);
+            }
+        });
+        Ok(Box::new(DirectSshSession::new(channel, exit_code, on_done)) as Box<dyn TargetSession>)
     }
 }
 
@@ -248,111 +275,35 @@ impl DirectGateway {
 
 #[async_trait]
 impl Gateway for DirectGateway {
-    async fn exec(&self, target: &str, request: &ExecRequest) -> Result<i32, GatewayError> {
-        let resolved = self.resolve_target(target).await?;
-        let mut lease = self.get_connection(&resolved).await?;
-
-        // Take stdin_rx from the gateway request (consuming it so the channel
-        // is owned by the connection layer for forwarding).
-        let stdin_rx = request.stdin_rx.lock().ok().and_then(|mut g| g.take());
-
-        // Build the connection-level request
-        let mut conn_request = ConnExecRequest {
-            argv: request.argv.clone(),
-            sender: request.sender.clone(),
-            tty: request.tty,
-            cols: request.cols,
-            rows: request.rows,
-            shell: Self::effective_shell(&request.shell, request.no_shell, &resolved),
-            no_shell: request.no_shell,
-            timeout_ms: request.timeout_ms,
-            stdin: request.stdin,
-            stdin_intent: request.stdin_intent,
-            stdin_rx,
-        };
-
-        let result = lease.resource_mut().exec(&mut conn_request).await;
-
-        match result {
-            Ok(exit_code) => {
-                self.pool.return_healthy(lease);
-                Ok(exit_code)
-            }
-            Err(e) if is_transport_error(&e) => {
-                debug!(
-                    gateway = %self.gateway_name,
-                    target = %target,
-                    generation = %lease.generation(),
-                    "transport error on direct exec after checkout; discarding connection: {}",
-                    e
-                );
-                self.pool.discard(lease);
-                Err(GatewayError::transport(e))
-            }
-            Err(e) => {
-                self.pool.return_healthy(lease);
-                Err(GatewayError::execution(e))
-            }
-        }
+    fn name(&self) -> &str {
+        &self.gateway_name
     }
 
+    fn kind(&self) -> GatewayKind {
+        GatewayKind::Direct
+    }
 
-    async fn exec_interactive(
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::EXEC | Capabilities::COPY | Capabilities::PROXY | Capabilities::LIST
+    }
+
+    async fn open_exec_session(
         &self,
         target: &str,
-        request: &InteractiveRequest,
-    ) -> Result<InteractiveHandle, GatewayError> {
+        argv: &[String],
+        shell: &str,
+        no_shell: bool,
+    ) -> Result<(Box<dyn TargetSession>, String), GatewayError> {
         let resolved = self.resolve_target(target).await?;
-        let mut lease = self.get_connection(&resolved).await?;
+        let eff_shell = Self::effective_shell(shell, no_shell, &resolved);
+        let command = build_final_command(argv, &eff_shell);
+        let session = self.open_pooled_session(&resolved).await?;
+        Ok((session, command))
+    }
 
-        let conn_request = ConnInteractiveRequest {
-            argv: request.argv.clone(),
-            cols: request.cols,
-            rows: request.rows,
-            sender: request.sender.clone(),
-            shell: Self::effective_shell(&request.shell, request.no_shell, &resolved),
-            no_shell: request.no_shell,
-        };
-
-        let handle = match lease.resource_mut().exec_interactive(&conn_request).await {
-            Ok(handle) => handle,
-            Err(e) if is_transport_error(&e) => {
-                self.pool.discard(lease);
-                return Err(GatewayError::transport(e));
-            }
-            Err(e) => {
-                self.pool.return_healthy(lease);
-                return Err(GatewayError::execution(e));
-            }
-        };
-
-        let crate::daemon::connection::InteractiveHandle {
-            stdin_tx,
-            resize_tx,
-            stdout_rx,
-            exit_rx,
-            mut abort_handles,
-        } = handle;
-        let (gateway_exit_tx, gateway_exit_rx) = tokio::sync::oneshot::channel();
-        let pool = self.pool.clone();
-        let wrapper_task = tokio::spawn(async move {
-            let exit_code = exit_rx.await.unwrap_or(255);
-            if lease.resource_mut().is_alive() {
-                pool.return_healthy(lease);
-            } else {
-                pool.discard(lease);
-            }
-            let _ = gateway_exit_tx.send(exit_code);
-        });
-        abort_handles.push(wrapper_task.abort_handle());
-
-        Ok(InteractiveHandle {
-            stdin_tx,
-            resize_tx,
-            stdout_rx,
-            exit_rx: gateway_exit_rx,
-            abort_handles,
-        })
+    async fn open_session(&self, target: &str) -> Result<Box<dyn TargetSession>, GatewayError> {
+        let resolved = self.resolve_target(target).await?;
+        self.open_pooled_session(&resolved).await
     }
 
     async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError> {
@@ -369,12 +320,8 @@ impl Gateway for DirectGateway {
         Ok(rows)
     }
 
-    fn kind(&self) -> GatewayKind {
-        GatewayKind::Direct
-    }
-
-    fn name(&self) -> &str {
-        &self.gateway_name
+    async fn pool_status(&self) -> Vec<ConnectionStatusSnapshot> {
+        self.pool.status_snapshot_with(|key| key.label())
     }
 
     async fn prune_idle(&self) {

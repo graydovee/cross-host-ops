@@ -1,17 +1,15 @@
 #[allow(dead_code)]
 pub mod authorized_keys;
 #[allow(dead_code)]
-pub mod connection;
-#[allow(dead_code)]
-pub mod proxy_server;
-#[allow(dead_code)]
 pub mod connection_manager;
 #[allow(dead_code)]
 pub mod gateway;
 #[allow(dead_code)]
-pub mod resolver;
+pub mod jumpserver_engine;
 #[allow(dead_code)]
-pub mod session;
+pub mod proxy_server;
+#[allow(dead_code)]
+pub mod resolver;
 #[allow(dead_code)]
 pub mod reverse_client;
 #[allow(dead_code)]
@@ -20,6 +18,10 @@ pub mod reverse_proxy;
 pub mod review;
 #[allow(dead_code)]
 pub mod rpc;
+#[allow(dead_code)]
+pub mod session;
+#[allow(dead_code)]
+pub mod shell;
 #[allow(dead_code)]
 pub mod ssh_server;
 #[allow(dead_code)]
@@ -290,6 +292,7 @@ pub async fn run_with_overrides(
             Arc::new(gateway::localhost::LocalhostGateway::new(
                 loaded.reverse_proxy.shell.clone(),
                 loaded.reverse_proxy.user.clone(),
+                loaded.server.proxy.sftp_server_path.clone(),
             )),
         ));
         info!("_self (localhost) gateway registered");
@@ -596,25 +599,22 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                         spec.upload_rx = Some(upload_rx);
 
                         tokio::spawn(async move {
-                            loop {
-                                match inbound.message().await {
-                                    Ok(Some(msg)) => match msg.request {
-                                        Some(proto_rpc::copy_request::Request::Frame(frame)) => {
-                                            let Ok(frame) = protocol::copy_frame_from_rpc(frame) else {
-                                                break;
-                                            };
-                                            let eof = matches!(frame, CopyFrame::EndOfStream);
-                                            if upload_tx.send(frame).await.is_err() {
-                                                break;
-                                            }
-                                            if eof {
-                                                break;
-                                            }
+                            while let Ok(Some(msg)) = inbound.message().await {
+                                match msg.request {
+                                    Some(proto_rpc::copy_request::Request::Frame(frame)) => {
+                                        let Ok(frame) = protocol::copy_frame_from_rpc(frame) else {
+                                            break;
+                                        };
+                                        let eof = matches!(frame, CopyFrame::EndOfStream);
+                                        if upload_tx.send(frame).await.is_err() {
+                                            break;
                                         }
-                                        Some(proto_rpc::copy_request::Request::AuthInput(_)) => {}
-                                        Some(proto_rpc::copy_request::Request::Start(_)) | None => {}
-                                    },
-                                    Ok(None) | Err(_) => break,
+                                        if eof {
+                                            break;
+                                        }
+                                    }
+                                    Some(proto_rpc::copy_request::Request::AuthInput(_)) => {}
+                                    Some(proto_rpc::copy_request::Request::Start(_)) | None => {}
                                 }
                             }
                         });
@@ -754,11 +754,25 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
             })
             .collect();
 
+        // Aggregate per-gateway connection pool snapshots (real reuse status).
+        let mut pools: Vec<proto_rpc::PoolStatus> = Vec::new();
+        for (_name, gw) in &self.state.gateways {
+            for snap in gw.pool_status().await {
+                pools.push(proto_rpc::PoolStatus {
+                    key: snap.key,
+                    total: (snap.active + snap.idle) as u64,
+                    busy: snap.active as u64,
+                    idle: snap.idle as u64,
+                    queued: 0,
+                });
+            }
+        }
+
         let response = proto_rpc::StatusResponse {
             daemon_running: true,
             local_socket_path: socket_path,
             active_executions: 0,
-            pools: Vec::new(),
+            pools,
             daemon_origin: self.state.origin.as_str().to_string(),
             cli_controllable: self.state.origin.cli_controllable(),
             cli_start_config_path: self
@@ -797,6 +811,12 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                 "active".to_string()
             } else {
                 "disabled".to_string()
+            },
+            proxy_listening: config.server.proxy.enable,
+            proxy_addr: if config.server.proxy.enable {
+                config.server.proxy.listen_addr.clone()
+            } else {
+                String::new()
             },
         };
         Ok(Response::new(response))
@@ -1673,7 +1693,7 @@ async fn process_interactive_execute(
     }
 
     // Open interactive session via the unified TargetSession abstraction.
-    let mut handle: gateway::InteractiveHandle = {
+    let mut handle: session::InteractiveHandle = {
         let (sess, command) = session::open_exec_session(
             state,
             route,

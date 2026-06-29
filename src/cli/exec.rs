@@ -66,7 +66,7 @@ pub fn set_raw_mode(fd: RawFd) -> Result<RawModeGuard> {
 }
 
 fn raw_mode_diagnostic_bytes(message: &str) -> Vec<u8> {
-    let message = message.trim_end_matches(|c| c == '\r' || c == '\n');
+    let message = message.trim_end_matches(['\r', '\n']);
     if message.is_empty() {
         return Vec::new();
     }
@@ -144,6 +144,7 @@ pub(crate) fn detect_double_dash_separator(target: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_command(
     target: String,
     argv: Vec<String>,

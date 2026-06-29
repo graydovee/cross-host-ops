@@ -39,84 +39,142 @@ pub fn print_version_json() {
 pub(crate) async fn status() -> Result<i32> {
     let mut client = connect_data_client(ClientAccess::NoAutoStart).await?;
     let response = client.status(rpc::StatusRequest {}).await?.into_inner();
-    println!("daemon:");
-    println!("  origin: {}", response.daemon_origin);
-    println!("  cli_controllable: {}", response.cli_controllable);
-    println!("  active_executions: {}", response.active_executions);
+
+    // ── Daemon header ──
+    println!(
+        "daemon    origin={}    controllable={}    active={}",
+        response.daemon_origin, response.cli_controllable, response.active_executions
+    );
     if !response.cli_start_config_path.is_empty() {
-        println!(
-            "  cli_start_config_path: {}",
-            response.cli_start_config_path
-        );
+        println!("  config: {}", response.cli_start_config_path);
     }
     if !response.cli_start_log_level.is_empty() {
-        println!("  cli_start_log_level: {}", response.cli_start_log_level);
-    }
-    if response.remote_listening {
-        println!("remote:");
-        println!("  listening: {}", response.remote_addr);
-        println!("  user: {}", response.remote_ssh_user);
+        println!("  log-level: {}", response.cli_start_log_level);
     }
 
-    // Print gateways from the daemon's StatusResponse.
+    // ── LISTENERS ──
+    let has_listeners = response.remote_listening || response.proxy_listening;
+    if has_listeners {
+        println!("\nLISTENERS");
+        let mut listener_rows: Vec<Vec<String>> = Vec::new();
+        if response.remote_listening {
+            let auth = format!("user={}", response.remote_ssh_user);
+            listener_rows.push(vec![
+                "control".to_string(),
+                response.remote_addr.clone(),
+                auth,
+                "up".to_string(),
+            ]);
+        }
+        if response.proxy_listening {
+            listener_rows.push(vec![
+                "proxy".to_string(),
+                response.proxy_addr.clone(),
+                "-".to_string(),
+                "up".to_string(),
+            ]);
+        }
+        print_aligned_rows(&["TYPE", "ADDRESS", "AUTH", "STATUS"], &listener_rows, "  ");
+    }
+
+    // ── GATEWAYS ──
     if !response.gateways.is_empty() {
-        println!("gateways:");
-        for jh in &response.gateways {
-            println!("  - name: {}", jh.name);
-            println!("    kind: {}", jh.kind);
-            println!("    address: {}", jh.address);
-            if let Some(sub) = &jh.sub_status {
-                println!("    sub_status:");
-                println!("      daemon_running: {}", sub.daemon_running);
-                println!("      active_executions: {}", sub.active_executions);
-                if !sub.pools.is_empty() {
-                    println!("      pools:");
-                    for pool in &sub.pools {
-                        println!(
-                            "        {} total={} busy={} idle={} queued={}",
-                            pool.key, pool.total, pool.busy, pool.idle, pool.queued
-                        );
-                    }
-                }
-            }
+        println!("\nGATEWAYS");
+        let mut gw_rows: Vec<Vec<String>> = Vec::new();
+        for gw in &response.gateways {
+            gw_rows.push(vec![
+                gw.name.clone(),
+                gw.kind.clone(),
+                gw.address.clone(),
+                "-".to_string(),
+            ]);
         }
+        print_aligned_rows(&["NAME", "KIND", "ADDRESS", "POOL"], &gw_rows, "  ");
     }
 
-    // Reverse proxy server info.
-    if response.reverse_proxy_server_enabled {
-        println!("reverse_proxy_server:");
-        println!("  enabled: true");
-        if !response.reverse_proxy_nodes.is_empty() {
-            println!("  nodes:");
-            for node in &response.reverse_proxy_nodes {
-                println!("    - name: {}", node.name);
-                if !node.peer_addr.is_empty() {
-                    println!("      peer: {}", node.peer_addr);
-                }
-                if !node.fingerprint.is_empty() {
-                    println!("      key: {}", node.fingerprint);
-                }
-            }
-        }
-    }
-
-    // Reverse proxy client info.
-    if response.reverse_proxy_client_enabled {
-        println!("reverse_proxy_client:");
-        println!("  target: {}", response.reverse_proxy_client_target);
-        println!("  status: {}", response.reverse_proxy_client_status);
-    }
-
+    // ── POOLS ──
     if !response.pools.is_empty() {
-        println!("pools:");
-        for pool in response.pools {
+        println!("\nPOOLS");
+        let mut pool_rows: Vec<Vec<String>> = Vec::new();
+        for p in &response.pools {
+            pool_rows.push(vec![
+                p.key.clone(),
+                format!("{}", p.total),
+                format!("{}", p.busy),
+                format!("{}", p.idle),
+            ]);
+        }
+        print_aligned_rows(&["KEY", "TOTAL", "BUSY", "IDLE"], &pool_rows, "  ");
+    }
+
+    // ── REVERSE PROXY ──
+    let has_rp = response.reverse_proxy_server_enabled || response.reverse_proxy_client_enabled;
+    if has_rp {
+        println!("\nREVERSE PROXY");
+        if response.reverse_proxy_server_enabled {
             println!(
-                "  {} total={} busy={} idle={} queued={}",
-                pool.key, pool.total, pool.busy, pool.idle, pool.queued
+                "  server    enabled=yes    nodes={}",
+                response.reverse_proxy_nodes.len()
+            );
+            for node in &response.reverse_proxy_nodes {
+                let peer = if node.peer_addr.is_empty() {
+                    "-"
+                } else {
+                    &node.peer_addr
+                };
+                println!("    - {}     peer={}", node.name, peer);
+            }
+        }
+        if response.reverse_proxy_client_enabled {
+            println!(
+                "  client    target={}    status={}",
+                response.reverse_proxy_client_target, response.reverse_proxy_client_status
             );
         }
     }
     Ok(0)
+}
+
+/// Print headers + rows with aligned columns.
+fn print_aligned_rows(headers: &[&str], rows: &[Vec<String>], indent: &str) {
+    let col_count = headers.len();
+    let mut widths = vec![0usize; col_count];
+
+    // Include header in width calculation.
+    for (i, h) in headers.iter().enumerate() {
+        widths[i] = h.len();
+    }
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            if i < col_count && cell.len() > widths[i] {
+                widths[i] = cell.len();
+            }
+        }
+    }
+
+    // Print header.
+    print!("{indent}");
+    for (i, h) in headers.iter().enumerate() {
+        if i > 0 {
+            print!("    ");
+        }
+        print!("{:width$}", h, width = widths[i]);
+    }
+    println!();
+
+    // Print rows.
+    for row in rows {
+        print!("{indent}");
+        for (i, cell) in row.iter().enumerate() {
+            if i > 0 {
+                print!("    ");
+            }
+            if i < col_count {
+                print!("{:width$}", cell, width = widths[i]);
+            }
+        }
+        println!();
+    }
 }
 
 pub(crate) async fn list_servers(refresh: bool) -> Result<i32> {

@@ -15,12 +15,10 @@ use async_trait::async_trait;
 use proptest::prelude::*;
 
 use xho::config::{DirectAuth, ServerEntry};
-use xho::daemon::gateway::{
-    ErrorKind, ExecRequest, Gateway, GatewayError, GatewayKind, InteractiveHandle,
-    InteractiveRequest,
-};
+use xho::daemon::gateway::{Capabilities, ErrorKind, Gateway, GatewayError, GatewayKind};
+use xho::daemon::session::TargetSession;
 use xho::protocol::ServerListRow;
-use xho::types::{CopySpec, ServerListSource};
+use xho::types::ServerListSource;
 
 // ---------------------------------------------------------------------------
 // Mock Gateway implementation
@@ -34,35 +32,35 @@ struct MockGateway {
 
 #[async_trait]
 impl Gateway for MockGateway {
-    async fn exec(&self, _target: &str, _request: &ExecRequest) -> Result<i32, GatewayError> {
-        unimplemented!("not needed for this test")
-    }
-
-    async fn copy(&self, _target: &str, _spec: CopySpec) -> Result<(), GatewayError> {
-        unimplemented!("not needed for this test")
-    }
-
-    async fn exec_interactive(
-        &self,
-        _target: &str,
-        _request: &InteractiveRequest,
-    ) -> Result<InteractiveHandle, GatewayError> {
-        unimplemented!("not needed for this test")
-    }
-
-    async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError> {
-        Ok(self.rows.clone())
+    fn name(&self) -> &str {
+        &self.gateway_name
     }
 
     fn kind(&self) -> GatewayKind {
         GatewayKind::Direct
     }
 
-    fn name(&self) -> &str {
-        &self.gateway_name
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::LIST
     }
 
-    async fn prune_idle(&self) {}
+    async fn open_exec_session(
+        &self,
+        _target: &str,
+        _argv: &[String],
+        _shell: &str,
+        _no_shell: bool,
+    ) -> Result<(Box<dyn TargetSession>, String), GatewayError> {
+        unimplemented!("not needed for this test")
+    }
+
+    async fn open_session(&self, _target: &str) -> Result<Box<dyn TargetSession>, GatewayError> {
+        unimplemented!("not needed for this test")
+    }
+
+    async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError> {
+        Ok(self.rows.clone())
+    }
 }
 
 // ---------------------------------------------------------------------------

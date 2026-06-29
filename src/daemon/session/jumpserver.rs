@@ -1,59 +1,92 @@
-// JumpserverSession — a `TargetSession` backed by a menu-driven bastion.
+// JumpserverSession — a `TargetSession` backed by a navigated bastion PTY.
 //
-// Jumpserver is a third-party gateway whose model is "connect → navigate an
-// interactive asset menu → get a PTY shell on the chosen asset". It is not
-// session-channel-shaped, so this implementation reuses the existing, proven
-// menu/TOTP/asset-selection engine on `JumpserverGateway`:
-//   - `exec(argv)` → `gateway.exec` (now sentinel-free `run_command_plain`:
-//     streams stdout until the asset prompt, returns 0 — no exit code, by
-//     design, since a menu bastion's PTY has no native exec/exit-status).
-//   - `shell()`   → `gateway.exec_interactive` (interactive asset shell).
-//   - pty params / data / resize forward to the active backend.
-//   - `subsystem` returns `Unsupported` (bastions expose no sftp directly).
+// The gateway hands this session a `PtyShell` already navigated to the asset
+// shell prompt (plus a transport keepalive guard). From there:
+//   - `exec(command)` streams stdout until the asset prompt reappears and
+//     reports exit 0 (a menu bastion PTY exposes no native exit status);
+//   - `shell()` switches the PTY to raw bidirectional passthrough;
+//   - `subsystem("sftp")` launches `sftp-server` on the asset in raw mode and
+//     bridges SFTP bytes — giving `xho cp` the same sftp path as every backend.
 //
-// The raw argv is stored (not a pre-built command string) so `gateway.exec`
-// constructs the command exactly as the legacy path did (no double-quoting).
+// All driving runs in a spawned task; trait methods are thin senders and
+// `next_event` pulls from the active backend.
 
-use std::sync::Arc;
-
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use async_trait::async_trait;
 use russh::Pty;
-use tokio::sync::mpsc;
-use tracing::warn;
+use tokio::sync::{mpsc, oneshot};
 
-use crate::protocol::ServerEvent;
+use crate::daemon::jumpserver_engine::PtyShell;
 
-use crate::daemon::gateway::{ExecRequest, Gateway, GatewayError, InteractiveHandle, InteractiveRequest};
 use super::{SessionEvent, TargetSession, unsupported};
 
+/// Shell snippet that locates `sftp-server`, switches the PTY to raw mode, and
+/// execs the server so SFTP framing passes through untranslated.
+const SFTP_LAUNCH: &str = "P=$(command -v sftp-server 2>/dev/null || \
+for c in /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server \
+/usr/libexec/sftp-server /usr/lib/ssh/sftp-server; do [ -x \"$c\" ] && echo \"$c\" && break; done); \
+stty raw -echo 2>/dev/null; exec \"$P\"";
+
 pub(crate) struct JumpserverSession {
-    gateway: Arc<dyn Gateway>,
-    target: String,
-    argv: Vec<String>,
+    /// The navigated shell, taken when a backend starts.
+    shell: Option<PtyShell>,
     cols: u32,
     rows: u32,
-    // Non-interactive exec backend (sentinel-free gateway.exec).
-    exec_rx: Option<mpsc::UnboundedReceiver<ServerEvent>>,
-    exec_join: Option<tokio::task::JoinHandle<Result<i32, GatewayError>>>,
-    // Interactive shell backend.
-    shell: Option<InteractiveHandle>,
+    backend: Backend,
     exited: bool,
+    /// Keeps the bastion transport lease alive for the session's lifetime.
+    _transport_guard: Box<dyn Send>,
+}
+
+enum Backend {
+    /// No backend started yet.
+    None,
+    /// `exec`: streaming stdout, then a synthetic exit code.
+    Exec {
+        stdout_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        exit_rx: oneshot::Receiver<i32>,
+        exit_seen: bool,
+    },
+    /// `shell`/`subsystem`: raw bidirectional passthrough.
+    Raw {
+        stdin_tx: mpsc::Sender<Vec<u8>>,
+        stdout_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        exit_rx: oneshot::Receiver<i32>,
+    },
 }
 
 impl JumpserverSession {
-    pub(crate) fn new(gateway: Arc<dyn Gateway>, target: String, argv: Vec<String>) -> Self {
+    /// Wrap a navigated `shell` (at the asset prompt). `transport_guard` keeps
+    /// the bastion connection alive while this session is in use.
+    pub(crate) fn new(shell: PtyShell, transport_guard: Box<dyn Send>) -> Self {
         Self {
-            gateway,
-            target,
-            argv,
+            shell: Some(shell),
             cols: 80,
             rows: 24,
-            exec_rx: None,
-            exec_join: None,
-            shell: None,
+            backend: Backend::None,
             exited: false,
+            _transport_guard: transport_guard,
         }
+    }
+
+    fn start_raw(&mut self) -> Result<()> {
+        let shell = self
+            .shell
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("jumpserver session already started"))?;
+        let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (stdout_tx, stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (exit_tx, exit_rx) = oneshot::channel::<i32>();
+        tokio::spawn(async move {
+            let code = shell.run_raw_passthrough(stdin_rx, stdout_tx).await;
+            let _ = exit_tx.send(code);
+        });
+        self.backend = Backend::Raw {
+            stdin_tx,
+            stdout_rx,
+            exit_rx,
+        };
+        Ok(())
     }
 }
 
@@ -80,65 +113,50 @@ impl TargetSession for JumpserverSession {
     }
 
     async fn exec(&mut self, command: &str) -> Result<()> {
-        // CLI path stores the raw argv tokens (preserves multi-arg quoting); the
-        // proxy/tunnel path has only a command string, so use [command]. gateway.exec
-        // is sentinel-free (run_command_plain): streams stdout, returns 0.
-        let argv = if !self.argv.is_empty() {
-            self.argv.clone()
-        } else {
-            vec![command.to_string()]
+        let mut shell = self
+            .shell
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("jumpserver session already started"))?;
+        let command = command.to_string();
+        let (stdout_tx, stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (exit_tx, exit_rx) = oneshot::channel::<i32>();
+        tokio::spawn(async move {
+            // run_command_plain has no native exit code; report 0 on success,
+            // 255 if the bastion PTY errored mid-command.
+            let code = match shell.run_command_plain(&command, &stdout_tx).await {
+                Ok(()) => 0,
+                Err(_) => 255,
+            };
+            let _ = exit_tx.send(code);
+        });
+        self.backend = Backend::Exec {
+            stdout_rx,
+            exit_rx,
+            exit_seen: false,
         };
-        let (sender, stdout_rx) = mpsc::unbounded_channel::<ServerEvent>();
-        let request = ExecRequest {
-            argv,
-            sender,
-            tty: false,
-            tty_intent: crate::types::FlagIntent::Default,
-            cols: self.cols,
-            rows: self.rows,
-            shell: String::new(),
-            no_shell: false,
-            timeout_ms: 0,
-            // No live stdin on this path (run_command_plain doesn't forward it);
-            // stdin=false + None avoids collect_stdin_payload blocking forever.
-            stdin: false,
-            stdin_intent: crate::types::FlagIntent::Default,
-            stdin_rx: std::sync::Mutex::new(None),
-        };
-        let gateway = self.gateway.clone();
-        let target = self.target.clone();
-        let join = tokio::spawn(async move { gateway.exec(&target, &request).await });
-        self.exec_rx = Some(stdout_rx);
-        self.exec_join = Some(join);
         Ok(())
     }
 
     async fn shell(&mut self) -> Result<()> {
-        let (sender, _rx) = mpsc::unbounded_channel::<ServerEvent>();
-        let request = InteractiveRequest {
-            argv: Vec::new(),
-            cols: self.cols,
-            rows: self.rows,
-            sender,
-            shell: String::new(),
-            no_shell: false,
-        };
-        let handle = self
-            .gateway
-            .exec_interactive(&self.target, &request)
-            .await
-            .map_err(|e| anyhow!("jumpserver: {}", e.user_message()))?;
-        self.shell = Some(handle);
-        Ok(())
+        self.start_raw()
     }
 
     async fn subsystem(&mut self, name: &str) -> Result<()> {
-        Err(unsupported(&format!("jumpserver subsystem {name}")))
+        if name != "sftp" {
+            return Err(unsupported(&format!("jumpserver subsystem {name}")));
+        }
+        // Launch sftp-server on the asset in raw mode, then passthrough SFTP.
+        if let Some(shell) = self.shell.as_mut() {
+            shell
+                .write_raw(format!("{SFTP_LAUNCH}\r").as_bytes())
+                .await?;
+        }
+        self.start_raw()
     }
 
     async fn window_change(&mut self, cols: u32, rows: u32) -> Result<()> {
-        if let Some(handle) = self.shell.as_ref() {
-            let _ = handle.resize_tx.send((cols, rows)).await;
+        if let Some(shell) = self.shell.as_mut() {
+            shell.window_change(cols, rows).await;
         }
         Ok(())
     }
@@ -148,19 +166,22 @@ impl TargetSession for JumpserverSession {
     }
 
     async fn write_stdin(&mut self, data: &[u8]) -> Result<()> {
-        if let Some(handle) = self.shell.as_ref() {
-            handle
-                .stdin_tx
+        if let Backend::Raw { stdin_tx, .. } = &self.backend {
+            stdin_tx
                 .send(data.to_vec())
                 .await
-                .map_err(|_| anyhow!("jumpserver session closed"))?;
-            return Ok(());
+                .map_err(|_| anyhow::anyhow!("jumpserver session closed"))?;
         }
-        // exec mode has no live stdin forwarding (run_command_plain); ignore.
+        // exec mode has no live stdin (run_command_plain); ignore.
         Ok(())
     }
 
     async fn eof(&mut self) -> Result<()> {
+        // Dropping the stdin sender signals EOF to the raw passthrough.
+        if let Backend::Raw { stdin_tx, .. } = &mut self.backend {
+            let (closed_tx, _) = mpsc::channel::<Vec<u8>>(1);
+            *stdin_tx = closed_tx;
+        }
         Ok(())
     }
 
@@ -168,49 +189,42 @@ impl TargetSession for JumpserverSession {
         if self.exited {
             return None;
         }
-
-        // Non-interactive exec backend: stream stdout/stderr, then exit code.
-        if let Some(rx) = self.exec_rx.as_mut() {
-            loop {
-                match rx.recv().await {
-                    Some(ServerEvent::Stdout { data }) => return Some(SessionEvent::Stdout(data)),
-                    Some(ServerEvent::Stderr { data }) => return Some(SessionEvent::Stderr(data)),
-                    Some(_) => continue,
-                    None => {
-                        self.exec_rx = None;
-                        self.exited = true;
-                        let join = self.exec_join.take()?;
-                        let code = match join.await {
-                            Ok(Ok(c)) => c,
-                            Ok(Err(e)) => {
-                                warn!(error = %e, "jumpserver exec failed");
-                                255
-                            }
-                            Err(_) => 255,
-                        };
-                        return Some(SessionEvent::ExitStatus(code));
-                    }
+        match &mut self.backend {
+            Backend::None => None,
+            Backend::Exec {
+                stdout_rx,
+                exit_rx,
+                exit_seen,
+            } => {
+                if let Some(data) = stdout_rx.recv().await {
+                    return Some(SessionEvent::Stdout(data));
                 }
-            }
-        }
-
-        // Interactive shell backend.
-        if let Some(handle) = self.shell.as_mut() {
-            tokio::select! {
-                data = handle.stdout_rx.recv() => match data {
-                    Some(data) => return Some(SessionEvent::Stdout(data)),
-                    None => {
-                        self.exited = true;
-                        return Some(SessionEvent::Eof);
-                    }
-                },
-                code = &mut handle.exit_rx => {
+                // Stdout drained: emit the exit code once, then end.
+                if *exit_seen {
                     self.exited = true;
-                    return Some(SessionEvent::ExitStatus(code.unwrap_or(0)));
+                    return None;
+                }
+                *exit_seen = true;
+                let code = (&mut *exit_rx).await.unwrap_or(255);
+                Some(SessionEvent::ExitStatus(code))
+            }
+            Backend::Raw {
+                stdout_rx, exit_rx, ..
+            } => {
+                tokio::select! {
+                    data = stdout_rx.recv() => match data {
+                        Some(data) => Some(SessionEvent::Stdout(data)),
+                        None => {
+                            self.exited = true;
+                            Some(SessionEvent::Eof)
+                        }
+                    },
+                    code = &mut *exit_rx => {
+                        self.exited = true;
+                        Some(SessionEvent::ExitStatus(code.unwrap_or(0)))
+                    }
                 }
             }
         }
-
-        None
     }
 }

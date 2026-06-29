@@ -22,8 +22,8 @@ use russh::{Channel, ChannelId, Sig};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use super::session::{self, SessionEvent, TargetSession};
 use super::DaemonState;
+use super::session::{self, SessionEvent, TargetSession};
 
 // -----------------------------------------------------------------------
 // Server + Handler types
@@ -136,7 +136,9 @@ fn spawn_bridge(
                 return;
             }
         };
-        let mut sess: Box<dyn TargetSession> = match session::open_target_session(&state, &route).await {
+        let mut sess: Box<dyn TargetSession> = match session::open_target_session(&state, &route)
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 warn!(target = %user, error = %format!("{e:#}"), "proxy: failed to open session");
@@ -146,9 +148,7 @@ fn spawn_bridge(
 
         // Apply buffered pty + env.
         if let Some(pty) = &entry.pty {
-            let _ = sess
-                .request_pty(&pty.term, pty.cols, pty.rows, &[])
-                .await;
+            let _ = sess.request_pty(&pty.term, pty.cols, pty.rows, &[]).await;
         }
         for (k, v) in &entry.env {
             let _ = sess.set_env(k, v).await;
@@ -197,8 +197,6 @@ fn spawn_bridge(
                 },
             }
         }
-        // `channel_id` kept for future per-channel logging.
-        let _ = channel_id;
     });
     bridges.insert(channel_id, tx);
 }
@@ -222,11 +220,9 @@ impl server::Handler for ProxySshHandler {
         key: &ssh_key::PublicKey,
     ) -> Result<Auth, Self::Error> {
         // The username selects the target; auth is by proxy authorized_keys.
-        let ok = super::authorized_keys::is_authorized_key(
-            Path::new(&self.authorized_keys_path),
-            key,
-        )
-        .unwrap_or(false);
+        let ok =
+            super::authorized_keys::is_authorized_key(Path::new(&self.authorized_keys_path), key)
+                .unwrap_or(false);
         if ok {
             self.user = Some(user.to_string());
             info!(peer = ?self.peer, ssh_user = %user, "proxy: accepted publickey");
@@ -373,8 +369,13 @@ impl server::Handler for ProxySshHandler {
         _session: &mut server::Session,
     ) -> Result<(), Self::Error> {
         let name = format!("{signal:?}");
-        forward_or_buffer(&mut self.bridges, &mut self.channels, channel, ProxyMsg::Signal(name))
-            .await;
+        forward_or_buffer(
+            &mut self.bridges,
+            &mut self.channels,
+            channel,
+            ProxyMsg::Signal(name),
+        )
+        .await;
         Ok(())
     }
 

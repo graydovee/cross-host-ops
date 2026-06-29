@@ -179,7 +179,13 @@ impl LocalSession {
         let (control_tx, control_rx) = mpsc::channel::<Control>(32);
         let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(64);
         let (events_tx, events_rx) = mpsc::unbounded_channel::<SessionEvent>();
-        tokio::spawn(driver(shell, sftp_server_path, control_rx, stdin_rx, events_tx));
+        tokio::spawn(driver(
+            shell,
+            sftp_server_path,
+            control_rx,
+            stdin_rx,
+            events_tx,
+        ));
         Self {
             control_tx,
             stdin_tx,
@@ -292,7 +298,9 @@ fn signal_pid(pid: u32, signal: &str) {
         "USR2" => libc::SIGUSR2,
         _ => libc::SIGTERM,
     };
-    unsafe { libc::kill(pid as libc::pid_t, sig); }
+    unsafe {
+        libc::kill(pid as libc::pid_t, sig);
+    }
 }
 
 /// Spawn `argv` (program + args) on a PTY (when requested) or pipes. A waiter
@@ -325,7 +333,14 @@ async fn spawn(
         let stderr = std::process::Stdio::from(slave_file);
         let mut cmd = Command::new(&program);
         cmd.args(args).stdin(stdin).stdout(stdout).stderr(stderr);
-        cmd.env("TERM", if term.is_empty() { "xterm-256color" } else { term.as_str() });
+        cmd.env(
+            "TERM",
+            if term.is_empty() {
+                "xterm-256color"
+            } else {
+                term.as_str()
+            },
+        );
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -401,7 +416,10 @@ fn spawn_pty_reader(mut read: tokio::fs::File, events_tx: mpsc::UnboundedSender<
             match read.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    if events_tx.send(SessionEvent::Stdout(buf[..n].to_vec())).is_err() {
+                    if events_tx
+                        .send(SessionEvent::Stdout(buf[..n].to_vec()))
+                        .is_err()
+                    {
                         break;
                     }
                 }

@@ -7,7 +7,7 @@
 
 use proptest::prelude::*;
 
-use xho::daemon::connection::shared::resolve_shell;
+use xho::daemon::shell::resolve_shell;
 
 // ---------------------------------------------------------------------------
 // Proptest strategies

@@ -5,7 +5,7 @@
 
 use proptest::prelude::*;
 
-use xho::daemon::connection::shared::{build_final_command, build_remote_command};
+use xho::daemon::shell::{build_final_command, build_remote_command};
 
 // ---------------------------------------------------------------------------
 // Strategies

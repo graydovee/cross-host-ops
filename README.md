@@ -2,7 +2,7 @@
 
 # Cross Host Ops
 
-Remote command execution, file copy, and **transparent SSH proxy**. Manages SSH sessions through a local daemon with a unified `TargetSession` abstraction, supporting direct connection, jump host, remote xhod, and transparent `ssh`/`scp`/`sftp` access.
+Remote command execution, file copy, and **transparent SSH proxy**. Manages SSH sessions through a local daemon with a two-layer `Gateway` / `TargetSession` architecture — every backend (direct SSH, remote xhod, jumpserver bastion) implements the same trait, and backends declare which operations they support via capability flags.
 
 ## Features
 
@@ -10,7 +10,7 @@ Remote command execution, file copy, and **transparent SSH proxy**. Manages SSH 
 - **Multi-hop Tunnel** — `ssh → local xhod → control plane → remote xhod → machine` reaches servers behind other xhod instances
 - **Interactive PTY** — Run full-screen programs like vim, htop, with an experience identical to native SSH
 - **Connection Pool** — Reuse SSH connections by target IP, avoiding repeated handshakes
-- **Multiple Gateways** — Direct SSH, enterprise jumpserver (MFA), remote xhod daemon — unified behind `TargetSession`
+- **Multiple Gateways** — Direct SSH, enterprise jumpserver (MFA), remote xhod daemon — unified behind `Gateway` trait with capability flags; partial backends (e.g. jumpserver without `list_servers`) report errors clearly
 - **Unified Target Resolution** — server.toml aliases, explicit routing, IP derivation, fallback chain
 - **Command Review** — Optional LLM security review, local allowlist + AI semantic analysis
 - **File Copy** — `xho cp` aligns with scp semantics, supports recursion and mode preservation
@@ -39,35 +39,44 @@ ssh web1@localhost -p 2222 -- hostname
 scp file.txt web1@localhost:/tmp/ -P 2222
 ```
 
-## Architecture Overview (v0.4.0)
+## Architecture Overview (v0.5.0)
 
 ```
- xho CLI (unchanged)                    ssh/scp/sftp (new)
-   │ gRPC / Unix socket                   │ SSH / TCP 2222
-   ▼                                      ▼
-┌──────────────────── xhod (Daemon) ────────────────────────┐
-│                                                            │
-│  Execute/Copy RPC ──┐           ProxySshServer (port 2222)│
-│  (CLI path)         │           (transparent proxy path)   │
-│                     ▼                    │                 │
-│              open_target_session(route)  │                 │
-│                     │                    │                 │
-│              ┌──────┴─── TargetSession ──┘                 │
-│              │     (unified abstraction)                    │
-│              ├── DirectSshSession  (raw SSH bridge)         │
-│              ├── LocalSession      (PTY + sftp-server)      │
-│              ├── TunneledSession   (OpenSession RPC)        │
-│              └── JumpserverSession (menu-driven bastion)    │
-│                                                            │
-│  Control Plane SSH (port 12222)                            │
-│  · xho-rpc subsystem (daemon↔daemon gRPC)                  │
-│  · xho-reverse subsystem (reverse proxy registration)      │
-│  · OpenSession RPC (multi-hop session tunnel)              │
-└────────────────────────────────────────────────────────────┘
+ xho CLI                                  ssh/scp/sftp
+   │ gRPC / Unix socket                    │ SSH / TCP 2222
+   ▼                                       ▼
+┌───────────────────── xhod (Daemon) ─────────────────────────┐
+│                                                              │
+│  Execute/Copy/OpenSession RPC handlers                      │
+│                  │                                           │
+│                  ▼                                           │
+│          gateway.open_session(target)                       │
+│          gateway.open_exec_session(target, argv, …)         │
+│                  │                                           │
+│     ┌────────────┼────────────┬──────────────┬─────────┐    │
+│     ▼            ▼            ▼              ▼         ▼    │
+│  Direct     Localhost     Xhod          Reverse    Jumpserver│
+│  Gateway    Gateway       Gateway       Proxy      Gateway  │
+│  (pooled)                (tunneled)    (tunneled)  (partial)│
+│     │            │            │              │         │    │
+│     ▼            ▼            ▼              ▼         ▼    │
+│  ┌──────────── TargetSession ─────────────────────────┐    │
+│  │ DirectSshSession | LocalSession | TunneledSession   │    │
+│  │  (pooled handle)   (PTY+pipe)    (OpenSession RPC)  │    │
+│  │               JumpserverSession (PTY + raw/sftp)    │    │
+│  └────────────────────────────────────────────────────┘    │
+│                                                              │
+│  Control Plane SSH (port 12222)                              │
+│  · xho-rpc subsystem (daemon↔daemon gRPC)                    │
+│  · xho-reverse subsystem (reverse proxy registration)        │
+│  · OpenSession RPC (multi-hop session tunnel)                │
+└──────────────────────────────────────────────────────────────┘
 ```
 
+- **Two-layer architecture**: `Gateway` trait (routing, pooling, kind-aware command building) + `TargetSession` trait (per-operation SSH channel contract). All dispatch lives inside the trait — callers are fully generic.
+- **Capability flags**: each `Gateway` declares what it supports (`EXEC | COPY | PROXY | LIST`). Callers check capabilities generically; partial backends (e.g. jumpserver without `LIST`) report clear errors.
+- **Connection pooling**: `DirectGateway` pools authenticated `client::Handle` — one SSH handshake, many session channels. Visible in `xho status` POOLS.
 - **Two ports**: transparent proxy **2222** (human-facing `ssh`/`scp`), control plane **12222** (machine-to-machine RPC + reverse proxy + OpenSession tunnel)
-- **Unified `TargetSession`**: all operations — CLI exec/cp, transparent proxy, multi-hop tunnel — flow through one session abstraction
 - **Transparent proxy**: SSH username selects the target; xhod brokers credentials
 - **Multi-hop**: `ssh node@xhod` → local proxy → control-plane `OpenSession` → remote xhod → machine
 

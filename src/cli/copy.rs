@@ -433,8 +433,6 @@ fn download_progress_name(path: &Path, relative_path: &str) -> String {
         .to_string()
 }
 
-/// Dispatch a HostCommand to the appropriate handler function.
-
 struct CopyCliPlan {
     target: String,
     spec: CopySpec,

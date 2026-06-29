@@ -17,17 +17,13 @@ use russh::ChannelStream;
 use tokio::sync::RwLock;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
-use tracing::{info, warn};
+use tracing::info;
 
-use crate::daemon::connection::xhod::XhodConnection;
-use crate::daemon::connection::{
-    Connection, ExecRequest as ConnExecRequest, InteractiveRequest as ConnInteractiveRequest,
-};
-use crate::daemon::gateway::{
-    ExecRequest, Gateway, GatewayError, GatewayKind, InteractiveHandle, InteractiveRequest,
-    is_transport_error,
-};
+use crate::daemon::gateway::{Capabilities, Gateway, GatewayError, GatewayKind};
 use crate::daemon::rpc::prefix_source;
+use crate::daemon::session::TargetSession;
+use crate::daemon::session::tunnel::TunneledSession;
+use crate::daemon::shell::build_remote_command;
 use crate::daemon::ssh_server::ReverseProxyHandshake;
 use crate::protocol::{self, ServerListRow, rpc};
 use crate::types::ServerListSource;
@@ -168,6 +164,11 @@ impl ReverseProxyRegistry {
     /// Number of registered nodes.
     pub async fn len(&self) -> usize {
         self.inner.read().await.len()
+    }
+
+    /// Whether the registry has no nodes.
+    pub async fn is_empty(&self) -> bool {
+        self.inner.read().await.is_empty()
     }
 }
 
@@ -350,96 +351,39 @@ impl ReverseProxyGateway {
             registry,
         }
     }
-
-    /// On a transport error, deregister this node from the registry.
-    async fn handle_transport_error(&self) {
-        warn!(
-            node = %self.name,
-            "transport error on reverse proxy gateway; deregistering node"
-        );
-        self.registry.unregister(&self.name).await;
-    }
 }
 
 #[async_trait]
 impl Gateway for ReverseProxyGateway {
-    async fn exec(&self, target: &str, request: &ExecRequest) -> Result<i32, GatewayError> {
-        let client = {
-            let guard = self.client.lock().await;
-            (*guard).clone()
-        };
-
-        let mut conn = XhodConnection::new(client, target.to_string());
-
-        let stdin_rx = request.stdin_rx.lock().ok().and_then(|mut g| g.take());
-
-        let mut conn_request = ConnExecRequest {
-            argv: request.argv.clone(),
-            sender: request.sender.clone(),
-            tty: request.tty,
-            cols: request.cols,
-            rows: request.rows,
-            shell: request.shell.clone(),
-            no_shell: request.no_shell,
-            timeout_ms: request.timeout_ms,
-            stdin: request.stdin,
-            stdin_intent: request.stdin_intent,
-            stdin_rx,
-        };
-
-        let result = conn.exec(&mut conn_request).await;
-
-        match result {
-            Ok(exit_code) => Ok(exit_code),
-            Err(e) if is_transport_error(&e) => {
-                self.handle_transport_error().await;
-                Err(GatewayError::transport(e))
-            }
-            Err(e) => Err(GatewayError::execution(e)),
-        }
+    fn name(&self) -> &str {
+        &self.name
     }
 
+    fn kind(&self) -> GatewayKind {
+        GatewayKind::ReverseProxy
+    }
 
-    async fn exec_interactive(
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::EXEC | Capabilities::COPY | Capabilities::PROXY | Capabilities::LIST
+    }
+
+    async fn open_exec_session(
         &self,
         target: &str,
-        request: &InteractiveRequest,
-    ) -> Result<InteractiveHandle, GatewayError> {
-        let client = {
-            let guard = self.client.lock().await;
-            (*guard).clone()
-        };
-
-        let mut conn = XhodConnection::new(client, target.to_string());
-        let conn_request = ConnInteractiveRequest {
-            argv: request.argv.clone(),
-            cols: request.cols,
-            rows: request.rows,
-            sender: request.sender.clone(),
-            shell: request.shell.clone(),
-            no_shell: request.no_shell,
-        };
-
-        let result = conn.exec_interactive(&conn_request).await;
-
-        match result {
-            Ok(handle) => Ok(InteractiveHandle {
-                stdin_tx: handle.stdin_tx,
-                resize_tx: handle.resize_tx,
-                stdout_rx: handle.stdout_rx,
-                exit_rx: handle.exit_rx,
-                abort_handles: handle.abort_handles,
-            }),
-            Err(e) if is_transport_error(&e) => {
-                self.handle_transport_error().await;
-                Err(GatewayError::transport(e))
-            }
-            Err(e) => Err(GatewayError::execution(e)),
-        }
+        argv: &[String],
+        _shell: &str,
+        _no_shell: bool,
+    ) -> Result<(Box<dyn TargetSession>, String), GatewayError> {
+        let client = (*self.client.lock().await).clone();
+        let command = build_remote_command(argv);
+        let session =
+            Box::new(TunneledSession::new(client, target.to_string())) as Box<dyn TargetSession>;
+        Ok((session, command))
     }
 
-    async fn rpc_client(&self) -> Option<rpc::xho_rpc_client::XhoRpcClient<Channel>> {
-        Some((*self.client.lock().await).clone())
+    async fn open_session(&self, target: &str) -> Result<Box<dyn TargetSession>, GatewayError> {
+        let client = (*self.client.lock().await).clone();
+        Ok(Box::new(TunneledSession::new(client, target.to_string())) as Box<dyn TargetSession>)
     }
 
     async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError> {
@@ -488,14 +432,6 @@ impl Gateway for ReverseProxyGateway {
             })
             .collect();
         Ok(rows)
-    }
-
-    fn kind(&self) -> GatewayKind {
-        GatewayKind::ReverseProxy
-    }
-
-    fn name(&self) -> &str {
-        &self.name
     }
 
     async fn prune_idle(&self) {

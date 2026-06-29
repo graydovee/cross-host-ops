@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ConnectionStage {
+pub enum ConnectionStage {
     Connect,
     Prepare,
     Started,
@@ -29,7 +29,7 @@ impl ConnectionStage {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ConnectionStatusSnapshot {
+pub struct ConnectionStatusSnapshot {
     pub(crate) key: String,
     pub(crate) generation: u64,
     pub(crate) active: usize,

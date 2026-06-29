@@ -75,9 +75,7 @@ impl ServerConfig {
                 bail!("server.proxy.authorized_keys_path must not be empty");
             }
             if self.remote.enable && self.proxy.listen_addr == self.remote.listen_addr {
-                bail!(
-                    "server.proxy.listen_addr must differ from server.remote.listen_addr"
-                );
+                bail!("server.proxy.listen_addr must differ from server.remote.listen_addr");
             }
         }
         Ok(())

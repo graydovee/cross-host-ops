@@ -1,5 +1,20 @@
 // Gateway trait and supporting types.
-// Will contain the Gateway trait, GatewayKind, Route, GatewayError, and build_gateways factory.
+//
+// `Gateway` is THE high-level abstraction for every connection backend (direct
+// SSH, localhost, a remote xhod, a reverse-proxy node, a jumpserver bastion).
+// A gateway knows how to:
+//   - open a low-level [`TargetSession`] to one of its end targets
+//     (`open_session`) — used by the transparent proxy, the `OpenSession`
+//     tunnel, and `xho cp`;
+//   - open a session for the CLI exec path together with the kind-aware command
+//     string to run (`open_exec_session`);
+//   - enumerate its reachable servers (`list_servers`).
+//
+// Backends declare which operations they support via [`Capabilities`]. Callers
+// gate generically on the advertised capabilities — there is no per-kind
+// special-casing outside a gateway's own implementation. A backend that cannot
+// realise an operation simply does not advertise the capability (and its
+// default trait method returns an `Unsupported` error).
 
 pub mod auth;
 pub mod direct;
@@ -10,14 +25,16 @@ pub mod xhod;
 use std::fmt;
 use std::sync::Arc;
 
+use anyhow::anyhow;
 use async_trait::async_trait;
+use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{RwLock, mpsc, oneshot};
-use tokio::task::AbortHandle;
+use tokio::sync::RwLock;
 
 use crate::config::GatewayConfig;
-use crate::protocol::{ServerEvent, ServerListRow};
-use crate::types::FlagIntent;
+use crate::daemon::connection_manager::ConnectionStatusSnapshot;
+use crate::daemon::session::TargetSession;
+use crate::protocol::ServerListRow;
 
 use self::auth::AuthPrompter;
 use self::direct::DirectGateway;
@@ -25,46 +42,78 @@ use self::jumpserver::JumpserverGateway;
 use self::xhod::XhodGateway;
 
 // ---------------------------------------------------------------------------
+// Capabilities
+// ---------------------------------------------------------------------------
+
+bitflags! {
+    /// The set of high-level operations a gateway supports. Callers check the
+    /// relevant flag before invoking an operation, so a backend can implement a
+    /// subset of functionality and the rest reports a clear `Unsupported` error.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct Capabilities: u32 {
+        /// `open_exec_session` — run a command (CLI `xho exec`, including `-it`).
+        const EXEC = 1 << 0;
+        /// `open_session` + sftp subsystem for `xho cp`.
+        const COPY = 1 << 1;
+        /// `open_session` as a transparent SSH proxy backend (`ssh node@xhod`).
+        const PROXY = 1 << 2;
+        /// `list_servers` — enumerate reachable servers.
+        const LIST = 1 << 3;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Gateway trait
 // ---------------------------------------------------------------------------
 
-/// The external interface for all jump host / connection abstractions.
-/// Callers only see exec/copy/exec_interactive/list_servers.
-/// Connection management (pooling, reconnection, auth) is fully internal.
 #[async_trait]
 pub trait Gateway: Send + Sync {
-    /// Execute a command on the specified end target.
-    async fn exec(&self, target: &str, request: &ExecRequest) -> Result<i32, GatewayError>;
-
-    /// Open an interactive PTY session to the specified end target.
-    async fn exec_interactive(
-        &self,
-        target: &str,
-        request: &InteractiveRequest,
-    ) -> Result<InteractiveHandle, GatewayError>;
-
-    /// List servers reachable through this gateway.
-    async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError>;
-
-    /// A cloneable handle to this gateway's control-plane gRPC client, when it
-    /// has one (Xhod / ReverseProxy). Used to open `OpenSession` tunnels so the
-    /// transparent proxy / multi-hop can reach machines behind another xhod.
-    /// Returns `None` for gateways without an RPC client (Direct/Localhost/
-    /// Jumpserver).
-    async fn rpc_client(
-        &self,
-    ) -> Option<crate::protocol::rpc::xho_rpc_client::XhoRpcClient<tonic::transport::Channel>> {
-        None
-    }
+    /// The configured name of this gateway (e.g., "local", "remote-xhod").
+    fn name(&self) -> &str;
 
     /// The concrete kind of this gateway.
     fn kind(&self) -> GatewayKind;
 
-    /// The configured name of this gateway (e.g., "local", "remote-xhod").
-    fn name(&self) -> &str;
+    /// The set of operations this gateway supports.
+    fn capabilities(&self) -> Capabilities;
 
-    /// Prune idle connections. Called by the daemon's reaper timer.
-    async fn prune_idle(&self);
+    /// Open a [`TargetSession`] to `target` for the CLI exec path, returning the
+    /// session plus the command string to run on it. Command construction is
+    /// kind-aware (each backend builds with the shell it resolves), which is why
+    /// this is distinct from [`Gateway::open_session`].
+    ///
+    /// Requires [`Capabilities::EXEC`].
+    async fn open_exec_session(
+        &self,
+        target: &str,
+        argv: &[String],
+        shell: &str,
+        no_shell: bool,
+    ) -> Result<(Box<dyn TargetSession>, String), GatewayError>;
+
+    /// Open a bare [`TargetSession`] to `target`. Used by the transparent proxy,
+    /// the multi-hop tunnel, and `xho cp` (which then drives the sftp subsystem).
+    ///
+    /// Requires [`Capabilities::PROXY`] or [`Capabilities::COPY`] depending on
+    /// the caller.
+    async fn open_session(&self, target: &str) -> Result<Box<dyn TargetSession>, GatewayError>;
+
+    /// List servers reachable through this gateway. Default: `Unsupported`.
+    async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError> {
+        Err(GatewayError::unsupported(anyhow!(
+            "gateway '{}' does not support list_servers",
+            self.name()
+        )))
+    }
+
+    /// Snapshot of this gateway's connection pool, for `xho status`.
+    /// Default: no pools.
+    async fn pool_status(&self) -> Vec<ConnectionStatusSnapshot> {
+        Vec::new()
+    }
+
+    /// Prune idle connections. Called by the daemon's reaper timer. Default: no-op.
+    async fn prune_idle(&self) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -102,46 +151,6 @@ pub struct Route {
     pub end_target: String,
 }
 
-/// Request payload for exec operations.
-#[derive(Debug)]
-pub struct ExecRequest {
-    pub argv: Vec<String>,
-    pub sender: mpsc::UnboundedSender<ServerEvent>,
-    pub tty: bool,
-    pub tty_intent: FlagIntent,
-    pub cols: u32,
-    pub rows: u32,
-    pub shell: String,
-    pub no_shell: bool,
-    pub timeout_ms: u64,
-    pub stdin: bool,
-    pub stdin_intent: FlagIntent,
-    /// Optional stdin receiver for forwarding stdin data to the remote process.
-    /// Created by process_execute when the client requests stdin forwarding.
-    /// Wrapped in Mutex<Option<...>> so the gateway can take ownership from `&self`.
-    pub stdin_rx: std::sync::Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
-}
-
-/// Request payload for interactive PTY sessions.
-#[derive(Clone, Debug)]
-pub struct InteractiveRequest {
-    pub argv: Vec<String>,
-    pub cols: u32,
-    pub rows: u32,
-    pub sender: mpsc::UnboundedSender<ServerEvent>,
-    pub shell: String,
-    pub no_shell: bool,
-}
-
-/// Handle for driving an interactive session.
-pub struct InteractiveHandle {
-    pub stdin_tx: mpsc::Sender<Vec<u8>>,
-    pub resize_tx: mpsc::Sender<(u32, u32)>,
-    pub stdout_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    pub exit_rx: oneshot::Receiver<i32>,
-    pub abort_handles: Vec<AbortHandle>,
-}
-
 // ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
@@ -158,16 +167,12 @@ pub struct GatewayError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ErrorKind {
     /// Target cannot be found or resolved by this Gateway.
-    /// Daemon should try the next route candidate.
     Resolution,
     /// Network connection failed (SSH disconnect, gRPC stream broken, timeout).
-    /// Gateway handles retry internally; if propagated, daemon treats as fatal for this route.
     Transport,
-    /// Remote command execution failed (permission denied at remote shell, command not found).
-    /// Non-zero exit code is NOT an Execution error — that's a successful exec with non-zero status.
-    /// Daemon should return immediately without trying further candidates.
+    /// Remote command execution failed.
     Execution,
-    /// Gateway does not support the requested operation (e.g., list_servers on Jumpserver).
+    /// Gateway does not support the requested operation.
     Unsupported,
 }
 
@@ -240,7 +245,6 @@ impl GatewayError {
 
 /// Classify an anyhow::Error as transport or not, by inspecting the error chain.
 pub fn is_transport_error(error: &anyhow::Error) -> bool {
-    // Check for tonic::Status with transport-indicative codes
     if let Some(status) = error.downcast_ref::<tonic::Status>() {
         matches!(
             status.code(),
@@ -249,13 +253,9 @@ pub fn is_transport_error(error: &anyhow::Error) -> bool {
                 | tonic::Code::Unknown
                 | tonic::Code::Internal
         )
-    }
-    // Check for russh::Error (any variant is transport-level)
-    else if error.downcast_ref::<russh::Error>().is_some() {
+    } else if error.downcast_ref::<russh::Error>().is_some() {
         true
-    }
-    // String heuristic fallback
-    else {
+    } else {
         let msg = error.to_string().to_ascii_lowercase();
         msg.contains("channel closed")
             || msg.contains("closed unexpectedly")
@@ -278,7 +278,6 @@ mod tests {
     #[test]
     fn transport_user_message_includes_retry_hint() {
         let error = GatewayError::transport(anyhow::anyhow!("channel closed"));
-
         assert_eq!(
             error.user_message(),
             "[transport] channel closed; please retry the operation to open a fresh connection"
@@ -288,7 +287,6 @@ mod tests {
     #[test]
     fn non_transport_user_message_is_unchanged() {
         let error = GatewayError::execution(anyhow::anyhow!("command failed"));
-
         assert_eq!(error.user_message(), "[execution] command failed");
     }
 }
@@ -299,8 +297,8 @@ mod tests {
 
 /// Construct all Gateways from the loaded configuration.
 /// Always creates one DirectGateway named "local".
-/// Creates one XhodGateway or JumpserverGateway per `[[gateways]]` entry.
-/// No network connections are established during construction.
+/// Creates one XhodGateway, JumpserverGateway, or DirectGateway per
+/// `[[gateways]]` entry. No network connections are established here.
 pub fn build_gateways(
     config: Arc<RwLock<crate::config::AppConfig>>,
     server_config_path: &str,
@@ -309,21 +307,14 @@ pub fn build_gateways(
 ) -> Vec<(String, Arc<dyn Gateway>)> {
     let mut gateways: Vec<(String, Arc<dyn Gateway>)> = Vec::new();
 
-    // Read max_connections_per_ip and max_idle_time from a blocking snapshot.
-    // These are read at construction time and won't change until daemon restart.
-    let (max_connections_per_address, max_idle_time) = {
-        // Use try_read to avoid async context; fall back to defaults if locked.
-        match config.try_read() {
-            Ok(cfg) => (cfg.ssh.max_connections_per_ip, cfg.ssh.max_idle_time),
-            Err(_) => {
-                // Fallback to defaults if config is locked (should not happen at startup)
-                let defaults = crate::config::SshConfig::default();
-                (defaults.max_connections_per_ip, defaults.max_idle_time)
-            }
+    let (max_connections_per_address, max_idle_time) = match config.try_read() {
+        Ok(cfg) => (cfg.ssh.max_connections_per_ip, cfg.ssh.max_idle_time),
+        Err(_) => {
+            let defaults = crate::config::SshConfig::default();
+            (defaults.max_connections_per_ip, defaults.max_idle_time)
         }
     };
 
-    // Always create the "local" gateway first.
     gateways.push((
         "local".to_string(),
         Arc::new(DirectGateway::new(
@@ -336,7 +327,6 @@ pub fn build_gateways(
         )),
     ));
 
-    // Create one gateway per gateways_config entry, preserving declaration order.
     for gc in gateways_config {
         let gateway: Arc<dyn Gateway> = match gc {
             GatewayConfig::Xhod(c) => Arc::new(XhodGateway::new(
@@ -354,19 +344,14 @@ pub fn build_gateways(
                 auth_prompter.clone(),
                 max_idle_time,
             )),
-            GatewayConfig::Direct(c) => {
-                // Direct gateways are treated as a DirectGateway with their own name.
-                // They use the same server.toml resolution as "local" but route
-                // through the named gateway for resolver distinction.
-                Arc::new(DirectGateway::new(
-                    c.name.clone(),
-                    config.clone(),
-                    server_config_path.to_string(),
-                    auth_prompter.clone(),
-                    max_connections_per_address,
-                    max_idle_time,
-                ))
-            }
+            GatewayConfig::Direct(c) => Arc::new(DirectGateway::new(
+                c.name.clone(),
+                config.clone(),
+                server_config_path.to_string(),
+                auth_prompter.clone(),
+                max_connections_per_address,
+                max_idle_time,
+            )),
         };
         gateways.push((gc.name().to_string(), gateway));
     }

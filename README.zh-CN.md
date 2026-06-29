@@ -2,7 +2,7 @@
 
 # Cross Host Ops
 
-远程命令执行、文件复制和**透明 SSH 代理**工具。通过本地 daemon 以统一的 `TargetSession` 抽象管理 SSH 会话，支持直连、跳板机、远程 xhod，以及原生 `ssh`/`scp`/`sftp` 透明代理。
+远程命令执行、文件复制和**透明 SSH 代理**工具。通过本地 daemon 以双层 `Gateway` / `TargetSession` 架构管理 SSH 会话 — 每种后端（直连 SSH、远程 xhod、jumpserver 堡垒机）实现同一套 trait，并通过 capability 标志声明自己支持的操作。
 
 ## 特性
 
@@ -10,7 +10,7 @@
 - **多跳隧道** — `ssh → 本机xhod → 控制面 → 远程xhod → 机器`，穿透其他 xhod 后面的服务器
 - **交互式 PTY** — 运行 vim、htop 等全屏程序，体验与原生 SSH 一致
 - **连接池** — 按目标 IP 复用 SSH 连接，避免重复握手
-- **多种跳板** — 直连 SSH、企业 jumpserver（MFA）、远程 xhod daemon — 统一在 `TargetSession` 抽象下
+- **多种跳板** — 直连 SSH、企业 jumpserver（MFA）、远程 xhod daemon — 统一在 `Gateway` trait 下，通过 capability 标志声明功能；部分后端（如 jumpserver 不支持 `list_servers`）明确报错
 - **统一目标解析** — server.toml 别名、显式路由、IP 推导、fallback 链
 - **命令审查** — 可选 LLM 安全审查，本地白名单 + AI 语义分析
 - **文件复制** — `xho cp` 对齐 scp 语义，支持递归和 mode 保留
@@ -39,35 +39,44 @@ ssh web1@localhost -p 2222 -- hostname
 scp file.txt web1@localhost:/tmp/ -P 2222
 ```
 
-## 架构概览 (v0.4.0)
+## 架构概览 (v0.5.0)
 
 ```
- xho CLI（不变）                      ssh/scp/sftp（新）
+ xho CLI                                ssh/scp/sftp
    │ gRPC / Unix socket                  │ SSH / TCP 2222
    ▼                                     ▼
-┌──────────────────── xhod (Daemon) ────────────────────────┐
-│                                                           │
-│  Execute/Copy RPC ──┐          ProxySshServer (端口 2222) │
-│  (CLI 路径)          │          (透明代理路径)              │
-│                     ▼                     │                │
-│              open_target_session(route)   │                │
-│                     │                     │                │
-│              ┌──────┴── TargetSession ────┘                │
-│              │    （统一抽象）                               │
-│              ├── DirectSshSession  (原始 SSH 桥接)          │
-│              ├── LocalSession      (PTY + sftp-server)      │
-│              ├── TunneledSession   (OpenSession RPC 隧道)   │
-│              └── JumpserverSession (菜单式堡垒机)            │
-│                                                           │
-│  控制面 SSH (端口 12222)                                   │
-│  · xho-rpc 子系统 (daemon↔daemon gRPC)                     │
-│  · xho-reverse 子系统 (反向代理注册)                        │
-│  · OpenSession RPC (多跳会话隧道)                           │
-└───────────────────────────────────────────────────────────┘
+┌───────────────────── xhod (Daemon) ─────────────────────────┐
+│                                                              │
+│  Execute/Copy/OpenSession RPC handlers                      │
+│                  │                                           │
+│                  ▼                                           │
+│          gateway.open_session(target)                       │
+│          gateway.open_exec_session(target, argv, …)         │
+│                  │                                           │
+│     ┌────────────┼────────────┬──────────────┬─────────┐    │
+│     ▼            ▼            ▼              ▼         ▼    │
+│  Direct     Localhost     Xhod          Reverse    Jumpserver│
+│  Gateway    Gateway       Gateway       Proxy      Gateway  │
+│  (pooled)                (tunneled)    (tunneled)  (partial)│
+│     │            │            │              │         │    │
+│     ▼            ▼            ▼              ▼         ▼    │
+│  ┌──────────── TargetSession ─────────────────────────┐    │
+│  │ DirectSshSession | LocalSession | TunneledSession   │    │
+│  │  (连接池复用)       (PTY+pipe)    (OpenSession RPC)  │    │
+│  │               JumpserverSession (PTY + raw/sftp)    │    │
+│  └────────────────────────────────────────────────────┘    │
+│                                                              │
+│  控制面 SSH (端口 12222)                                     │
+│  · xho-rpc 子系统 (daemon↔daemon gRPC)                       │
+│  · xho-reverse 子系统 (反向代理注册)                          │
+│  · OpenSession RPC (多跳会话隧道)                             │
+└──────────────────────────────────────────────────────────────┘
 ```
 
+- **双层架构**：`Gateway` trait（路由、连接池、感知后端的命令构建）+ `TargetSession` trait（每次操作的 SSH channel 契约）。所有调度都在 trait 内部，调用方完全通用。
+- **Capability 标志**：每个 `Gateway` 声明自己支持的操作（`EXEC | COPY | PROXY | LIST`）。调用方通过 capability 通用判断；部分后端（如 jumpserver 无 `LIST`）返回明确错误。
+- **连接池复用**：`DirectGateway` 池化已认证的 `client::Handle` — 一次 SSH 握手，多个 session channel。可在 `xho status` POOLS 中查看。
 - **双端口**：透明代理 **2222**（人类用 `ssh`/`scp`），控制面 **12222**（机器间 RPC + 反向代理 + OpenSession 隧道）
-- **统一 `TargetSession`**：所有操作 — CLI exec/cp、透明代理、多跳隧道 — 走同一个会话抽象
 - **透明代理**：SSH 用户名 = 目标节点名；xhod 代理凭据
 - **多跳**：`ssh node@xhod` → 本地代理 → 控制面 `OpenSession` → 远程 xhod → 机器
 

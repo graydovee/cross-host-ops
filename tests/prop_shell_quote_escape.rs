@@ -13,7 +13,7 @@
 
 use proptest::prelude::*;
 
-use xho::daemon::connection::shared::wrap_in_shell;
+use xho::daemon::shell::wrap_in_shell;
 
 /// Strategy that generates strings guaranteed to contain at least one single quote.
 fn string_with_quotes() -> impl Strategy<Value = String> {

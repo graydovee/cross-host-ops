@@ -66,7 +66,9 @@ async fn driver(
     let response = match client.open_session(Request::new(outbound)).await {
         Ok(resp) => resp.into_inner(),
         Err(status) => {
-            let _ = events_tx.send(SessionEvent::Stderr(format!("open_session: {status}\n").into_bytes()));
+            let _ = events_tx.send(SessionEvent::Stderr(
+                format!("open_session: {status}\n").into_bytes(),
+            ));
             let _ = events_tx.send(SessionEvent::ExitStatus(255));
             let _ = events_tx.send(SessionEvent::Eof);
             return;
@@ -75,7 +77,13 @@ async fn driver(
     let mut response = response;
 
     // Kick off: open the session on the remote end_target.
-    if send_req(&req_tx, r::session_request::Msg::Open(r::SessionOpen { target })).await.is_err() {
+    if send_req(
+        &req_tx,
+        r::session_request::Msg::Open(r::SessionOpen { target }),
+    )
+    .await
+    .is_err()
+    {
         return;
     }
 

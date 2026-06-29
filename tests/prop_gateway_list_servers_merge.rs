@@ -15,12 +15,10 @@ use async_trait::async_trait;
 use proptest::prelude::*;
 
 use xho::config::{DirectAuth, ServerEntry};
-use xho::daemon::gateway::{
-    ErrorKind, ExecRequest, Gateway, GatewayError, GatewayKind, InteractiveHandle,
-    InteractiveRequest,
-};
+use xho::daemon::gateway::{Capabilities, ErrorKind, Gateway, GatewayError, GatewayKind};
+use xho::daemon::session::TargetSession;
 use xho::protocol::ServerListRow;
-use xho::types::{CopySpec, ServerListSource};
+use xho::types::ServerListSource;
 
 // ---------------------------------------------------------------------------
 // Mock Gateway implementations
@@ -34,19 +32,26 @@ struct OkGateway {
 
 #[async_trait]
 impl Gateway for OkGateway {
-    async fn exec(&self, _target: &str, _request: &ExecRequest) -> Result<i32, GatewayError> {
-        unimplemented!("not needed for this test")
+    fn name(&self) -> &str {
+        &self.gateway_name
+    }
+    fn kind(&self) -> GatewayKind {
+        GatewayKind::Direct
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::LIST
     }
 
-    async fn copy(&self, _target: &str, _spec: CopySpec) -> Result<(), GatewayError> {
-        unimplemented!("not needed for this test")
-    }
-
-    async fn exec_interactive(
+    async fn open_exec_session(
         &self,
         _target: &str,
-        _request: &InteractiveRequest,
-    ) -> Result<InteractiveHandle, GatewayError> {
+        _argv: &[String],
+        _shell: &str,
+        _no_shell: bool,
+    ) -> Result<(Box<dyn TargetSession>, String), GatewayError> {
+        unimplemented!("not needed for this test")
+    }
+    async fn open_session(&self, _target: &str) -> Result<Box<dyn TargetSession>, GatewayError> {
         unimplemented!("not needed for this test")
     }
 
@@ -61,16 +66,6 @@ impl Gateway for OkGateway {
             .collect();
         Ok(rows)
     }
-
-    fn kind(&self) -> GatewayKind {
-        GatewayKind::Direct
-    }
-
-    fn name(&self) -> &str {
-        &self.gateway_name
-    }
-
-    async fn prune_idle(&self) {}
 }
 
 /// A mock gateway that returns GatewayError::unsupported for list_servers.
@@ -80,19 +75,26 @@ struct UnsupportedGateway {
 
 #[async_trait]
 impl Gateway for UnsupportedGateway {
-    async fn exec(&self, _target: &str, _request: &ExecRequest) -> Result<i32, GatewayError> {
-        unimplemented!("not needed for this test")
+    fn name(&self) -> &str {
+        &self.gateway_name
+    }
+    fn kind(&self) -> GatewayKind {
+        GatewayKind::Jumpserver
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::empty()
     }
 
-    async fn copy(&self, _target: &str, _spec: CopySpec) -> Result<(), GatewayError> {
-        unimplemented!("not needed for this test")
-    }
-
-    async fn exec_interactive(
+    async fn open_exec_session(
         &self,
         _target: &str,
-        _request: &InteractiveRequest,
-    ) -> Result<InteractiveHandle, GatewayError> {
+        _argv: &[String],
+        _shell: &str,
+        _no_shell: bool,
+    ) -> Result<(Box<dyn TargetSession>, String), GatewayError> {
+        unimplemented!("not needed for this test")
+    }
+    async fn open_session(&self, _target: &str) -> Result<Box<dyn TargetSession>, GatewayError> {
         unimplemented!("not needed for this test")
     }
 
@@ -102,16 +104,6 @@ impl Gateway for UnsupportedGateway {
             self.gateway_name
         )))
     }
-
-    fn kind(&self) -> GatewayKind {
-        GatewayKind::Jumpserver
-    }
-
-    fn name(&self) -> &str {
-        &self.gateway_name
-    }
-
-    async fn prune_idle(&self) {}
 }
 
 // ---------------------------------------------------------------------------
