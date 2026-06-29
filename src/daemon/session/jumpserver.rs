@@ -32,6 +32,10 @@ pub(crate) struct JumpserverSession {
     shell: Option<PtyShell>,
     cols: u32,
     rows: u32,
+    /// True when `request_pty` was explicitly called (interactive mode).
+    /// Drives the exec() branch: interactive → raw passthrough; non-interactive
+    /// → prompt-based exec with optional stdin forwarding.
+    pty_requested: bool,
     backend: Backend,
     exited: bool,
     /// Keeps the bastion transport lease alive for the session's lifetime.
@@ -47,17 +51,21 @@ pub(crate) struct JumpserverSession {
 enum Backend {
     /// No backend started yet.
     None,
-    /// `exec`: streaming stdout, then a synthetic exit code.
+    /// `exec` (non-interactive): streaming stdout with optional stdin
+    /// forwarding, then a synthetic exit code.
     Exec {
         stdout_rx: mpsc::UnboundedReceiver<Vec<u8>>,
         exit_rx: oneshot::Receiver<i32>,
         exit_seen: bool,
+        stdin_tx: mpsc::Sender<Vec<u8>>,
     },
-    /// `shell`/`subsystem`: raw bidirectional passthrough.
+    /// `shell`/`subsystem`/interactive-`exec`: raw bidirectional passthrough
+    /// with dynamic terminal resize support.
     Raw {
         stdin_tx: mpsc::Sender<Vec<u8>>,
         stdout_rx: mpsc::UnboundedReceiver<Vec<u8>>,
         exit_rx: oneshot::Receiver<i32>,
+        resize_tx: mpsc::Sender<(u32, u32)>,
     },
 }
 
@@ -75,6 +83,7 @@ impl JumpserverSession {
             shell: Some(shell),
             cols: 80,
             rows: 24,
+            pty_requested: false,
             backend: Backend::None,
             exited: false,
             _transport_guard: transport_guard,
@@ -94,14 +103,16 @@ impl JumpserverSession {
         let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(64);
         let (stdout_tx, stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (exit_tx, exit_rx) = oneshot::channel::<i32>();
+        let (resize_tx, resize_rx) = mpsc::channel::<(u32, u32)>(8);
         tokio::spawn(async move {
-            let code = shell.run_raw_passthrough(stdin_rx, stdout_tx).await;
+            let code = shell.run_raw_passthrough(stdin_rx, stdout_tx, resize_rx).await;
             let _ = exit_tx.send(code);
         });
         self.backend = Backend::Raw {
             stdin_tx,
             stdout_rx,
             exit_rx,
+            resize_tx,
         };
         Ok(())
     }
@@ -122,6 +133,7 @@ impl TargetSession for JumpserverSession {
         if rows > 0 {
             self.rows = rows;
         }
+        self.pty_requested = true;
         Ok(())
     }
 
@@ -134,22 +146,68 @@ impl TargetSession for JumpserverSession {
             .shell
             .take()
             .ok_or_else(|| anyhow::anyhow!("jumpserver session already started"))?;
+
+        if self.pty_requested {
+            // Interactive exec (-it): resize PTY to the requested terminal
+            // size, write the command, then switch to raw bidirectional
+            // passthrough. This lets interactive programs (vim, bash, top)
+            // receive keystrokes and produce terminal output without false
+            // prompt detection. The shell is consumed (not returned to cache).
+            shell.window_change(self.cols, self.rows).await;
+            shell.write_line(command).await?;
+            shell.clear_pending();
+            self.shell = Some(shell);
+            return self.start_raw();
+        }
+
+        // Non-interactive exec: prompt-based execution with optional stdin
+        // forwarding (for `xho exec -i`). On success the shell is still at the
+        // asset prompt — return it to the cache for reuse.
+        //
+        // stdin handling: the bastion PTY may not propagate Ctrl+D (\x04)
+        // correctly, so we buffer stdin data and feed it via a base64 heredoc
+        // pipe. This avoids the EOF detection problem entirely.
         let return_fn = self.return_shell.take();
         let command = command.to_string();
         let (stdout_tx, stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (exit_tx, exit_rx) = oneshot::channel::<i32>();
+        let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(64);
         tokio::spawn(async move {
-            // run_command_plain has no native exit code; report 0 on success,
-            // 255 if the bastion PTY errored mid-command. On success the shell
-            // is still at the asset prompt — return it to the cache for reuse.
-            let code = match shell.run_command_plain(&command, &stdout_tx).await {
-                Ok(()) => {
-                    if let Some(f) = return_fn {
-                        f(shell);
+            // Buffer all stdin data until EOF.
+            let mut stdin_data = Vec::new();
+            while let Some(chunk) = stdin_rx.recv().await {
+                stdin_data.extend_from_slice(&chunk);
+            }
+
+            let code = if stdin_data.is_empty() {
+                // No stdin — run the command directly.
+                match shell.run_command_plain(&command, &stdout_tx).await {
+                    Ok(()) => {
+                        if let Some(f) = return_fn {
+                            f(shell);
+                        }
+                        0
                     }
-                    0
+                    Err(_) => 255,
                 }
-                Err(_) => 255,
+            } else {
+                // Pipe stdin data via base64 to avoid Ctrl+D issues on the
+                // bastion PTY. printf avoids heredoc's secondary prompt (PS2).
+                use base64::Engine;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&stdin_data);
+                let piped = format!(
+                    "printf '%s' '{}' | base64 -d | {}",
+                    encoded, command
+                );
+                match shell.run_command_plain(&piped, &stdout_tx).await {
+                    Ok(()) => {
+                        if let Some(f) = return_fn {
+                            f(shell);
+                        }
+                        0
+                    }
+                    Err(_) => 255,
+                }
             };
             let _ = exit_tx.send(code);
         });
@@ -157,6 +215,7 @@ impl TargetSession for JumpserverSession {
             stdout_rx,
             exit_rx,
             exit_seen: false,
+            stdin_tx,
         };
         Ok(())
     }
@@ -182,8 +241,16 @@ impl TargetSession for JumpserverSession {
     }
 
     async fn window_change(&mut self, cols: u32, rows: u32) -> Result<()> {
-        if let Some(shell) = self.shell.as_mut() {
-            shell.window_change(cols, rows).await;
+        match &self.backend {
+            Backend::Raw { resize_tx, .. } => {
+                let _ = resize_tx.send((cols, rows)).await;
+            }
+            _ => {
+                // Pre-exec: apply directly to the shell.
+                if let Some(shell) = self.shell.as_mut() {
+                    shell.window_change(cols, rows).await;
+                }
+            }
         }
         Ok(())
     }
@@ -193,21 +260,28 @@ impl TargetSession for JumpserverSession {
     }
 
     async fn write_stdin(&mut self, data: &[u8]) -> Result<()> {
-        if let Backend::Raw { stdin_tx, .. } = &self.backend {
-            stdin_tx
-                .send(data.to_vec())
-                .await
-                .map_err(|_| anyhow::anyhow!("jumpserver session closed"))?;
+        match &self.backend {
+            Backend::Raw { stdin_tx, .. } | Backend::Exec { stdin_tx, .. } => {
+                stdin_tx
+                    .send(data.to_vec())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("jumpserver session closed"))?;
+            }
+            Backend::None => {}
         }
-        // exec mode has no live stdin (run_command_plain); ignore.
         Ok(())
     }
 
     async fn eof(&mut self) -> Result<()> {
-        // Dropping the stdin sender signals EOF to the raw passthrough.
-        if let Backend::Raw { stdin_tx, .. } = &mut self.backend {
-            let (closed_tx, _) = mpsc::channel::<Vec<u8>>(1);
-            *stdin_tx = closed_tx;
+        // Dropping the stdin sender signals EOF to the spawned task.
+        // For Exec mode, the task receives None on stdin_rx and sends Ctrl+D.
+        // For Raw mode, the task receives None and sends channel eof.
+        match &mut self.backend {
+            Backend::Raw { stdin_tx, .. } | Backend::Exec { stdin_tx, .. } => {
+                let (closed_tx, _) = mpsc::channel::<Vec<u8>>(1);
+                *stdin_tx = closed_tx;
+            }
+            Backend::None => {}
         }
         Ok(())
     }
@@ -222,6 +296,7 @@ impl TargetSession for JumpserverSession {
                 stdout_rx,
                 exit_rx,
                 exit_seen,
+                ..
             } => {
                 if let Some(data) = stdout_rx.recv().await {
                     return Some(SessionEvent::Stdout(data));

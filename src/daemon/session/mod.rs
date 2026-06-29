@@ -198,6 +198,11 @@ pub async fn drive_exec(
     }
     sess.exec(&command).await?;
     let mut stdin_done = stdin_rx.is_none();
+    if stdin_done {
+        // No stdin channel — signal EOF immediately so the session's spawned
+        // exec task knows not to wait for stdin data.
+        let _ = sess.eof().await;
+    }
     loop {
         tokio::select! {
             ev = sess.next_event() => match ev {

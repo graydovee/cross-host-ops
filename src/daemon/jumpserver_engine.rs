@@ -293,15 +293,76 @@ impl PtyShell {
         }
     }
 
+    /// Like `run_command_plain` but concurrently forwards stdin from
+    /// `stdin_rx` to the PTY. When stdin closes (sender dropped), sends
+    /// Ctrl+D (\x04) to signal EOF to the remote program. Used for
+    /// non-interactive exec with stdin piping (e.g. `xho exec -i -- cat`).
+    pub(crate) async fn run_command_with_stdin(
+        &mut self,
+        command: &str,
+        sender: &mpsc::UnboundedSender<Vec<u8>>,
+        mut stdin_rx: mpsc::Receiver<Vec<u8>>,
+    ) -> Result<()> {
+        self.clear_prompt_remainder();
+        self.write_line(command).await?;
+        let mut first_output = true;
+        let mut stdin_open = true;
+        loop {
+            tokio::select! {
+                chunk = self.read_chunk() => {
+                    let chunk = chunk?;
+                    self.pending.extend_from_slice(&chunk);
+                    if let Some(split) = prompt_output_split(&self.pending, &self.prompt_suffixes) {
+                        let out = if first_output {
+                            strip_leading_shell_noise(&self.pending[..split])
+                        } else {
+                            &self.pending[..split]
+                        };
+                        if !out.is_empty() {
+                            let _ = sender.send(out.to_vec());
+                        }
+                        self.pending.drain(..split);
+                        return Ok(());
+                    }
+                    let keep = 64;
+                    if self.pending.len() > keep {
+                        let safe_len = self.pending.len() - keep;
+                        let data = if first_output {
+                            first_output = false;
+                            strip_leading_shell_noise(&self.pending[..safe_len]).to_vec()
+                        } else {
+                            self.pending[..safe_len].to_vec()
+                        };
+                        self.pending.drain(..safe_len);
+                        if !data.is_empty() {
+                            let _ = sender.send(data);
+                        }
+                    }
+                }
+                data = stdin_rx.recv(), if stdin_open => match data {
+                    Some(data) => {
+                        self.write_raw(&data).await?;
+                    }
+                    None => {
+                        self.write_raw(b"\x04").await?;
+                        stdin_open = false;
+                    }
+                }
+            }
+        }
+    }
+
     /// Byte-for-byte bidirectional passthrough: forward `stdin_rx` to the PTY and
     /// PTY output to `stdout_tx` until either side closes. Any `pending` bytes
-    /// buffered during navigation are flushed first. Used by the interactive
-    /// shell and the sftp subsystem. Returns the exit code (0 unless the channel
-    /// reported one).
+    /// buffered during navigation are flushed first. `resize_rx` carries
+    /// terminal resize events (cols, rows) that are applied to the PTY channel.
+    /// Used by the interactive shell and the interactive exec path. Returns the
+    /// exit code (0 unless the channel reported one).
     pub(crate) async fn run_raw_passthrough(
         mut self,
         mut stdin_rx: mpsc::Receiver<Vec<u8>>,
         stdout_tx: mpsc::UnboundedSender<Vec<u8>>,
+        mut resize_rx: mpsc::Receiver<(u32, u32)>,
     ) -> i32 {
         if !self.pending.is_empty() {
             let _ = stdout_tx.send(std::mem::take(&mut self.pending));
@@ -321,6 +382,11 @@ impl PtyShell {
                         stdin_open = false;
                     }
                 },
+                resize = resize_rx.recv() => {
+                    if let Some((cols, rows)) = resize {
+                        let _ = self.channel.window_change(cols, rows, 0, 0).await;
+                    }
+                }
                 msg = self.channel.wait() => match msg {
                     Some(ChannelMsg::Data { data }) => {
                         if stdout_tx.send(data.to_vec()).is_err() {
