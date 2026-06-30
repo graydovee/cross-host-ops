@@ -25,7 +25,10 @@ pub(crate) const MENU_PROMPT_CONTAINS: &str = "Opt";
 pub(crate) const MFA_PROMPT_CONTAINS: &str = "MFA";
 pub(crate) const SHELL_PROMPT_SUFFIXES: &[&str] = &["$ ", "# "];
 pub(crate) const PAGE_PROMPT_CONTAINS: &str = "上一页";
-const DEFAULT_PTY_TERM: &str = "xterm";
+// 256-color so the asset shell's rc (e.g. the default `~/.bashrc`) enables its
+// `ls --color=auto` alias, which it gates on `TERM` matching `*-256color`.
+// Matches what every other backend requests (see `drive_exec`/`drive_interactive`).
+const DEFAULT_PTY_TERM: &str = "xterm-256color";
 const DEFAULT_PTY_COLS: u32 = 80;
 const DEFAULT_PTY_ROWS: u32 = 24;
 
@@ -236,6 +239,11 @@ impl PtyShell {
     /// data (command output) stays in `pending` for the caller or passthrough.
     ///
     /// Times out after `timeout_ms` to avoid blocking if echo doesn't arrive.
+    /// On timeout/EOF the pending bytes are LEFT INTACT (not cleared): the
+    /// strict `SentinelScanner` downstream tolerates a leftover echo line (it
+    /// only matches `marker:<digits>\n`, never the echoed `marker:%s`), so a
+    /// slow echo degrades to "user sees the command line" instead of "output
+    /// destroyed → empty result".
     pub(crate) async fn drain_echo_line(&mut self, timeout_ms: u64) -> Result<()> {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
         loop {
@@ -245,15 +253,11 @@ impl PtyShell {
             }
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                self.pending.clear();
                 return Ok(());
             }
             match tokio::time::timeout(deadline - now, self.read_chunk()).await {
                 Ok(Ok(chunk)) => self.pending.extend_from_slice(&chunk),
-                Ok(Err(_)) | Err(_) => {
-                    self.pending.clear();
-                    return Ok(());
-                }
+                Ok(Err(_)) | Err(_) => return Ok(()),
             }
         }
     }
@@ -332,36 +336,64 @@ impl PtyShell {
     }
 
     /// Byte-for-byte bidirectional passthrough: forward `stdin_rx` to the PTY and
-    /// PTY output to `stdout_tx` until either side closes. Any `pending` bytes
-    /// buffered during navigation are flushed first. `resize_rx` carries
-    /// terminal resize events (cols, rows) that are applied to the PTY channel.
+    /// PTY output to `stdout_tx` until either side closes. `resize_rx` carries
+    /// terminal resize events (cols, rows) applied to the PTY channel.
     ///
-    /// When `sentinel` is `Some(marker)`, output is scanned for the marker
-    /// (`__XHO_E_{uuid}__`). On match the exit code is parsed from the bytes
-    /// following the marker (`:{code}\n`) and the channel is closed immediately —
-    /// the user never sees the marker, the post-command shell prompt, or the
-    /// JumpServer menu. The scanner uses `partial_suffix_match` to hold at most
-    /// a few bytes at chunk boundaries; within a chunk there is zero latency.
+    /// When `sentinel` is `Some(marker)`, ALL output — starting with any bytes
+    /// already buffered in `pending` (e.g. a fast command's output that arrived
+    /// during echo draining) — is fed through a strict [`SentinelScanner`] that
+    /// matches only `marker:<digits>\n`. On match the exit code is parsed and
+    /// the still-open shell is RETURNED (`Some`) so the caller can return it to
+    /// the session cache: the user never sees the marker, the post-command
+    /// prompt, or the JumpServer menu, and the next exec reuses the shell.
+    ///
+    /// Feeding `pending` through the scanner (instead of flushing it raw) is
+    /// what prevents the `__XHO_E_<uuid>:0` marker + post-command prompt from
+    /// leaking when a fast command's output was already buffered.
+    ///
+    /// Returns `(exit_code, Some(shell))` when the channel is still reusable
+    /// (sentinel completed), else `(exit_code, None)` (channel closed/dead).
     pub(crate) async fn run_raw_passthrough(
         mut self,
         mut stdin_rx: mpsc::Receiver<Vec<u8>>,
         stdout_tx: mpsc::UnboundedSender<Vec<u8>>,
         mut resize_rx: mpsc::Receiver<(u32, u32)>,
         sentinel: Option<Vec<u8>>,
-    ) -> i32 {
-        if !self.pending.is_empty() {
-            let _ = stdout_tx.send(std::mem::take(&mut self.pending));
-        }
+    ) -> (i32, Option<PtyShell>) {
         let mut exit_code = 0;
         let mut stdin_open = true;
-        let marker = sentinel.unwrap_or_default();
-        let scanning = !marker.is_empty();
-        let mut hold: Vec<u8> = Vec::new();
+        let mut scanner = sentinel.clone().map(SentinelScanner::new);
+        // Only sentinel mode can leave the channel reusable (the asset shell is
+        // still at its prompt after the wrapped command completes). `shell()` /
+        // `subsystem("sftp")` (no sentinel) always consume the channel.
+        let mut reusable = scanner.is_some();
+
+        // Feed any bytes already buffered in `pending` through the scanner FIRST
+        // (sentinel mode) — never flush them raw. In non-sentinel mode pending is
+        // flushed raw (interactive login shell / sftp launch output).
+        let pending = std::mem::take(&mut self.pending);
+        if let Some(sc) = scanner.as_mut() {
+            if !pending.is_empty() {
+                let (forward, done) = sc.feed(&pending);
+                if !forward.is_empty() {
+                    let _ = stdout_tx.send(forward);
+                }
+                if done {
+                    exit_code = sc.exit_code();
+                    self.pending = sc.take_leftover();
+                    return self.finish_passthrough(exit_code, reusable).await;
+                }
+            }
+        } else if !pending.is_empty() {
+            let _ = stdout_tx.send(pending);
+        }
+
         loop {
             tokio::select! {
                 stdin = stdin_rx.recv(), if stdin_open => match stdin {
                     Some(data) => {
                         if self.channel.data(Cursor::new(data)).await.is_err() {
+                            reusable = false;
                             break;
                         }
                     }
@@ -378,35 +410,26 @@ impl PtyShell {
                 msg = self.channel.wait() => match msg {
                     Some(ChannelMsg::Data { data }) => {
                         let chunk = data.to_vec();
-                        if scanning {
-                            hold.extend_from_slice(&chunk);
-                            if let Some(pos) = find_subslice(&hold, &marker) {
-                                if pos > 0 {
-                                    let _ = stdout_tx.send(hold[..pos].to_vec());
-                                }
-                                let after = &hold[pos + marker.len()..];
-                                if after.starts_with(b":") {
-                                    let rest = &after[1..];
-                                    let line_end = rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len());
-                                    let code_str = std::str::from_utf8(&rest[..line_end]).unwrap_or("0").trim();
-                                    exit_code = code_str.parse::<i32>().unwrap_or(0);
-                                }
+                        if let Some(sc) = scanner.as_mut() {
+                            let (forward, done) = sc.feed(&chunk);
+                            if !forward.is_empty() && stdout_tx.send(forward).is_err() {
+                                reusable = false;
                                 break;
                             }
-                            let pm = partial_suffix_match(&hold, &marker);
-                            if hold.len() > pm {
-                                let safe = hold.len() - pm;
-                                let _ = stdout_tx.send(hold[..safe].to_vec());
-                                hold = hold[safe..].to_vec();
+                            if done {
+                                exit_code = sc.exit_code();
+                                let leftover = sc.take_leftover();
+                                self.pending = leftover;
+                                return self.finish_passthrough(exit_code, reusable).await;
                             }
-                        } else {
-                            if stdout_tx.send(chunk).is_err() {
-                                break;
-                            }
+                        } else if stdout_tx.send(chunk).is_err() {
+                            reusable = false;
+                            break;
                         }
                     }
                     Some(ChannelMsg::ExtendedData { data, .. }) => {
                         if stdout_tx.send(data.to_vec()).is_err() {
+                            reusable = false;
                             break;
                         }
                     }
@@ -415,14 +438,29 @@ impl PtyShell {
                     }
                     Some(ChannelMsg::ExitSignal { .. }) => {
                         exit_code = 255;
+                        reusable = false;
                     }
-                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                        reusable = false;
+                        break;
+                    }
                     _ => {}
                 },
             }
         }
-        let _ = tokio::time::timeout(Duration::from_secs(3), self.channel.close()).await;
-        exit_code
+
+        self.finish_passthrough(exit_code, reusable).await
+    }
+
+    /// Finalize passthrough: hand back the still-open shell when reusable, or
+    /// close the channel and discard it otherwise.
+    async fn finish_passthrough(self, exit_code: i32, reusable: bool) -> (i32, Option<PtyShell>) {
+        if reusable {
+            (exit_code, Some(self))
+        } else {
+            let _ = tokio::time::timeout(Duration::from_secs(3), self.channel.close()).await;
+            (exit_code, None)
+        }
     }
 }
 
@@ -498,6 +536,174 @@ fn partial_suffix_match(buf: &[u8], pattern: &[u8]) -> usize {
     }
     let max = buf.len().min(pattern.len() - 1);
     (1..=max).rev().find(|&len| &buf[buf.len() - len..] == &pattern[..len]).unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// SentinelScanner — strict streaming match for `marker:<digits>\n`
+// ---------------------------------------------------------------------------
+
+/// A streaming scanner that matches a sentinel `marker:<digits>\n` across an
+/// arbitrary byte stream, forwarding everything before it and parsing the exit
+/// code. Pure (no I/O) so it is unit-testable; `run_raw_passthrough` drives it.
+///
+/// The match is **strict**: the marker counts only when immediately followed by
+/// `:` + one or more ASCII digits + `\n`. This is what keeps the echoed command
+/// line — which contains the literal marker followed by `:%s` (printf format)
+/// — from being mistaken for the real sentinel. A false occurrence is skipped
+/// and scanning continues, so an incomplete echo drain degrades to "the user
+/// sees the command line" rather than "empty output / premature exit".
+pub(crate) struct SentinelScanner {
+    marker: Vec<u8>,
+    hold: Vec<u8>,
+    leftover: Vec<u8>,
+    done: bool,
+    exit_code: i32,
+}
+
+impl SentinelScanner {
+    pub(crate) fn new(marker: Vec<u8>) -> Self {
+        Self {
+            marker,
+            hold: Vec::new(),
+            leftover: Vec::new(),
+            done: false,
+            exit_code: 0,
+        }
+    }
+
+    /// Feed one chunk of output. Returns `(bytes safe to forward now, done)`.
+    /// When `done` is true the sentinel matched and [`Self::exit_code`] /
+    /// [`Self::take_leftover`] are available.
+    pub(crate) fn feed(&mut self, chunk: &[u8]) -> (Vec<u8>, bool) {
+        if self.done {
+            return (Vec::new(), true);
+        }
+        self.hold.extend_from_slice(chunk);
+        match find_sentinel(&self.hold, &self.marker) {
+            SentinelFind::Confirmed { pos, code, end } => {
+                let forward = self.hold[..pos].to_vec();
+                self.leftover = self.hold[end..].to_vec();
+                self.hold.clear();
+                self.exit_code = code;
+                self.done = true;
+                (forward, true)
+            }
+            // A candidate marker is present but its `:digits\n` lookahead is
+            // incomplete — hold back from the marker until more bytes arrive.
+            SentinelFind::Incomplete(pos) => {
+                let forward = self.hold[..pos].to_vec();
+                self.hold.drain(..pos);
+                (forward, false)
+            }
+            // No marker candidate; hold back only a possible partial-prefix suffix.
+            SentinelFind::None => {
+                let pm = partial_suffix_match(&self.hold, &self.marker);
+                let safe = self.hold.len().saturating_sub(pm);
+                let forward = self.hold[..safe].to_vec();
+                self.hold.drain(..safe);
+                (forward, false)
+            }
+        }
+    }
+
+    pub(crate) fn exit_code(&self) -> i32 {
+        self.exit_code
+    }
+
+    /// Bytes after the sentinel (e.g. the post-command shell prompt), used to
+    /// return the shell to the session cache in a known state.
+    pub(crate) fn take_leftover(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.leftover)
+    }
+}
+
+enum SentinelFind {
+    /// Confirmed sentinel at `pos`; exit `code`; total consumed length is `end`.
+    Confirmed { pos: usize, code: i32, end: usize },
+    /// Marker at `pos` but the lookahead is incomplete (need more bytes).
+    Incomplete(usize),
+    /// No confirmed sentinel (no marker, or only false occurrences).
+    None,
+}
+
+/// Search `buf` for the first confirmed `marker:digits\n`. False marker
+/// occurrences (e.g. the echo, where the marker is followed by `:%s`) are
+/// skipped so scanning can continue to the real sentinel.
+fn find_sentinel(buf: &[u8], marker: &[u8]) -> SentinelFind {
+    if marker.is_empty() {
+        return SentinelFind::None;
+    }
+    let mut search_from = 0;
+    while let Some(rel) = find_subslice(&buf[search_from..], marker) {
+        let pos = search_from + rel;
+        let after = &buf[pos + marker.len()..];
+        match lookahead_sentinel(after) {
+            Lookahead::Confirmed { code, consumed } => {
+                return SentinelFind::Confirmed {
+                    pos,
+                    code,
+                    end: pos + marker.len() + consumed,
+                };
+            }
+            Lookahead::Incomplete => return SentinelFind::Incomplete(pos),
+            Lookahead::Mismatch => {
+                // False occurrence — skip past it and keep searching.
+                search_from = pos + marker.len();
+            }
+        }
+    }
+    SentinelFind::None
+}
+
+enum Lookahead {
+    Confirmed { code: i32, consumed: usize },
+    Incomplete,
+    Mismatch,
+}
+
+/// Inspect the bytes immediately following a marker occurrence (`after`).
+fn lookahead_sentinel(after: &[u8]) -> Lookahead {
+    match after.first() {
+        None => return Lookahead::Incomplete,
+        Some(&b':') => {}
+        Some(_) => return Lookahead::Mismatch,
+    }
+    // Collect ASCII digits after the colon.
+    let mut i = 1;
+    while i < after.len() && after[i].is_ascii_digit() {
+        i += 1;
+    }
+    let digit_count = i - 1;
+    if digit_count == 0 {
+        // No digit after ':'. Mismatch if more bytes follow, else incomplete.
+        return if i < after.len() {
+            Lookahead::Mismatch
+        } else {
+            Lookahead::Incomplete
+        };
+    }
+    if i >= after.len() {
+        return Lookahead::Incomplete; // digits present, waiting for the terminator
+    }
+    // Terminator: `\n` OR `\r\n`. A PTY translates `\n` -> `\r\n` (onlcr), so a
+    // real bastion emits `marker:0\r\n`; requiring a bare `\n` here would reject
+    // the CRLF form, leak the marker, and leave the session attached.
+    let (term_len, matched) = match after[i] {
+        b'\n' => (1, true),
+        b'\r' if after.get(i + 1) == Some(&b'\n') => (2, true),
+        // `\r` at the buffer boundary: wait for the following `\n` to confirm.
+        b'\r' if i + 1 >= after.len() => return Lookahead::Incomplete,
+        _ => (0, false),
+    };
+    if !matched {
+        return Lookahead::Mismatch; // e.g. ":12x" or ":12:"
+    }
+    let code = std::str::from_utf8(&after[1..i])
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(0);
+    // consumed = ':' + digits + terminator ('\n' or '\r\n')
+    Lookahead::Confirmed { code, consumed: i + term_len }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -636,5 +842,137 @@ Opt>
 Opt>";
         let error = select_exact_asset_id(text, "10.0.0.1").unwrap_err();
         assert!(error.to_string().contains("returned 2 exact matches"));
+    }
+
+    // ---- SentinelScanner ----
+
+    fn scan(marker: &[u8], chunks: &[&[u8]]) -> (Vec<u8>, i32, Vec<u8>) {
+        let mut sc = SentinelScanner::new(marker.to_vec());
+        let mut out = Vec::new();
+        let mut done = false;
+        for chunk in chunks {
+            if done {
+                break;
+            }
+            let (forward, d) = sc.feed(chunk);
+            out.extend_from_slice(&forward);
+            done = d;
+        }
+        let code = if done { sc.exit_code() } else { -1 };
+        let leftover = sc.take_leftover();
+        (out, code, leftover)
+    }
+
+    /// The leak bug: marker fully present in the first "pending" feed must be
+    /// stripped, not forwarded, with the exit code parsed.
+    #[test]
+    fn scanner_strips_marker_present_in_first_chunk() {
+        let marker = b"__XHO_E_test__";
+        let feed = b"file1 file2\n__XHO_E_test__:0\ndevops@host:~$ ";
+        let (out, code, leftover) = scan(marker, &[feed]);
+        assert_eq!(out, b"file1 file2\n");
+        assert_eq!(code, 0);
+        assert_eq!(leftover, b"devops@host:~$ ");
+    }
+
+    #[test]
+    fn scanner_matches_marker_split_across_chunks() {
+        let marker = b"__XHO_E_test__";
+        let (out, code, _leftover) = scan(
+            marker,
+            &[
+                b"file1\n__XHO_E_t",
+                b"est__:42\ndevops@host:~$ ",
+            ],
+        );
+        assert_eq!(out, b"file1\n");
+        assert_eq!(code, 42);
+    }
+
+    #[test]
+    fn scanner_lookahead_split_across_chunks() {
+        // Marker complete in chunk 1, but the `:7\n` lookahead arrives later.
+        let marker = b"__XHO_E_test__";
+        let (out, code, _leftover) = scan(
+            marker,
+            &[b"out__XHO_E_test__", b":7\nprompt$ "],
+        );
+        assert_eq!(out, b"out");
+        assert_eq!(code, 7);
+    }
+
+    /// The echoed command line contains the marker followed by `:%s` — it must
+    /// NOT match. Scanning continues to the real sentinel.
+    #[test]
+    fn scanner_ignores_marker_in_echoed_command_line() {
+        let marker = b"__XHO_E_test__";
+        let echo = b"{ ls; }; status=$?; printf '__XHO_E_test__:%s\\n' \"$status\"\r\n";
+        let output = b"file1\n__XHO_E_test__:0\n$ ";
+        let (out, code, _leftover) = scan(marker, &[echo, output]);
+        // Real output is recovered and the real sentinel is matched with code 0.
+        assert!(out.ends_with(b"file1\n"));
+        assert!(find_subslice(&out, marker).is_some()); // echo line forwarded
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn scanner_parses_nonzero_exit_codes() {
+        let marker = b"__XHO_E_test__";
+        let (_, code1, _) = scan(marker, &[b"__XHO_E_test__:1\n"]);
+        assert_eq!(code1, 1);
+        let (_, code255, _) = scan(marker, &[b"__XHO_E_test__:255\n"]);
+        assert_eq!(code255, 255);
+    }
+
+    /// A real bastion is a PTY: `\n` is translated to `\r\n` (onlcr), so the
+    /// sentinel arrives as `marker:0\r\n`. The scanner MUST accept CRLF — this
+    /// is the form that actually occurs in production.
+    #[test]
+    fn scanner_matches_crlf_terminator() {
+        let marker = b"__XHO_E_test__";
+        let (out, code, leftover) =
+            scan(marker, &[b"file1\r\n__XHO_E_test__:0\r\ndevops@host:~$ "]);
+        assert_eq!(out, b"file1\r\n");
+        assert_eq!(code, 0);
+        assert_eq!(leftover, b"devops@host:~$ ");
+    }
+
+    #[test]
+    fn scanner_matches_crlf_split_before_newline() {
+        // `:0\r` in one chunk, `\n` in the next — the `\r` is held as incomplete.
+        let marker = b"__XHO_E_test__";
+        let (out, code, _) = scan(marker, &[b"out__XHO_E_test__:0\r", b"\n$ "]);
+        assert_eq!(out, b"out");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn scanner_marker_at_start_forwards_nothing() {
+        let marker = b"__XHO_E_test__";
+        let (out, code, leftover) = scan(marker, &[b"__XHO_E_test__:0\nafter$ "]);
+        assert!(out.is_empty());
+        assert_eq!(code, 0);
+        assert_eq!(leftover, b"after$ ");
+    }
+
+    #[test]
+    fn scanner_without_marker_forwards_everything() {
+        // Many feeds, no marker -> all bytes forwarded, never done (code -1).
+        let marker = b"__XHO_E_test__";
+        let (out, code, _) = scan(marker, &[b"abc", b"def", b"ghi"]);
+        assert_eq!(out, b"abcdefghi");
+        assert_eq!(code, -1);
+    }
+
+    #[test]
+    fn scanner_holds_partial_marker_suffix() {
+        // Chunk ends with a prefix of the marker; it must be held, not flushed.
+        let marker = b"__XHO_E_test__";
+        let (out, code, _leftover) = scan(
+            marker,
+            &[b"data __XHO_E", b"_test__:0\n"],
+        );
+        assert_eq!(out, b"data ");
+        assert_eq!(code, 0);
     }
 }

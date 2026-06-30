@@ -38,6 +38,9 @@ pub(crate) struct JumpserverSession {
     pty_requested: bool,
     backend: Backend,
     exited: bool,
+    /// Captured exit code for a Raw session, held until stdout is fully drained
+    /// so trailing output is never lost to a stdout/exit race.
+    pending_exit: Option<i32>,
     /// Keeps the bastion transport lease alive for the session's lifetime.
     _transport_guard: Box<dyn Send>,
     /// Called with the surviving `PtyShell` when `exec` succeeds (the shell is
@@ -86,6 +89,7 @@ impl JumpserverSession {
             pty_requested: false,
             backend: Backend::None,
             exited: false,
+            pending_exit: None,
             _transport_guard: transport_guard,
             return_shell,
         }
@@ -96,16 +100,22 @@ impl JumpserverSession {
             .shell
             .take()
             .ok_or_else(|| anyhow::anyhow!("jumpserver session already started"))?;
-        // Raw passthrough (interactive shell / sftp subsystem) consumes the
-        // channel — it is closed when passthrough ends. The shell cannot be
-        // returned to the cache.
-        self.return_shell = None;
+        // In sentinel mode (interactive exec), `run_raw_passthrough` RETURNS the
+        // still-open shell (at the asset prompt) when the wrapped command
+        // completes — we hand it back to the session cache for reuse, so the
+        // next `xho exec -it` skips the ~3-8s menu navigation. Non-sentinel
+        // mode (`shell()` / sftp) consumes the channel and yields `None`.
+        let return_fn = self.return_shell.take();
         let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(64);
         let (stdout_tx, stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (exit_tx, exit_rx) = oneshot::channel::<i32>();
         let (resize_tx, resize_rx) = mpsc::channel::<(u32, u32)>(8);
         tokio::spawn(async move {
-            let code = shell.run_raw_passthrough(stdin_rx, stdout_tx, resize_rx, sentinel).await;
+            let (code, maybe_shell) =
+                shell.run_raw_passthrough(stdin_rx, stdout_tx, resize_rx, sentinel).await;
+            if let (Some(shell), Some(f)) = (maybe_shell, return_fn) {
+                f(shell);
+            }
             let _ = exit_tx.send(code);
         });
         self.backend = Backend::Raw {
@@ -321,18 +331,48 @@ impl TargetSession for JumpserverSession {
             Backend::Raw {
                 stdout_rx, exit_rx, ..
             } => {
-                tokio::select! {
-                    data = stdout_rx.recv() => match data {
+                // If we already captured the exit code, drain remaining stdout
+                // before emitting it (a Raw passthrough can deliver stdout and
+                // exit back-to-back; we must not let exit preempt buffered
+                // output).
+                if self.pending_exit.is_none() {
+                    match stdout_rx.try_recv() {
+                        Ok(data) => return Some(SessionEvent::Stdout(data)),
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            self.exited = true;
+                            let code = (&mut *exit_rx).await.unwrap_or(0);
+                            return Some(SessionEvent::ExitStatus(code));
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => {}
+                    }
+                    tokio::select! {
+                        data = stdout_rx.recv() => match data {
+                            Some(data) => return Some(SessionEvent::Stdout(data)),
+                            None => {
+                                self.exited = true;
+                                let code = (&mut *exit_rx).await.unwrap_or(0);
+                                return Some(SessionEvent::ExitStatus(code));
+                            }
+                        },
+                        code = &mut *exit_rx => {
+                            self.pending_exit = Some(code.unwrap_or(0));
+                        }
+                    }
+                }
+                // Exit captured — keep draining stdout until it closes.
+                match stdout_rx.try_recv() {
+                    Ok(data) => Some(SessionEvent::Stdout(data)),
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        self.exited = true;
+                        Some(SessionEvent::ExitStatus(self.pending_exit.take().unwrap_or(0)))
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => match stdout_rx.recv().await {
                         Some(data) => Some(SessionEvent::Stdout(data)),
                         None => {
                             self.exited = true;
-                            Some(SessionEvent::Eof)
+                            Some(SessionEvent::ExitStatus(self.pending_exit.take().unwrap_or(0)))
                         }
                     },
-                    code = &mut *exit_rx => {
-                        self.exited = true;
-                        Some(SessionEvent::ExitStatus(code.unwrap_or(0)))
-                    }
                 }
             }
         }

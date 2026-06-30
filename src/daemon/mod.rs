@@ -1726,7 +1726,21 @@ async fn process_interactive_execute(
                         }
                     }
                     None => {
-                        debug!(execution_id = %execution_id, "stdout channel closed");
+                        // stdout closed; the exit code follows immediately (the
+                        // passthrough task sends it right after closing stdout).
+                        // Await it so the client always receives the terminal
+                        // ExitStatus rather than a bare stream end — otherwise
+                        // races between stdout-close and exit-delivery drop the
+                        // exit code (e.g. `xho exec -it -- ls` would lose it).
+                        debug!(execution_id = %execution_id, "stdout channel closed; awaiting exit code");
+                        let code = (&mut handle.exit_rx).await.unwrap_or(0);
+                        info!(execution_id = %execution_id, code, "interactive session exited (after stdout close)");
+                        while let Ok(bytes) = handle.stdout_rx.try_recv() {
+                            if send_execute_event(sender, ServerEvent::Stdout { data: bytes }).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                        let _ = send_execute_event(sender, ServerEvent::ExitStatus { code }).await;
                         break;
                     }
                 }
