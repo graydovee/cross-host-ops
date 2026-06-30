@@ -120,6 +120,11 @@ jobs:
       - build-release-binaries
       - docker-ghcr
     steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
       - name: Download artifacts
         uses: actions/download-artifact@v5
         with:
@@ -127,7 +132,27 @@ jobs:
           merge-multiple: true
           path: dist
 
+      - name: Generate changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)
+          {
+            echo "## Commits"
+            echo ""
+            if [ -n "${PREV_TAG}" ]; then
+              git log ${PREV_TAG}..HEAD --no-merges --pretty=format:"- %s (%h)"
+            else
+              git log HEAD --no-merges --pretty=format:"- %s (%h)"
+            fi
+            echo ""
+          } > RELEASE_NOTES.md
+          echo "Generated RELEASE_NOTES.md:"
+          cat RELEASE_NOTES.md
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/**/*.tar.gz
+          body_path: RELEASE_NOTES.md
+          generate_release_notes: true
