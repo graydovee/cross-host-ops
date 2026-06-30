@@ -32,7 +32,7 @@ use crate::daemon::jumpserver_engine::{
 use crate::daemon::resolver::derive_target_ip;
 use crate::daemon::session::TargetSession;
 use crate::daemon::session::jumpserver::JumpserverSession;
-use crate::daemon::shell::{build_final_command, resolve_shell};
+use crate::daemon::shell::{build_remote_command, resolve_shell};
 
 use super::auth::{AuthPrompt, AuthPrompter, ClientHandler, authenticate_with_key, connect_handle};
 use super::{Capabilities, ErrorKind, Gateway, GatewayError, GatewayKind, is_transport_error};
@@ -547,11 +547,14 @@ impl Gateway for JumpserverGateway {
         &self,
         target: &str,
         argv: &[String],
-        shell: &str,
-        no_shell: bool,
+        _shell: &str,
+        _no_shell: bool,
     ) -> Result<(Box<dyn TargetSession>, String), GatewayError> {
-        let eff_shell = self.effective_shell(shell, no_shell).await;
-        let command = build_final_command(argv, &eff_shell);
+        // The jumpserver PTY is already at the asset's shell prompt, so shell
+        // wrapping (e.g. `bash -ic '…'`) is unnecessary and harmful: the `-i`
+        // flag keeps the subshell alive, preventing the exit-code sentinel from
+        // firing. Build the command directly from argv instead.
+        let command = build_remote_command(argv);
         let session = self.open_session_inner(target).await?;
         Ok((session, command))
     }

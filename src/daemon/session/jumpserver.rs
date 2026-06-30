@@ -91,7 +91,7 @@ impl JumpserverSession {
         }
     }
 
-    fn start_raw(&mut self) -> Result<()> {
+    fn start_raw(&mut self, scan_sentinel: bool) -> Result<()> {
         let shell = self
             .shell
             .take()
@@ -105,7 +105,9 @@ impl JumpserverSession {
         let (exit_tx, exit_rx) = oneshot::channel::<i32>();
         let (resize_tx, resize_rx) = mpsc::channel::<(u32, u32)>(8);
         tokio::spawn(async move {
-            let code = shell.run_raw_passthrough(stdin_rx, stdout_tx, resize_rx).await;
+            let code = shell
+                .run_raw_passthrough(stdin_rx, stdout_tx, resize_rx, scan_sentinel)
+                .await;
             let _ = exit_tx.send(code);
         });
         self.backend = Backend::Raw {
@@ -148,25 +150,34 @@ impl TargetSession for JumpserverSession {
             .ok_or_else(|| anyhow::anyhow!("jumpserver session already started"))?;
 
         if self.pty_requested {
-            // Interactive exec (-it): resize PTY to the requested terminal
-            // size, write the command, then switch to raw bidirectional
-            // passthrough. This lets interactive programs (vim, bash, top)
-            // receive keystrokes and produce terminal output without false
-            // prompt detection. The shell is consumed (not returned to cache).
+            // Interactive exec (-it): resize PTY to the user's terminal size,
+            // reset terminal settings (navigation left stty -echo), then write
+            // the command with an exit-code sentinel and switch to raw
+            // bidirectional passthrough with sentinel scanning.
+            //
+            // stty sane restores echo/icanon so bash/vim display typed input.
+            // The sentinel lets the passthrough detect command exit, capture
+            // the exit code, and close the PTY cleanly.
             shell.window_change(self.cols, self.rows).await;
-            shell.write_line(command).await?;
+            shell.write_line("stty sane").await?;
+            shell.wait_for_prompt().await?;
+            shell.clear_pending();
+            shell
+                .write_line(&format!(
+                    "{command}{}",
+                    crate::daemon::jumpserver_engine::SENTINEL_SUFFIX
+                ))
+                .await?;
             shell.clear_pending();
             self.shell = Some(shell);
-            return self.start_raw();
+            return self.start_raw(true);
         }
 
         // Non-interactive exec: prompt-based execution with optional stdin
-        // forwarding (for `xho exec -i`). On success the shell is still at the
-        // asset prompt — return it to the cache for reuse.
-        //
-        // stdin handling: the bastion PTY may not propagate Ctrl+D (\x04)
-        // correctly, so we buffer stdin data and feed it via a base64 heredoc
-        // pipe. This avoids the EOF detection problem entirely.
+        // forwarding (for `xho exec -i`). run_command_plain wraps the command
+        // with the exit-code sentinel internally and returns the real exit
+        // code. On success the shell is still at the asset prompt — return it
+        // to the cache for reuse.
         let return_fn = self.return_shell.take();
         let command = command.to_string();
         let (stdout_tx, stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -182,11 +193,11 @@ impl TargetSession for JumpserverSession {
             let code = if stdin_data.is_empty() {
                 // No stdin — run the command directly.
                 match shell.run_command_plain(&command, &stdout_tx).await {
-                    Ok(()) => {
+                    Ok(code) => {
                         if let Some(f) = return_fn {
                             f(shell);
                         }
-                        0
+                        code
                     }
                     Err(_) => 255,
                 }
@@ -195,16 +206,13 @@ impl TargetSession for JumpserverSession {
                 // bastion PTY. printf avoids heredoc's secondary prompt (PS2).
                 use base64::Engine;
                 let encoded = base64::engine::general_purpose::STANDARD.encode(&stdin_data);
-                let piped = format!(
-                    "printf '%s' '{}' | base64 -d | {}",
-                    encoded, command
-                );
+                let piped = format!("printf '%s' '{}' | base64 -d | {}", encoded, command);
                 match shell.run_command_plain(&piped, &stdout_tx).await {
-                    Ok(()) => {
+                    Ok(code) => {
                         if let Some(f) = return_fn {
                             f(shell);
                         }
-                        0
+                        code
                     }
                     Err(_) => 255,
                 }
@@ -221,7 +229,7 @@ impl TargetSession for JumpserverSession {
     }
 
     async fn shell(&mut self) -> Result<()> {
-        self.start_raw()
+        self.start_raw(false)
     }
 
     async fn subsystem(&mut self, name: &str) -> Result<()> {
@@ -237,7 +245,7 @@ impl TargetSession for JumpserverSession {
                 .write_raw(format!("{SFTP_LAUNCH}\r").as_bytes())
                 .await?;
         }
-        self.start_raw()
+        self.start_raw(false)
     }
 
     async fn window_change(&mut self, cols: u32, rows: u32) -> Result<()> {

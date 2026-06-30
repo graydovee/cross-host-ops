@@ -249,32 +249,38 @@ impl PtyShell {
         let _ = self.channel.window_change(cols, rows, 0, 0).await;
     }
 
-    /// Sentinel-free command execution: write the command, stream stdout to
-    /// `sender` until the prompt reappears, stripping the prompt. No exit code
-    /// (a menu bastion PTY has no native exec/exit-status). The prompt is KEPT
-    /// in `pending` so a subsequent command's roundtrip resolves immediately.
+    /// Sentinel-free command execution: write the command wrapped with an
+    /// exit-code sentinel, stream stdout to `sender` until the prompt
+    /// reappears, stripping the prompt and sentinel. Returns the exit code
+    /// extracted from the sentinel (0 if not found).
+    ///
+    /// The prompt is KEPT in `pending` so a subsequent command's roundtrip
+    /// resolves immediately.
     pub(crate) async fn run_command_plain(
         &mut self,
         command: &str,
         sender: &mpsc::UnboundedSender<Vec<u8>>,
-    ) -> Result<()> {
+    ) -> Result<i32> {
         self.clear_prompt_remainder();
-        self.write_line(command).await?;
+        self.write_line(&format!("{command}{SENTINEL_SUFFIX}"))
+            .await?;
         let mut first_output = true;
         loop {
             let chunk = self.read_chunk().await?;
             self.pending.extend_from_slice(&chunk);
             if let Some(split) = prompt_output_split(&self.pending, &self.prompt_suffixes) {
+                let raw = &self.pending[..split];
+                let (exit_code, clean) = strip_sentinel(raw);
                 let out = if first_output {
-                    strip_leading_shell_noise(&self.pending[..split])
+                    strip_leading_shell_noise(clean)
                 } else {
-                    &self.pending[..split]
+                    clean
                 };
                 if !out.is_empty() {
                     let _ = sender.send(out.to_vec());
                 }
                 self.pending.drain(..split);
-                return Ok(());
+                return Ok(exit_code);
             }
             let keep = 64;
             if self.pending.len() > keep {
@@ -356,19 +362,28 @@ impl PtyShell {
     /// PTY output to `stdout_tx` until either side closes. Any `pending` bytes
     /// buffered during navigation are flushed first. `resize_rx` carries
     /// terminal resize events (cols, rows) that are applied to the PTY channel.
-    /// Used by the interactive shell and the interactive exec path. Returns the
-    /// exit code (0 unless the channel reported one).
+    ///
+    /// When `scan_sentinel` is true, stdout is scanned for the exit-code
+    /// sentinel (`\x01E{code}\x01`). On detection the sentinel is stripped,
+    /// the channel is closed, and the extracted exit code is returned. This
+    /// lets interactive exec (`-it`) end cleanly when the command exits.
+    ///
+    /// Used by the interactive shell (no sentinel) and interactive exec
+    /// (with sentinel). Returns the exit code.
     pub(crate) async fn run_raw_passthrough(
         mut self,
         mut stdin_rx: mpsc::Receiver<Vec<u8>>,
         stdout_tx: mpsc::UnboundedSender<Vec<u8>>,
         mut resize_rx: mpsc::Receiver<(u32, u32)>,
+        scan_sentinel: bool,
     ) -> i32 {
         if !self.pending.is_empty() {
             let _ = stdout_tx.send(std::mem::take(&mut self.pending));
         }
         let mut exit_code = 0;
         let mut stdin_open = true;
+        // Hold buffer for sentinel scanning across chunk boundaries.
+        let mut hold_buf: Vec<u8> = Vec::new();
         loop {
             tokio::select! {
                 stdin = stdin_rx.recv(), if stdin_open => match stdin {
@@ -389,8 +404,31 @@ impl PtyShell {
                 }
                 msg = self.channel.wait() => match msg {
                     Some(ChannelMsg::Data { data }) => {
-                        if stdout_tx.send(data.to_vec()).is_err() {
-                            break;
+                        let data = data.to_vec();
+                        if scan_sentinel {
+                            hold_buf.extend_from_slice(&data);
+                            if let Some((code, start, _end)) = find_sentinel(&hold_buf) {
+                                // Forward data before the sentinel, then close.
+                                if start > 0 {
+                                    let _ = stdout_tx.send(hold_buf[..start].to_vec());
+                                }
+                                exit_code = code;
+                                let _ = self.channel.close().await;
+                                return exit_code;
+                            }
+                            // Forward all but a small hold for partial sentinel.
+                            let hold = partial_sentinel_hold(&hold_buf);
+                            let forward_len = hold_buf.len() - hold;
+                            if forward_len > 0 {
+                                if stdout_tx.send(hold_buf[..forward_len].to_vec()).is_err() {
+                                    break;
+                                }
+                                hold_buf = hold_buf[forward_len..].to_vec();
+                            }
+                        } else {
+                            if stdout_tx.send(data).is_err() {
+                                break;
+                            }
                         }
                     }
                     Some(ChannelMsg::ExtendedData { data, .. }) => {
@@ -430,8 +468,74 @@ pub(crate) async fn request_default_pty(channel: &russh::Channel<client::Msg>) -
 }
 
 // ---------------------------------------------------------------------------
-// Asset menu parsing
+// Exit-code sentinel
 // ---------------------------------------------------------------------------
+
+/// Sentinel marker printed after a command exits to capture its exit code.
+/// Format: `__XHO_EXIT_{code}__`. Printable, no escape-sequence issues across
+/// shells/PTYs. Double-underscore prefix is virtually absent from normal
+/// command output.
+const SENTINEL_PREFIX: &[u8] = b"__XHO_EXIT_";
+
+/// Search `buf` for a complete sentinel `__XHO_EXIT_{digits}__`.
+/// Returns `(exit_code, start, end)` where `buf[start..end]` is the sentinel.
+pub(crate) fn find_sentinel(buf: &[u8]) -> Option<(i32, usize, usize)> {
+    let prefix = SENTINEL_PREFIX;
+    if buf.len() < prefix.len() + 2 {
+        return None;
+    }
+    let mut i = 0;
+    while i + prefix.len() <= buf.len() {
+        if &buf[i..i + prefix.len()] == prefix {
+            let digits_start = i + prefix.len();
+            let mut digits_end = digits_start;
+            while digits_end < buf.len() && buf[digits_end].is_ascii_digit() {
+                digits_end += 1;
+            }
+            if digits_end > digits_start
+                && digits_end + 2 <= buf.len()
+                && &buf[digits_end..digits_end + 2] == b"__"
+            {
+                let code = std::str::from_utf8(&buf[digits_start..digits_end])
+                    .ok()?
+                    .parse::<i32>()
+                    .ok()?;
+                return Some((code, i, digits_end + 2));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// If `buf` ends with a partial sentinel prefix, return how many bytes to hold
+/// back so the sentinel isn't split across forwarded chunks.
+fn partial_sentinel_hold(buf: &[u8]) -> usize {
+    let prefix = SENTINEL_PREFIX;
+    let max_hold = prefix.len();
+    let start = buf.len().saturating_sub(max_hold);
+    let tail = &buf[start..];
+    for hold in (1..=tail.len().min(prefix.len())).rev() {
+        if &prefix[..hold] == &tail[tail.len() - hold..] {
+            return hold;
+        }
+    }
+    0
+}
+
+/// Strip a trailing sentinel from `buf`, returning `(exit_code, cleaned_buf)`.
+/// If no sentinel is found, returns `(0, buf)`.
+fn strip_sentinel(buf: &[u8]) -> (i32, &[u8]) {
+    if let Some((code, start, _end)) = find_sentinel(buf) {
+        (code, &buf[..start])
+    } else {
+        (0, buf)
+    }
+}
+
+/// Shell snippet that prints the sentinel after the command exits.
+/// Uses `echo` (universally available) instead of `printf`.
+pub(crate) const SENTINEL_SUFFIX: &str = "; echo __XHO_EXIT_$?__";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct JumpserverAssetRow {
