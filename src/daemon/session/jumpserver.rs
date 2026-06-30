@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use russh::Pty;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::daemon::jumpserver_engine::PtyShell;
+use crate::daemon::jumpserver_engine::{PtyShell, make_marker};
 
 use super::{SessionEvent, TargetSession, unsupported};
 
@@ -91,7 +91,7 @@ impl JumpserverSession {
         }
     }
 
-    fn start_raw(&mut self) -> Result<()> {
+    fn start_raw(&mut self, sentinel: Option<Vec<u8>>) -> Result<()> {
         let shell = self
             .shell
             .take()
@@ -105,7 +105,7 @@ impl JumpserverSession {
         let (exit_tx, exit_rx) = oneshot::channel::<i32>();
         let (resize_tx, resize_rx) = mpsc::channel::<(u32, u32)>(8);
         tokio::spawn(async move {
-            let code = shell.run_raw_passthrough(stdin_rx, stdout_tx, resize_rx).await;
+            let code = shell.run_raw_passthrough(stdin_rx, stdout_tx, resize_rx, sentinel).await;
             let _ = exit_tx.send(code);
         });
         self.backend = Backend::Raw {
@@ -149,19 +149,26 @@ impl TargetSession for JumpserverSession {
 
         if self.pty_requested {
             // Interactive exec (-it): resize PTY to the user's terminal size,
-            // reset terminal settings (navigation left stty -echo), then write
-            // the command followed by `; exit` so the shell exits when the
-            // command finishes — closing the PTY and ending the session cleanly.
-            // No sentinel scanning: avoids false positives and character delay
-            // during interactive use. Exit code is always 0 in interactive mode.
+            // disable echo so the injected command isn't visible, then run the
+            // command with a UUID marker. The raw passthrough scanner detects
+            // the marker in the output stream and closes the channel — the user
+            // never sees the marker, the post-command prompt, or the JumpServer
+            // menu. Interactive programs (vim, bash, htop) override stty -echo
+            // with their own terminal setup; non-interactive programs (ls, cat)
+            // don't need echo.
+            let marker = make_marker();
+            let marker_bytes = marker.as_bytes().to_vec();
             shell.window_change(self.cols, self.rows).await;
-            shell.write_line("stty sane").await?;
+            shell.write_line("stty -echo").await?;
             shell.wait_for_prompt().await?;
             shell.clear_pending();
-            shell.write_line(&format!("{command}; exit")).await?;
+            let wrapped = format!(
+                "{{ {command}; }}; status=$?; printf '{marker}:%s\\n' \"$status\""
+            );
+            shell.write_line(&wrapped).await?;
             shell.clear_pending();
             self.shell = Some(shell);
-            return self.start_raw();
+            return self.start_raw(Some(marker_bytes));
         }
 
         // Non-interactive exec: prompt-based execution with optional stdin
@@ -220,7 +227,7 @@ impl TargetSession for JumpserverSession {
     }
 
     async fn shell(&mut self) -> Result<()> {
-        self.start_raw()
+        self.start_raw(None)
     }
 
     async fn subsystem(&mut self, name: &str) -> Result<()> {
@@ -236,7 +243,7 @@ impl TargetSession for JumpserverSession {
                 .write_raw(format!("{SFTP_LAUNCH}\r").as_bytes())
                 .await?;
         }
-        self.start_raw()
+        self.start_raw(None)
     }
 
     async fn window_change(&mut self, cols: u32, rows: u32) -> Result<()> {

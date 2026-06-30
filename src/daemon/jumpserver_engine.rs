@@ -306,18 +306,28 @@ impl PtyShell {
     /// PTY output to `stdout_tx` until either side closes. Any `pending` bytes
     /// buffered during navigation are flushed first. `resize_rx` carries
     /// terminal resize events (cols, rows) that are applied to the PTY channel.
-    /// Used by the interactive shell and the interactive exec path.
+    ///
+    /// When `sentinel` is `Some(marker)`, output is scanned for the marker
+    /// (`__XHO_E_{uuid}__`). On match the exit code is parsed from the bytes
+    /// following the marker (`:{code}\n`) and the channel is closed immediately —
+    /// the user never sees the marker, the post-command shell prompt, or the
+    /// JumpServer menu. The scanner uses `partial_suffix_match` to hold at most
+    /// a few bytes at chunk boundaries; within a chunk there is zero latency.
     pub(crate) async fn run_raw_passthrough(
         mut self,
         mut stdin_rx: mpsc::Receiver<Vec<u8>>,
         stdout_tx: mpsc::UnboundedSender<Vec<u8>>,
         mut resize_rx: mpsc::Receiver<(u32, u32)>,
+        sentinel: Option<Vec<u8>>,
     ) -> i32 {
         if !self.pending.is_empty() {
             let _ = stdout_tx.send(std::mem::take(&mut self.pending));
         }
         let mut exit_code = 0;
         let mut stdin_open = true;
+        let marker = sentinel.unwrap_or_default();
+        let scanning = !marker.is_empty();
+        let mut hold: Vec<u8> = Vec::new();
         loop {
             tokio::select! {
                 stdin = stdin_rx.recv(), if stdin_open => match stdin {
@@ -338,8 +348,32 @@ impl PtyShell {
                 }
                 msg = self.channel.wait() => match msg {
                     Some(ChannelMsg::Data { data }) => {
-                        if stdout_tx.send(data.to_vec()).is_err() {
-                            break;
+                        let chunk = data.to_vec();
+                        if scanning {
+                            hold.extend_from_slice(&chunk);
+                            if let Some(pos) = find_subslice(&hold, &marker) {
+                                if pos > 0 {
+                                    let _ = stdout_tx.send(hold[..pos].to_vec());
+                                }
+                                let after = &hold[pos + marker.len()..];
+                                if after.starts_with(b":") {
+                                    let rest = &after[1..];
+                                    let line_end = rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len());
+                                    let code_str = std::str::from_utf8(&rest[..line_end]).unwrap_or("0").trim();
+                                    exit_code = code_str.parse::<i32>().unwrap_or(0);
+                                }
+                                break;
+                            }
+                            let pm = partial_suffix_match(&hold, &marker);
+                            if hold.len() > pm {
+                                let safe = hold.len() - pm;
+                                let _ = stdout_tx.send(hold[..safe].to_vec());
+                                hold = hold[safe..].to_vec();
+                            }
+                        } else {
+                            if stdout_tx.send(chunk).is_err() {
+                                break;
+                            }
                         }
                     }
                     Some(ChannelMsg::ExtendedData { data, .. }) => {
@@ -358,8 +392,6 @@ impl PtyShell {
                 },
             }
         }
-        // Close with a timeout — the channel may already be dead (idle timeout,
-        // network drop) and close() would hang forever waiting for a response.
         let _ = tokio::time::timeout(Duration::from_secs(3), self.channel.close()).await;
         exit_code
     }
@@ -386,7 +418,7 @@ pub(crate) async fn request_default_pty(channel: &russh::Channel<client::Msg>) -
 
 /// Generate a unique exit-code marker: `__XHO_E_{uuid}__`.
 /// The UUID guarantees the marker cannot appear in user output.
-fn make_marker() -> String {
+pub(crate) fn make_marker() -> String {
     format!("__XHO_E_{}__", uuid::Uuid::new_v4().simple())
 }
 
@@ -424,6 +456,19 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+/// Returns the length of the longest suffix of `buf` that is also a prefix of
+/// `pattern`. This determines how many bytes to retain at a chunk boundary for
+/// a potential marker match — e.g. if `buf` ends with `__` and `pattern` starts
+/// with `__XHO_E_`, returns 2. Only non-zero when `buf` ends with characters
+/// that begin the pattern, so in practice the hold is 0 for most chunks.
+fn partial_suffix_match(buf: &[u8], pattern: &[u8]) -> usize {
+    if pattern.len() <= 1 || buf.is_empty() {
+        return 0;
+    }
+    let max = buf.len().min(pattern.len() - 1);
+    (1..=max).rev().find(|&len| &buf[buf.len() - len..] == &pattern[..len]).unwrap_or(0)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
