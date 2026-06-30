@@ -85,3 +85,77 @@ pub fn parse_duration(value: &str) -> Result<Duration> {
     };
     Ok(Duration::from_secs(seconds))
 }
+
+// ---------------------------------------------------------------------------
+// Option<Duration> serde helpers
+// ---------------------------------------------------------------------------
+
+pub(super) fn serialize_optional_duration<S>(
+    duration: &Option<Duration>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match duration {
+        Some(d) => serialize_duration(d, serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
+pub(super) fn deserialize_optional_duration<'de, D>(
+    deserializer: D,
+) -> Result<Option<Duration>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct OptionDurationVisitor;
+
+    impl<'de> Visitor<'de> for OptionDurationVisitor {
+        type Value = Option<Duration>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a duration string like 10s, or null/absent")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(Duration::from_secs(value)))
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            if value.is_empty() {
+                return Ok(None);
+            }
+            parse_duration(value).map(Some).map_err(E::custom)
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            self.visit_str(&value)
+        }
+    }
+
+    deserializer.deserialize_option(OptionDurationVisitor)
+}

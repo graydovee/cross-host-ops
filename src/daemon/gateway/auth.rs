@@ -261,7 +261,7 @@ pub(crate) async fn connect_handle(
         // Keep idle transports (including jumpserver hops) alive with active
         // keepalive pings rather than letting inactivity_timeout drop them.
         keepalive_interval: Some(config.ssh.keepalive_interval),
-        inactivity_timeout: Some(config.ssh.keepalive_interval * 2),
+        inactivity_timeout: config.ssh.inactivity_timeout,
         ..Default::default()
     };
     let handle = timeout(

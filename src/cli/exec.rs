@@ -256,7 +256,15 @@ pub(crate) async fn run_command(
     let mut stream = response.into_inner();
     let mut exit_code = 1;
 
-    while let Some(message) = stream.message().await? {
+    loop {
+        let message = match stream.message().await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("error: connection lost: {e}");
+                break;
+            }
+        };
         match message
             .event
             .ok_or_else(|| anyhow!("execute stream returned empty event"))?
@@ -418,7 +426,19 @@ pub(crate) async fn run_interactive(
 
     // Step 6: Process response stream — write stdout directly, handle exit.
     let mut exit_code = 1;
-    while let Some(message) = stream.message().await? {
+    loop {
+        let message = match stream.message().await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => break,
+            Err(e) => {
+                // gRPC stream broke (daemon restart, SSH connection lost, etc.).
+                // Show a clean diagnostic instead of the raw h2/hyper error.
+                write_raw_mode_diagnostic(&format!(
+                    "\n\x1b[31mConnection lost: {e}\x1b[0m\n"
+                ))?;
+                break;
+            }
+        };
         match message
             .event
             .ok_or_else(|| anyhow!("execute stream returned empty event"))?

@@ -3,7 +3,10 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::duration::{deserialize_duration, serialize_duration};
+use super::duration::{
+    deserialize_duration, deserialize_optional_duration, serialize_duration,
+    serialize_optional_duration,
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -27,6 +30,15 @@ pub struct SshConfig {
         serialize_with = "serialize_duration"
     )]
     pub keepalive_interval: Duration,
+    /// SSH inactivity timeout. If no data is received from the server for this
+    /// duration, the connection is closed. `None` = never timeout (rely on
+    /// keepalive for liveness detection). Default: `None`.
+    #[serde(
+        deserialize_with = "deserialize_optional_duration",
+        serialize_with = "serialize_optional_duration",
+        default
+    )]
+    pub inactivity_timeout: Option<Duration>,
     #[serde(
         deserialize_with = "deserialize_duration",
         serialize_with = "serialize_duration"
@@ -46,6 +58,7 @@ impl Default for SshConfig {
             auto_tty_detect: true,
             connect_timeout: Duration::from_secs(10),
             keepalive_interval: Duration::from_secs(30),
+            inactivity_timeout: None,
             max_idle_time: Duration::from_secs(600),
             max_connections_per_ip: 10,
         }

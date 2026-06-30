@@ -61,6 +61,9 @@
 # auto_tty_detect = true
 # connect_timeout = "10s"
 # keepalive_interval = "30s"
+# SSH inactivity timeout: close connection if no data received for this long.
+# unset/none = never timeout (rely on keepalive pings for liveness detection).
+# inactivity_timeout = "300s"
 # max_idle_time = "10m"
 # max_connections_per_ip = 10
 

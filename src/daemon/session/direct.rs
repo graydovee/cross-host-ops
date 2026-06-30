@@ -112,7 +112,7 @@ async fn connect_handle(
 ) -> Result<client::Handle<ClientHandler>> {
     let client_config = client::Config {
         keepalive_interval: Some(config.ssh.keepalive_interval),
-        inactivity_timeout: Some(config.ssh.keepalive_interval * 2),
+        inactivity_timeout: config.ssh.inactivity_timeout,
         ..Default::default()
     };
     let handle = timeout(

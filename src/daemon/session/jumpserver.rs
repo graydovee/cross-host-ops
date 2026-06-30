@@ -91,7 +91,7 @@ impl JumpserverSession {
         }
     }
 
-    fn start_raw(&mut self, scan_sentinel: bool) -> Result<()> {
+    fn start_raw(&mut self) -> Result<()> {
         let shell = self
             .shell
             .take()
@@ -105,9 +105,7 @@ impl JumpserverSession {
         let (exit_tx, exit_rx) = oneshot::channel::<i32>();
         let (resize_tx, resize_rx) = mpsc::channel::<(u32, u32)>(8);
         tokio::spawn(async move {
-            let code = shell
-                .run_raw_passthrough(stdin_rx, stdout_tx, resize_rx, scan_sentinel)
-                .await;
+            let code = shell.run_raw_passthrough(stdin_rx, stdout_tx, resize_rx).await;
             let _ = exit_tx.send(code);
         });
         self.backend = Backend::Raw {
@@ -152,25 +150,18 @@ impl TargetSession for JumpserverSession {
         if self.pty_requested {
             // Interactive exec (-it): resize PTY to the user's terminal size,
             // reset terminal settings (navigation left stty -echo), then write
-            // the command with an exit-code sentinel and switch to raw
-            // bidirectional passthrough with sentinel scanning.
-            //
-            // stty sane restores echo/icanon so bash/vim display typed input.
-            // The sentinel lets the passthrough detect command exit, capture
-            // the exit code, and close the PTY cleanly.
+            // the command followed by `; exit` so the shell exits when the
+            // command finishes — closing the PTY and ending the session cleanly.
+            // No sentinel scanning: avoids false positives and character delay
+            // during interactive use. Exit code is always 0 in interactive mode.
             shell.window_change(self.cols, self.rows).await;
             shell.write_line("stty sane").await?;
             shell.wait_for_prompt().await?;
             shell.clear_pending();
-            shell
-                .write_line(&format!(
-                    "{command}{}",
-                    crate::daemon::jumpserver_engine::SENTINEL_SUFFIX
-                ))
-                .await?;
+            shell.write_line(&format!("{command}; exit")).await?;
             shell.clear_pending();
             self.shell = Some(shell);
-            return self.start_raw(true);
+            return self.start_raw();
         }
 
         // Non-interactive exec: prompt-based execution with optional stdin
@@ -229,7 +220,7 @@ impl TargetSession for JumpserverSession {
     }
 
     async fn shell(&mut self) -> Result<()> {
-        self.start_raw(false)
+        self.start_raw()
     }
 
     async fn subsystem(&mut self, name: &str) -> Result<()> {
@@ -245,7 +236,7 @@ impl TargetSession for JumpserverSession {
                 .write_raw(format!("{SFTP_LAUNCH}\r").as_bytes())
                 .await?;
         }
-        self.start_raw(false)
+        self.start_raw()
     }
 
     async fn window_change(&mut self, cols: u32, rows: u32) -> Result<()> {
