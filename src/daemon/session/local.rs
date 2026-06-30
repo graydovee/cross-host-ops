@@ -61,7 +61,7 @@ fn pty_resize(fd: libc::c_int, cols: u32, rows: u32) {
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    unsafe { libc::ioctl(fd, libc::TIOCSWINSZ as libc::c_ulong, &ws) };
+    unsafe { libc::ioctl(fd, libc::TIOCSWINSZ as _, &ws) };
 }
 
 /// Resolve the sftp-server binary: explicit config, common locations, PATH.
@@ -347,7 +347,7 @@ async fn spawn(
         unsafe {
             cmd.pre_exec(|| {
                 libc::setsid();
-                libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0i32);
+                libc::ioctl(0, libc::TIOCSCTTY as _, 0i32);
                 Ok(())
             });
         }
