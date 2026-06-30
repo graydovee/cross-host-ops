@@ -230,6 +230,34 @@ impl PtyShell {
         Ok(())
     }
 
+    /// After `write_line`, the PTY echoes the typed command back. This drains
+    /// everything up to and including the first newline byte (0x0A) in the
+    /// output — the echoed command line — so the user never sees it. Remaining
+    /// data (command output) stays in `pending` for the caller or passthrough.
+    ///
+    /// Times out after `timeout_ms` to avoid blocking if echo doesn't arrive.
+    pub(crate) async fn drain_echo_line(&mut self, timeout_ms: u64) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            if let Some(pos) = self.pending.iter().position(|&b| b == b'\n') {
+                self.pending.drain(..=pos);
+                return Ok(());
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                self.pending.clear();
+                return Ok(());
+            }
+            match tokio::time::timeout(deadline - now, self.read_chunk()).await {
+                Ok(Ok(chunk)) => self.pending.extend_from_slice(&chunk),
+                Ok(Err(_)) | Err(_) => {
+                    self.pending.clear();
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     pub(crate) async fn read_chunk(&mut self) -> Result<Vec<u8>> {
         let message = timeout(self.shell_timeout, self.channel.wait())
             .await
@@ -266,6 +294,7 @@ impl PtyShell {
         );
         self.clear_prompt_remainder();
         self.write_line(&wrapped).await?;
+        self.drain_echo_line(3000).await?;
         let marker_bytes = marker.as_bytes();
         let keep = marker_bytes.len() + 32;
         let mut first_output = true;

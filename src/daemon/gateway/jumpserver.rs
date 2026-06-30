@@ -427,7 +427,6 @@ impl JumpserverGateway {
 
     /// Drive the bastion menu state machine to the asset shell prompt:
     /// MFA → search by IP → exact asset selection (with pagination) → prompt.
-    /// Finishes by disabling echo so command output is clean.
     async fn navigate_to_asset(&self, shell: &mut PtyShell, target: &str) -> Result<()> {
         let ip = derive_target_ip(target);
         debug!(gateway = %self.gateway_name, target = %target, ip = %ip, "waiting for jumpserver menu");
@@ -519,10 +518,6 @@ impl JumpserverGateway {
                 break;
             }
         }
-        shell.clear_pending();
-
-        shell.write_line("stty -echo").await?;
-        shell.wait_for_prompt().await?;
         shell.clear_pending();
         Ok(())
     }

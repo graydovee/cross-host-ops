@@ -148,25 +148,27 @@ impl TargetSession for JumpserverSession {
             .ok_or_else(|| anyhow::anyhow!("jumpserver session already started"))?;
 
         if self.pty_requested {
-            // Interactive exec (-it): resize PTY to the user's terminal size,
-            // disable echo so the injected command isn't visible, then run the
-            // command with a UUID marker. The raw passthrough scanner detects
-            // the marker in the output stream and closes the channel — the user
-            // never sees the marker, the post-command prompt, or the JumpServer
-            // menu. Interactive programs (vim, bash, htop) override stty -echo
-            // with their own terminal setup; non-interactive programs (ls, cat)
-            // don't need echo.
+            // Interactive exec (-it): resize PTY, send the command with a UUID
+            // marker, drain the PTY's echo of the command line (so the user
+            // doesn't see the injected command), then start raw passthrough with
+            // sentinel scanning. When the marker appears the channel closes —
+            // the user never sees the marker, the post-command prompt, or the
+            // JumpServer menu.
+            //
+            // No stty changes: the PTY keeps its default echo + canonical mode.
+            // This means bash/vim/htop get proper terminal settings — echo and
+            // colors work naturally. Interactive programs override stty with
+            // their own terminal setup; the drain only removes the one echoed
+            // command line, not the program's output.
             let marker = make_marker();
             let marker_bytes = marker.as_bytes().to_vec();
             shell.window_change(self.cols, self.rows).await;
-            shell.write_line("stty -echo").await?;
-            shell.wait_for_prompt().await?;
             shell.clear_pending();
             let wrapped = format!(
                 "{{ {command}; }}; status=$?; printf '{marker}:%s\\n' \"$status\""
             );
             shell.write_line(&wrapped).await?;
-            shell.clear_pending();
+            shell.drain_echo_line(3000).await?;
             self.shell = Some(shell);
             return self.start_raw(Some(marker_bytes));
         }
