@@ -257,51 +257,14 @@ xho exec --no-tty <target> -- echo ok  # Minimal connectivity test
 | "transport error" | SSH connection dropped | Auto-retries; check network |
 | "token rejected" | Token expired, already consumed, or unknown | Run `xho token gen` for a fresh token |
 
-## Token-based bootstrap
-
-`xho host add` and `xho host login` can auto-append the client's public key
-to the remote xhod's `authorized_keys` by presenting a short-lived token
-issued on the remote host. This avoids editing `authorized_keys` by hand.
-
-### Workflow
-
-```bash
-# 1. On the remote host (where xhod runs): generate a token.
-xho token gen                       # 5m, single-use (default)
-xho token gen --ttl 1h --reusable --label ci
-
-# 2. On the client: add or re-login with the token.
-xho host add prod-xhod xho@bastion:12222 --token <TOKEN>
-xho host login prod-xhod --token <TOKEN>
-```
-
-`xho host add` without a token (or with empty prompt input) skips bootstrap
-and falls back to the legacy flow (trust host key, persist config). The
-client must then have its key added to `authorized_keys` by other means.
-`xho host login` always requires a token.
-
-### Managing tokens
-
-```bash
-xho token list                       # prefix | expires_at | once | consumed | label
-xho token invalid <prefix-or-full>   # invalidate
-```
-
-Tokens are in-memory only and vanish on daemon restart.
-
-### Fixed bootstrap token
-
-A long-lived fallback can be set in the daemon's config:
-
-```toml
-[server.remote]
-bootstrap_token = "vault:bootstrap_token"   # or plaintext, env:VAR, file:PATH
-```
-
-Store it in the vault first via `xho secret set bootstrap_token`. If the
-field is unset or empty, only dynamic tokens issued by `xho token gen` are
-accepted by SSH password auth.
-
 ### Terminal not restored after interactive session
 
 Run `reset` to manually restore terminal state.
+
+## Token-based bootstrap
+
+Token-based key bootstrap — generating a token, `xho host add --token`, the
+`xho token` subcommands, and the fixed `[server.remote].bootstrap_token`
+fallback — is a one-time setup task covered in
+[setup-and-deploy.md](setup-and-deploy.md). The `bootstrap_token` config field
+itself is shown under [Main Config](#main-config).
