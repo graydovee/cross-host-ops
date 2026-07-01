@@ -217,16 +217,20 @@ docker pull "${IMAGE}:${IMAGE_TAG}"
 echo "==> Removing any existing container '${CONTAINER_NAME}'"
 docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
 
-echo "==> Mounting host config dir ${data_dir} -> /etc/xho, socket /var/run/xho, exposing :2222"
+echo "==> Mounting host config dir ${data_dir} -> /etc/xho, socket /var/run/xho, exposing :2222 (proxy) + :12222 (control plane)"
 mkdir -p "$data_dir" /var/run/xho
 
 # The container runs as root, so default_socket_path() resolves to
 # /var/run/xho/xhod.sock.  By bind-mounting the directory the host CLI
 # (also root) finds the control socket at the same path automatically.
+# Publish both SSH ports: 2222 = transparent human proxy, 12222 = control
+# plane (daemon↔daemon xho-rpc + OpenSession). Omitting 12222 breaks remote
+# xhod / `xho host add` routing.
 docker run -d \
   --name "${CONTAINER_NAME}" \
   --restart unless-stopped \
   -p 2222:2222 \
+  -p 12222:12222 \
   -v "${data_dir}:/etc/xho" \
   -v /var/run/xho:/var/run/xho \
   "${IMAGE}:${IMAGE_TAG}"

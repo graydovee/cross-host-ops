@@ -1,6 +1,6 @@
 ---
 name: xho-remote-ops
-description: Install/deploy xho & xhod and operate remote machines via the xho CLI. Use when: (1) deploying xhod to a server (Docker image or systemd unit) or installing/upgrading the xho client, (2) running commands on remote hosts, (3) copying files to/from remote, (4) checking server status or listing available servers, (5) managing daemon or jump host configuration. Triggers on phrases like "install xho", "deploy xhod", "upgrade xho", "run xhod in docker", "set up jump host", "run on remote", "execute on server", "copy to remote", "deploy to", "check status of", "list servers", "ssh to", or any task requiring remote machine access via xho.
+description: Install/deploy xho & xhod and operate remote machines via the xho CLI. Use when: (1) deploying xhod to a server (Docker image or systemd unit) or installing/upgrading the xho client, (2) running commands on remote hosts, (3) copying files to/from remote, (4) checking server status or listing available servers, (5) managing daemon or jump host configuration, (6) connecting to a remote host directly through xhod's transparent SSH proxy (plain ssh/scp/sftp/rsync, no xho client needed). Triggers on phrases like "install xho", "deploy xhod", "upgrade xho", "run xhod in docker", "set up jump host", "run on remote", "execute on server", "copy to remote", "deploy to", "check status of", "list servers", "ssh to", "scp to remote", "sftp", "rsync to", "ssh node@xhod", "transparent ssh proxy", or any task requiring remote machine access via xho.
 ---
 
 # xho Remote Operations
@@ -18,7 +18,8 @@ The release ships a multi-arch image `ghcr.io/graydovee/cross-host-ops:<tag>`
 
 ```bash
 # Remote xhod via Docker (DEFAULT): pulls the image and runs a restarted
-# container with the config dir mounted at /etc/xho, port 2222 exposed.
+# container with the config dir mounted at /etc/xho, ports 2222 (proxy) +
+# 12222 (control plane) exposed.
 bash scripts/deploy.sh root@bastion.example.com
 bash scripts/deploy.sh root@bastion.example.com --version v0.2.0
 
@@ -50,13 +51,16 @@ bash scripts/deploy.sh --local
 | `--password <pw>` | (none) | SSH password for the remote host (password login). Requires `sshpass` locally. Key auth is the default; prefer `--password`/`SSHPASS` only when the host has no key |
 
 **Docker config layout.** The container runs `xhod --config /etc/xho/config.toml
---origin external`. Put your real config, host key, authorized keys, and
+--origin external`. Put your real config, host key, authorized-keys files, and
 `server.toml` under the mounted host dir (default `/etc/xho`), and make sure the
 config references them by paths inside that dir (e.g. `host_key_path =
-"/etc/xho/host_key"`) so they persist across container restarts. Enable
-`[server.remote]` and add the client's public key to the authorized-keys file.
-See [references/config-and-usage.md](references/config-and-usage.md) for the full
-config format.
+"/etc/xho/host_key"`) so they persist across container restarts. Enable **both**
+listeners and publish both ports: `[server.remote]` (control plane, 12222) for
+daemon-to-daemon routing and `[server.proxy]` (transparent proxy, 2222) for
+human `ssh`/`scp`. The control plane trusts *machine* keys in `authorized_keys`;
+the proxy trusts *human* keys in `proxy_authorized_keys` (see **Transparent SSH
+Proxy** below). See [references/config-and-usage.md](references/config-and-usage.md)
+for the full config format.
 
 The control socket is at `/var/run/xho/xhod.sock` (root daemon default, matching
 the Docker / systemd convention). The deploy script mount keeps this directory
@@ -67,6 +71,82 @@ Release asset pattern (for systemd/bare/local; target is auto-detected):
 ```
 https://github.com/graydovee/cross-host-ops/releases/download/<tag>/cross-host-ops-<tag>-<target>.tar.gz
 ```
+
+## Port Layout
+
+xhod listens on two SSH ports with **separate key stores**, so a key granted for
+human access can't be reused for machine-to-machine control-plane access (and
+vice versa):
+
+| Port | Server | Key file | SSH user | Purpose |
+|------|--------|----------|----------|---------|
+| **2222** | Transparent proxy (`ProxySshServer`) | `proxy_authorized_keys` | target node name | Human `ssh`/`scp`/`sftp`/`rsync` — no xho client needed |
+| **12222** | Control plane (`RemoteSshServer`) | `authorized_keys` | `xho` (single) | daemon↔daemon `xho-rpc`/`xho-reverse` subsystems + `OpenSession` multi-hop |
+| Unix socket | gRPC | (local) | — | local `xho` CLI ↔ daemon |
+
+> **v0.4.0 migration:** the control plane moved `2222 → 12222` to free 2222 for
+> the transparent proxy. Update existing `[[gateways]]` `address` values and
+> `reverse_proxy.server_address` from `:2222` to `:12222`.
+
+## Transparent SSH Proxy — `ssh node@xhod`
+
+A second SSH server (default port **2222**) lets a human reach any target the
+daemon can resolve using plain `ssh`/`scp`/`sftp`/`rsync` — no `xho` client and
+no per-target client config. This is the simplest entry point for ad-hoc shell
+access or file transfer.
+
+**Targeting.** The SSH *username* is the target — a `server.toml` alias, an IP,
+or `_self` (the xhod host itself). It is resolved exactly like an `xho exec`
+target, so anything `xho ls` shows is reachable, including machines behind
+another xhod (the proxy drives the same `TargetSession` as everything else, so
+multi-hop `OpenSession` tunneling works transparently).
+
+**Auth.** Public key only, against a **separate** `proxy_authorized_keys`
+(default `~/.xho/proxy_authorized_keys`) — not the control-plane
+`authorized_keys`. xhod then brokers the real target's credentials (key or
+vault-resolved password) on your behalf, so a human needs just one key in
+`proxy_authorized_keys` regardless of how many targets they reach.
+
+```bash
+# Interactive shell on a target alias
+ssh web1@bastion.example.com -p 2222
+
+# One-off exec
+ssh web1@bastion.example.com -p 2222 -- uname -a
+
+# File transfer (scp uses -P for the port, not -p)
+scp -P 2222 file.txt web1@bastion.example.com:/tmp/
+scp -P 2222 web1@bastion.example.com:/etc/hosts ./hosts
+sftp -P 2222 web1@bastion.example.com
+rsync -e "ssh -p 2222" ./dist/ web1@bastion.example.com:/var/www/html/
+
+# Reach the xhod host itself
+ssh _self@bastion.example.com -p 2222
+```
+
+**Enable it** (on by default):
+
+```toml
+[server.proxy]
+enable = true
+listen_addr = "0.0.0.0:2222"
+host_key_path = "~/.xho/host_key"                  # may share the control-plane host key
+authorized_keys_path = "~/.xho/proxy_authorized_keys"
+# sftp_server_path = "/usr/lib/openssh/sftp-server" # auto-detected when unset
+```
+
+Then authorize a human key:
+```bash
+echo "ssh-ed25519 AAAA… user@laptop" >> ~/.xho/proxy_authorized_keys
+```
+
+**Gotchas.**
+- `ssh`/`scp` treat the first `user@host:path` colon as `host:path`, so a
+  multi-hop username containing a colon (`gateway:server`) must be passed
+  separately: `ssh -p 2222 -o User=gateway:server bastion.example.com`.
+- Serving sftp to a `_self` (localhost) target needs an `sftp-server` binary on
+  the xhod host (Debian: `apt-get install openssh-sftp-server`); for *remote*
+  targets, xhod uses the target's own sftp subsystem.
 
 ## Token-based bootstrap
 
@@ -92,11 +172,12 @@ Tokens live in memory only and are lost on daemon restart — keep TTL short.
 **Add a gateway with auto-bootstrap** (run on the client):
 
 ```bash
-# Pass --token, or omit it and enter at the prompt.
-xho host add prod-xhod xho@bastion.example.com --token <TOKEN>
+# Pass --token, or omit it and enter at the prompt. Note the control-plane port
+# (12222), not the proxy port.
+xho host add prod-xhod xho@bastion.example.com:12222 --token <TOKEN>
 
 # Empty input at the prompt skips bootstrap (legacy behavior).
-xho host add prod-xhod xho@bastion.example.com
+xho host add prod-xhod xho@bastion.example.com:12222
 ```
 
 **Re-register the public key on an already-configured gateway** (e.g. after
@@ -145,6 +226,10 @@ xho ls
 
 # Status
 xho status
+
+# Transparent SSH proxy (plain ssh/scp/sftp — no xho client needed)
+ssh <node>@<xhod-host> -p 2222
+scp -P 2222 file.txt <node>@<xhod-host>:/tmp/
 
 # Daemon management
 xho daemon start|stop|restart
@@ -213,3 +298,8 @@ See [references/config-and-usage.md](references/config-and-usage.md) for full co
 - Use `--` separator when remote args start with `-`
 - Single command without `--` is wrapped in `sh -c`
 - `xho ls --refresh` bypasses server list cache
+- The transparent proxy (port 2222) is enabled by default; set
+  `[server.remote].enable = true` (port 12222) when other xhod instances or
+  `xho` clients connect to this daemon
+- v0.4.0 moved the control plane 2222→12222; old `[[gateways]]` addresses or
+  `reverse_proxy.server_address` ending in `:2222` must be updated to `:12222`

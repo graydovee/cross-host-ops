@@ -5,6 +5,7 @@
 - [Config File Locations](#config-file-locations)
 - [Main Config (config.toml)](#main-config)
 - [Server List (server.toml)](#server-list)
+- [Transparent SSH Proxy](#transparent-ssh-proxy)
 - [Jump Host Types](#jump-host-types)
 - [Target Resolution Rules](#target-resolution)
 - [Connection Pool](#connection-pool)
@@ -19,7 +20,8 @@
 | Server list | `~/.xho/server.toml` | Target server definitions |
 | Known hosts | `~/.xho/known_hosts` | xhod host key verification |
 | Host key | `~/.xho/host_key` | Server-side identity (auto-generated) |
-| Authorized keys | `~/.xho/authorized_keys` | Client public keys for auth |
+| Control-plane authorized keys | `~/.xho/authorized_keys` | Machine pubkeys for daemon↔daemon auth (port 12222) |
+| Proxy authorized keys | `~/.xho/proxy_authorized_keys` | Human pubkeys for the transparent SSH proxy (port 2222) |
 
 ## Main Config
 
@@ -32,9 +34,11 @@ log_level = "info"  # trace|debug|info|warn|error
 enable = true
 socket_path = "~/.xho/xhod.sock"
 
+# Control plane: daemon↔daemon xho-rpc/xho-reverse subsystems + OpenSession
+# multi-hop. v0.4.0 moved 2222 → 12222 to free 2222 for the proxy below.
 [server.remote]
 enable = true
-listen_addr = "0.0.0.0:2222"
+listen_addr = "0.0.0.0:12222"
 user = "xho"
 host_key_path = "~/.xho/host_key"
 authorized_keys_path = "~/.xho/authorized_keys"
@@ -43,6 +47,16 @@ authorized_keys_path = "~/.xho/authorized_keys"
 # any secret reference (vault:NAME, env:VAR, file:PATH). Leave unset to
 # only accept short-lived tokens issued via `xho token gen`.
 bootstrap_token = "vault:bootstrap_token"
+
+# Transparent SSH proxy: human-facing ssh/scp/sftp/rsync (v0.4.0). The SSH
+# username is the target node; auth via a separate proxy_authorized_keys so a
+# human key can't be reused for control-plane access. Enabled by default.
+[server.proxy]
+enable = true
+listen_addr = "0.0.0.0:2222"
+host_key_path = "~/.xho/host_key"
+authorized_keys_path = "~/.xho/proxy_authorized_keys"
+# sftp_server_path = "/usr/lib/openssh/sftp-server"  # auto-detected when unset
 
 [ssh]
 ssh_config_path = "~/.ssh/config"
@@ -59,7 +73,7 @@ max_connections_per_ip = 10
 [[gateways]]
 kind = "xhod"
 name = "prod-xhod"
-address = "xho@bastion.example.com:2222"
+address = "xho@bastion.example.com:12222"
 identity_file = "~/.ssh/id_ed25519"
 known_hosts_path = "~/.xho/known_hosts"
 
@@ -96,6 +110,34 @@ shell = "zsh"
 
 Auth priority: `password > identity_file > defaults.identity_file`
 
+## Transparent SSH Proxy
+
+xhod's second SSH server (default port **2222**) lets humans connect with plain
+`ssh`/`scp`/`sftp`/`rsync` — no `xho` client and no per-target client config.
+The SSH **username is the target** (a `server.toml` alias, an IP, or `_self` for
+the xhod host itself); auth is by public key against a **separate**
+`proxy_authorized_keys`. xhod brokers each target's real credentials (key or
+vault-resolved password), so a human needs just one key to reach every target.
+
+```bash
+ssh web1@bastion.example.com -p 2222                 # interactive shell
+ssh web1@bastion.example.com -p 2222 -- uname -a     # one-off exec
+scp -P 2222 file.txt web1@bastion.example.com:/tmp/  # upload (scp uses -P)
+scp -P 2222 web1@bastion.example.com:/etc/hosts .    # download
+sftp -P 2222 web1@bastion.example.com
+ssh _self@bastion.example.com -p 2222                # the xhod host itself
+```
+
+Config: `[server.proxy]` (see [Main Config](#main-config)), enabled by default.
+It is deliberately separate from the control-plane `[server.remote]` (port
+12222) so a human key can't grant daemon-to-daemon access. Multi-hop —
+`ssh node@xhod` reaching a machine *behind another xhod* — works via the
+`OpenSession` tunnel.
+
+> **scp gotcha:** `user@host:path` makes the first colon ambiguous for a
+> multi-hop username containing a colon (`gateway:server`). Pass it separately:
+> `ssh -p 2222 -o User=gateway:server bastion.example.com`.
+
 ## Jump Host Types
 
 ### xhod (remote daemon)
@@ -106,7 +148,7 @@ Routes through a remote xhod instance over its custom SSH protocol.
 [[gateways]]
 kind = "xhod"
 name = "prod"
-address = "xho@bastion.example.com:2222"
+address = "xho@bastion.example.com:12222"
 identity_file = "~/.ssh/id_ed25519"
 known_hosts_path = "~/.xho/known_hosts"
 ```
@@ -229,7 +271,7 @@ xho token gen                       # 5m, single-use (default)
 xho token gen --ttl 1h --reusable --label ci
 
 # 2. On the client: add or re-login with the token.
-xho host add prod-xhod xho@bastion:2222 --token <TOKEN>
+xho host add prod-xhod xho@bastion:12222 --token <TOKEN>
 xho host login prod-xhod --token <TOKEN>
 ```
 
