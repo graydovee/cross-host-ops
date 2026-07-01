@@ -18,6 +18,11 @@
 # log_path = "/var/log/xhod.log"
 # log_level = "info"
 # reaper_interval = "30s"
+# Server-side SSH inactivity timeout shared by every SSH listener (the
+# `server.remote` control plane + `server.proxy` transparent proxy): drop an
+# idle connection after this long with no data from the client. Default is
+# unset (no idle timeout — listeners stay up until the client disconnects).
+# inactivity_timeout = "30m"
 
 # [server.local]
 # enable = true

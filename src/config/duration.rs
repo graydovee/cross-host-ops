@@ -132,6 +132,13 @@ where
             Ok(None)
         }
 
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserialize_duration(deserializer).map(Some)
+        }
+
         fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
         where
             E: de::Error,

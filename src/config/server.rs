@@ -4,7 +4,10 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use super::duration::{deserialize_duration, serialize_duration};
+use super::duration::{
+    deserialize_duration, deserialize_optional_duration, serialize_duration,
+    serialize_optional_duration,
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -16,6 +19,18 @@ pub struct ServerConfig {
         serialize_with = "serialize_duration"
     )]
     pub reaper_interval: Duration,
+    /// Server-side SSH inactivity timeout shared by every SSH listener
+    /// (`server.remote` control plane + `server.proxy` transparent proxy):
+    /// drop the connection if no data is received from the client for this
+    /// long. `None` (the default) means no idle timeout — listeners stay up
+    /// until the client disconnects. Applied to
+    /// `russh::server::Config::inactivity_timeout`.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_duration",
+        serialize_with = "serialize_optional_duration"
+    )]
+    pub inactivity_timeout: Option<Duration>,
     pub local: LocalServerConfig,
     pub remote: RemoteServerConfig,
     pub proxy: ProxyServerConfig,
@@ -27,6 +42,7 @@ impl Default for ServerConfig {
             log_path: None,
             log_level: "info".to_string(),
             reaper_interval: Duration::from_secs(30),
+            inactivity_timeout: None,
             local: LocalServerConfig::default(),
             remote: RemoteServerConfig::default(),
             proxy: ProxyServerConfig::default(),

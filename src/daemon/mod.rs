@@ -361,7 +361,8 @@ pub async fn run_with_overrides(
     }
 
     if let Some(listener) = remote_listener {
-        let remote_config = state.config.read().await.server.remote.clone();
+        let server_cfg = state.config.read().await.server.clone();
+        let remote_config = server_cfg.remote.clone();
         let host_keys = load_host_keys(Path::new(&remote_config.host_key_path))?;
         let mut server = RemoteSshServer {
             state: state.clone(),
@@ -371,7 +372,7 @@ pub async fn run_with_overrides(
             auth_rejection_time: Duration::from_secs(1),
             auth_rejection_time_initial: Some(Duration::from_secs(0)),
             keys: host_keys,
-            inactivity_timeout: Some(Duration::from_secs(600)),
+            inactivity_timeout: server_cfg.inactivity_timeout,
             ..Default::default()
         });
         info!(listen_addr = %remote_config.listen_addr, "listening on remote SSH");
@@ -388,7 +389,8 @@ pub async fn run_with_overrides(
 
     // Transparent SSH proxy listener (human-facing `ssh node@xhod`, default 2222).
     if state.config.read().await.server.proxy.enable {
-        let proxy_config = state.config.read().await.server.proxy.clone();
+        let server_cfg = state.config.read().await.server.clone();
+        let proxy_config = server_cfg.proxy.clone();
         match TcpListener::bind(&proxy_config.listen_addr).await {
             Ok(listener) => match load_host_keys(Path::new(&proxy_config.host_key_path)) {
                 Ok(host_keys) => {
@@ -400,7 +402,7 @@ pub async fn run_with_overrides(
                         auth_rejection_time: Duration::from_secs(1),
                         auth_rejection_time_initial: Some(Duration::from_secs(0)),
                         keys: host_keys,
-                        inactivity_timeout: Some(Duration::from_secs(600)),
+                        inactivity_timeout: server_cfg.inactivity_timeout,
                         ..Default::default()
                     });
                     info!(

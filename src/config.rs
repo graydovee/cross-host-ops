@@ -265,6 +265,24 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
+    #[test]
+    fn server_inactivity_timeout_defaults_and_overrides() {
+        use std::time::Duration;
+        // Absent [server] table → None (no idle timeout).
+        assert_eq!(AppConfig::default().server.inactivity_timeout, None);
+        // Partial [server] table without the field → None as well.
+        let config: AppConfig =
+            toml::from_str("[server]\nlog_level = \"debug\"\n").expect("parse");
+        assert_eq!(config.server.inactivity_timeout, None);
+        // Explicit override is honored.
+        let config: AppConfig =
+            toml::from_str("[server]\ninactivity_timeout = \"30m\"\n").expect("parse");
+        assert_eq!(
+            config.server.inactivity_timeout,
+            Some(Duration::from_secs(1800))
+        );
+    }
+
     // -----------------------------------------------------------------------
     // FallbackEntry property-based tests
     // -----------------------------------------------------------------------

@@ -327,11 +327,20 @@ pub fn build_gateways(
 ) -> Vec<(String, Arc<dyn Gateway>)> {
     let mut gateways: Vec<(String, Arc<dyn Gateway>)> = Vec::new();
 
-    let (max_connections_per_address, max_idle_time) = match config.try_read() {
-        Ok(cfg) => (cfg.ssh.max_connections_per_ip, cfg.ssh.max_idle_time),
+    let (max_connections_per_address, max_idle_time, keepalive_interval) = match config.try_read()
+    {
+        Ok(cfg) => (
+            cfg.ssh.max_connections_per_ip,
+            cfg.ssh.max_idle_time,
+            cfg.ssh.keepalive_interval,
+        ),
         Err(_) => {
             let defaults = crate::config::SshConfig::default();
-            (defaults.max_connections_per_ip, defaults.max_idle_time)
+            (
+                defaults.max_connections_per_ip,
+                defaults.max_idle_time,
+                defaults.keepalive_interval,
+            )
         }
     };
 
@@ -356,6 +365,7 @@ pub fn build_gateways(
                 c.known_hosts_path.clone(),
                 auth_prompter.clone(),
                 max_idle_time,
+                keepalive_interval,
             )),
             GatewayConfig::Jumpserver(c) => Arc::new(JumpserverGateway::new(
                 c.name.clone(),

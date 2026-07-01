@@ -45,6 +45,7 @@ struct XhodConnectorConfig {
     identity_file: String,
     known_hosts_path: String,
     auth_prompter: Arc<AuthPrompter>,
+    keepalive_interval: Duration,
 }
 
 // ---------------------------------------------------------------------------
@@ -58,6 +59,7 @@ pub struct XhodGateway {
     known_hosts_path: String,
     auth_prompter: Arc<AuthPrompter>,
     max_idle_time: Duration,
+    keepalive_interval: Duration,
     /// Single shared gRPC client (lazily connected).
     client: ManagedSingleton<XhoRpcClient>,
 }
@@ -71,6 +73,7 @@ impl XhodGateway {
         known_hosts_path: String,
         auth_prompter: Arc<AuthPrompter>,
         max_idle_time: Duration,
+        keepalive_interval: Duration,
     ) -> Self {
         Self {
             gateway_name,
@@ -79,6 +82,7 @@ impl XhodGateway {
             known_hosts_path,
             auth_prompter,
             max_idle_time,
+            keepalive_interval,
             client: ManagedSingleton::new(),
         }
     }
@@ -116,6 +120,7 @@ impl XhodGateway {
             identity_file: self.identity_file.clone(),
             known_hosts_path: self.known_hosts_path.clone(),
             auth_prompter: self.auth_prompter.clone(),
+            keepalive_interval: self.keepalive_interval,
         }
     }
 
@@ -175,7 +180,15 @@ impl XhodGateway {
             "opening xho-rpc subsystem"
         );
 
-        let client_config = client::Config::default();
+        let client_config = client::Config {
+            // Keep the gRPC-over-SSH tunnel alive through long idle periods
+            // (e.g. an interactive `xho exec -it` shell sitting at a prompt)
+            // so neither an intermediate NAT nor a server-side idle timer
+            // drops the connection and surfaces a BrokenPipe on the next
+            // keystroke. Mirrors the direct/gateway client path.
+            keepalive_interval: Some(config.keepalive_interval),
+            ..Default::default()
+        };
         let mut handle = client::connect(
             Arc::new(client_config),
             (target.host.as_str(), target.port),
