@@ -10,7 +10,21 @@ pub(crate) fn path_to_string(path: &Path) -> Result<String> {
 
 pub(crate) fn relative_path_to_string(path: &Path) -> Result<String> {
     validate_relative_path(path)?;
-    path_to_string(path)
+    // The relative path crosses to a remote host that may use a different path
+    // separator (e.g. a Windows client uploading to a Linux daemon). Rejoin the
+    // normalized components with forward slashes so the on-wire path is always
+    // Unix-style regardless of the local OS.
+    let mut parts: Vec<String> = Vec::new();
+    for component in path.components() {
+        if let Component::Normal(name) = component {
+            parts.push(
+                name.to_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", path.display()))?,
+            );
+        }
+    }
+    Ok(parts.join("/"))
 }
 
 pub(crate) fn validate_relative_path(path: &Path) -> Result<()> {
