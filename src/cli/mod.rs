@@ -5,19 +5,25 @@ mod copy;
 mod daemon;
 mod exec;
 mod host;
+mod local_conn;
 mod output;
 mod progress;
 mod prompt;
 mod secret;
 mod token;
+mod tty;
 
 use std::io::IsTerminal;
 
 use anyhow::Result;
 
 pub use args::{ArunCli, ArunCommand, DaemonCommand, HostCommand, OutputFormat, TokenCommand};
-pub use exec::{RawModeGuard, set_raw_mode};
 pub use output::print_version_json;
+pub use tty::{RawModeGuard, set_raw_mode_stdin};
+
+// Unix-only entry point kept for tests that exercise raw-mode on arbitrary fds.
+#[cfg(unix)]
+pub use exec::set_raw_mode;
 
 use crate::config::{AppConfig, parse_duration};
 use crate::types::{

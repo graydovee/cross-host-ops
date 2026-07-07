@@ -10,7 +10,7 @@ use crate::config::{ClientConfig, default_config_path};
 use crate::protocol::rpc;
 
 use super::args::DaemonCommand;
-use super::client::connect_unix_client;
+use super::local_conn::{LocalEndpoint, connect};
 
 pub(crate) async fn run_daemon_command(command: DaemonCommand) -> Result<i32> {
     match command {
@@ -35,8 +35,8 @@ fn daemon_start(options: CliDaemonStartOptions) -> Result<i32> {
 }
 
 async fn daemon_stop() -> Result<i32> {
-    let socket_path = local_socket_path()?;
-    let mut client = match connect_unix_client(&socket_path).await {
+    let endpoint = local_endpoint()?;
+    let mut client = match connect(&endpoint).await {
         Ok(client) => client,
         Err(_) => {
             eprintln!("xhod is not running");
@@ -45,7 +45,7 @@ async fn daemon_stop() -> Result<i32> {
     };
     let response = client.shutdown(rpc::ShutdownRequest {}).await?;
     let message = response.into_inner().message;
-    wait_for_socket_removal(&socket_path).await?;
+    wait_for_endpoint_removal(&endpoint).await?;
     println!("{}", message);
     Ok(0)
 }
@@ -74,6 +74,13 @@ pub(crate) fn spawn_daemon(options: &CliDaemonStartOptions) -> Result<()> {
     if let Some(log_level) = &options.log_level {
         command.arg("--log-level").arg(log_level);
     }
+    // On Windows, detach from the parent's console window.
+    #[cfg(windows)]
+    {
+        // CREATE_NO_WINDOW = 0x08000000
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -83,30 +90,29 @@ pub(crate) fn spawn_daemon(options: &CliDaemonStartOptions) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn wait_for_socket(socket_path: &PathBuf) -> Result<()> {
+/// Poll until the daemon endpoint's on-disk marker is gone (socket file for
+/// Unix transport, lock file for TCP), used after `shutdown` to confirm exit.
+async fn wait_for_endpoint_removal(endpoint: &LocalEndpoint) -> Result<()> {
+    let marker = endpoint_marker_path(endpoint);
     for _ in 0..50 {
-        if socket_path.exists() && connect_unix_client(socket_path).await.is_ok() {
+        if !marker.exists() {
             return Ok(());
         }
         sleep(Duration::from_millis(100)).await;
     }
     bail!(
-        "timed out waiting for daemon socket {}",
-        socket_path.display()
+        "timed out waiting for daemon endpoint {} to be removed",
+        marker.display()
     );
 }
 
-async fn wait_for_socket_removal(socket_path: &PathBuf) -> Result<()> {
-    for _ in 0..50 {
-        if !socket_path.exists() {
-            return Ok(());
-        }
-        sleep(Duration::from_millis(100)).await;
+/// Filesystem path whose presence/absence signals daemon liveness.
+fn endpoint_marker_path(endpoint: &LocalEndpoint) -> &std::path::Path {
+    match endpoint {
+        #[cfg(unix)]
+        LocalEndpoint::Unix(p) => p,
+        LocalEndpoint::Tcp(p) => p,
     }
-    bail!(
-        "timed out waiting for daemon socket {} to be removed",
-        socket_path.display()
-    );
 }
 
 fn daemon_path() -> Result<PathBuf> {
@@ -117,9 +123,9 @@ fn daemon_path() -> Result<PathBuf> {
     Ok(directory.join("xhod"))
 }
 
-fn local_socket_path() -> Result<PathBuf> {
+fn local_endpoint() -> Result<LocalEndpoint> {
     let client_config = ClientConfig::load()?;
-    Ok(PathBuf::from(client_config.local.socket_path))
+    LocalEndpoint::from_config(&client_config)
 }
 
 fn local_config_path_if_exists() -> Result<Option<PathBuf>> {
@@ -132,10 +138,10 @@ fn local_config_path_if_exists() -> Result<Option<PathBuf>> {
 }
 
 async fn current_cli_start_options() -> Result<CliDaemonStartOptions> {
-    let socket_path = local_socket_path()?;
-    let mut client = connect_unix_client(&socket_path)
+    let endpoint = local_endpoint()?;
+    let mut client = connect(&endpoint)
         .await
-        .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
+        .with_context(|| format!("failed to connect to {}", endpoint.describe_internal()))?;
     let response = client.status(rpc::StatusRequest {}).await?.into_inner();
     Ok(CliDaemonStartOptions {
         config: (!response.cli_start_config_path.is_empty())

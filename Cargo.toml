@@ -58,6 +58,17 @@ tower = { version = "0.5", features = ["util"] }
 uuid = { version = "1.19", features = ["serde", "v4"] }
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 
+# Windows-only: ConPTY + Console + process-query APIs for the local PTY backend,
+# raw terminal mode, and TCP lock-file staleness checks.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"

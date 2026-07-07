@@ -1,5 +1,4 @@
 use std::io::{self, IsTerminal};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -134,8 +133,8 @@ async fn send_path_copy_frames(
         tx.send(crate::protocol::copy_frame_request(
             CopyFrame::BeginDirectory {
                 relative_path: String::new(),
-                mode: metadata.permissions().mode(),
-                mtime: metadata.mtime(),
+                mode: crate::fs_meta::entry_mode(&metadata),
+                mtime: crate::fs_meta::entry_mtime(&metadata),
             },
         ))
         .await
@@ -219,8 +218,8 @@ async fn send_path_entry_frame_with_metadata(
         tx.send(crate::protocol::copy_frame_request(
             CopyFrame::BeginDirectory {
                 relative_path: relative_path.clone(),
-                mode: metadata.permissions().mode(),
-                mtime: metadata.mtime(),
+                mode: crate::fs_meta::entry_mode(metadata),
+                mtime: crate::fs_meta::entry_mtime(metadata),
             },
         ))
         .await
@@ -235,9 +234,9 @@ async fn send_path_entry_frame_with_metadata(
     progress.begin_file(relative_path.clone(), metadata.len());
     tx.send(crate::protocol::copy_frame_request(CopyFrame::BeginFile {
         relative_path: relative_path.clone(),
-        mode: metadata.permissions().mode(),
+        mode: crate::fs_meta::entry_mode(metadata),
         size: metadata.len(),
-        mtime: metadata.mtime(),
+        mtime: crate::fs_meta::entry_mtime(metadata),
     }))
     .await
     .map_err(|_| anyhow!("failed to send file copy frame"))?;
@@ -313,12 +312,10 @@ impl CopyDownloadWriter {
                     .await
                     .with_context(|| format!("failed to create {}", path.display()))?;
                 if mode != 0 {
-                    let permissions = std::fs::Permissions::from_mode(mode);
-                    tokio::fs::set_permissions(&path, permissions)
-                        .await
-                        .with_context(|| {
-                            format!("failed to set permissions on {}", path.display())
-                        })?;
+                    if let Err(error) = crate::fs_meta::apply_mode(&path, mode) {
+                        // Non-fatal: copy fidelity on Windows targets is best-effort.
+                        tracing::debug!(error = %error, "failed to set permissions on {}", path.display());
+                    }
                 }
                 self.progress
                     .begin_file(download_progress_name(&path, &relative_path), size);
@@ -352,12 +349,9 @@ impl CopyDownloadWriter {
                     .await
                     .with_context(|| format!("failed to create directory {}", path.display()))?;
                 if mode != 0 {
-                    let permissions = std::fs::Permissions::from_mode(mode);
-                    tokio::fs::set_permissions(&path, permissions)
-                        .await
-                        .with_context(|| {
-                            format!("failed to set permissions on {}", path.display())
-                        })?;
+                    if let Err(error) = crate::fs_meta::apply_mode(&path, mode) {
+                        tracing::debug!(error = %error, "failed to set permissions on {}", path.display());
+                    }
                 }
             }
             CopyFrame::Symlink {
@@ -376,7 +370,7 @@ impl CopyDownloadWriter {
                     }
                 }
                 let _ = tokio::fs::remove_file(&path).await;
-                std::os::unix::fs::symlink(target, &path)
+                crate::fs_meta::create_symlink(Path::new(&target), &path)
                     .with_context(|| format!("failed to create symlink {}", path.display()))?;
             }
             CopyFrame::EndOfStream => {

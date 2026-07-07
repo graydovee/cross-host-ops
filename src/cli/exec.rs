@@ -1,14 +1,13 @@
 use std::env;
 use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Write};
-use std::os::unix::io::RawFd;
 
 use anyhow::{Result, anyhow};
 use tokio::io::AsyncReadExt;
-use tokio::signal::unix::SignalKind;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::cli::tty::{self, set_raw_mode_stdin};
 use crate::config::AppConfig;
 use crate::exit_codes::cap_remote_exit_code;
 use crate::protocol::rpc;
@@ -25,44 +24,13 @@ pub(crate) fn get_terminal_size() -> (u16, u16) {
         .unwrap_or((80, 24))
 }
 
-/// RAII guard that restores terminal to original mode on drop.
-pub struct RawModeGuard {
-    original_termios: libc::termios,
-    fd: RawFd,
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        // Restore original terminal settings unconditionally.
-        unsafe {
-            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original_termios);
-        }
-    }
-}
-
-/// Set the terminal to raw mode and return a guard that restores it on drop.
+/// Set the terminal to raw mode for a specific file descriptor (Unix only).
 ///
-/// If raw mode setup fails (e.g., fd is not a terminal), returns an error
-/// so the caller can fall back to non-interactive mode.
-pub fn set_raw_mode(fd: RawFd) -> Result<RawModeGuard> {
-    unsafe {
-        let mut original_termios: libc::termios = std::mem::zeroed();
-        if libc::tcgetattr(fd, &mut original_termios) != 0 {
-            return Err(anyhow!("tcgetattr failed: {}", io::Error::last_os_error()));
-        }
-
-        let mut raw = original_termios;
-        libc::cfmakeraw(&mut raw);
-
-        if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
-            return Err(anyhow!("tcsetattr failed: {}", io::Error::last_os_error()));
-        }
-
-        Ok(RawModeGuard {
-            original_termios,
-            fd,
-        })
-    }
+/// Provided for backwards compatibility with tests that exercise raw-mode
+/// behavior on arbitrary fds. On Windows this entry point is absent.
+#[cfg(unix)]
+pub fn set_raw_mode(fd: std::os::unix::io::RawFd) -> Result<crate::cli::tty::RawModeGuard> {
+    crate::cli::tty::tty_unix::set_raw_mode(fd)
 }
 
 fn raw_mode_diagnostic_bytes(message: &str) -> Vec<u8> {
@@ -376,7 +344,7 @@ pub(crate) async fn run_interactive(
     let mut stream = response.into_inner();
 
     // Step 3: Set terminal to raw mode with RAII guard.
-    let _guard = set_raw_mode(libc::STDIN_FILENO)?;
+    let _guard = set_raw_mode_stdin()?;
 
     // Step 4: Spawn stdin forwarding task (channel capacity 32 via tx clone).
     let stdin_tx = tx.clone();
@@ -401,15 +369,14 @@ pub(crate) async fn run_interactive(
         }
     });
 
-    // Step 5: Spawn SIGWINCH handler (resize channel capacity 8 via bounded sender).
-    let resize_tx = tx.clone();
+    // Step 5: Spawn terminal-resize watcher (SIGWINCH on Unix, polling on
+    // Windows). It emits (cols, rows) tuples; a forwarder converts them to
+    // WindowResize RPCs on the execute stream.
+    let (resize_notice_tx, mut resize_notice_rx) = mpsc::channel::<(u16, u16)>(8);
+    tty::spawn_resize_watcher(resize_notice_tx);
+    let resize_rpc_tx = tx.clone();
     let sigwinch_task = tokio::spawn(async move {
-        let mut signal = match tokio::signal::unix::signal(SignalKind::window_change()) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        while signal.recv().await.is_some() {
-            let (cols, rows) = get_terminal_size();
+        while let Some((cols, rows)) = resize_notice_rx.recv().await {
             let msg = rpc::ExecuteRequest {
                 request: Some(rpc::execute_request::Request::WindowResize(
                     rpc::WindowResize {
@@ -418,7 +385,7 @@ pub(crate) async fn run_interactive(
                     },
                 )),
             };
-            if resize_tx.send(msg).await.is_err() {
+            if resize_rpc_tx.send(msg).await.is_err() {
                 break;
             }
         }

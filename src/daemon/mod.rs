@@ -38,22 +38,29 @@ use anyhow::{Context, Result, anyhow, bail};
 use russh::keys::ssh_key::{self, LineEnding};
 use russh::server::{self, Server as _};
 use tokio::fs;
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixListener;
+#[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{RwLock, mpsc};
 use tokio::time::sleep;
-use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
+use tokio_stream::wrappers::ReceiverStream;
+#[cfg(unix)]
+use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use self::ssh_server::{IncomingConn, RemoteSshServer, load_host_keys};
+use self::ssh_server::{IncomingConn, LocalConn, RemoteSshServer, load_host_keys};
 use crate::config::{
     AppConfig, GatewayConfig, ReviewAction, default_config_path, load_server_config,
     validate_gateways,
 };
-use crate::logging::{init_logging, reopen_log_output};
+use crate::logging::init_logging;
+#[cfg(unix)]
+use crate::logging::reopen_log_output;
 use crate::protocol::{self, ExecRequest, ServerEvent, rpc as proto_rpc};
 use crate::types::{CopyDirection, CopyFrame, CopySpec};
 
@@ -311,13 +318,38 @@ pub async fn run_with_overrides(
         reverse_proxy_registry: Arc::new(reverse_proxy::ReverseProxyRegistry::new()),
     };
 
-    let local_socket_path = if state.config.read().await.server.local.enable {
-        let socket_path = PathBuf::from(state.config.read().await.server.local.socket_path.clone());
-        ensure_socket_parent(&socket_path).await?;
-        if socket_path.exists() {
-            let _ = fs::remove_file(&socket_path).await;
+    // Local control channel: Unix-domain socket or TCP loopback, per config.
+    // `local_endpoint_cleanup` holds the path (socket file or TCP lock file)
+    // to remove on shutdown.
+    let local_config = state.config.read().await.server.local.clone();
+    let local_endpoint_cleanup: Option<PathBuf> = if local_config.enable {
+        match local_config.transport {
+            crate::config::LocalTransport::Unix => {
+                #[cfg(unix)]
+                {
+                    let socket_path = PathBuf::from(local_config.socket_path.clone());
+                    ensure_socket_parent(&socket_path).await?;
+                    if socket_path.exists() {
+                        let _ = fs::remove_file(&socket_path).await;
+                    }
+                    Some(socket_path)
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = local_config.socket_path;
+                    warn!(
+                        "server.local.transport = \"unix\" is not supported on Windows; \
+                         set transport = \"tcp\" or disable server.local"
+                    );
+                    None
+                }
+            }
+            crate::config::LocalTransport::Tcp => {
+                let lock_file = PathBuf::from(local_config.tcp_lock_file.clone());
+                ensure_socket_parent(&lock_file).await?;
+                Some(lock_file)
+            }
         }
-        Some(socket_path)
     } else {
         None
     };
@@ -337,27 +369,87 @@ pub async fn run_with_overrides(
 
     let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingConn>(32);
 
-    if let Some(socket_path) = local_socket_path.clone() {
-        let listener = UnixListener::bind(&socket_path)
-            .with_context(|| format!("failed to bind {}", socket_path.display()))?;
-        info!(socket_path = %socket_path.display(), "listening on local socket");
-        let local_tx = incoming_tx.clone();
-        tokio::spawn(async move {
-            let mut incoming = UnixListenerStream::new(listener);
-            use tokio_stream::StreamExt;
-            while let Some(result) = incoming.next().await {
-                match result {
-                    Ok(stream) => {
-                        if local_tx.send(IncomingConn::Local(stream)).await.is_err() {
-                            warn!("failed to hand off local socket connection");
+    // Bind the local control listener per transport.
+    if local_config.enable {
+        match local_config.transport {
+            crate::config::LocalTransport::Unix => {
+                #[cfg(unix)]
+                {
+                    let socket_path = PathBuf::from(local_config.socket_path.clone());
+                    let listener = UnixListener::bind(&socket_path)
+                        .with_context(|| format!("failed to bind {}", socket_path.display()))?;
+                    info!(socket_path = %socket_path.display(), "listening on local socket");
+                    let local_tx = incoming_tx.clone();
+                    tokio::spawn(async move {
+                        let mut incoming = UnixListenerStream::new(listener);
+                        use tokio_stream::StreamExt;
+                        while let Some(result) = incoming.next().await {
+                            match result {
+                                Ok(stream) => {
+                                    if local_tx
+                                        .send(IncomingConn::Local(LocalConn::Unix(stream)))
+                                        .await
+                                        .is_err()
+                                    {
+                                        warn!("failed to hand off local socket connection");
+                                    }
+                                }
+                                Err(error) => {
+                                    warn!(error = %error, "failed to accept local socket connection");
+                                }
+                            }
+                        }
+                    });
+                }
+                // #[cfg(not(unix))] case handled above (warned + no listener).
+            }
+            crate::config::LocalTransport::Tcp => {
+                let lock_file = PathBuf::from(local_config.tcp_lock_file.clone());
+                let listener = TcpListener::bind(&local_config.tcp_bind)
+                    .await
+                    .with_context(|| format!("failed to bind {}", local_config.tcp_bind))?;
+                let actual_addr = listener.local_addr().with_context(|| {
+                    format!("failed to resolve local addr for {}", local_config.tcp_bind)
+                })?;
+                // Publish the actual address + PID to the lock file for clients.
+                let pid = std::process::id();
+                let lock_content = format!("{actual_addr}\n{pid}\n");
+                if let Some(parent) = lock_file.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+                tokio::fs::write(&lock_file, lock_content)
+                    .await
+                    .with_context(|| {
+                        format!("failed to write TCP lock file {}", lock_file.display())
+                    })?;
+                info!(
+                    listen_addr = %actual_addr,
+                    lock_file = %lock_file.display(),
+                    "listening on local TCP control channel"
+                );
+                let local_tx = incoming_tx.clone();
+                tokio::spawn(async move {
+                    use tokio_stream::StreamExt;
+                    let mut incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+                    while let Some(result) = incoming.next().await {
+                        match result {
+                            Ok(stream) => {
+                                if local_tx
+                                    .send(IncomingConn::Local(LocalConn::Tcp(stream)))
+                                    .await
+                                    .is_err()
+                                {
+                                    warn!("failed to hand off local TCP connection");
+                                }
+                            }
+                            Err(error) => {
+                                warn!(error = %error, "failed to accept local TCP connection");
+                            }
                         }
                     }
-                    Err(error) => {
-                        warn!(error = %error, "failed to accept local socket connection");
-                    }
-                }
+                });
             }
-        });
+        }
     }
 
     if let Some(listener) = remote_listener {
@@ -456,22 +548,27 @@ pub async fn run_with_overrides(
         None
     };
 
-    // Spawn SIGHUP handler for config reload + log reopen.
-    let sighup_state = state.clone();
-    tokio::spawn(async move {
-        let Ok(mut sighup) = signal(SignalKind::hangup()) else {
-            return;
-        };
-        while sighup.recv().await.is_some() {
-            match reopen_log_output() {
-                Ok(()) => info!("reopened log output after SIGHUP"),
-                Err(error) => {
-                    warn!(error = %format!("{error:#}"), "failed to reopen log output after SIGHUP")
+    // Spawn SIGHUP handler for config reload + log reopen (Unix only).
+    // Windows has no SIGHUP; config reload there is via restart or a future
+    // control-surface command.
+    #[cfg(unix)]
+    {
+        let sighup_state = state.clone();
+        tokio::spawn(async move {
+            let Ok(mut sighup) = signal(SignalKind::hangup()) else {
+                return;
+            };
+            while sighup.recv().await.is_some() {
+                match reopen_log_output() {
+                    Ok(()) => info!("reopened log output after SIGHUP"),
+                    Err(error) => {
+                        warn!(error = %format!("{error:#}"), "failed to reopen log output after SIGHUP")
+                    }
                 }
+                sighup_state.reload_config().await;
             }
-            sighup_state.reload_config().await;
-        }
-    });
+        });
+    }
 
     let incoming = ReceiverStream::new(receiver_map_incoming(
         incoming_rx,
@@ -487,9 +584,9 @@ pub async fn run_with_overrides(
             let _ = shutdown_rx.recv().await;
         })
         .await?;
-    if let Some(socket_path) = local_socket_path {
-        if socket_path.exists() {
-            let _ = fs::remove_file(&socket_path).await;
+    if let Some(path) = local_endpoint_cleanup {
+        if path.exists() {
+            let _ = fs::remove_file(&path).await;
         }
     }
     Ok(())
@@ -1864,6 +1961,7 @@ async fn send_session_msg(
         .is_err()
 }
 
+#[allow(dead_code)] // reused by the TCP control channel in stage 2 (lock-file parent dir).
 async fn ensure_socket_parent(socket_path: &Path) -> Result<()> {
     let parent = socket_path
         .parent()

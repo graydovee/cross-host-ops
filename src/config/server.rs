@@ -57,8 +57,27 @@ impl ServerConfig {
                 "at least one of server.local.enable, server.remote.enable, or server.proxy.enable must be true"
             );
         }
-        if self.local.enable && self.local.socket_path.trim().is_empty() {
-            bail!("server.local.socket_path must not be empty");
+        if self.local.enable {
+            match self.local.transport {
+                super::path::LocalTransport::Unix => {
+                    if self.local.socket_path.trim().is_empty() {
+                        bail!("server.local.socket_path must not be empty when transport = unix");
+                    }
+                }
+                super::path::LocalTransport::Tcp => {
+                    if self.local.tcp_bind.trim().is_empty() {
+                        bail!("server.local.tcp_bind must not be empty when transport = tcp");
+                    }
+                    if self.local.tcp_bind.parse::<SocketAddr>().is_err()
+                        && !self.local.tcp_bind.ends_with(":0")
+                    {
+                        bail!(
+                            "server.local.tcp_bind is not a valid bind address: {}",
+                            self.local.tcp_bind
+                        );
+                    }
+                }
+            }
         }
         if self.remote.enable {
             if self.remote.user.trim().is_empty() {
@@ -102,14 +121,29 @@ impl ServerConfig {
 #[serde(default)]
 pub struct LocalServerConfig {
     pub enable: bool,
+    /// Control-channel transport. Defaults to Unix-domain socket on Unix and
+    /// TCP loopback on Windows.
+    #[serde(default)]
+    pub transport: super::path::LocalTransport,
+    /// Unix-domain socket path (used when `transport = "unix"`).
     pub socket_path: String,
+    /// Loopback bind address used when `transport = "tcp"`. Use port `0` to let
+    /// the OS assign a free port; the actual address is written to
+    /// `tcp_lock_file` for clients to discover.
+    pub tcp_bind: String,
+    /// Lock file recording the daemon's actual TCP address + PID, used by
+    /// clients to discover the port when `transport = "tcp"`.
+    pub tcp_lock_file: String,
 }
 
 impl Default for LocalServerConfig {
     fn default() -> Self {
         Self {
             enable: true,
+            transport: super::path::default_local_transport(),
             socket_path: crate::config::path::default_socket_path(),
+            tcp_bind: "127.0.0.1:0".to_string(),
+            tcp_lock_file: crate::config::path::default_tcp_lock_file(),
         }
     }
 }

@@ -29,6 +29,9 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-latest
             use-cross: false
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            use-cross: false
 
     steps:
       - name: Checkout
@@ -55,7 +58,8 @@ jobs:
             cargo build --release --target ${{ matrix.target }} --bin xho --bin xhod
           fi
 
-      - name: Package release archive
+      - name: Package release archive (Unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           TAG="${GITHUB_REF_NAME}"
@@ -67,11 +71,26 @@ jobs:
           cp packaging/systemd/xhod.service "${PKG}/"
           tar -czf "${PKG}.tar.gz" "${PKG}"
 
+      - name: Package release archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $TAG = ${env:GITHUB_REF_NAME}
+          $PKG = "cross-host-ops-$TAG-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $PKG | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/xho.exe" "$PKG/"
+          Copy-Item "target/${{ matrix.target }}/release/xhod.exe" "$PKG/"
+          Copy-Item config.example.toml "$PKG/"
+          # No systemd unit on Windows.
+          Compress-Archive -Path "$PKG/*" -DestinationPath "$PKG.zip"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
           name: release-${{ matrix.target }}
-          path: cross-host-ops-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          path: |
+            cross-host-ops-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+            cross-host-ops-${{ github.ref_name }}-${{ matrix.target }}.zip
 
   docker-ghcr:
     name: docker ghcr
@@ -153,6 +172,8 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/**/*.tar.gz
+          files: |
+            dist/**/*.tar.gz
+            dist/**/*.zip
           body_path: RELEASE_NOTES.md
           generate_release_notes: true

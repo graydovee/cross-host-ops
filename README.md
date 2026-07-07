@@ -16,6 +16,20 @@ Remote command execution, file copy, and **transparent SSH proxy**. Manages SSH 
 - **File Copy** — `xho cp` aligns with scp semantics, supports recursion and mode preservation
 - **Zero Configuration** — Works with just `~/.ssh/config`, no configuration files required
 
+## Platform Support
+
+`xho` runs on **Linux, macOS, and Windows**, with platform-specific defaults for the local control channel between the CLI and daemon:
+
+- **Linux / macOS** — the CLI talks to the local daemon over a **Unix-domain socket** (`~/.xho/xhod.sock`). This is the default and requires no configuration.
+- **Windows** — the control channel uses a **TCP loopback** listener by default. The daemon binds `127.0.0.1:0` (OS-assigned port) and publishes the actual address plus its PID to a lock file (`~/.xho/xhod.tcp`) that the CLI reads. This avoids fixed-port conflicts and works without Unix socket path semantics.
+
+Both platforms can switch transport explicitly via `[server.local]` (daemon) and `[local]` (client) `transport = "unix" | "tcp"`. The transport must match between client and daemon.
+
+**Windows notes:**
+- Local interactive PTY sessions (`xho exec --tty` against the `_self` localhost gateway) require the ConPTY backend (Windows 10 1803+); pipe-based execution works on all versions.
+- Remote operations (connecting to a Linux `xhod`, SSH targets, jumpserver) work identically to Unix — the Windows machine acts as a client.
+- Releases publish `xho.exe` / `xhod.exe` as a `.zip` (no systemd unit); Linux/macOS releases are `.tar.gz`.
+
 ## Quick Start
 
 ```bash
@@ -180,7 +194,7 @@ docker run --rm -p 2222:2222 -p 12222:12222 -v /etc/xho:/etc/xho xhod:latest
 
 ### GitHub Release
 
-Pushing a `v*` tag automatically publishes multi-platform binaries and Docker images.
+Pushing a `v*` tag automatically publishes multi-platform binaries (Linux musl, macOS, Windows) and Docker images.
 
 ## Development
 

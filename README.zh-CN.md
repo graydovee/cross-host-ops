@@ -16,6 +16,20 @@
 - **文件复制** — `xho cp` 对齐 scp 语义，支持递归和 mode 保留
 - **零配置可用** — 只要有 `~/.ssh/config`，无需任何配置文件
 
+## 平台支持
+
+`xho` 支持 **Linux、macOS 和 Windows**，CLI 与本地 daemon 之间的控制通道按平台有不同的默认实现：
+
+- **Linux / macOS** — CLI 通过 **Unix domain socket**（`~/.xho/xhod.sock`）连接本地 daemon，这是默认行为，无需配置。
+- **Windows** — 控制通道默认使用 **TCP loopback**。daemon 绑定 `127.0.0.1:0`（由操作系统分配端口），并把实际地址和 PID 写入锁文件（`~/.xho/xhod.tcp`）供 CLI 读取。这样彻底避免固定端口冲突，也不依赖 Unix socket 路径语义。
+
+两种平台都可以通过 `[server.local]`（daemon 侧）和 `[local]`（client 侧）的 `transport = "unix" | "tcp"` 显式切换传输方式，但 client 与 daemon 必须一致。
+
+**Windows 注意事项：**
+- 本地交互式 PTY 会话（对 `_self` 本机 gateway 执行 `xho exec --tty`）需要 ConPTY 后端（Windows 10 1803+）；基于管道的非交互执行在所有版本可用。
+- 远程操作（连接 Linux 上的 `xhod`、SSH 目标、跳板机）与 Unix 完全一致 —— Windows 机器仅作为客户端。
+- Release 产物以 `.zip` 发布 `xho.exe` / `xhod.exe`（不含 systemd unit）；Linux/macOS 产物为 `.tar.gz`。
+
 ## 快速开始
 
 ```bash
@@ -179,7 +193,7 @@ docker run --rm -p 2222:2222 -p 12222:12222 -v /etc/xho:/etc/xho xhod:latest
 
 ### GitHub Release
 
-推送 `v*` tag 自动发布多平台二进制和 Docker 镜像。
+推送 `v*` tag 自动发布多平台二进制（Linux musl、macOS、Windows）和 Docker 镜像。
 
 ## 开发
 

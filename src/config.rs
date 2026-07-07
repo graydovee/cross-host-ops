@@ -29,8 +29,9 @@ pub use self::inventory::{
     resolve_ssh_host,
 };
 pub use self::path::{
-    default_client_config_path, default_config_path, default_known_hosts_path, default_root_dir,
-    default_vault_path, expand_tilde,
+    LocalTransport, default_client_config_path, default_config_path, default_known_hosts_path,
+    default_local_transport, default_root_dir, default_tcp_lock_file, default_vault_path,
+    expand_tilde,
 };
 pub use self::reverse_proxy::ReverseProxyClientConfig;
 pub use self::review::{
@@ -104,6 +105,7 @@ impl AppConfig {
             self.server.log_path = Some(expand_tilde(log_path)?);
         }
         self.server.local.socket_path = expand_tilde(&self.server.local.socket_path)?;
+        self.server.local.tcp_lock_file = expand_tilde(&self.server.local.tcp_lock_file)?;
         self.server.remote.host_key_path = expand_tilde(&self.server.remote.host_key_path)?;
         self.server.remote.authorized_keys_path =
             expand_tilde(&self.server.remote.authorized_keys_path)?;
