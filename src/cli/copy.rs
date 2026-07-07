@@ -480,6 +480,17 @@ fn remote_source_name(remote_path: &str) -> String {
 }
 
 fn parse_remote_spec(value: &str) -> Option<(String, String)> {
+    // A Windows drive-absolute path like `C:\Users\...` or `C:/Users/...` has a
+    // drive-letter colon that must NOT be mistaken for the `host:path` colon.
+    // Treat any `<letter>:[/\]` prefix as a local path (not a remote spec).
+    let bytes = value.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return None;
+    }
     let colon_pos = value.rfind(':')?;
     let target = &value[..colon_pos];
     let path = &value[colon_pos + 1..];
@@ -513,5 +524,13 @@ mod tests {
             parse_remote_spec("host1:/tmp/x"),
             Some(("host1".to_string(), "/tmp/x".to_string()))
         );
+    }
+
+    #[test]
+    fn parse_remote_spec_rejects_windows_drive_paths() {
+        // A drive-letter colon must not be parsed as a host:path separator.
+        assert_eq!(parse_remote_spec(r"C:\Users\me\file.txt"), None);
+        assert_eq!(parse_remote_spec("C:/Users/me/file.txt"), None);
+        assert_eq!(parse_remote_spec(r"D:\tmp\dir"), None);
     }
 }
