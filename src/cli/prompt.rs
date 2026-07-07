@@ -1,7 +1,11 @@
 use std::io::{self, Write};
+
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 
-use anyhow::{Result, anyhow};
+#[cfg(unix)]
+use anyhow::anyhow;
+use anyhow::Result;
 
 pub(crate) fn prompt_for_confirmation(reason: &str) -> Result<bool> {
     eprintln!("confirmation required: {}", reason);
@@ -24,6 +28,7 @@ pub(crate) fn prompt_for_auth_input(message: &str, secret: bool) -> Result<Strin
     }
 }
 
+#[cfg(unix)]
 fn read_secret_line() -> Result<String> {
     let stdin = io::stdin();
     let fd = stdin.as_raw_fd();
@@ -48,4 +53,17 @@ fn read_secret_line() -> Result<String> {
         read_result?;
         Ok(input.trim_end().to_string())
     }
+}
+
+/// Windows fallback for secret input: terminal echo is not masked.
+///
+/// The Win32 Console API path (GetConsoleMode/SetConsoleMode toggling
+/// ENABLE_ECHO_INPUT) lands alongside the full raw-mode implementation. For
+/// now the secret is read plainly; users who need echo suppression can pipe
+/// the value in or set it via the secret vault.
+#[cfg(not(unix))]
+fn read_secret_line() -> Result<String> {
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim_end().to_string())
 }

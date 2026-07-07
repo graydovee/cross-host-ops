@@ -39,10 +39,11 @@ impl LocalhostGateway {
         Self {
             shell: shell
                 .or_else(|| std::env::var("SHELL").ok())
-                .unwrap_or_else(|| "/bin/sh".to_string()),
+                .unwrap_or_else(default_shell),
             user: user
                 .or_else(|| std::env::var("USER").ok())
                 .or_else(|| std::env::var("LOGNAME").ok())
+                .or_else(|| std::env::var("USERNAME").ok())
                 .unwrap_or_else(|| "unknown".to_string()),
             hostname: get_hostname(),
             sftp_server_path,
@@ -58,13 +59,38 @@ impl LocalhostGateway {
 }
 
 fn get_hostname() -> String {
-    let mut buf = [0u8; 256];
-    let ret = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-    if ret == 0 {
-        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        String::from_utf8_lossy(&buf[..len]).to_string()
-    } else {
-        "localhost".to_string()
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        let ret = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+        if ret == 0 {
+            let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            String::from_utf8_lossy(&buf[..len]).to_string()
+        } else {
+            "localhost".to_string()
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Win32 `gethostname` operates on sockets and is awkward to reach from
+        // `libc` here; the `COMPUTERNAME` env var is the reliable, dependency-
+        // free way to get the machine name on Windows.
+        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "localhost".to_string())
+    }
+}
+
+/// Platform-default login shell for the `_self` gateway.
+///
+/// Unix falls back to `/bin/sh` (or `$SHELL`); Windows prefers `$COMSPEC`
+/// (typically `C:\Windows\System32\cmd.exe`) since there is no `SHELL` analog.
+fn default_shell() -> String {
+    #[cfg(unix)]
+    {
+        "/bin/sh".to_string()
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
     }
 }
 

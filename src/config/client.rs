@@ -53,6 +53,7 @@ impl ClientConfig {
 
     pub fn expand_paths(&mut self) -> Result<()> {
         self.local.socket_path = expand_tilde(&self.local.socket_path)?;
+        self.local.tcp_lock_file = expand_tilde(&self.local.tcp_lock_file)?;
         Ok(())
     }
 }
@@ -60,14 +61,21 @@ impl ClientConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LocalClientConfig {
+    /// Control-channel transport; must match the daemon's `server.local.transport`.
+    #[serde(default)]
+    pub transport: super::path::LocalTransport,
     pub socket_path: String,
+    /// Lock file the daemon writes its actual TCP address into (transport = tcp).
+    pub tcp_lock_file: String,
     pub auto_start: bool,
 }
 
 impl Default for LocalClientConfig {
     fn default() -> Self {
         Self {
+            transport: super::path::default_local_transport(),
             socket_path: crate::config::path::default_socket_path(),
+            tcp_lock_file: crate::config::path::default_tcp_lock_file(),
             auto_start: true,
         }
     }

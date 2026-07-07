@@ -26,10 +26,19 @@
 
 # [server.local]
 # enable = true
-# socket_path — auto-chosen by euid when unset:
+# Control-channel transport between the CLI and this daemon.
+#   "unix" (default on Linux/macOS) — Unix-domain socket at `socket_path`.
+#   "tcp"  (default on Windows)      — TCP loopback; bind `tcp_bind`, publish the
+#                                       actual address + PID to `tcp_lock_file`.
+# transport = "unix"
+# socket_path — used when transport = "unix"; auto-chosen by euid when unset:
 #   root → "/var/run/xho/xhod.sock"  (docker / systemd convention)
 #   non-root → "~/.xho/xhod.sock"    (per-user directory)
 # socket_path = "/var/run/xho/xhod.sock"
+# tcp_bind — used when transport = "tcp"; port 0 lets the OS pick a free port.
+# tcp_bind = "127.0.0.1:0"
+# tcp_lock_file — records the daemon's actual TCP address + PID for the CLI.
+# tcp_lock_file = "~/.xho/xhod.tcp"
 
 # [server.remote]
 # Control plane: machine-to-machine RPC + reverse proxy + OpenSession tunnel.

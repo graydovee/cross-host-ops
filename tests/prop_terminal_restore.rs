@@ -16,6 +16,10 @@
 //! 4. `set_raw_mode` is total (never panics) for arbitrary fd values
 //!
 //! **Validates: Requirement 4.2**
+//
+// Unix-only: exercises termios/raw-fd semantics that have no Windows equivalent.
+
+#![cfg(unix)]
 
 use proptest::prelude::*;
 use std::os::unix::io::RawFd;

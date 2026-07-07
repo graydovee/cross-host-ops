@@ -7,6 +7,11 @@
 //! - session-cache reuse across consecutive calls (#4),
 //! - `xterm-256color` PTY term so the remote rc enables colors (#2),
 //! - raw ANSI passthrough (no stripping).
+//
+// Unix-only: the mock bastion drives a local `sh -c` and the test asserts
+// Unix file permissions / PTY behavior.
+
+#![cfg(unix)]
 
 mod support;
 

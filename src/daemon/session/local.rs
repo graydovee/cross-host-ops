@@ -9,6 +9,7 @@
 // A dedicated waiter task owns each spawned `Child` (so the driver's `select!`
 // never holds a borrow across `child.wait()`) and reports `ExitStatus`/`Eof`.
 
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 
@@ -22,9 +23,22 @@ use tokio::sync::{mpsc, oneshot};
 use super::{SessionEvent, TargetSession};
 
 // -----------------------------------------------------------------------
-// PTY helpers
+// PTY helpers (platform-specific)
 // -----------------------------------------------------------------------
 
+/// Opaque handle to a live PTY controller, used for resize/signaling.
+///
+/// On Unix this is the master fd; on Windows it will hold the ConPTY
+/// `HPCON` + process handle once implemented (see `windows` backend).
+#[cfg(unix)]
+type PtyHandle = libc::c_int;
+
+/// Windows placeholder. ConPTY support is added in a follow-up; until then
+/// PTY-backed local sessions return an error and only pipe mode is available.
+#[cfg(not(unix))]
+type PtyHandle = ();
+
+#[cfg(unix)]
 fn openpty_pair() -> Result<(OwnedFd, OwnedFd)> {
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
@@ -46,6 +60,7 @@ fn openpty_pair() -> Result<(OwnedFd, OwnedFd)> {
     Ok(unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) })
 }
 
+#[cfg(unix)]
 fn dup_fd(fd: &OwnedFd) -> Result<OwnedFd> {
     let new = unsafe { libc::dup(fd.as_raw_fd()) };
     if new < 0 {
@@ -54,6 +69,7 @@ fn dup_fd(fd: &OwnedFd) -> Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(new) })
 }
 
+#[cfg(unix)]
 fn pty_resize(fd: libc::c_int, cols: u32, rows: u32) {
     let ws = libc::winsize {
         ws_row: rows as u16,
@@ -64,28 +80,60 @@ fn pty_resize(fd: libc::c_int, cols: u32, rows: u32) {
     unsafe { libc::ioctl(fd, libc::TIOCSWINSZ as _, &ws) };
 }
 
+/// No-op window resize for the (not-yet-implemented) Windows PTY backend.
+#[cfg(not(unix))]
+fn pty_resize(_handle: PtyHandle, _cols: u32, _rows: u32) {}
+
 /// Resolve the sftp-server binary: explicit config, common locations, PATH.
 fn resolve_sftp_server(configured: Option<&str>) -> Option<PathBuf> {
     if let Some(p) = configured {
         let expanded = crate::config::expand_tilde(p).unwrap_or_else(|_| p.to_string());
         return Some(PathBuf::from(expanded));
     }
-    for candidate in [
-        "/usr/lib/openssh/sftp-server",
-        "/usr/libexec/openssh/sftp-server",
-        "/usr/libexec/sftp-server",
-        "/usr/lib/ssh/sftp-server",
-    ] {
-        if std::path::Path::new(candidate).exists() {
-            return Some(PathBuf::from(candidate));
+    for candidate in sftp_server_candidates() {
+        if candidate.exists() {
+            return Some(candidate);
         }
     }
+    let exe_name = sftp_server_exe_name();
     std::env::var_os("PATH").and_then(|path| {
         std::env::split_paths(&path).find_map(|dir| {
-            let full = dir.join("sftp-server");
+            let full = dir.join(exe_name);
             full.is_file().then_some(full)
         })
     })
+}
+
+/// Common `sftp-server` install locations, per platform.
+fn sftp_server_candidates() -> Vec<PathBuf> {
+    #[cfg(unix)]
+    {
+        vec![
+            PathBuf::from("/usr/lib/openssh/sftp-server"),
+            PathBuf::from("/usr/libexec/openssh/sftp-server"),
+            PathBuf::from("/usr/libexec/sftp-server"),
+            PathBuf::from("/usr/lib/ssh/sftp-server"),
+        ]
+    }
+    #[cfg(not(unix))]
+    {
+        // Win32 OpenSSH (Microsoft's port) installs sftp-server here.
+        vec![
+            PathBuf::from(r"C:\Program Files\OpenSSH\sftp-server.exe"),
+            PathBuf::from(r"C:\Windows\System32\OpenSSH\sftp-server.exe"),
+        ]
+    }
+}
+
+/// Executable name to search for on PATH.
+#[cfg(unix)]
+fn sftp_server_exe_name() -> &'static str {
+    "sftp-server"
+}
+
+#[cfg(not(unix))]
+fn sftp_server_exe_name() -> &'static str {
+    "sftp-server.exe"
 }
 
 // -----------------------------------------------------------------------
@@ -129,8 +177,8 @@ enum Control {
 struct Backend {
     /// Write side for stdin (PTY master or pipe stdin).
     write: WriteSide,
-    /// PTY master raw fd for window-resize ioctl (None for pipes).
-    pty_fd: Option<libc::c_int>,
+    /// PTY controller handle for window-resize (None for pipes).
+    pty_fd: Option<PtyHandle>,
     /// Process id for signal delivery.
     pid: u32,
 }
@@ -287,6 +335,7 @@ async fn driver(
     }
 }
 
+#[cfg(unix)]
 fn signal_pid(pid: u32, signal: &str) {
     let sig = match signal.to_ascii_uppercase().as_str() {
         "HUP" => libc::SIGHUP,
@@ -301,6 +350,90 @@ fn signal_pid(pid: u32, signal: &str) {
     unsafe {
         libc::kill(pid as libc::pid_t, sig);
     }
+}
+
+/// Windows has no POSIX signals; the ConPTY backend will translate INT/TERM to
+/// `GenerateConsoleCtrlEvent` and KILL to `TerminateProcess` once implemented.
+/// For now this is a no-op (local Windows sessions are pipe-only).
+#[cfg(not(unix))]
+fn signal_pid(_pid: u32, _signal: &str) {}
+
+/// Spawn `argv` on a pseudo-terminal.
+///
+/// Unix uses openpty + setsid + TIOCSCTTY; Windows ConPTY support is tracked
+/// separately and currently returns an error (local Windows sessions fall back
+/// to pipe mode).
+#[cfg(unix)]
+async fn spawn_pty(
+    term: &str,
+    cols: u32,
+    rows: u32,
+    program: String,
+    args: &[String],
+    env: &[(String, String)],
+    events_tx: &mpsc::UnboundedSender<SessionEvent>,
+) -> Result<Backend> {
+    let (master, slave) = openpty_pair()?;
+    if cols > 0 && rows > 0 {
+        pty_resize(slave.as_raw_fd(), cols, rows);
+    }
+    let pty_fd = master.as_raw_fd();
+    let read_fd = dup_fd(&master)?;
+    let master_read = tokio::fs::File::from_std(std::fs::File::from(read_fd));
+    let master_write = tokio::fs::File::from_std(std::fs::File::from(master));
+
+    let slave_file = std::fs::File::from(slave);
+    let stdin = std::process::Stdio::from(slave_file.try_clone()?);
+    let stdout = std::process::Stdio::from(slave_file.try_clone()?);
+    let stderr = std::process::Stdio::from(slave_file);
+    let mut cmd = Command::new(&program);
+    cmd.args(args).stdin(stdin).stdout(stdout).stderr(stderr);
+    cmd.env(
+        "TERM",
+        if term.is_empty() {
+            "xterm-256color"
+        } else {
+            term
+        },
+    );
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            libc::ioctl(0, libc::TIOCSCTTY as _, 0i32);
+            Ok(())
+        });
+    }
+    let child = cmd.spawn()?;
+    let pid = child.id().unwrap_or(0);
+    spawn_pty_reader(master_read, events_tx.clone());
+    spawn_waiter(child, events_tx.clone());
+    Ok(Backend {
+        write: WriteSide::Pty(master_write),
+        pty_fd: Some(pty_fd),
+        pid,
+    })
+}
+
+/// Windows ConPTY backend is not yet implemented; local Windows sessions use
+/// pipe mode only. This keeps the daemon compiling and the non-PTY paths
+/// (`xho exec` without `--tty`, sftp subsystem) functional on Windows.
+#[cfg(not(unix))]
+async fn spawn_pty(
+    _term: &str,
+    _cols: u32,
+    _rows: u32,
+    _program: String,
+    _args: &[String],
+    _env: &[(String, String)],
+    _events_tx: &mpsc::UnboundedSender<SessionEvent>,
+) -> Result<Backend> {
+    Err(anyhow::anyhow!(
+        "PTY-backed local sessions are not yet supported on Windows; \
+         re-run without --tty or connect to a Unix xhod for interactive mode"
+    ))
 }
 
 /// Spawn `argv` (program + args) on a PTY (when requested) or pipes. A waiter
@@ -318,48 +451,7 @@ async fn spawn(
     let args = &argv[1..];
 
     if let Some((term, cols, rows)) = pty {
-        let (master, slave) = openpty_pair()?;
-        if *cols > 0 && *rows > 0 {
-            pty_resize(slave.as_raw_fd(), *cols, *rows);
-        }
-        let pty_fd = master.as_raw_fd();
-        let read_fd = dup_fd(&master)?;
-        let master_read = tokio::fs::File::from_std(std::fs::File::from(read_fd));
-        let master_write = tokio::fs::File::from_std(std::fs::File::from(master));
-
-        let slave_file = std::fs::File::from(slave);
-        let stdin = std::process::Stdio::from(slave_file.try_clone()?);
-        let stdout = std::process::Stdio::from(slave_file.try_clone()?);
-        let stderr = std::process::Stdio::from(slave_file);
-        let mut cmd = Command::new(&program);
-        cmd.args(args).stdin(stdin).stdout(stdout).stderr(stderr);
-        cmd.env(
-            "TERM",
-            if term.is_empty() {
-                "xterm-256color"
-            } else {
-                term.as_str()
-            },
-        );
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                libc::ioctl(0, libc::TIOCSCTTY as _, 0i32);
-                Ok(())
-            });
-        }
-        let child = cmd.spawn()?;
-        let pid = child.id().unwrap_or(0);
-        spawn_pty_reader(master_read, events_tx.clone());
-        spawn_waiter(child, events_tx.clone());
-        Ok(Backend {
-            write: WriteSide::Pty(master_write),
-            pty_fd: Some(pty_fd),
-            pid,
-        })
+        return spawn_pty(term, *cols, *rows, program, args, env, events_tx).await;
     } else {
         let mut cmd = Command::new(&program);
         cmd.args(args)
@@ -409,6 +501,7 @@ async fn spawn_sftp(
     })
 }
 
+#[cfg(unix)]
 fn spawn_pty_reader(mut read: tokio::fs::File, events_tx: mpsc::UnboundedSender<SessionEvent>) {
     tokio::spawn(async move {
         let mut buf = vec![0u8; 8192];

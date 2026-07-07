@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  check:
+    name: check ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: cargo check
+        run: cargo check --target ${{ matrix.target }} --locked
+
+      - name: cargo test (unix)
+        if: runner.os != 'Windows'
+        run: cargo test --target ${{ matrix.target }} --no-run
+
+      - name: cargo build binaries (windows)
+        if: runner.os == 'Windows'
+        run: cargo build --target ${{ matrix.target }} --bin xho --bin xhod

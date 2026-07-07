@@ -14,8 +14,10 @@ use russh::keys::ssh_key::{self, HashAlg};
 use russh::server::{self, Auth, Msg};
 use russh::{Channel, ChannelId};
 use subtle::ConstantTimeEq;
-use tokio::net::UnixStream;
 use tokio::sync::mpsc;
+#[cfg(unix)]
+use tokio::net::UnixStream;
+use tokio::net::TcpStream;
 use tonic::transport::server::Connected;
 use tracing::{info, warn};
 
@@ -45,10 +47,71 @@ pub(crate) fn reverse_proxy_subsystem_name() -> &'static str {
 // Types
 // ---------------------------------------------------------------------------
 
-/// Represents an incoming connection, either from a local Unix socket or a
-/// remote SSH subsystem channel.
+/// A connection on the local control channel.
+///
+/// `Unix` is used when `server.local.transport = "unix"`; `Tcp` when
+/// `transport = "tcp"` (default on Windows). Both implement AsyncRead/AsyncWrite
+/// so [`LocalConn`] can be driven uniformly.
+pub(super) enum LocalConn {
+    #[cfg(unix)]
+    Unix(UnixStream),
+    Tcp(TcpStream),
+}
+
+impl tokio::io::AsyncRead for LocalConn {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match &mut *self {
+            #[cfg(unix)]
+            LocalConn::Unix(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            LocalConn::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for LocalConn {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        match &mut *self {
+            #[cfg(unix)]
+            LocalConn::Unix(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            LocalConn::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match &mut *self {
+            #[cfg(unix)]
+            LocalConn::Unix(s) => std::pin::Pin::new(s).poll_flush(cx),
+            LocalConn::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match &mut *self {
+            #[cfg(unix)]
+            LocalConn::Unix(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            LocalConn::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Represents an incoming connection, either from a local control channel
+/// (`LocalConn`) or a remote SSH subsystem channel.
 pub(super) enum IncomingConn {
-    Local(UnixStream),
+    Local(LocalConn),
     Remote(RemoteChannelStream),
     ReverseProxy(ReverseProxyHandshake),
 }
