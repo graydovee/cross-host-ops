@@ -53,19 +53,41 @@ fn is_safe_shell_command_word(arg: &str) -> bool {
 /// Determine the flags for a given shell name.
 /// bash, zsh: use -ic (interactive)
 /// sh, fish, others: use -c only
+///
+/// Matches on the basename so `C:\...\bash.exe` is recognized as bash.
 fn shell_flags(shell_name: &str) -> &'static str {
-    match shell_name {
-        "bash" | "zsh" => "-ic",
+    let basename = shell_name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(shell_name)
+        .to_ascii_lowercase();
+    match basename.as_str() {
+        "bash" | "bash.exe" | "zsh" | "zsh.exe" => "-ic",
         _ => "-c",
     }
 }
 
 /// Wrap a command string in the specified shell invocation.
 /// Single quotes in the input are escaped using the `'\''` technique.
+///
+/// Only the shell *basename* is embedded in the wrapped command (e.g. `bash`,
+/// not `C:\Program Files\Git\bin\bash.exe`), so the inner shell is resolved via
+/// PATH and the embedded path can't break on backslashes/spaces.
 pub fn wrap_in_shell(inner_cmd: &str, shell_name: &str) -> String {
     let escaped = inner_cmd.replace('\'', "'\\''");
     let flags = shell_flags(shell_name);
-    format!("{} {} '{}'", shell_name, flags, escaped)
+    let basename = shell_basename(shell_name);
+    format!("{basename} {flags} '{escaped}'")
+}
+
+/// Reduce a shell path to its basename for embedding in a wrapped command.
+/// `/usr/bin/bash` → `bash`; `C:\dir\cmd.exe` → `cmd.exe`; `sh` → `sh`.
+fn shell_basename(shell_name: &str) -> &str {
+    shell_name
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(shell_name)
 }
 
 /// Build the final remote command, optionally wrapping in a shell.
@@ -143,6 +165,18 @@ mod tests {
         build_final_command, build_remote_command, resolve_shell, shell_flags, shell_quote,
         wrap_in_shell,
     };
+
+    #[test]
+    fn wrap_in_shell_uses_only_basename() {
+        // A Windows absolute path with spaces/backslashes must reduce to its
+        // basename so the embedded command stays parseable.
+        assert_eq!(
+            wrap_in_shell("echo hi", r"C:\Program Files\Git\bin\bash.exe"),
+            "bash.exe -ic 'echo hi'"
+        );
+        assert_eq!(wrap_in_shell("echo hi", "/usr/bin/bash"), "bash -ic 'echo hi'");
+        assert_eq!(wrap_in_shell("echo hi", "sh"), "sh -c 'echo hi'");
+    }
 
     #[test]
     fn shell_quotes_arguments() {

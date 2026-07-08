@@ -70,7 +70,30 @@ pub async fn run_cli(cli: ArunCli) -> Result<i32> {
             }
 
             let argv = if !has_separator && cmd.len() == 1 {
-                vec!["sh".to_string(), "-c".to_string(), cmd[0].clone()]
+                // Single-quoted command (no `--`): wrap in a shell so the
+                // command string is executed as a shell command. Prefer $SHELL
+                // (POSIX shells, or Git-Bash bash.exe on Windows), else the
+                // platform default (sh on Unix, cmd.exe on Windows).
+                #[cfg(unix)]
+                {
+                    let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+                    vec![shell, "-c".to_string(), cmd[0].clone()]
+                }
+                #[cfg(not(unix))]
+                {
+                    let shell = std::env::var("SHELL")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| {
+                            std::env::var("COMSPEC")
+                                .unwrap_or_else(|_| "cmd.exe".to_string())
+                        });
+                    // Match the flag to the shell: bash/sh take -c, cmd.exe /c.
+                    let lower = shell.to_ascii_lowercase();
+                    let is_cmd = lower.ends_with("cmd.exe") || lower.ends_with("cmd");
+                    let flag = if is_cmd { "/c" } else { "-c" };
+                    vec![shell, flag.to_string(), cmd[0].clone()]
+                }
             } else {
                 cmd
             };
