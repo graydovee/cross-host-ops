@@ -21,6 +21,7 @@ pub mod config;
 pub(crate) mod copy_frames;
 pub mod daemon;
 pub mod exit_codes;
+pub(crate) mod filepath;
 pub(crate) mod fs_meta;
 pub mod logging;
 pub mod output;

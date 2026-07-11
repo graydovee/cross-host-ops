@@ -242,9 +242,9 @@ fn sftp_server_exe_name() -> &'static str {
 /// Git-Bash environment may set `SHELL` to bash.exe, in which case `-c` still
 /// applies. `Control::Exec` wraps a command as `[shell, flag, command]`.
 fn shell_exec_flag(shell: &str) -> &'static str {
-    // Lowercase the basename for matching.
+    // Lowercase the basename for matching (via the unified filepath helper).
     let lower = shell.to_ascii_lowercase();
-    let basename = lower.rsplit(['/', '\\']).next().unwrap_or(&lower);
+    let basename = crate::filepath::quote::shell_basename(&lower);
     if basename == "cmd.exe" || basename == "cmd" || basename.starts_with("powershell") {
         "/c"
     } else {

@@ -336,15 +336,16 @@ fn resolve_upload_path(remote_root: &str, relative_path: &str, recursive: bool) 
     join_remote(remote_root, relative_path)
 }
 
+/// Join a remote root and a relative path with a forward slash (jumpserver
+/// targets are always POSIX). Forwards to the unified filepath library.
 fn join_remote(root: &str, relative: &str) -> String {
-    let root = root.trim_end_matches('/');
-    format!("{root}/{relative}")
+    crate::filepath::NormalizedPath::from_str(root)
+        .join(relative)
+        .to_string_normalized()
 }
 
+/// POSIX single-quote a shell argument. Forwards to the unified filepath
+/// library to avoid the duplicate implementation that previously lived here.
 fn shell_quote(arg: &str) -> String {
-    if arg.is_empty() {
-        return "''".to_string();
-    }
-    let escaped = arg.replace('\'', "'\\''");
-    format!("'{escaped}'")
+    crate::filepath::quote::shell_quote(arg)
 }

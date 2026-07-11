@@ -205,9 +205,13 @@ async fn send_path_entry_frame_with_metadata(
         let target = tokio::fs::read_link(path)
             .await
             .with_context(|| format!("failed to read symlink {}", path.display()))?;
+        // Normalize the symlink target to forward-slash so a Windows client's
+        // backslash target doesn't get re-applied verbatim on a Unix remote.
+        let target_norm =
+            crate::filepath::NormalizedPath::from_local(&target).to_string_normalized();
         tx.send(crate::protocol::copy_frame_request(CopyFrame::Symlink {
             relative_path,
-            target: target.to_string_lossy().to_string(),
+            target: target_norm,
         }))
         .await
         .map_err(|_| anyhow!("failed to send symlink copy frame"))?;
@@ -480,30 +484,12 @@ fn remote_source_name(remote_path: &str) -> String {
 }
 
 fn parse_remote_spec(value: &str) -> Option<(String, String)> {
-    // A Windows drive-absolute path like `C:\Users\...` or `C:/Users/...` has a
-    // drive-letter colon that must NOT be mistaken for the `host:path` colon.
-    // Treat any `<letter>:[/\]` prefix as a local path (not a remote spec).
-    let bytes = value.as_bytes();
-    if bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/')
-    {
-        return None;
-    }
-    let colon_pos = value.rfind(':')?;
-    let target = &value[..colon_pos];
-    let path = &value[colon_pos + 1..];
-    if target.is_empty()
-        || path.is_empty()
-        || target.contains('/')
-        || target.contains('\\')
-        || target == "."
-        || target == ".."
-    {
-        return None;
-    }
-    Some((target.to_string(), path.to_string()))
+    // Delegate to the unified filepath library. It handles `host:/p`,
+    // `gw:host:/p` (multi-hop), local `C:\…` rejection, and `host:C:\…`
+    // (remote Windows target). The wire path is emitted in normalized
+    // forward-slash form so a Windows client never pollutes a Unix remote.
+    let spec = crate::filepath::spec::parse_remote(value)?;
+    Some((spec.target, spec.path.to_string_normalized()))
 }
 
 #[cfg(test)]
@@ -532,5 +518,15 @@ mod tests {
         assert_eq!(parse_remote_spec(r"C:\Users\me\file.txt"), None);
         assert_eq!(parse_remote_spec("C:/Users/me/file.txt"), None);
         assert_eq!(parse_remote_spec(r"D:\tmp\dir"), None);
+    }
+
+    #[test]
+    fn parse_remote_spec_supports_remote_windows_path() {
+        // `host:C:\Users\x` — remote is a Windows target; the path is carried
+        // in normalized forward-slash form (`C:/Users/x`).
+        assert_eq!(
+            parse_remote_spec(r"win-srv:C:\Users\x"),
+            Some(("win-srv".to_string(), "C:/Users/x".to_string()))
+        );
     }
 }

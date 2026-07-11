@@ -6,12 +6,10 @@
 
 /// Shell-quote a single argument using single-quote wrapping.
 /// Empty strings produce `''`. Internal single-quotes are escaped via `'\''`.
+///
+/// Forwards to [`crate::filepath::quote::shell_quote`].
 pub fn shell_quote(arg: &str) -> String {
-    if arg.is_empty() {
-        return "''".to_string();
-    }
-    let escaped = arg.replace('\'', "'\\''");
-    format!("'{}'", escaped)
+    crate::filepath::quote::shell_quote(arg)
 }
 
 /// Build a remote command string by shell-quoting every argument.
@@ -54,17 +52,9 @@ fn is_safe_shell_command_word(arg: &str) -> bool {
 /// bash, zsh: use -ic (interactive)
 /// sh, fish, others: use -c only
 ///
-/// Matches on the basename so `C:\...\bash.exe` is recognized as bash.
+/// Forwards to [`crate::filepath::quote::shell_flags`].
 fn shell_flags(shell_name: &str) -> &'static str {
-    let basename = shell_name
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(shell_name)
-        .to_ascii_lowercase();
-    match basename.as_str() {
-        "bash" | "bash.exe" | "zsh" | "zsh.exe" => "-ic",
-        _ => "-c",
-    }
+    crate::filepath::quote::shell_flags(shell_name)
 }
 
 /// Wrap a command string in the specified shell invocation.
@@ -82,12 +72,10 @@ pub fn wrap_in_shell(inner_cmd: &str, shell_name: &str) -> String {
 
 /// Reduce a shell path to its basename for embedding in a wrapped command.
 /// `/usr/bin/bash` → `bash`; `C:\dir\cmd.exe` → `cmd.exe`; `sh` → `sh`.
+///
+/// Forwards to [`crate::filepath::quote::shell_basename`].
 fn shell_basename(shell_name: &str) -> &str {
-    shell_name
-        .rsplit(['/', '\\'])
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(shell_name)
+    crate::filepath::quote::shell_basename(shell_name)
 }
 
 /// Build the final remote command, optionally wrapping in a shell.
