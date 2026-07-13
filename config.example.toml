@@ -131,6 +131,11 @@
 # Eliminates ~3-5s menu navigation overhead on cache hit.
 # max_cached_sessions = 8          # optional, default: unlimited
 # session_idle_timeout = "5m"      # default: 5 minutes
+# Suppress shell history on the target after navigation (default: true). When
+# enabled, xho sends `HISTFILE=/dev/null; HISTSIZE=0; ...` once per navigated
+# shell so its own exec/copy commands don't pollute the target's
+# ~/.bash_history. Only affects the jumpserver PTY path.
+# suppress_history = true
 
 # Example: a remote xhod daemon reachable over SSH
 # [[gateways]]

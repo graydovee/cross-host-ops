@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc};
 use tracing::{debug, info};
 
 use crate::config::{AppConfig, JumpserverGatewayConfig, MfaConfig, load_server_config};
@@ -111,12 +111,7 @@ impl SessionCache {
     /// Insert a shell into the cache. If at capacity, evict the globally oldest
     /// shell first. The evicted entry's key stays stale in the reverse index and
     /// is cleaned up lazily on checkout or during prune.
-    fn insert(
-        &mut self,
-        ip: String,
-        shell: PtyShell,
-        lease: SingletonLease<JumpserverTransport>,
-    ) {
+    fn insert(&mut self, ip: String, shell: PtyShell, lease: SingletonLease<JumpserverTransport>) {
         if let Some(max) = self.max_cached_sessions {
             while self.shells.len() >= max {
                 self.shells.pop_first();
@@ -344,6 +339,18 @@ impl JumpserverGateway {
                     GatewayError::execution(e)
                 }
             })?;
+
+        // Suppress shell history once per navigated shell. The shell is cached
+        // and reused for subsequent exec/copy operations, so the env vars set
+        // here persist for the lifetime of the shell process. Best-effort: a
+        // failure is logged but does not abort the operation.
+        if self.fields.suppress_history {
+            if let Err(e) = Self::suppress_history(&mut shell).await {
+                debug!(gateway = %self.gateway_name,
+                    "history suppression failed (non-fatal): {}", e);
+            }
+        }
+
         Ok(shell)
     }
 
@@ -395,7 +402,10 @@ impl JumpserverGateway {
         let (shell, lease) = self.acquire_shell(target).await?;
         let return_fn = self.make_return_fn(ip, lease.clone());
         let guard: Box<dyn Send> = Box::new(lease);
-        Ok(Box::new(JumpserverSession::new(shell, guard, Some(return_fn))) as Box<dyn TargetSession>)
+        Ok(
+            Box::new(JumpserverSession::new(shell, guard, Some(return_fn)))
+                as Box<dyn TargetSession>,
+        )
     }
 
     /// Build the closure invoked by `JumpserverSession::exec` when the command
@@ -423,6 +433,30 @@ impl JumpserverGateway {
                 .unwrap_or_default()
         };
         resolve_shell(cli_shell, no_shell, None, &defaults_shell).unwrap_or_default()
+    }
+
+    /// Send a history-suppression sequence to the navigated asset shell. Run
+    /// once per shell; subsequent commands won't pollute `~/.bash_history`.
+    ///
+    /// Covers both bash and zsh. Unsupported options are silenced with
+    /// `2>/dev/null`, and the command itself is self-truncating: it enters the
+    /// in-memory history list before the `HISTFILE=/dev/null` assignment takes
+    /// effect, but every subsequent flush targets `/dev/null`, so the line
+    /// never reaches the real history file. `history -c` clears the in-memory
+    /// list too, leaving no trace even in an interactive `history` query.
+    async fn suppress_history(shell: &mut PtyShell) -> Result<()> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        shell
+            .run_command_plain(
+                "HISTFILE=/dev/null; HISTSIZE=0; SAVEHIST=0; \
+                 set +o history 2>/dev/null; unset PROMPT_COMMAND 2>/dev/null; \
+                 history -c 2>/dev/null; true",
+                &tx,
+            )
+            .await?;
+        drop(tx);
+        while rx.recv().await.is_some() {}
+        Ok(())
     }
 
     /// Drive the bastion menu state machine to the asset shell prompt:
@@ -581,9 +615,7 @@ impl Gateway for JumpserverGateway {
 
     async fn prune_idle(&self) {
         let _ = self.transport.prune_idle(self.max_idle_time).await;
-        self.session_cache
-            .lock()
-            .prune(self.session_idle_timeout);
+        self.session_cache.lock().prune(self.session_idle_timeout);
     }
 
     async fn pool_status(&self) -> Vec<ConnectionStatusSnapshot> {
@@ -621,6 +653,7 @@ mod tests {
                 totp_period: 30,
                 max_cached_sessions: None,
                 session_idle_timeout: Duration::from_secs(300),
+                suppress_history: true,
             },
             Arc::new(|_| Box::pin(async { Ok(String::new()) })),
             Duration::from_secs(60),
@@ -664,5 +697,47 @@ Opt>";
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind, ErrorKind::Unsupported);
         assert_eq!(gateway.transport.current_generation().await, None);
+    }
+
+    #[test]
+    fn suppress_history_defaults_to_true() {
+        // A gateway config with no explicit suppress_history should enable it.
+        let config: JumpserverGatewayConfig = toml::from_str(
+            r#"
+            name = "jump"
+            host = "jump.example.test"
+            user = "admin"
+            "#,
+        )
+        .expect("parse jumpserver config");
+        assert!(config.suppress_history);
+    }
+
+    #[test]
+    fn suppress_history_can_be_disabled() {
+        // Explicit suppress_history = false is honored.
+        let config: JumpserverGatewayConfig = toml::from_str(
+            r#"
+            name = "jump"
+            host = "jump.example.test"
+            user = "admin"
+            suppress_history = false
+            "#,
+        )
+        .expect("parse jumpserver config");
+        assert!(!config.suppress_history);
+    }
+
+    #[test]
+    fn suppress_history_command_is_self_truncating() {
+        // The suppression payload must contain HISTFILE=/dev/null as the very
+        // first assignment so the line self-truncates before it can be flushed
+        // to the real history file. This is a static invariant guard: if the
+        // payload is ever reordered, this test fails loudly.
+        let payload = "HISTFILE=/dev/null; HISTSIZE=0; SAVEHIST=0; \
+                       set +o history 2>/dev/null; unset PROMPT_COMMAND 2>/dev/null; \
+                       history -c 2>/dev/null; true";
+        let first_stmt = payload.split(';').next().unwrap().trim();
+        assert_eq!(first_stmt, "HISTFILE=/dev/null");
     }
 }

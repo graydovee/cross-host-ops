@@ -79,6 +79,7 @@ async fn setup() -> E2E {
         totp_period: 30,
         max_cached_sessions: Some(4),
         session_idle_timeout: Duration::from_secs(300),
+        suppress_history: true,
     })];
 
     // Serve the daemon over an in-process duplex and connect a gRPC client.
@@ -138,7 +139,10 @@ async fn exec_interactive(
     .await
     .expect("send start");
 
-    let response = client.execute(ReceiverStream::new(rx)).await.expect("execute");
+    let response = client
+        .execute(ReceiverStream::new(rx))
+        .await
+        .expect("execute");
     let mut stream = response.into_inner();
     let mut stdout = Vec::new();
     let mut code = None;
@@ -173,10 +177,7 @@ async fn no_marker_leak_and_exit_zero() {
         "marker leaked into stdout: {:?}",
         String::from_utf8_lossy(&stdout)
     );
-    assert!(
-        !stdout.is_empty(),
-        "expected ls output, got empty stdout"
-    );
+    assert!(!stdout.is_empty(), "expected ls output, got empty stdout");
 }
 
 #[tokio::test]
@@ -210,11 +211,8 @@ async fn raw_ansi_is_passed_through() {
     // The interactive path is raw passthrough — ANSI escapes must survive
     // unstripped (color support assumes no stripping).
     let mut e2e = setup().await;
-    let (stdout, _code) = exec_interactive(
-        &mut e2e.client,
-        &["printf", "\\033[31mred\\033[0m"],
-    )
-    .await;
+    let (stdout, _code) =
+        exec_interactive(&mut e2e.client, &["printf", "\\033[31mred\\033[0m"]).await;
     assert!(
         stdout.windows(2).any(|w| w == b"\x1b["),
         "ANSI escape stripped from stdout: {:?}",

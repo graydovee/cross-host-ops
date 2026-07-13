@@ -311,6 +311,9 @@ identity_file = "~/.ssh/id_rsa"
 totp_secret_base32 = "YOUR_SECRET"
 totp_digits = 6
 totp_period = 30
+# Suppress shell history on the target so xho's own exec/copy commands don't
+# pollute ~/.bash_history (default: true). Set to false to keep history.
+suppress_history = true
 
 # Command review (optional)
 [review]

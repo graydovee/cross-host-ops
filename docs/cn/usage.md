@@ -298,6 +298,9 @@ identity_file = "~/.ssh/id_rsa"
 totp_secret_base32 = "YOUR_SECRET"
 totp_digits = 6
 totp_period = 30
+# 抑制目标机的 shell 历史，避免 xho 自身的 exec/copy 命令污染 ~/.bash_history（默认 true）。
+# 设为 false 可保留历史。
+suppress_history = true
 
 # 命令审查（可选）
 [review]
