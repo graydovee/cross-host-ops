@@ -38,8 +38,22 @@ async fn daemon_stop() -> Result<i32> {
     let socket_path = local_socket_path()?;
     let mut client = match connect_unix_client(&socket_path).await {
         Ok(client) => client,
-        Err(_) => {
-            eprintln!("xhod is not running");
+        Err(e) => {
+            // Distinguish "socket doesn't exist" (daemon really not running)
+            // from "socket exists but connection failed" (crashed/stale socket).
+            if socket_path.exists() {
+                eprintln!(
+                    "error: failed to connect to daemon socket {}: {e}",
+                    socket_path.display()
+                );
+                eprintln!(
+                    "hint: the socket file exists but the daemon may have crashed; \
+                     try removing it: rm {}",
+                    socket_path.display()
+                );
+            } else {
+                eprintln!("xhod is not running");
+            }
             return Ok(1);
         }
     };

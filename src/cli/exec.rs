@@ -261,8 +261,9 @@ pub(crate) async fn run_command(
             Ok(Some(msg)) => msg,
             Ok(None) => break,
             Err(e) => {
-                eprintln!("error: connection lost: {e}");
-                break;
+                return Err(
+                    crate::exit_codes::XhoError::Internal(format!("connection lost: {e}")).into(),
+                );
             }
         };
         match message
@@ -320,8 +321,7 @@ pub(crate) async fn run_command(
                 eprintln!("{}", info.message);
             }
             rpc::execute_response::Event::Error(error) => {
-                eprintln!("error: {}", error.message);
-                return Ok(1);
+                return Err(super::classify_daemon_error(&error.message).into());
             }
         }
     }
@@ -432,11 +432,13 @@ pub(crate) async fn run_interactive(
             Ok(None) => break,
             Err(e) => {
                 // gRPC stream broke (daemon restart, SSH connection lost, etc.).
-                // Show a clean diagnostic instead of the raw h2/hyper error.
-                write_raw_mode_diagnostic(&format!(
-                    "\n\x1b[31mConnection lost: {e}\x1b[0m\n"
-                ))?;
-                break;
+                // Return a typed error — the RawModeGuard restores the terminal
+                // on return, then main's eprintln prints cleanly.
+                stdin_task.abort();
+                sigwinch_task.abort();
+                return Err(
+                    crate::exit_codes::XhoError::Internal(format!("connection lost: {e}")).into(),
+                );
             }
         };
         match message
@@ -452,10 +454,12 @@ pub(crate) async fn run_interactive(
                 break;
             }
             rpc::execute_response::Event::Error(error) => {
-                write_raw_mode_diagnostic(&format!("error: {}", error.message))?;
+                // Return a typed error — the RawModeGuard (_guard) restores the
+                // terminal on return, then main's eprintln prints the message
+                // cleanly. This avoids double-printing.
                 stdin_task.abort();
                 sigwinch_task.abort();
-                return Ok(1);
+                return Err(super::classify_daemon_error(&error.message).into());
             }
             rpc::execute_response::Event::Info(info) => {
                 write_raw_mode_diagnostic(&info.message)?;

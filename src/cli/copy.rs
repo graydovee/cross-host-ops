@@ -76,8 +76,7 @@ pub(crate) async fn run_copy(
                 .map_err(|_| anyhow!("failed to send copy auth input request"))?;
             }
             rpc::copy_response::Event::Error(error) => {
-                eprintln!("error: {}", error.message);
-                return Ok(1);
+                return Err(super::classify_daemon_error(&error.message).into());
             }
             rpc::copy_response::Event::Complete(done) => {
                 if !quiet && !done.message.is_empty() {
