@@ -293,9 +293,7 @@ impl PtyShell {
         sender: &mpsc::UnboundedSender<Vec<u8>>,
     ) -> Result<i32> {
         let marker = make_marker();
-        let wrapped = format!(
-            "{{ {command}; }}; status=$?; printf '{marker}:%s\\n' \"$status\""
-        );
+        let wrapped = format!("{{ {command}; }}; status=$?; printf '{marker}:%s\\n' \"$status\"");
         self.clear_prompt_remainder();
         self.write_line(&wrapped).await?;
         self.drain_echo_line(3000).await?;
@@ -333,6 +331,230 @@ impl PtyShell {
                 }
             }
         }
+    }
+
+    /// Like [`Self::run_command_plain`], but designed for raw mode (`stty raw
+    /// -echo`): skips `drain_echo_line` (no echo to drain) and uses a strict
+    /// [`SentinelScanner`] instead of prompt-suffix sniffing for completion
+    /// detection. This is critical for binary data transfers where the output
+    /// stream may contain bytes that look like a prompt (`$ `/`# `) — prompt
+    /// sniffing would false-match and truncate the transfer.
+    ///
+    /// The command is wrapped with a UUID **begin** marker (`printf` before the
+    /// command) and a UUID **end** marker (`printf '{end}:%s\n' "$?"` after).
+    /// Output is only forwarded AFTER the begin marker — this discards any
+    /// shell prompt/noise that precedes the command output in raw mode.
+    /// Completion is detected SOLELY by the end sentinel.
+    pub(crate) async fn run_command_raw(
+        &mut self,
+        command: &str,
+        sender: &mpsc::UnboundedSender<Vec<u8>>,
+    ) -> Result<i32> {
+        let begin_marker = make_marker();
+        let end_marker = make_marker();
+        let begin_bytes = begin_marker.as_bytes().to_vec();
+        let end_bytes = end_marker.as_bytes().to_vec();
+        // Wrap: print begin marker, run command, print end marker + exit code.
+        let wrapped = format!(
+            "printf '{begin_marker}'; {{ {command}; }}; status=$?; printf '{end_marker}:%s\\n' \"$status\""
+        );
+        self.clear_prompt_remainder();
+        self.write_line(&wrapped).await?;
+        // No drain_echo_line — raw mode has no echo.
+
+        // Phase 1: discard everything until the begin marker appears.
+        // This removes the shell prompt + any pre-command noise.
+        let mut discard_buf = Vec::new();
+        loop {
+            let chunk = self.read_chunk().await?;
+            discard_buf.extend_from_slice(&chunk);
+            if let Some(pos) = find_subslice(&discard_buf, &begin_bytes) {
+                // Found begin marker. Keep anything after it (it's real output).
+                let after_begin = &discard_buf[pos + begin_bytes.len()..];
+                if !after_begin.is_empty() {
+                    self.pending.extend_from_slice(after_begin);
+                }
+                break;
+            }
+            // Keep only a tail to avoid unbounded growth (begin marker is ~42 bytes).
+            if discard_buf.len() > begin_bytes.len() * 2 {
+                let keep_from = discard_buf.len() - begin_bytes.len() * 2;
+                discard_buf = discard_buf[keep_from..].to_vec();
+            }
+        }
+
+        // Phase 2: scan pending for the end sentinel, forwarding real output.
+        let mut scanner = SentinelScanner::new(end_bytes);
+        // Feed any bytes we already have (between begin and end markers).
+        let pending = std::mem::take(&mut self.pending);
+        if !pending.is_empty() {
+            let (forward, done) = scanner.feed(&pending);
+            if !forward.is_empty() {
+                let _ = sender.send(forward);
+            }
+            if done {
+                let leftover = scanner.take_leftover();
+                if !leftover.is_empty() {
+                    self.pending.extend_from_slice(&leftover);
+                }
+                return Ok(scanner.exit_code());
+            }
+        }
+        loop {
+            let chunk = self.read_chunk().await?;
+            let (forward, done) = scanner.feed(&chunk);
+            if !forward.is_empty() {
+                let _ = sender.send(forward);
+            }
+            if done {
+                let leftover = scanner.take_leftover();
+                if !leftover.is_empty() {
+                    self.pending.extend_from_slice(&leftover);
+                }
+                return Ok(scanner.exit_code());
+            }
+        }
+    }
+
+    /// Upload binary data via a three-phase protocol designed for raw PTY mode:
+    ///
+    /// 1. Send `command` (e.g. `head -c <size> > tmp`), which starts reading
+    ///    from stdin. Wait until `ready_marker` appears in the output — this
+    ///    confirms the receiver process is running and ready to consume data.
+    /// 2. Write binary data chunks from `data_rx` to the PTY (the receiver
+    ///    reads them from its stdin). This is serial — one chunk at a time.
+    /// 3. After `data_rx` closes (all data sent), wait for the `end_marker`
+    ///    sentinel to confirm the command completed with its exit code.
+    ///
+    /// The ready-signal synchronization eliminates the race where data is
+    /// written to the PTY before the receiver process has started reading.
+    pub(crate) async fn upload_binary(
+        &mut self,
+        command: &str,
+        ready_marker: &[u8],
+        end_marker: &[u8],
+        mut data_rx: mpsc::Receiver<Vec<u8>>,
+    ) -> Result<i32> {
+        self.clear_prompt_remainder();
+        self.write_line(command).await?;
+
+        // Phase 1: discard output until the ready marker appears.
+        let mut buf = Vec::new();
+        loop {
+            let chunk = self.read_chunk().await?;
+            buf.extend_from_slice(&chunk);
+            if let Some(pos) = find_subslice(&buf, ready_marker) {
+                let after = &buf[pos + ready_marker.len()..];
+                self.pending.extend_from_slice(after);
+                break;
+            }
+            if buf.len() > ready_marker.len() * 4 {
+                let keep = buf.len() - ready_marker.len() * 2;
+                buf = buf[keep..].to_vec();
+            }
+        }
+
+        // Phase 2: feed binary data chunks to the PTY (receiver reads them).
+        while let Some(chunk) = data_rx.recv().await {
+            self.write_raw(&chunk).await?;
+        }
+
+        // Phase 3: wait for the end sentinel (UUID-based, strict match).
+        let mut scanner = SentinelScanner::new(end_marker.to_vec());
+        let pending = std::mem::take(&mut self.pending);
+        if !pending.is_empty() {
+            let (_, done) = scanner.feed(&pending);
+            if done {
+                let leftover = scanner.take_leftover();
+                if !leftover.is_empty() {
+                    self.pending.extend_from_slice(&leftover);
+                }
+                return Ok(scanner.exit_code());
+            }
+        }
+        loop {
+            let chunk = self.read_chunk().await?;
+            let (_, done) = scanner.feed(&chunk);
+            if done {
+                let leftover = scanner.take_leftover();
+                if !leftover.is_empty() {
+                    self.pending.extend_from_slice(&leftover);
+                }
+                return Ok(scanner.exit_code());
+            }
+        }
+    }
+    /// from `stdin_rx` into the PTY while the command runs. Designed for raw-mode
+    /// binary upload: the command (e.g. `head -c N > file`) reads stdin, and we
+    /// feed it chunk-by-chunk without buffering the whole file.
+    ///
+    /// The command is wrapped in the same UUID-sentinel as `run_command_plain`,
+    /// so completion is detected by the strict marker match — no prompt sniffing.
+    /// Output (if any) is forwarded to `sender`. Returns the exit code.
+    pub(crate) async fn run_command_with_stdin(
+        &mut self,
+        command: &str,
+        sender: &mpsc::UnboundedSender<Vec<u8>>,
+        mut stdin_rx: mpsc::Receiver<Vec<u8>>,
+    ) -> Result<i32> {
+        let marker = make_marker();
+        let wrapped = format!("{{ {command}; }}; status=$?; printf '{marker}:%s\\n' \"$status\"");
+        self.clear_prompt_remainder();
+        self.write_line(&wrapped).await?;
+        // No drain_echo_line — this runs in raw mode where echo is disabled.
+        // Use SentinelScanner (not prompt sniffing) for completion detection,
+        // since this path transfers binary data that could false-match prompts.
+        let mut scanner = SentinelScanner::new(marker.as_bytes().to_vec());
+        let mut first_output = true;
+        loop {
+            tokio::select! {
+                // Drain stdin data → write to PTY (feed the running command).
+                data = stdin_rx.recv() => match data {
+                    Some(chunk) => {
+                        self.write_raw(&chunk).await?;
+                    }
+                    None => {
+                        // stdin closed — continue waiting for command output.
+                    }
+                },
+                // Read PTY output → detect completion via strict sentinel scan.
+                chunk_result = self.read_chunk() => {
+                    let chunk = chunk_result?;
+                    let (forward, done) = scanner.feed(&chunk);
+                    if !forward.is_empty() {
+                        let out = if first_output {
+                            first_output = false;
+                            strip_leading_shell_noise(&forward).to_vec()
+                        } else {
+                            forward
+                        };
+                        if !out.is_empty() {
+                            let _ = sender.send(out);
+                        }
+                    }
+                    if done {
+                        let leftover = scanner.take_leftover();
+                        if !leftover.is_empty() {
+                            self.pending.extend_from_slice(&leftover);
+                        }
+                        return Ok(scanner.exit_code());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Force-close the underlying channel with a timeout. Used for cleanup when
+    /// the shell is in an unrecoverable state (e.g. raw mode + failed transfer).
+    /// After this, the shell must be discarded — never returned to the cache.
+    pub(crate) async fn force_close(&mut self) {
+        let _ = tokio::time::timeout(Duration::from_secs(3), self.channel.close()).await;
+    }
+
+    /// Send a Ctrl-C to the PTY (interrupt a potentially stuck command).
+    /// Best-effort, no await on output.
+    pub(crate) async fn send_interrupt(&mut self) {
+        let _ = self.channel.data(Cursor::new(b"\x03")).await;
     }
 
     /// Byte-for-byte bidirectional passthrough: forward `stdin_rx` to the PTY and
@@ -535,7 +757,10 @@ fn partial_suffix_match(buf: &[u8], pattern: &[u8]) -> usize {
         return 0;
     }
     let max = buf.len().min(pattern.len() - 1);
-    (1..=max).rev().find(|&len| &buf[buf.len() - len..] == &pattern[..len]).unwrap_or(0)
+    (1..=max)
+        .rev()
+        .find(|&len| &buf[buf.len() - len..] == &pattern[..len])
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -703,7 +928,10 @@ fn lookahead_sentinel(after: &[u8]) -> Lookahead {
         .and_then(|s| s.parse::<i32>().ok())
         .unwrap_or(0);
     // consumed = ':' + digits + terminator ('\n' or '\r\n')
-    Lookahead::Confirmed { code, consumed: i + term_len }
+    Lookahead::Confirmed {
+        code,
+        consumed: i + term_len,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -878,13 +1106,8 @@ Opt>";
     #[test]
     fn scanner_matches_marker_split_across_chunks() {
         let marker = b"__XHO_E_test__";
-        let (out, code, _leftover) = scan(
-            marker,
-            &[
-                b"file1\n__XHO_E_t",
-                b"est__:42\ndevops@host:~$ ",
-            ],
-        );
+        let (out, code, _leftover) =
+            scan(marker, &[b"file1\n__XHO_E_t", b"est__:42\ndevops@host:~$ "]);
         assert_eq!(out, b"file1\n");
         assert_eq!(code, 42);
     }
@@ -893,10 +1116,7 @@ Opt>";
     fn scanner_lookahead_split_across_chunks() {
         // Marker complete in chunk 1, but the `:7\n` lookahead arrives later.
         let marker = b"__XHO_E_test__";
-        let (out, code, _leftover) = scan(
-            marker,
-            &[b"out__XHO_E_test__", b":7\nprompt$ "],
-        );
+        let (out, code, _leftover) = scan(marker, &[b"out__XHO_E_test__", b":7\nprompt$ "]);
         assert_eq!(out, b"out");
         assert_eq!(code, 7);
     }
@@ -968,10 +1188,7 @@ Opt>";
     fn scanner_holds_partial_marker_suffix() {
         // Chunk ends with a prefix of the marker; it must be held, not flushed.
         let marker = b"__XHO_E_test__";
-        let (out, code, _leftover) = scan(
-            marker,
-            &[b"data __XHO_E", b"_test__:0\n"],
-        );
+        let (out, code, _leftover) = scan(marker, &[b"data __XHO_E", b"_test__:0\n"]);
         assert_eq!(out, b"data ");
         assert_eq!(code, 0);
     }

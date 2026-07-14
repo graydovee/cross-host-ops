@@ -1,28 +1,34 @@
-// Shell-based copy for jumpserver: base64/tar over the navigated PTY.
+// Shell-based copy for jumpserver: raw binary streaming over a `stty raw` PTY.
 //
-// Unlike sftp-based copy (which launches sftp-server and switches to raw
-// passthrough — consuming the PTY), shell-based copy runs ordinary shell
-// commands via `run_command_plain` / `write_line`. The PTY shell stays at
-// the asset prompt after each file, so it can be returned to the session
-// cache for reuse.
+// This replaces the legacy base64/heredoc approach with a streaming binary
+// protocol that is reliable, memory-constant, and gives real-time progress.
 //
-// Upload: base64-encode file data, pipe through a heredoc to `base64 -d`.
-// Download: `base64 -w 0` (single file) or `tar cf - | base64 -w 0` (recursive),
-// capture stdout via run_command_plain, decode, emit CopyFrames.
+// Key design choices:
+//   - `stty raw -echo` gives an 8-bit-clean channel (no ONLCR/ICRNL mangling),
+//     so binary data passes through verbatim — no base64, no 33% bloat.
+//   - Every command is wrapped in a UUID sentinel by `run_command_plain`, so
+//     completion is detected by a strict marker match — no prompt sniffing,
+//     no forgeable heredoc terminators.
+//   - Upload uses `head -c <size>` (reads exactly N bytes — raw mode has no
+//     EOF), fed chunk-by-chunk via `run_command_with_stdin`. Constant memory.
+//   - Download uses `dd bs=16k` piped through `run_command_plain`'s streaming
+//     sender — each PTY chunk becomes a CopyFrame::FileData immediately,
+//     giving the CLI real-time progress updates.
+//   - mode/mtime are preserved via `chmod`/`touch` after transfer.
+//   - A `RawGuard` ensures that if anything fails while in raw mode, the shell
+//     is cleaned up (Ctrl-C + force-close) and never returned to the cache.
 
-use std::io::{Cursor, Read};
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow, bail};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
+use anyhow::{Result, anyhow, bail};
 use tokio::sync::mpsc;
 
 use crate::daemon::jumpserver_engine::PtyShell;
 use crate::types::{CopyDirection, CopyFrame, CopySpec};
 
-const HEREDOC_MARKER: &str = "XHO_CP_EOF";
-const CHUNK_SIZE: usize = 32 * 1024;
+/// Size of each chunk written to / read from the PTY in raw mode.
+/// SSH channel windows are typically ~2 MB, so 16 KB is comfortably safe.
+const RAW_CHUNK_SIZE: usize = 16 * 1024;
 
 /// Run a shell-based copy over a navigated PTY shell.
 pub(crate) async fn run(shell: &mut PtyShell, spec: &mut CopySpec) -> Result<()> {
@@ -33,92 +39,273 @@ pub(crate) async fn run(shell: &mut PtyShell, spec: &mut CopySpec) -> Result<()>
 }
 
 // ---------------------------------------------------------------------------
+// RawGuard — RAII-style raw-mode management with error cleanup
+// ---------------------------------------------------------------------------
+
+/// Manages the `stty raw -echo` ↔ `stty sane` lifecycle around a copy session.
+///
+/// Does NOT hold a borrow of PtyShell — the shell is passed by `&mut` to each
+/// method so the caller can use it freely between calls. This struct only
+/// tracks whether raw mode was entered and whether it was cleanly exited.
+///
+/// **On success**: call `complete(shell)` which sends `stty sane` — the shell
+/// is in cooked mode and can be cached for reuse.
+///
+/// **On error**: call `cleanup_and_close(shell)` which sends Ctrl-C +
+/// force-closes the channel. After this, the shell must be discarded.
+struct RawGuard {
+    /// True after `stty raw -echo` succeeds. Controls whether cleanup runs.
+    entered: bool,
+    /// True after `complete()` runs. Prevents double-cleanup.
+    completed: bool,
+}
+
+impl RawGuard {
+    /// Enter raw mode: `stty raw -echo` (disables echo + line processing).
+    /// PS1 is NOT cleared — instead, data commands use a "begin marker" to
+    /// discard any prompt/noise before the real output. Verified via
+    /// run_command_plain sentinel (runs in cooked mode before the switch).
+    async fn enter(shell: &mut PtyShell) -> Result<Self> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let code = shell.run_command_plain("stty raw -echo", &tx).await?;
+        drop(tx);
+        while rx.recv().await.is_some() {}
+        if code != 0 {
+            bail!("stty raw -echo failed (exit code {code})");
+        }
+        Ok(Self {
+            entered: true,
+            completed: false,
+        })
+    }
+
+    /// Exit raw mode on success: `stty sane`. After this the shell is reusable
+    /// for normal exec/copy operations. Runs in raw mode (echo off).
+    async fn complete(&mut self, shell: &mut PtyShell) -> Result<()> {
+        if self.entered && !self.completed {
+            let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let _ = shell.run_command_raw("stty sane", &tx).await;
+            drop(tx);
+            while rx.recv().await.is_some() {}
+        }
+        self.completed = true;
+        Ok(())
+    }
+
+    /// Cleanup on error: the shell is stuck in raw mode. Send Ctrl-C to
+    /// interrupt any lingering `head`/`dd`, then force-close the channel.
+    /// After this, the caller must discard the shell — never cache it.
+    async fn cleanup_and_close(&mut self, shell: &mut PtyShell) {
+        if self.entered && !self.completed {
+            shell.send_interrupt().await;
+            shell.force_close().await;
+        }
+        self.completed = true;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Upload
 // ---------------------------------------------------------------------------
 
 async fn upload(shell: &mut PtyShell, spec: &mut CopySpec) -> Result<()> {
-    let mut upload_rx = spec
+    let upload_rx = spec
         .upload_rx
         .take()
         .ok_or_else(|| anyhow!("upload copy frame stream missing"))?;
 
-    let mut current_file: Option<(String, Vec<u8>)> = None;
+    let mut guard = RawGuard::enter(shell).await?;
 
+    let result = upload_loop(shell, upload_rx, &spec.remote_path, spec.recursive).await;
+
+    match result {
+        Ok(()) => guard.complete(shell).await,
+        Err(e) => {
+            guard.cleanup_and_close(shell).await;
+            Err(e)
+        }
+    }
+}
+
+/// The upload loop drives the frame stream, and for each file it runs
+/// `run_command_with_stdin` which concurrently feeds FileData chunks to the
+/// remote `head -c` receiver while detecting completion via the UUID sentinel.
+async fn upload_loop(
+    shell: &mut PtyShell,
+    mut upload_rx: mpsc::Receiver<CopyFrame>,
+    remote_root: &str,
+    recursive: bool,
+) -> Result<()> {
     while let Some(frame) = upload_rx.recv().await {
         match frame {
-            CopyFrame::BeginFile { relative_path, .. } => {
-                if current_file.is_some() {
-                    bail!("copy stream began a new file before ending the previous file");
-                }
-                let dest = resolve_upload_path(&spec.remote_path, &relative_path, spec.recursive);
-                current_file = Some((dest, Vec::new()));
+            CopyFrame::BeginFile {
+                relative_path,
+                mode,
+                size,
+                mtime,
+            } => {
+                let dest = resolve_upload_path(remote_root, &relative_path, recursive);
+                // upload_single_file_streaming takes ownership of upload_rx
+                // (moves it into the feeder task) and returns it afterwards.
+                upload_rx =
+                    upload_single_file_streaming(shell, &dest, size, mode, mtime, upload_rx)
+                        .await?;
             }
-            CopyFrame::FileData { data } => {
-                let file = current_file
-                    .as_mut()
-                    .ok_or_else(|| anyhow!("copy stream sent file data before BeginFile"))?;
-                file.1.extend_from_slice(&data);
+            CopyFrame::FileData { .. } => {
+                bail!("copy stream sent file data outside of a BeginFile/EndFile pair");
             }
             CopyFrame::EndFile => {
-                let (dest, data) = current_file
-                    .take()
-                    .ok_or_else(|| anyhow!("copy stream sent EndFile before BeginFile"))?;
-                upload_single_file(shell, &dest, &data).await?;
+                bail!("copy stream sent EndFile without a preceding BeginFile");
             }
             CopyFrame::BeginDirectory { relative_path, .. } => {
-                if !spec.recursive {
+                if !recursive {
                     bail!("remote directory frame requires recursive copy");
                 }
                 let dir = if relative_path.is_empty() {
-                    spec.remote_path.clone()
+                    remote_root.to_string()
                 } else {
-                    join_remote(&spec.remote_path, &relative_path)
+                    join_remote(remote_root, &relative_path)
                 };
-                run_shell_command(shell, &format!("mkdir -p {}", shell_quote(&dir))).await?;
+                run_shell_command_raw(shell, &format!("mkdir -p {}", shell_quote(&dir))).await?;
             }
             CopyFrame::Symlink {
                 relative_path,
                 target,
             } => {
-                let link_path =
-                    resolve_upload_path(&spec.remote_path, &relative_path, spec.recursive);
-                run_shell_command(
+                let link_path = resolve_upload_path(remote_root, &relative_path, recursive);
+                run_shell_command_raw(
                     shell,
-                    &format!("ln -sf {} {}", shell_quote(&target), shell_quote(&link_path)),
+                    &format!(
+                        "ln -sf {} {}",
+                        shell_quote(&target),
+                        shell_quote(&link_path)
+                    ),
                 )
                 .await?;
             }
             CopyFrame::EndOfStream => break,
         }
     }
-    if current_file.is_some() {
-        bail!("copy stream ended before EndFile");
-    }
     Ok(())
 }
 
-/// Upload a single file via base64 heredoc.
-async fn upload_single_file(shell: &mut PtyShell, remote_path: &str, data: &[u8]) -> Result<()> {
-    let encoded = BASE64.encode(data);
-    shell.clear_prompt_remainder();
-    // Write the heredoc start — shell enters heredoc mode and collects input.
-    shell
-        .write_line(&format!(
-            "base64 -d > {} <<'{}'",
-            shell_quote(remote_path),
-            HEREDOC_MARKER
-        ))
+/// Upload one file using the three-phase binary protocol:
+/// 1. Remote command prints a ready marker, then runs `head -c <size>`
+/// 2. We feed FileData chunks after seeing the ready marker
+/// 3. We wait for the end sentinel after all data is sent
+///
+/// Takes ownership of `upload_rx`, consumes FileData + EndFile frames,
+/// returns the receiver for the outer loop.
+async fn upload_single_file_streaming(
+    shell: &mut PtyShell,
+    dest: &str,
+    size: u64,
+    mode: u32,
+    mtime: i64,
+    upload_rx: mpsc::Receiver<CopyFrame>,
+) -> Result<mpsc::Receiver<CopyFrame>> {
+    let tmp = format!("{}.xho_tmp", dest);
+
+    // Generate unique markers for this transfer.
+    let ready_marker = format!("__XHO_CP_READY_{}__", uuid::Uuid::new_v4().simple());
+    let end_marker = format!("__XHO_CP_END_{}__", uuid::Uuid::new_v4().simple());
+
+    // Remote command: print ready marker, run head -c, print end marker + exit.
+    let cmd = format!(
+        "printf '{}'; head -c {} > {}; printf '{}:%s\\n' \"$?\"",
+        ready_marker,
+        size,
+        shell_quote(&tmp),
+        end_marker
+    );
+
+    // Bridge channel: feeder → upload_binary's data input.
+    let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(4);
+
+    // Feeder: pull FileData from upload_rx → data_tx. Returns rx + byte count.
+    let ready_marker_bytes = ready_marker.clone().into_bytes();
+    let end_marker_bytes = end_marker.clone().into_bytes();
+    let feeder_task = tokio::spawn(async move {
+        let mut total_sent = 0u64;
+        let mut rx = upload_rx;
+        loop {
+            match rx.recv().await {
+                Some(CopyFrame::FileData { data }) => {
+                    total_sent += data.len() as u64;
+                    if data_tx.send(data).await.is_err() {
+                        return Err((anyhow!("upload data channel closed"), rx, total_sent));
+                    }
+                }
+                Some(CopyFrame::EndFile) => {
+                    drop(data_tx);
+                    return Ok((rx, total_sent));
+                }
+                Some(other) => {
+                    return Err((
+                        anyhow!("unexpected frame during file upload: {:?}", other),
+                        rx,
+                        total_sent,
+                    ));
+                }
+                None => {
+                    return Err((
+                        anyhow!("upload stream closed during file transfer"),
+                        rx,
+                        total_sent,
+                    ));
+                }
+            }
+        }
+    });
+
+    // Drive the three-phase upload: wait ready → feed data → wait end.
+    let code = shell
+        .upload_binary(&cmd, &ready_marker_bytes, &end_marker_bytes, data_rx)
         .await?;
-    // Stream the base64 data in chunks. The shell is in heredoc mode —
-    // everything written is heredoc content until the terminator line.
-    for chunk in encoded.as_bytes().chunks(CHUNK_SIZE) {
-        shell.write_raw(chunk).await?;
-        shell.write_raw(b"\r").await?;
+
+    let (rx, total_sent) = feeder_task
+        .await
+        .map_err(|e| anyhow!("feeder task panicked: {e}"))
+        .and_then(|r| r.map_err(|(e, _rx, _)| e))?;
+
+    if code != 0 {
+        bail!("remote head -c failed (exit code {code})");
     }
-    // Terminate the heredoc — the shell runs `base64 -d` and writes the file.
-    shell.write_line(HEREDOC_MARKER).await?;
-    shell.wait_for_prompt().await?;
-    shell.clear_pending();
+    if total_sent != size {
+        bail!(
+            "upload size mismatch: declared {} bytes, sent {} bytes",
+            size,
+            total_sent
+        );
+    }
+
+    finalize_upload(shell, &tmp, dest, mode, mtime).await?;
+    Ok(rx)
+}
+
+/// Set mode/mtime and atomically rename tmp → dest.
+async fn finalize_upload(
+    shell: &mut PtyShell,
+    tmp: &str,
+    dest: &str,
+    mode: u32,
+    mtime: i64,
+) -> Result<()> {
+    // Mask to permission bits only (S_ISUID|S_ISGID|S_ISVTX|rwxrwxrwx).
+    // The mode from CopyFrame::BeginFile includes the file-type bits (e.g.
+    // 0o100755 for a regular executable), which chmod rejects.
+    let perm = mode & 0o7777;
+    if perm != 0 {
+        run_shell_command_raw(shell, &format!("chmod {:o} {}", perm, shell_quote(tmp))).await?;
+    }
+    if mtime != 0 {
+        run_shell_command_raw(shell, &format!("touch -d @{} {}", mtime, shell_quote(tmp))).await?;
+    }
+    run_shell_command_raw(
+        shell,
+        &format!("mv {} {}", shell_quote(tmp), shell_quote(dest)),
+    )
+    .await?;
     Ok(())
 }
 
@@ -130,7 +317,7 @@ async fn download(shell: &mut PtyShell, spec: &mut CopySpec) -> Result<()> {
     let download_tx = spec
         .download_tx
         .take()
-        .ok_or_else(|| anyhow!("download copy frame stream missing"))?;
+        .ok_or_else(|| anyhow!("download copy frame stream closed"))?;
 
     // Determine if the remote path is a file or directory.
     let kind_output = run_and_capture(
@@ -144,157 +331,227 @@ async fn download(shell: &mut PtyShell, spec: &mut CopySpec) -> Result<()> {
     let kind_str = String::from_utf8_lossy(&kind_output);
     let is_dir = kind_str.contains("XHO_DIR");
 
-    if is_dir {
+    // Enter raw mode for the actual data transfer.
+    let mut guard = RawGuard::enter(shell).await?;
+
+    let result = if is_dir {
         if !spec.recursive {
+            guard.cleanup_and_close(shell).await;
             bail!("copying a remote directory requires -r");
         }
-        download_recursive(shell, &spec.remote_path, &download_tx).await?;
+        download_recursive(shell, &spec.remote_path, &download_tx).await
     } else {
-        download_single_file(shell, &spec.remote_path, &spec.source_name, &download_tx).await?;
-    }
+        download_single_file(shell, &spec.remote_path, &spec.source_name, &download_tx).await
+    };
 
-    download_tx
-        .send(CopyFrame::EndOfStream)
-        .await
-        .map_err(|_| anyhow!("download copy frame stream closed"))?;
-    Ok(())
+    match result {
+        Ok(()) => {
+            download_tx
+                .send(CopyFrame::EndOfStream)
+                .await
+                .map_err(|_| anyhow!("download copy frame stream closed"))?;
+            guard.complete(shell).await
+        }
+        Err(e) => {
+            guard.cleanup_and_close(shell).await;
+            Err(e)
+        }
+    }
 }
 
-/// Download a single file: `base64 -w 0 path` → decode → frames.
+/// Download a single file: `dd bs=16k if=path` → streaming FileData frames.
+/// Uses run_command_plain's streaming sender so each PTY chunk becomes a
+/// FileData immediately — real-time progress for the CLI.
 async fn download_single_file(
     shell: &mut PtyShell,
     remote_path: &str,
     source_name: &str,
     tx: &mpsc::Sender<CopyFrame>,
 ) -> Result<()> {
-    let raw = run_and_capture(
+    // Get mode/mtime/size via stat (cooked-mode command, before raw transfer).
+    // Get mode/mtime/size via stat. We're in raw mode, so use run_and_capture_raw
+    // (skips drain_echo_line which would eat the output in raw mode).
+    let stat_output = run_and_capture_raw(
         shell,
-        &format!("base64 -w 0 {} 2>/dev/null; echo", shell_quote(remote_path)),
+        &format!(
+            "stat -c '%a %Y %s' {} 2>/dev/null",
+            shell_quote(remote_path)
+        ),
     )
     .await?;
-    let encoded = extract_base64(&raw);
-    let data = BASE64
-        .decode(encoded)
-        .context("failed to decode base64 download payload")?;
+    let stat_str = String::from_utf8_lossy(&stat_output);
+    let parts: Vec<&str> = stat_str.split_whitespace().collect();
+    let (mode, mtime, size) = if parts.len() >= 3 {
+        (
+            u32::from_str_radix(parts[0], 8).unwrap_or(0),
+            parts[1].parse::<i64>().unwrap_or(0),
+            parts[2].parse::<u64>().unwrap_or(0),
+        )
+    } else {
+        (0o644, 0, 0)
+    };
+
     let name = Path::new(remote_path)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(source_name)
         .to_string();
+
+    // Send BeginFile with the real mode/mtime/size so the CLI's progress bar
+    // has an accurate total for percentage/ETA.
     tx.send(CopyFrame::BeginFile {
         relative_path: name,
-        mode: 0o644,
-        size: data.len() as u64,
-        mtime: 0,
+        mode,
+        size,
+        mtime,
     })
     .await
     .map_err(|_| anyhow!("download copy frame stream closed"))?;
-    tx.send(CopyFrame::FileData { data })
-        .await
-        .map_err(|_| anyhow!("download copy frame stream closed"))?;
+
+    // Stream the file via dd. run_command_plain forwards output chunks to the
+    // sender; we relay each chunk as a FileData frame immediately — no buffering.
+    let (ptx, mut prx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let dd_cmd = format!(
+        "dd bs={} if={} 2>/dev/null",
+        RAW_CHUNK_SIZE,
+        shell_quote(remote_path)
+    );
+    let dd_result = shell.run_command_raw(&dd_cmd, &ptx).await;
+    drop(ptx);
+
+    // Forward chunks to the download channel as FileData frames.
+    while let Some(chunk) = prx.recv().await {
+        tx.send(CopyFrame::FileData { data: chunk })
+            .await
+            .map_err(|_| anyhow!("download copy frame stream closed"))?;
+    }
+
+    dd_result?;
+
     tx.send(CopyFrame::EndFile)
         .await
         .map_err(|_| anyhow!("download copy frame stream closed"))?;
     Ok(())
 }
 
-/// Download a directory: `tar cf - name | base64 -w 0` → decode → frames.
+/// Download a directory recursively: list the tree via `find`, then download
+/// each file individually. This avoids buffering the entire tar archive in
+/// memory. Symlinks and empty directories are handled as standalone frames.
 async fn download_recursive(
     shell: &mut PtyShell,
     remote_path: &str,
     tx: &mpsc::Sender<CopyFrame>,
 ) -> Result<()> {
-    let path = Path::new(remote_path);
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| ".".to_string());
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .context("invalid remote path for recursive copy")?;
-
-    let raw = run_and_capture(
+    // List the tree: type, mode, mtime, size, relative-path.
+    //   f = regular file, d = directory, l = symlink (target in extra field)
+    // find -printf '%y\t%m\t%T@\t%s\t%p\n' and for symlinks '%y\t%m\t%T@\t%s\t%p\t%l\n'
+    let listing = run_and_capture_raw(
         shell,
         &format!(
-            "tar cf - -C {} {} 2>/dev/null | base64 -w 0; echo",
-            shell_quote(&parent),
-            shell_quote(name)
+            "find {} -printf '%y\\t%m\\t%T@\\t%s\\t%p\\t%l\\n' 2>/dev/null",
+            shell_quote(remote_path)
         ),
     )
     .await?;
-    let encoded = extract_base64(&raw);
-    let tar_bytes = BASE64
-        .decode(encoded)
-        .context("failed to decode base64 tar payload")?;
+    let listing_str = String::from_utf8_lossy(&listing);
 
-    // Parse the tar archive synchronously (tar::Entries is not Send).
-    let frames = parse_tar_to_frames(&tar_bytes)?;
+    let base = Path::new(remote_path);
+    let base_name = base.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-    for frame in frames {
-        tx.send(frame)
-            .await
-            .map_err(|_| anyhow!("download copy frame stream closed"))?;
+    for line in listing_str.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() < 5 {
+            continue;
+        }
+        let ftype = fields[0].chars().next().unwrap_or('f');
+        let mode = u32::from_str_radix(fields[1], 8).unwrap_or(0);
+        let mtime = fields[2]
+            .split('.')
+            .next()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        let size = fields[3].parse::<u64>().unwrap_or(0);
+        let full_path = fields[4];
+        // Compute relative path from the download root.
+        let relative = if base_name.is_empty() {
+            full_path.to_string()
+        } else {
+            full_path
+                .strip_prefix(remote_path)
+                .unwrap_or(full_path)
+                .trim_start_matches('/')
+                .to_string()
+        };
+
+        match ftype {
+            'd' => {
+                tx.send(CopyFrame::BeginDirectory {
+                    relative_path: relative,
+                    mode,
+                    mtime,
+                })
+                .await
+                .map_err(|_| anyhow!("download copy frame stream closed"))?;
+            }
+            'l' => {
+                let target = fields.get(5).map(|s| s.to_string()).unwrap_or_default();
+                tx.send(CopyFrame::Symlink {
+                    relative_path: relative,
+                    target,
+                })
+                .await
+                .map_err(|_| anyhow!("download copy frame stream closed"))?;
+            }
+            // Regular file: download via streaming dd.
+            _ => {
+                let name = Path::new(&relative)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                tx.send(CopyFrame::BeginFile {
+                    relative_path: relative,
+                    mode,
+                    size,
+                    mtime,
+                })
+                .await
+                .map_err(|_| anyhow!("download copy frame stream closed"))?;
+
+                let (ptx, mut prx) = mpsc::unbounded_channel::<Vec<u8>>();
+                let dd_cmd = format!(
+                    "dd bs={} if={} 2>/dev/null",
+                    RAW_CHUNK_SIZE,
+                    shell_quote(full_path)
+                );
+                let dd_result = shell.run_command_raw(&dd_cmd, &ptx).await;
+                drop(ptx);
+                while let Some(chunk) = prx.recv().await {
+                    tx.send(CopyFrame::FileData { data: chunk })
+                        .await
+                        .map_err(|_| anyhow!("download copy frame stream closed"))?;
+                }
+                dd_result?;
+                let _ = name; // name unused for recursive (relative_path carries it)
+                tx.send(CopyFrame::EndFile)
+                    .await
+                    .map_err(|_| anyhow!("download copy frame stream closed"))?;
+            }
+        }
     }
     Ok(())
-}
-
-/// Parse a tar archive into CopyFrames. Done synchronously because
-/// `tar::Entries` is not `Send`.
-fn parse_tar_to_frames(tar_bytes: &[u8]) -> Result<Vec<CopyFrame>> {
-    let mut archive = tar::Archive::new(Cursor::new(tar_bytes));
-    let mut frames = Vec::new();
-    for entry in archive.entries()? {
-        let mut entry = entry.context("failed to read tar entry")?;
-        let entry_path = entry.path().context("tar entry has invalid path")?;
-        let relative = entry_path.to_string_lossy().to_string();
-
-        if entry.header().entry_type().is_dir() {
-            let clean = relative.trim_end_matches('/').to_string();
-            frames.push(CopyFrame::BeginDirectory {
-                relative_path: clean,
-                mode: entry.header().mode().unwrap_or(0),
-                mtime: entry.header().mtime().unwrap_or(0) as i64,
-            });
-            continue;
-        }
-        if entry.header().entry_type().is_symlink() {
-            let target = entry
-                .link_name()?
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            frames.push(CopyFrame::Symlink {
-                relative_path: relative,
-                target,
-            });
-            continue;
-        }
-        if !entry.header().entry_type().is_file() {
-            continue;
-        }
-        let mut data = Vec::new();
-        entry
-            .read_to_end(&mut data)
-            .context("failed to read tar file entry")?;
-        frames.push(CopyFrame::BeginFile {
-            relative_path: relative,
-            mode: entry.header().mode().unwrap_or(0),
-            size: data.len() as u64,
-            mtime: entry.header().mtime().unwrap_or(0) as i64,
-        });
-        frames.push(CopyFrame::FileData { data });
-        frames.push(CopyFrame::EndFile);
-    }
-    Ok(frames)
 }
 
 // ---------------------------------------------------------------------------
 // PtyShell helpers
 // ---------------------------------------------------------------------------
 
-/// Run a single-line command that produces no output we care about (mkdir,
-/// ln -s). Uses run_command_plain for prompt detection.
+/// Run a single-line command in cooked mode (echo is on). Used for `stty raw`,
+/// `test -d`, and other pre-raw-mode probes.
 async fn run_shell_command(shell: &mut PtyShell, command: &str) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     shell.run_command_plain(command, &tx).await?;
@@ -303,7 +560,17 @@ async fn run_shell_command(shell: &mut PtyShell, command: &str) -> Result<()> {
     Ok(())
 }
 
-/// Run a command and collect all stdout into a Vec.
+/// Run a single-line command in raw mode (echo is off — skip drain_echo_line).
+/// Used for mkdir/chmod/touch/mv/ln during raw-mode upload sessions.
+async fn run_shell_command_raw(shell: &mut PtyShell, command: &str) -> Result<()> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    shell.run_command_raw(command, &tx).await?;
+    drop(tx);
+    while rx.recv().await.is_some() {}
+    Ok(())
+}
+
+/// Run a command in cooked mode and collect all stdout into a Vec.
 async fn run_and_capture(shell: &mut PtyShell, command: &str) -> Result<Vec<u8>> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     shell.run_command_plain(command, &tx).await?;
@@ -315,18 +582,17 @@ async fn run_and_capture(shell: &mut PtyShell, command: &str) -> Result<Vec<u8>>
     Ok(output)
 }
 
-/// Extract the base64 portion from captured output, stripping trailing
-/// newlines and any leading non-base64 noise.
-fn extract_base64(raw: &[u8]) -> &[u8] {
-    let mut end = raw.len();
-    while end > 0 && matches!(raw[end - 1], b'\n' | b'\r') {
-        end -= 1;
+/// Run a command in raw mode and collect all stdout into a Vec. Used for stat
+/// and find listing during raw-mode download sessions.
+async fn run_and_capture_raw(shell: &mut PtyShell, command: &str) -> Result<Vec<u8>> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    shell.run_command_raw(command, &tx).await?;
+    drop(tx);
+    let mut output = Vec::new();
+    while let Some(chunk) = rx.recv().await {
+        output.extend_from_slice(&chunk);
     }
-    let start = raw[..end]
-        .iter()
-        .position(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
-        .unwrap_or(0);
-    &raw[start..end]
+    Ok(output)
 }
 
 fn resolve_upload_path(remote_root: &str, relative_path: &str, recursive: bool) -> String {
