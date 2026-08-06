@@ -13,3 +13,4 @@
 ## 条目
 
 <!-- 新条目加在下方最顶部 -->
+2026-08-06 [bug] list_servers 跳过不具备 LIST 能力的网关（如 Jumpserver 堡垒机），不再向客户端返回 Unsupported 源
