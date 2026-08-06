@@ -63,8 +63,9 @@ v0.4.0 moved control plane `2222 → 12222` to free 2222 for the proxy. If you s
 `CHANGELOG.md`（仓库根）是本项目的变更记录，**仅向前维护，不回填历史**。
 
 - **每次 commit 前必须先更新 `CHANGELOG.md`**：在"条目"区最上方追加一行，简短描述本次变更。
-- 格式严格为：`yyyy-MM-dd [tag] 内容`，例如 `2026-08-06 [feat] jumpserver 支持 -i stdin 转发`。
-- tag 只有 4 种，**按本次变更的实质归类，而非看 commit 前缀**：
+- **条目一律用英文撰写**，简明描述变更实质，不得使用中文。
+- 格式严格为：`yyyy-MM-dd [tag] content`，例如 `2026-08-06 [feat] jumpserver supports -i stdin forwarding`。
+- tag 只有 4 种，**按本次变更的实质归类，而非 commit 前缀**：
 
   | tag         | 何时使用 |
   |-------------|---------|
@@ -75,6 +76,38 @@ v0.4.0 moved control plane `2222 → 12222` to free 2222 for the proxy. If you s
 
 - 伴随某次 `fix`/`feat` 的测试、格式化、小清理等改动**不单独记一行**，并入对应那条；Merge / Revert 提交不单独记录。
 - **changelog 行与代码改动放同一个 commit**，不要单独提一个 changelog commit。
+
+## 交互与文档规范
+
+### 语言规范
+
+所有面向用户的输出、解释、说明、问题回答，一律使用**中文**。
+
+代码注释（包括行内注释、函数注释、包注释）全部使用**英文**，不得混用中文。
+
+正确的做法：
+```rust
+// Calculate the sum of two numbers
+fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+```
+
+错误的做法：
+```rust
+// 计算两个数字的和
+fn 加法(a: i32, b: i32) -> i32 {
+    a + b
+}
+```
+
+### 文档生成规范
+
+不要主动生成任何文档文件（包括但不限于 `.md`、`.txt`、`README`、API 文档、设计文档等），除非用户明确要求。
+
+如果在完成任务过程中判断某个文档**非常必要**，必须先用中文向用户说明原因并征得同意，再生成。
+
+> 原则：文档是用户的决策，不是默认行为。
 
 ## Platform compatibility (real gotchas here)
 

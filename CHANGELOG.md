@@ -1,16 +1,16 @@
 # Changelog
 
-<!-- 维护规则：每次 commit 前在本文件"条目"区最上方追加一行。
-     格式：yyyy-MM-dd [tag] 简短内容
-     tag 取值：feat | bug | refactor | docs
-     归类按变更实质，而非 commit 前缀：
-       新增功能或能力（含独立新增的测试/工具）→ [feat]
-       修复缺陷 → [bug]
-       不改变外部行为的重构、内部清理、依赖升级、CI/构建调整 → [refactor]
-       文档变更 → [docs]
-     伴随某次 fix/feat 的测试、格式化等改动不单独记一行，并入对应条目。 -->
+<!-- Maintenance rules: before every commit, prepend one line to the "Entries" section below.
+     Format: yyyy-MM-dd [tag] brief content
+     tag values: feat | bug | refactor | docs
+     Classify by the substance of the change, not the commit prefix:
+       new feature or capability (incl. independently added tests/tools) -> [feat]
+       bug fix -> [bug]
+       behavior-preserving refactor, internal cleanup, dependency upgrade, CI/build adjustment -> [refactor]
+       documentation change -> [docs]
+     Tests/formatting/minor cleanup bundled with a fix/feat are NOT logged separately; fold them into that entry. -->
 
-## 条目
+## Entries
 
-<!-- 新条目加在下方最顶部 -->
-2026-08-06 [bug] list_servers 跳过不具备 LIST 能力的网关（如 Jumpserver 堡垒机），不再向客户端返回 Unsupported 源
+<!-- Prepend new entries at the very top -->
+2026-08-06 [bug] list_servers skips gateways without LIST capability (e.g. Jumpserver bastions); no longer returns Unsupported sources to clients
