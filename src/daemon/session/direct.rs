@@ -190,12 +190,14 @@ enum Control {
         signal: String,
     },
     Eof,
+    Data {
+        bytes: Vec<u8>,
+    },
 }
 
 /// A `TargetSession` backed by a raw outbound russh client channel.
 pub(crate) struct DirectSshSession {
     control_tx: mpsc::Sender<Control>,
-    stdin_tx: mpsc::Sender<Vec<u8>>,
     events_rx: mpsc::UnboundedReceiver<SessionEvent>,
 }
 
@@ -210,18 +212,21 @@ impl DirectSshSession {
         on_done: Box<dyn FnOnce() + Send>,
     ) -> Self {
         exit_code.store(NO_EXIT, Ordering::Relaxed);
-        let (control_tx, control_rx) = mpsc::channel::<Control>(32);
-        let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(64);
+        // Control messages and stdin payload deliberately share ONE ordered
+        // channel: the API contract is "start before data, data before eof".
+        // Two separate channels consumed by `select!` reorder messages at
+        // random — data or eof can reach the SSH channel before the exec /
+        // subsystem request, hanging the session or dropping stdin.
+        let (control_tx, control_rx) = mpsc::channel::<Control>(64);
         let (events_tx, events_rx) = mpsc::unbounded_channel::<SessionEvent>();
 
         tokio::spawn(async move {
-            driver(channel, control_rx, stdin_rx, events_tx, exit_code).await;
+            driver(channel, control_rx, events_tx, exit_code).await;
             on_done();
         });
 
         Self {
             control_tx,
-            stdin_tx,
             events_rx,
         }
     }
@@ -230,7 +235,6 @@ impl DirectSshSession {
 async fn driver(
     mut channel: Channel<client::Msg>,
     mut control_rx: mpsc::Receiver<Control>,
-    mut stdin_rx: mpsc::Receiver<Vec<u8>>,
     events_tx: mpsc::UnboundedSender<SessionEvent>,
     exit_code: Arc<AtomicU32>,
 ) {
@@ -238,15 +242,6 @@ async fn driver(
     let mut exit_sent = false;
     loop {
         tokio::select! {
-            stdin = stdin_rx.recv(), if stdin_open => match stdin {
-                Some(bytes) => {
-                    if channel.data(Cursor::new(bytes)).await.is_err() { break; }
-                }
-                None => {
-                    let _ = channel.eof().await;
-                    stdin_open = false;
-                }
-            },
             ctrl = control_rx.recv() => match ctrl {
                 Some(Control::Pty { term, cols, rows, modes, reply }) => {
                     let r = channel.request_pty(true, &term, cols, rows, 0, 0, &modes).await;
@@ -276,7 +271,12 @@ async fn driver(
                 }
                 Some(Control::Eof) => {
                     let _ = channel.eof().await;
+                    stdin_open = false;
                 }
+                Some(Control::Data { bytes }) if stdin_open => {
+                    if channel.data(Cursor::new(bytes)).await.is_err() { break; }
+                }
+                Some(Control::Data { .. }) => {}
                 None => break,
             },
             msg = channel.wait() => match msg {
@@ -415,8 +415,10 @@ impl TargetSession for DirectSshSession {
     }
 
     async fn write_stdin(&mut self, data: &[u8]) -> Result<()> {
-        self.stdin_tx
-            .send(data.to_vec())
+        self.control_tx
+            .send(Control::Data {
+                bytes: data.to_vec(),
+            })
             .await
             .map_err(|_| anyhow::anyhow!("session closed"))?;
         Ok(())

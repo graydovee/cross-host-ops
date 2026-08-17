@@ -22,6 +22,12 @@ use super::{SessionEvent, TargetSession};
 
 type RpcClient = XhoRpcClient<tonic::transport::Channel>;
 
+// Control AND stdin payload share ONE ordered channel: the session API
+// contract is "start (exec/subsystem) before data, data before eof", and a
+// single FIFO channel preserves that order on the wire. Splitting them into
+// two channels consumed by `select!` reorders messages randomly — eof/data
+// can overtake the exec request, leaving the remote session with no running
+// process (hang) or silently dropped stdin.
 enum Control {
     Pty { term: String, cols: u32, rows: u32 },
     Env { key: String, value: String },
@@ -31,23 +37,21 @@ enum Control {
     WindowChange { cols: u32, rows: u32 },
     Signal { signal: String },
     Eof,
+    Data { bytes: Vec<u8> },
 }
 
 pub(crate) struct TunneledSession {
     control_tx: mpsc::Sender<Control>,
-    stdin_tx: mpsc::Sender<Vec<u8>>,
     events_rx: mpsc::UnboundedReceiver<SessionEvent>,
 }
 
 impl TunneledSession {
     pub(crate) fn new(client: RpcClient, target: String) -> Self {
-        let (control_tx, control_rx) = mpsc::channel::<Control>(32);
-        let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (control_tx, control_rx) = mpsc::channel::<Control>(64);
         let (events_tx, events_rx) = mpsc::unbounded_channel::<SessionEvent>();
-        tokio::spawn(driver(client, target, control_rx, stdin_rx, events_tx));
+        tokio::spawn(driver(client, target, control_rx, events_tx));
         Self {
             control_tx,
-            stdin_tx,
             events_rx,
         }
     }
@@ -57,7 +61,6 @@ async fn driver(
     mut client: RpcClient,
     target: String,
     mut control_rx: mpsc::Receiver<Control>,
-    mut stdin_rx: mpsc::Receiver<Vec<u8>>,
     events_tx: mpsc::UnboundedSender<SessionEvent>,
 ) {
     let (req_tx, req_rx) = mpsc::channel::<r::SessionRequest>(64);
@@ -114,15 +117,10 @@ async fn driver(
                 Some(Control::Eof) => {
                     let _ = send_req(&req_tx, r::session_request::Msg::Eof(r::SessionEof {})).await;
                 }
+                Some(Control::Data { bytes }) => {
+                    let _ = send_req(&req_tx, r::session_request::Msg::Data(r::SessionData { data: bytes })).await;
+                }
                 None => break,
-            },
-            stdin = stdin_rx.recv() => match stdin {
-                Some(data) => {
-                    let _ = send_req(&req_tx, r::session_request::Msg::Data(r::SessionData { data })).await;
-                }
-                None => {
-                    let _ = send_req(&req_tx, r::session_request::Msg::Eof(r::SessionEof {})).await;
-                }
             },
             msg = response.message() => match msg {
                 Ok(Some(resp)) => match resp.msg {
@@ -251,8 +249,10 @@ impl TargetSession for TunneledSession {
     }
 
     async fn write_stdin(&mut self, data: &[u8]) -> Result<()> {
-        self.stdin_tx
-            .send(data.to_vec())
+        self.control_tx
+            .send(Control::Data {
+                bytes: data.to_vec(),
+            })
             .await
             .map_err(|_| anyhow!("session closed"))?;
         Ok(())

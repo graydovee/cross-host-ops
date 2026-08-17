@@ -123,6 +123,9 @@ enum Control {
         signal: String,
     },
     Eof,
+    Data {
+        bytes: Vec<u8>,
+    },
 }
 
 /// What the driver needs to drive a running backend.
@@ -170,25 +173,19 @@ impl WriteSide {
 
 pub(crate) struct LocalSession {
     control_tx: mpsc::Sender<Control>,
-    stdin_tx: mpsc::Sender<Vec<u8>>,
     events_rx: mpsc::UnboundedReceiver<SessionEvent>,
 }
 
 impl LocalSession {
     pub(crate) fn new(shell: String, sftp_server_path: Option<String>) -> Self {
-        let (control_tx, control_rx) = mpsc::channel::<Control>(32);
-        let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(64);
+        // Control and stdin share ONE ordered channel so eof/data cannot
+        // overtake the exec/subsystem start (see DirectSshSession for the
+        // rationale); pre-start stdin is buffered by the driver.
+        let (control_tx, control_rx) = mpsc::channel::<Control>(64);
         let (events_tx, events_rx) = mpsc::unbounded_channel::<SessionEvent>();
-        tokio::spawn(driver(
-            shell,
-            sftp_server_path,
-            control_rx,
-            stdin_rx,
-            events_tx,
-        ));
+        tokio::spawn(driver(shell, sftp_server_path, control_rx, events_tx));
         Self {
             control_tx,
-            stdin_tx,
             events_rx,
         }
     }
@@ -198,31 +195,18 @@ async fn driver(
     shell: String,
     sftp_server_path: Option<String>,
     mut control_rx: mpsc::Receiver<Control>,
-    mut stdin_rx: mpsc::Receiver<Vec<u8>>,
     events_tx: mpsc::UnboundedSender<SessionEvent>,
 ) {
     let mut pty: Option<(String, u32, u32)> = None;
     let mut env: Vec<(String, String)> = Vec::new();
     let mut backend: Option<Backend> = None;
+    // Stdin that arrived before a backend was started (kept for parity with
+    // the old backend-gated stdin channel; callers normally start first).
+    let mut pending_stdin: std::collections::VecDeque<Vec<u8>> = Default::default();
+    let mut pending_eof = false;
 
     loop {
         tokio::select! {
-            // Only poll stdin when a backend exists.
-            stdin = async {
-                match &backend {
-                    Some(_) => stdin_rx.recv().await,
-                    None => std::future::pending::<Option<Vec<u8>>>().await,
-                }
-            } => match stdin {
-                Some(bytes) => {
-                    if let Some(b) = backend.as_mut() {
-                        b.write.write(&bytes).await;
-                    }
-                }
-                None => {
-                    if let Some(b) = backend.as_mut() { b.write.eof().await; }
-                }
-            },
             ctrl = control_rx.recv() => match ctrl {
                 Some(Control::Pty { term, cols, rows, reply }) => {
                     pty = Some((term, cols, rows));
@@ -239,7 +223,11 @@ async fn driver(
                     }
                     let argv = vec![shell.clone(), "-c".to_string(), command];
                     match spawn(&pty, &env, &argv, &events_tx).await {
-                        Ok(b) => { backend = Some(b); let _ = reply.send(Ok(())); }
+                        Ok(b) => {
+                            backend = Some(b);
+                            flush_pending_stdin(&mut backend, &mut pending_stdin, &mut pending_eof).await;
+                            let _ = reply.send(Ok(()));
+                        }
                         Err(e) => { let _ = reply.send(Err(e)); }
                     }
                 }
@@ -250,7 +238,11 @@ async fn driver(
                     }
                     let argv = vec![shell.clone()];
                     match spawn(&pty, &env, &argv, &events_tx).await {
-                        Ok(b) => { backend = Some(b); let _ = reply.send(Ok(())); }
+                        Ok(b) => {
+                            backend = Some(b);
+                            flush_pending_stdin(&mut backend, &mut pending_stdin, &mut pending_eof).await;
+                            let _ = reply.send(Ok(()));
+                        }
                         Err(e) => { let _ = reply.send(Err(e)); }
                     }
                 }
@@ -264,7 +256,11 @@ async fn driver(
                         continue;
                     };
                     match spawn_sftp(&sftp, &events_tx).await {
-                        Ok(b) => { backend = Some(b); let _ = reply.send(Ok(())); }
+                        Ok(b) => {
+                            backend = Some(b);
+                            flush_pending_stdin(&mut backend, &mut pending_stdin, &mut pending_eof).await;
+                            let _ = reply.send(Ok(()));
+                        }
                         Err(e) => { let _ = reply.send(Err(e)); }
                     }
                 }
@@ -279,11 +275,38 @@ async fn driver(
                     }
                 }
                 Some(Control::Eof) => {
-                    if let Some(b) = backend.as_mut() { b.write.eof().await; }
+                    if let Some(b) = backend.as_mut() {
+                        b.write.eof().await;
+                    } else {
+                        pending_eof = true;
+                    }
+                }
+                Some(Control::Data { bytes }) => {
+                    if let Some(b) = backend.as_mut() {
+                        b.write.write(&bytes).await;
+                    } else {
+                        pending_stdin.push_back(bytes);
+                    }
                 }
                 None => break,
             },
         }
+    }
+}
+
+/// Deliver stdin that was buffered while no backend was running.
+async fn flush_pending_stdin(
+    backend: &mut Option<Backend>,
+    pending: &mut std::collections::VecDeque<Vec<u8>>,
+    pending_eof: &mut bool,
+) {
+    let Some(b) = backend.as_mut() else { return };
+    while let Some(bytes) = pending.pop_front() {
+        b.write.write(&bytes).await;
+    }
+    if *pending_eof {
+        b.write.eof().await;
+        *pending_eof = false;
     }
 }
 
@@ -546,8 +569,10 @@ impl TargetSession for LocalSession {
     }
 
     async fn write_stdin(&mut self, data: &[u8]) -> Result<()> {
-        self.stdin_tx
-            .send(data.to_vec())
+        self.control_tx
+            .send(Control::Data {
+                bytes: data.to_vec(),
+            })
             .await
             .map_err(|_| anyhow::anyhow!("session closed"))?;
         Ok(())
