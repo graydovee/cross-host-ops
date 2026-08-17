@@ -9,7 +9,7 @@
 //! - `1..=123` — remote command exit code (transparently forwarded, capped)
 //! - `124`     — `--timeout` deadline expired
 //! - `125`     — xho/daemon internal error (config, transport, resolver, missing operand)
-//! - `126`     — cannot execute (auth failure, host-key rejection, review deny, non-interactive prompt)
+//! - `126`     — cannot execute (auth failure, host-key rejection, review deny)
 //! - `127`     — target not found / unknown alias / unsupported capability
 
 /// Remote command succeeded.
@@ -27,8 +27,7 @@ pub const EXIT_TIMEOUT: i32 = 124;
 /// Xho/daemon internal error (config, transport, resolver, daemon unreachable).
 pub const EXIT_INTERNAL: i32 = 125;
 
-/// Cannot execute: authentication failure, host-key rejection, review deny,
-/// or non-interactive mode blocked a required prompt.
+/// Cannot execute: authentication failure, host-key rejection, or review deny.
 pub const EXIT_CANNOT_EXECUTE: i32 = 126;
 
 /// Target not found, unknown alias, or unsupported capability.
@@ -66,8 +65,7 @@ pub enum XhoError {
     /// Usage error: bad arguments or missing operand.
     UsageError(String),
 
-    /// Authentication failure, host-key rejection, review deny, or
-    /// non-interactive mode blocked a required prompt.
+    /// Authentication failure, host-key rejection, or review deny.
     CannotExecute(String),
 
     /// Target not found, unknown alias, or unsupported capability.

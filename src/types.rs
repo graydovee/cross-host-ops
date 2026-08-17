@@ -3,7 +3,7 @@
 // stable, module-independent home for types that outlive the legacy modules.
 
 /// Direction of a file copy operation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CopyDirection {
     Upload,
     Download,
@@ -53,7 +53,7 @@ impl Clone for CopySpec {
         // Frame channels are not clonable; cloning drops them (used only in retry paths
         // before channels are populated, so this is safe in practice).
         Self {
-            direction: self.direction.clone(),
+            direction: self.direction,
             remote_path: self.remote_path.clone(),
             recursive: self.recursive,
             source_name: self.source_name.clone(),

@@ -104,11 +104,7 @@ pub trait Gateway: Send + Sync {
     /// dependency and preserve the navigated shell for session cache reuse.
     ///
     /// Requires [`Capabilities::COPY`].
-    async fn copy(
-        &self,
-        target: &str,
-        spec: crate::types::CopySpec,
-    ) -> Result<(), GatewayError> {
+    async fn copy(&self, target: &str, spec: crate::types::CopySpec) -> Result<(), GatewayError> {
         let sess = self.open_session(target).await?;
         let sftp = crate::daemon::session::sftp_copy::open_sftp(sess)
             .await
@@ -327,8 +323,7 @@ pub fn build_gateways(
 ) -> Vec<(String, Arc<dyn Gateway>)> {
     let mut gateways: Vec<(String, Arc<dyn Gateway>)> = Vec::new();
 
-    let (max_connections_per_address, max_idle_time, keepalive_interval) = match config.try_read()
-    {
+    let (max_connections_per_address, max_idle_time, keepalive_interval) = match config.try_read() {
         Ok(cfg) => (
             cfg.ssh.max_connections_per_ip,
             cfg.ssh.max_idle_time,

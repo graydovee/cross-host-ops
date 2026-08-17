@@ -1,8 +1,10 @@
+mod audit;
 mod client;
 mod copy;
 mod duration;
 mod gateway;
 mod inventory;
+mod mfa;
 mod path;
 mod reverse_proxy;
 mod review;
@@ -16,6 +18,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+pub use self::audit::AuditConfig;
 pub use self::client::{ClientConfig, LocalClientConfig};
 pub use self::copy::CopyConfig;
 pub use self::duration::parse_duration;
@@ -28,16 +31,18 @@ pub use self::inventory::{
     glob_match, list_server_entries, load_server_config, parse_ssh_config, resolve_server_entry,
     resolve_ssh_host,
 };
+pub use self::mfa::MfaConfig;
 pub use self::path::{
-    default_client_config_path, default_config_path, default_known_hosts_path, default_root_dir,
-    default_vault_path, expand_tilde,
+    default_audit_log_path, default_client_config_path, default_config_path,
+    default_known_hosts_path, default_root_dir, default_vault_path, expand_tilde,
 };
 pub use self::reverse_proxy::ReverseProxyClientConfig;
 pub use self::review::{
-    FastAllowlistConfig, MfaConfig, ReviewAction, ReviewConfig, ReviewPolicy, ReviewPrompts,
-    RiskLevel, SemanticWhitelistEntry, default_review_api_key, default_review_endpoint,
-    default_review_model, default_review_system_prompt, default_review_template,
-    default_semantic_whitelist,
+    FastAllowlistConfig, ReviewAction, ReviewConfig, ReviewCopyConfig, ReviewCopyPrompts,
+    ReviewExecConfig, ReviewPolicy, ReviewPrompts, RiskLevel, SemanticWhitelistEntry,
+    default_copy_blocklist, default_copy_review_system_prompt, default_copy_review_template,
+    default_review_api_key, default_review_endpoint, default_review_model,
+    default_review_system_prompt, default_review_template, default_semantic_whitelist,
 };
 pub use self::secret::{Secret, SecretConfig, SecretResolver, SecretSource};
 pub use self::server::{LocalServerConfig, ProxyServerConfig, RemoteServerConfig, ServerConfig};
@@ -51,6 +56,8 @@ pub struct AppConfig {
     pub ssh: SshConfig,
     pub copy: CopyConfig,
     pub review: ReviewConfig,
+    #[serde(default)]
+    pub audit: AuditConfig,
     #[serde(default)]
     pub secret: SecretConfig,
     #[serde(default)]
@@ -71,6 +78,7 @@ impl Default for AppConfig {
             ssh: SshConfig::default(),
             copy: CopyConfig::default(),
             review: ReviewConfig::default(),
+            audit: AuditConfig::default(),
             secret: SecretConfig::default(),
             gateways: Vec::new(),
             reverse_proxy: ReverseProxyClientConfig::default(),
@@ -102,6 +110,9 @@ impl AppConfig {
     pub fn expand_paths(&mut self) -> Result<()> {
         if let Some(log_path) = &self.server.log_path {
             self.server.log_path = Some(expand_tilde(log_path)?);
+        }
+        if let Some(audit_path) = &self.audit.path {
+            self.audit.path = Some(expand_tilde(audit_path)?);
         }
         self.server.local.socket_path = expand_tilde(&self.server.local.socket_path)?;
         self.server.remote.host_key_path = expand_tilde(&self.server.remote.host_key_path)?;
@@ -266,13 +277,54 @@ mod tests {
     }
 
     #[test]
+    fn audit_defaults_enabled_with_fallback_path() {
+        let config = AppConfig::default();
+        assert!(config.audit.enabled, "audit should be enabled by default");
+        assert!(config.audit.include_identity);
+        assert!(
+            config.audit.path.is_none(),
+            "path defaults to code fallback"
+        );
+        // review sub-configs default to disabled, independent of each other
+        assert!(!config.review.exec.enable);
+        assert!(!config.review.copy.enable);
+        // copy blocklist has sensible defaults
+        assert!(!config.review.copy.blocklist.is_empty());
+    }
+
+    #[test]
+    fn audit_path_tilde_expansion() {
+        let mut config = AppConfig::default();
+        config.audit.path = Some("~/audit-test.jsonl".to_string());
+        config.expand_paths().expect("expand");
+        assert!(
+            !config.audit.path.as_ref().unwrap().contains('~'),
+            "tilde should be expanded"
+        );
+    }
+
+    #[test]
+    fn review_exec_and_copy_independent_toggles() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[review.exec]
+enable = true
+[review.copy]
+enable = false
+"#,
+        )
+        .expect("parse");
+        assert!(config.review.exec.enable);
+        assert!(!config.review.copy.enable);
+    }
+
+    #[test]
     fn server_inactivity_timeout_defaults_and_overrides() {
         use std::time::Duration;
         // Absent [server] table → None (no idle timeout).
         assert_eq!(AppConfig::default().server.inactivity_timeout, None);
         // Partial [server] table without the field → None as well.
-        let config: AppConfig =
-            toml::from_str("[server]\nlog_level = \"debug\"\n").expect("parse");
+        let config: AppConfig = toml::from_str("[server]\nlog_level = \"debug\"\n").expect("parse");
         assert_eq!(config.server.inactivity_timeout, None);
         // Explicit override is honored.
         let config: AppConfig =

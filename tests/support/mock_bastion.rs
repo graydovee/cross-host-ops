@@ -22,9 +22,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
+use russh::keys::ssh_key;
 use russh::server::{self, Auth, Msg, Server as _};
 use russh::{Channel, ChannelId, Pty, Sig};
-use russh::keys::ssh_key;
 use tokio::net::TcpListener;
 use tokio::process::Command;
 

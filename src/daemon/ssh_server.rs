@@ -63,11 +63,13 @@ pub(super) struct ReverseProxyHandshake {
 
 /// Metadata about a remote SSH connection (peer address, user, key fingerprint).
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
-pub(super) struct RemoteConnectInfo {
+pub(crate) struct RemoteConnectInfo {
     pub peer_addr: Option<SocketAddr>,
     pub ssh_user: String,
     pub public_key_fingerprint: String,
+    /// `true` when the connection authenticated via a dynamic/bootstrap token
+    /// (password auth) rather than an authorized public key.
+    pub via_token: bool,
 }
 
 /// Wraps a russh channel stream with connection metadata.
@@ -346,6 +348,7 @@ impl server::Handler for RemoteSshHandler {
             peer_addr: self.peer_addr,
             ssh_user: self.accepted_user.clone().unwrap_or_default(),
             public_key_fingerprint: self.accepted_fingerprint.clone().unwrap_or_default(),
+            via_token: self.authed_via_token,
         };
         session.channel_success(channel)?;
 

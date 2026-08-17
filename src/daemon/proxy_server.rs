@@ -16,7 +16,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use russh::Pty;
-use russh::keys::ssh_key;
+use russh::keys::ssh_key::{self, HashAlg};
 use russh::server::{self, Auth, Msg};
 use russh::{Channel, ChannelId, Sig};
 use tokio::sync::mpsc;
@@ -63,6 +63,8 @@ pub(super) struct ProxySshHandler {
     authorized_keys_path: String,
     peer: Option<SocketAddr>,
     user: Option<String>,
+    /// SHA-256 fingerprint of the accepted public key (for audit logging).
+    accepted_fingerprint: Option<String>,
     channels: HashMap<ChannelId, ChannelEntry>,
     /// Senders to running bridge tasks, keyed by channel id.
     bridges: HashMap<ChannelId, mpsc::Sender<ProxyMsg>>,
@@ -77,6 +79,7 @@ impl server::Server for ProxySshServer {
             authorized_keys_path: self.authorized_keys_path.clone(),
             peer: peer_addr,
             user: None,
+            accepted_fingerprint: None,
             channels: HashMap::new(),
             bridges: HashMap::new(),
         }
@@ -106,6 +109,7 @@ fn spawn_bridge(
     entry: ChannelEntry,
     channel_id: ChannelId,
     start: SessionStart,
+    caller: crate::oversight::Caller,
     bridges: &mut HashMap<ChannelId, mpsc::Sender<ProxyMsg>>,
 ) {
     let (tx, rx) = mpsc::channel::<ProxyMsg>(64);
@@ -136,6 +140,10 @@ fn spawn_bridge(
                 return;
             }
         };
+        let gateway_kind = state
+            .find_gateway_any(&route.gateway_name)
+            .await
+            .map(|g| g.kind());
         let mut sess: Box<dyn TargetSession> = match session::open_target_session(&state, &route)
             .await
         {
@@ -153,6 +161,32 @@ fn spawn_bridge(
         for (k, v) in &entry.env {
             let _ = sess.set_env(k, v).await;
         }
+
+        // Audit: proxy operation started.
+        let (session_kind, command_or_name): (&str, String) = match &start {
+            SessionStart::Exec(cmd) => ("exec", cmd.clone()),
+            SessionStart::Shell => ("shell", "(interactive)".to_string()),
+            SessionStart::Subsystem(name) => ("subsystem", name.clone()),
+        };
+        let mut started_event = crate::oversight::AuditEvent::new(
+            caller.source,
+            crate::oversight::OperationKind::Proxy.as_str(),
+            "started",
+        );
+        started_event.target_input = Some(user.clone());
+        started_event.gateway = Some(route.gateway_name.clone());
+        started_event.end_target = Some(route.end_target.clone());
+        started_event.gateway_kind = gateway_kind.map(|k| k.to_string());
+        started_event.session_kind = Some(session_kind.to_string());
+        started_event.command = Some(command_or_name);
+        if crate::oversight::audit::include_identity() {
+            started_event.caller_source = Some(caller.source.to_string());
+            started_event.caller_peer = caller.peer_addr.clone();
+            started_event.caller_ssh_user = caller.ssh_user.clone();
+            started_event.caller_key_fingerprint = caller.key_fingerprint.clone();
+            started_event.caller_via_token = Some(caller.via_token);
+        }
+        crate::oversight::audit::record(&started_event);
 
         // Start the backend.
         let started = match start {
@@ -179,6 +213,18 @@ fn spawn_bridge(
                     Some(SessionEvent::Stdout(d)) => { let _ = channel.data(Cursor::new(d)).await; }
                     Some(SessionEvent::Stderr(d)) => { let _ = channel.extended_data(1, Cursor::new(d)).await; }
                     Some(SessionEvent::ExitStatus(c)) => {
+                        let mut ev = crate::oversight::AuditEvent::new(
+                            caller.source,
+                            crate::oversight::OperationKind::Proxy.as_str(),
+                            "completed",
+                        );
+                        ev.target_input = Some(user.clone());
+                        ev.gateway = Some(route.gateway_name.clone());
+                        ev.end_target = Some(route.end_target.clone());
+                        ev.gateway_kind = gateway_kind.map(|k| k.to_string());
+                        ev.session_kind = Some(session_kind.to_string());
+                        ev.exit_code = Some(c);
+                        crate::oversight::audit::record(&ev);
                         let _ = channel.exit_status(c as u32).await;
                         let _ = channel.eof().await;
                         let _ = channel.close().await;
@@ -225,6 +271,7 @@ impl server::Handler for ProxySshHandler {
                 .unwrap_or(false);
         if ok {
             self.user = Some(user.to_string());
+            self.accepted_fingerprint = Some(key.fingerprint(HashAlg::Sha256).to_string());
             info!(peer = ?self.peer, ssh_user = %user, "proxy: accepted publickey");
             Ok(Auth::Accept)
         } else {
@@ -401,10 +448,23 @@ impl ProxySshHandler {
             Some(u) => u.clone(),
             None => return false,
         };
+        let caller = crate::oversight::Caller::proxy(
+            self.peer.map(|a| a.to_string()),
+            user.clone(),
+            self.accepted_fingerprint.clone(),
+        );
         let Some(entry) = self.channels.remove(&channel) else {
             return false;
         };
-        spawn_bridge(&self.state, &user, entry, channel, start, &mut self.bridges);
+        spawn_bridge(
+            &self.state,
+            &user,
+            entry,
+            channel,
+            start,
+            caller,
+            &mut self.bridges,
+        );
         true
     }
 }

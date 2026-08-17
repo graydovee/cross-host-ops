@@ -129,6 +129,7 @@ message CopyRequest {
     CopyStartRequest start = 1;
     AuthInputRequest auth_input = 2;
     CopyFrame frame = 3;
+    ConfirmRequest confirm = 4;
   }
 }
 
@@ -199,6 +200,8 @@ message CopyResponse {
     AuthPrompt auth_prompt = 3;
     CopyComplete complete = 4;
     CopyFrame frame = 5;
+    ReviewResult review_result = 6;
+    ConfirmRequired confirm_required = 7;
   }
 }
 

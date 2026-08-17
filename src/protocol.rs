@@ -351,6 +351,47 @@ pub fn copy_info_response(message: impl Into<String>) -> rpc::CopyResponse {
     }
 }
 
+pub fn copy_review_result_response(
+    execution_id: Uuid,
+    risk_level: RiskLevel,
+    action: ReviewAction,
+    reason: impl Into<String>,
+    matched_whitelist_reason: Option<String>,
+) -> rpc::CopyResponse {
+    rpc::CopyResponse {
+        event: Some(rpc::copy_response::Event::ReviewResult(rpc::ReviewResult {
+            execution_id: execution_id.to_string(),
+            risk_level: risk_level.to_string(),
+            action: action.to_string(),
+            reason: reason.into(),
+            matched_whitelist_reason: matched_whitelist_reason.unwrap_or_default(),
+        })),
+    }
+}
+
+pub fn copy_confirm_required_response(
+    execution_id: Uuid,
+    reason: impl Into<String>,
+) -> rpc::CopyResponse {
+    rpc::CopyResponse {
+        event: Some(rpc::copy_response::Event::ConfirmRequired(
+            rpc::ConfirmRequired {
+                execution_id: execution_id.to_string(),
+                reason: reason.into(),
+            },
+        )),
+    }
+}
+
+pub fn copy_confirm_request(execution_id: Uuid, allow: bool) -> rpc::CopyRequest {
+    rpc::CopyRequest {
+        request: Some(rpc::copy_request::Request::Confirm(rpc::ConfirmRequest {
+            execution_id: execution_id.to_string(),
+            allow,
+        })),
+    }
+}
+
 // --- GatewayStatus helpers ---
 
 /// Domain representation of a gateway's status, including optional nested

@@ -22,9 +22,9 @@ pub struct ArunCli {
     #[arg(long = "output", default_value = "text")]
     pub output_format: OutputFormat,
 
-    /// Disable all interactive prompts; fail instead of waiting for human input.
-    #[arg(long = "non-interactive")]
-    pub non_interactive: bool,
+    /// Automatically confirm review prompts (skip interactive [y/N] prompt).
+    #[arg(short = 'y', long = "yes")]
+    pub yes: bool,
 
     #[command(subcommand)]
     pub command: ArunCommand,
@@ -256,7 +256,7 @@ mod tests {
     fn argv_element_strategy() -> impl Strategy<Value = String> {
         prop_oneof![
             "[a-zA-Z0-9_./]{1,20}",
-            Just("--non-interactive".to_string()),
+            Just("--yes".to_string()),
             Just("--tty".to_string()),
             Just("--no-tty".to_string()),
             Just("--stdin".to_string()),

@@ -183,33 +183,57 @@
 # keepalive_interval = "30s"
 # max_idle_time = "10m"
 
-# Enable this only when you want LLM command review before execution.
-# If api_key is omitted, xho will try XHO_REVIEW_API_KEY first, then OPENAI_API_KEY.
-# endpoint, model, prompts, policy, and semantic_whitelist all have code defaults.
+# --- AI Review ---
+# LLM-based safety review. The connection settings (endpoint/model/api_key/
+# timeout/headers/failure_action) are shared; each operation kind has its own
+# sub-table with an independent enable flag, prompts, policy, and lists.
 # api_key accepts a secret reference (env:/file:/vault:) or a literal.
+# If api_key is omitted, xho tries XHO_REVIEW_API_KEY then OPENAI_API_KEY.
 # [review]
-# enable = true
 # endpoint = "https://api.openai.com/v1/chat/completions"
 # model = "gpt-4.1-mini"
 # api_key = "vault:review.api_key"
 # timeout = "10s"
-# failure_action = "deny"
-
-# [review.fast_allowlist]
-# enable = true
-# commands = ["ls", "ls *", "cat *", "grep *", "kubectl get *"]
+# failure_action = "deny"   # action when the LLM service itself errors
 
 # [review.headers]
 # Authorization = "vault:review.header.Authorization"
 
-# [review.prompts]
-# system = "You are a command safety reviewer. Return JSON only."
-# template = """
-# Classify the command into exactly one risk level: safe, risky, or dangerous.
-# Return compact JSON with keys: risk_level, reason, matched_whitelist_reason.
-# """
-
-# [review.policy]
+# --- exec review ---
+# Reviews shell commands before execution. Disabled by default.
+# [review.exec]
+# enable = true
+# [review.exec.fast_allowlist]
+# enable = true
+# commands = ["ls", "ls *", "cat *", "grep *", "kubectl get *"]
+# [review.exec.policy]
 # safe = "allow"
 # risky = "confirm"
 # dangerous = "deny"
+# [review.exec.prompts]
+# system = "You are a Unix command safety reviewer. Return JSON only."
+# template = """
+# Classify the command into exactly one risk level: safe, risky, or dangerous.
+# """
+
+# --- copy review ---
+# Reviews file-copy operations (upload/download) before transfer. Copies
+# matching blocklist patterns are denied; allowlist patterns are allowed;
+# everything else is classified by the LLM. Disabled by default.
+# [review.copy]
+# enable = true
+# blocklist = [".ssh", ".aws", ".gnupg", ".kube", "/etc/shadow", "/etc/ssh"]
+# allowlist = ["/var/log/*", "/tmp/*"]
+# [review.copy.policy]
+# safe = "allow"
+# risky = "confirm"
+# dangerous = "deny"
+
+# --- Audit ---
+# Records every machine operation (exec, copy, session tunnel, transparent
+# proxy) as a JSON-Lines record with source-identity metadata (peer address,
+# SSH user, key fingerprint). Enabled by default.
+# [audit]
+# enabled = true
+# path = "/var/log/xho/audit.jsonl"   # default: root→/var/log/xho/audit.jsonl, non-root→~/.xho/audit.jsonl
+# include_identity = true

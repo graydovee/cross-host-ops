@@ -111,8 +111,9 @@ impl JumpserverSession {
         let (exit_tx, exit_rx) = oneshot::channel::<i32>();
         let (resize_tx, resize_rx) = mpsc::channel::<(u32, u32)>(8);
         tokio::spawn(async move {
-            let (code, maybe_shell) =
-                shell.run_raw_passthrough(stdin_rx, stdout_tx, resize_rx, sentinel).await;
+            let (code, maybe_shell) = shell
+                .run_raw_passthrough(stdin_rx, stdout_tx, resize_rx, sentinel)
+                .await;
             if let (Some(shell), Some(f)) = (maybe_shell, return_fn) {
                 f(shell);
             }
@@ -174,9 +175,8 @@ impl TargetSession for JumpserverSession {
             let marker_bytes = marker.as_bytes().to_vec();
             shell.window_change(self.cols, self.rows).await;
             shell.clear_pending();
-            let wrapped = format!(
-                "{{ {command}; }}; status=$?; printf '{marker}:%s\\n' \"$status\""
-            );
+            let wrapped =
+                format!("{{ {command}; }}; status=$?; printf '{marker}:%s\\n' \"$status\"");
             shell.write_line(&wrapped).await?;
             shell.drain_echo_line(3000).await?;
             self.shell = Some(shell);
@@ -364,13 +364,17 @@ impl TargetSession for JumpserverSession {
                     Ok(data) => Some(SessionEvent::Stdout(data)),
                     Err(mpsc::error::TryRecvError::Disconnected) => {
                         self.exited = true;
-                        Some(SessionEvent::ExitStatus(self.pending_exit.take().unwrap_or(0)))
+                        Some(SessionEvent::ExitStatus(
+                            self.pending_exit.take().unwrap_or(0),
+                        ))
                     }
                     Err(mpsc::error::TryRecvError::Empty) => match stdout_rx.recv().await {
                         Some(data) => Some(SessionEvent::Stdout(data)),
                         None => {
                             self.exited = true;
-                            Some(SessionEvent::ExitStatus(self.pending_exit.take().unwrap_or(0)))
+                            Some(SessionEvent::ExitStatus(
+                                self.pending_exit.take().unwrap_or(0),
+                            ))
                         }
                     },
                 }

@@ -759,7 +759,7 @@ fn partial_suffix_match(buf: &[u8], pattern: &[u8]) -> usize {
     let max = buf.len().min(pattern.len() - 1);
     (1..=max)
         .rev()
-        .find(|&len| &buf[buf.len() - len..] == &pattern[..len])
+        .find(|&len| buf[buf.len() - len..] == pattern[..len])
         .unwrap_or(0)
 }
 

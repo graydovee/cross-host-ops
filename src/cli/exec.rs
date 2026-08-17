@@ -156,6 +156,7 @@ pub(crate) async fn run_command(
     shell: Option<String>,
     no_shell: bool,
     _config: &AppConfig,
+    yes: bool,
 ) -> Result<i32> {
     // Pass raw CLI flags to daemon; daemon resolves effective shell from server.toml.
     let cli_shell = shell.unwrap_or_default();
@@ -173,6 +174,7 @@ pub(crate) async fn run_command(
             no_shell,
             tty_intent,
             stdin_intent,
+            yes,
         )
         .await;
     }
@@ -280,7 +282,7 @@ pub(crate) async fn run_command(
             }
             rpc::execute_response::Event::ReviewResult(_result) => {}
             rpc::execute_response::Event::ConfirmRequired(confirm) => {
-                let allow = prompt_for_confirmation(&confirm.reason)?;
+                let allow = prompt_for_confirmation(&confirm.reason, yes)?;
                 let Some(ref response_tx) = response_tx else {
                     return Err(anyhow!(
                         "received ConfirmRequired but no response channel available"
@@ -338,6 +340,7 @@ pub(crate) async fn run_command(
 
 /// Run a command in interactive PTY mode with raw terminal, bidirectional
 /// byte streaming, and SIGWINCH forwarding.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_interactive(
     target: String,
     argv: Vec<String>,
@@ -346,6 +349,7 @@ pub(crate) async fn run_interactive(
     no_shell: bool,
     tty_intent: FlagIntent,
     stdin_intent: FlagIntent,
+    yes: bool,
 ) -> Result<i32> {
     // Step 1: Get initial terminal size.
     let (cols, rows) = get_terminal_size();
@@ -474,7 +478,7 @@ pub(crate) async fn run_interactive(
                 .map_err(|_| anyhow!("failed to send auth input request"))?;
             }
             rpc::execute_response::Event::ConfirmRequired(confirm) => {
-                let allow = prompt_for_confirmation(&confirm.reason)?;
+                let allow = prompt_for_confirmation(&confirm.reason, yes)?;
                 tx.send(rpc::ExecuteRequest {
                     request: Some(rpc::execute_request::Request::Confirm(
                         rpc::ConfirmRequest {

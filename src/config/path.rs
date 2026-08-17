@@ -43,6 +43,16 @@ pub fn default_socket_path() -> String {
     }
 }
 
+/// Default audit-log path. Root daemons write to `/var/log/xho/audit.jsonl`
+/// (standard syslog area); non-root daemons write to `~/.xho/audit.jsonl`.
+pub fn default_audit_log_path() -> String {
+    if unsafe { libc::geteuid() } == 0 {
+        "/var/log/xho/audit.jsonl".to_string()
+    } else {
+        "~/.xho/audit.jsonl".to_string()
+    }
+}
+
 pub fn expand_tilde(value: &str) -> Result<String> {
     if value == "~" {
         return Ok(home_dir()

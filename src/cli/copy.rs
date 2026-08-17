@@ -22,6 +22,7 @@ use super::prompt::prompt_for_auth_input;
 pub(crate) async fn run_copy(
     recursive: bool,
     quiet: bool,
+    yes: bool,
     source: String,
     dest: String,
     timeout_ms: u64,
@@ -93,6 +94,22 @@ pub(crate) async fn run_copy(
                 let frame = crate::protocol::copy_frame_from_rpc(frame)?;
                 if let Some(writer) = download_writer.as_mut() {
                     writer.apply(frame).await?;
+                }
+            }
+            rpc::copy_response::Event::ReviewResult(_result) => {
+                // Review outcome surfaced for structured-output consumers; the
+                // human copy path relies on ConfirmRequired below for interaction.
+            }
+            rpc::copy_response::Event::ConfirmRequired(confirm) => {
+                let allow = super::prompt::prompt_for_confirmation(&confirm.reason, yes)?;
+                tx.send(crate::protocol::copy_confirm_request(
+                    crate::protocol::parse_execution_id(&confirm.execution_id)?,
+                    allow,
+                ))
+                .await
+                .map_err(|_| anyhow!("failed to send copy confirmation request"))?;
+                if !allow {
+                    break;
                 }
             }
         }

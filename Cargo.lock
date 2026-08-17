@@ -618,6 +618,7 @@ dependencies = [
  "tempfile",
  "terminal_size",
  "thiserror 1.0.69",
+ "time",
  "tokio",
  "tokio-stream",
  "toml",

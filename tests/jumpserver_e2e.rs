@@ -66,7 +66,7 @@ async fn setup() -> E2E {
     config.ssh.server_config_path = server_toml.to_string_lossy().to_string();
     config.server.local.enable = false;
     config.server.remote.enable = false;
-    config.review.enable = false;
+    config.review.exec.enable = false;
     config.gateways = vec![GatewayConfig::Jumpserver(JumpserverGatewayConfig {
         name: "mockjump".to_string(),
         host: "127.0.0.1".to_string(),

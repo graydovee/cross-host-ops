@@ -137,7 +137,7 @@ async fn remote_connect(
                 target.address()
             );
             eprintln!("{} key fingerprint is {}.", algorithm, fingerprint);
-            if !prompt_for_confirmation("trust this host key and continue")? {
+            if !prompt_for_confirmation("trust this host key and continue", false)? {
                 bail!("host key not trusted");
             }
             trust_known_host(

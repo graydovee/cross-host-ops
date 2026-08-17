@@ -109,7 +109,7 @@ impl TestHarness {
         remote_config.ssh.server_config_path = remote_server_config_path.display().to_string();
         remote_config.server.local.enable = false;
         remote_config.server.remote.enable = false;
-        remote_config.review.enable = false;
+        remote_config.review.exec.enable = false;
 
         let remote_service = make_test_rpc_service(remote_config.clone(), remote_config_path);
 
@@ -126,7 +126,7 @@ impl TestHarness {
         local_config.ssh.server_config_path = local_server_config_path.display().to_string();
         local_config.server.local.enable = false;
         local_config.server.remote.enable = false;
-        local_config.review.enable = false;
+        local_config.review.exec.enable = false;
 
         let local_service = make_test_rpc_service(local_config.clone(), local_config_path);
 
