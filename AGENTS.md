@@ -62,9 +62,14 @@ v0.4.0 moved control plane `2222 → 12222` to free 2222 for the proxy. If you s
 
 `CHANGELOG.md`（仓库根）是本项目的变更记录，**仅向前维护，不回填历史**。
 
-- **每次 commit 前必须先更新 `CHANGELOG.md`**：在"条目"区最上方追加一行，简短描述本次变更。
+- **每次 commit 前必须先更新 `CHANGELOG.md`**：在对应分组的最上方追加一条条目，简短描述本次变更。
 - **条目一律用英文撰写**，简明描述变更实质，不得使用中文。
-- 格式严格为：`yyyy-MM-dd [tag] content`，例如 `2026-08-06 [feat] jumpserver supports -i stdin forwarding`。
+- 每条条目必须是**一个 Markdown 列表项**（`- ` 开头，保证 GitHub 渲染时正确分行），格式严格为：
+  `- yyyy-MM-dd [tag] content`，例如 `- 2026-08-06 [feat] jumpserver supports -i stdin forwarding`。
+- 条目**按发布版本分组**，组内倒序（新条目在上）：
+  - 每个已发布的 git tag（`v*`）对应一个 `## v0.x.y` 小节，只收录该版本区间内的变更。
+  - **已发布版本的小节是冻结的**：之后不得再追加或改写其中条目。
+  - 下一版未定稿时，新条目一律写入最顶部的 `## latest` 小节（不存在则创建）；打 tag 发布时把 `## latest` 重命名为 `## v0.x.y`。
 - tag 只有 4 种，**按本次变更的实质归类，而非 commit 前缀**：
 
   | tag         | 何时使用 |
