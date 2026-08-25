@@ -94,31 +94,31 @@ async fn driver(
         tokio::select! {
             ctrl = control_rx.recv() => match ctrl {
                 Some(Control::Pty { term, cols, rows }) => {
-                    let _ = send_req(&req_tx, r::session_request::Msg::Pty(r::SessionPty { term, cols, rows })).await;
+                    if send_req(&req_tx, r::session_request::Msg::Pty(r::SessionPty { term, cols, rows })).await.is_err() { break; }
                 }
                 Some(Control::Env { key, value }) => {
-                    let _ = send_req(&req_tx, r::session_request::Msg::Env(r::SessionEnv { key, value })).await;
+                    if send_req(&req_tx, r::session_request::Msg::Env(r::SessionEnv { key, value })).await.is_err() { break; }
                 }
                 Some(Control::Exec { command }) => {
-                    let _ = send_req(&req_tx, r::session_request::Msg::Exec(r::SessionExec { command })).await;
+                    if send_req(&req_tx, r::session_request::Msg::Exec(r::SessionExec { command })).await.is_err() { break; }
                 }
                 Some(Control::Shell) => {
-                    let _ = send_req(&req_tx, r::session_request::Msg::Shell(r::SessionShell {})).await;
+                    if send_req(&req_tx, r::session_request::Msg::Shell(r::SessionShell {})).await.is_err() { break; }
                 }
                 Some(Control::Subsystem { name }) => {
-                    let _ = send_req(&req_tx, r::session_request::Msg::Subsystem(r::SessionSubsystem { name })).await;
+                    if send_req(&req_tx, r::session_request::Msg::Subsystem(r::SessionSubsystem { name })).await.is_err() { break; }
                 }
                 Some(Control::WindowChange { cols, rows }) => {
-                    let _ = send_req(&req_tx, r::session_request::Msg::Resize(r::SessionResize { cols, rows })).await;
+                    if send_req(&req_tx, r::session_request::Msg::Resize(r::SessionResize { cols, rows })).await.is_err() { break; }
                 }
                 Some(Control::Signal { signal }) => {
-                    let _ = send_req(&req_tx, r::session_request::Msg::Signal(r::SessionSignal { signal })).await;
+                    if send_req(&req_tx, r::session_request::Msg::Signal(r::SessionSignal { signal })).await.is_err() { break; }
                 }
                 Some(Control::Eof) => {
-                    let _ = send_req(&req_tx, r::session_request::Msg::Eof(r::SessionEof {})).await;
+                    if send_req(&req_tx, r::session_request::Msg::Eof(r::SessionEof {})).await.is_err() { break; }
                 }
                 Some(Control::Data { bytes }) => {
-                    let _ = send_req(&req_tx, r::session_request::Msg::Data(r::SessionData { data: bytes })).await;
+                    if send_req(&req_tx, r::session_request::Msg::Data(r::SessionData { data: bytes })).await.is_err() { break; }
                 }
                 None => break,
             },
@@ -166,8 +166,14 @@ async fn send_req(
     tx: &mpsc::Sender<r::SessionRequest>,
     msg: r::session_request::Msg,
 ) -> Result<()> {
-    tx.send(r::SessionRequest { msg: Some(msg) })
+    // Mirror-image of the server-side guard: if the remote peer stops reading
+    // the inbound stream (HTTP/2 flow control), a plain `send` parks this
+    // driver forever and deadlocks both ends of the session. Time out and
+    // abort so the session tears down cleanly and the client can reconnect.
+    const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    tokio::time::timeout(SEND_TIMEOUT, tx.send(r::SessionRequest { msg: Some(msg) }))
         .await
+        .map_err(|_| anyhow!("session stream send timed out"))?
         .map_err(|_| anyhow!("session stream closed"))
 }
 

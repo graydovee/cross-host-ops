@@ -1002,14 +1002,14 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
 
                 // Acknowledge the open. Exec/shell/subsystem arrive as later
                 // requests and drive the session start.
-                sender
-                    .send(Ok(proto_rpc::SessionResponse {
-                        msg: Some(proto_rpc::session_response::Msg::Started(
-                            proto_rpc::SessionStarted {},
-                        )),
-                    }))
-                    .await
-                    .map_err(|_| anyhow!("open_session: client stream closed"))?;
+                if send_session_msg(
+                    &sender,
+                    proto_rpc::session_response::Msg::Started(proto_rpc::SessionStarted {}),
+                )
+                .await
+                {
+                    bail!("open_session: client stream closed")
+                }
 
                 loop {
                     tokio::select! {
@@ -1020,19 +1020,19 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                                 Some(proto_rpc::session_request::Msg::Exec(e)) => {
                                     audit_session_op(&caller, &route, gateway_kind, &target, SessionKind::Exec, &e.command, "started");
                                     if let Err(er) = sess.exec(&e.command).await {
-                                        let _ = sender.send(Ok(proto_rpc::SessionResponse { msg: Some(proto_rpc::session_response::Msg::Error(proto_rpc::SessionError { message: er.to_string() })) })).await;
+                                        let _ = send_session_msg(&sender, proto_rpc::session_response::Msg::Error(proto_rpc::SessionError { message: er.to_string() })).await;
                                     }
                                 }
                                 Some(proto_rpc::session_request::Msg::Shell(_)) => {
                                     audit_session_op(&caller, &route, gateway_kind, &target, SessionKind::Shell, "(interactive)", "started");
                                     if let Err(er) = sess.shell().await {
-                                        let _ = sender.send(Ok(proto_rpc::SessionResponse { msg: Some(proto_rpc::session_response::Msg::Error(proto_rpc::SessionError { message: er.to_string() })) })).await;
+                                        let _ = send_session_msg(&sender, proto_rpc::session_response::Msg::Error(proto_rpc::SessionError { message: er.to_string() })).await;
                                     }
                                 }
                                 Some(proto_rpc::session_request::Msg::Subsystem(s)) => {
                                     audit_session_op(&caller, &route, gateway_kind, &target, SessionKind::Subsystem, &s.name, "started");
                                     if let Err(er) = sess.subsystem(&s.name).await {
-                                        let _ = sender.send(Ok(proto_rpc::SessionResponse { msg: Some(proto_rpc::session_response::Msg::Error(proto_rpc::SessionError { message: er.to_string() })) })).await;
+                                        let _ = send_session_msg(&sender, proto_rpc::session_response::Msg::Error(proto_rpc::SessionError { message: er.to_string() })).await;
                                     }
                                 }
                                 Some(proto_rpc::session_request::Msg::Resize(r)) => { let _ = sess.window_change(r.cols, r.rows).await; }
@@ -1077,15 +1077,13 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
             .await;
             if let Err(error) = result {
                 error!(error = %format!("{error:#}"), "open_session stream failed");
-                let _ = sender
-                    .send(Ok(proto_rpc::SessionResponse {
-                        msg: Some(proto_rpc::session_response::Msg::Error(
-                            proto_rpc::SessionError {
-                                message: error.to_string(),
-                            },
-                        )),
-                    }))
-                    .await;
+                let _ = send_session_msg(
+                    &sender,
+                    proto_rpc::session_response::Msg::Error(proto_rpc::SessionError {
+                        message: error.to_string(),
+                    }),
+                )
+                .await;
             }
         });
 
@@ -2268,10 +2266,19 @@ async fn send_session_msg(
     sender: &mpsc::Sender<Result<proto_rpc::SessionResponse, Status>>,
     msg: proto_rpc::session_response::Msg,
 ) -> bool {
-    sender
-        .send(Ok(proto_rpc::SessionResponse { msg: Some(msg) }))
-        .await
-        .is_err()
+    // The gRPC response stream can stall under HTTP/2 flow control when the
+    // peer stops reading. A plain `send` would park this task forever and,
+    // because it shares a `select!` with the inbound read loop, freeze the
+    // whole session (cascading deadlock with the client-side tunnel driver).
+    // Time out and tear the session down instead: the client can reconnect.
+    const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    tokio::time::timeout(
+        SEND_TIMEOUT,
+        sender.send(Ok(proto_rpc::SessionResponse { msg: Some(msg) })),
+    )
+    .await
+    .map(|r| r.is_err())
+    .unwrap_or(true)
 }
 
 async fn ensure_socket_parent(socket_path: &Path) -> Result<()> {

@@ -15,6 +15,7 @@
 
 ## latest
 
+- 2026-08-25 [bug] fix occasional permanent freeze of tunneled interactive sessions (2222 proxy via xhod gateway): both ends of the OpenSession stream parked on bounded sends while sharing a select with their read loop, deadlocking under output bursts; all cross-stream sends now time out (30s) and tear the session down so the client can reconnect
 - 2026-08-24 [docs] changelog entries switch to per-version sections with markdown list items so GitHub renders them on separate lines; AGENTS.md changelog conventions updated to match
 
 ## v0.5.5
