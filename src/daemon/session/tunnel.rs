@@ -13,7 +13,8 @@
 // gRPC request stream (parking on flow control only pauses stdin), the other
 // drains responses into the event stream. Neither can starve the other.
 
-use tokio::sync::mpsc;
+use anyhow::{Result, anyhow};
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 
@@ -91,36 +92,56 @@ async fn driver(
     let mut uplink = tokio::spawn(async move {
         let mut cmd_rx = cmd_rx;
         while let Some(cmd) = cmd_rx.recv().await {
-            let msg = match cmd {
+            // "Start" commands carry a reply: acknowledge once the request is
+            // handed to the gRPC stream. Transport failures surface later as
+            // an Error event on the response stream, as in the old design.
+            let (reply, msg) = match cmd {
                 SessionCommand::Pty {
-                    term, cols, rows, ..
-                } => r::session_request::Msg::Pty(r::SessionPty { term, cols, rows }),
-                SessionCommand::Env { key, value, .. } => {
-                    r::session_request::Msg::Env(r::SessionEnv { key, value })
-                }
-                SessionCommand::Exec { command, .. } => {
-                    r::session_request::Msg::Exec(r::SessionExec { command })
-                }
-                SessionCommand::Shell { .. } => r::session_request::Msg::Shell(r::SessionShell {}),
-                SessionCommand::Subsystem { name, .. } => {
-                    r::session_request::Msg::Subsystem(r::SessionSubsystem { name })
-                }
-                SessionCommand::Resize { cols, rows } => {
-                    r::session_request::Msg::Resize(r::SessionResize { cols, rows })
-                }
-                SessionCommand::Signal { signal } => {
-                    r::session_request::Msg::Signal(r::SessionSignal { signal })
-                }
-                SessionCommand::Eof => r::session_request::Msg::Eof(r::SessionEof {}),
-                SessionCommand::Data { bytes } => {
-                    r::session_request::Msg::Data(r::SessionData { data: bytes })
-                }
+                    term,
+                    cols,
+                    rows,
+                    reply,
+                    ..
+                } => (
+                    Some(reply),
+                    r::session_request::Msg::Pty(r::SessionPty { term, cols, rows }),
+                ),
+                SessionCommand::Env { key, value, reply } => (
+                    Some(reply),
+                    r::session_request::Msg::Env(r::SessionEnv { key, value }),
+                ),
+                SessionCommand::Exec { command, reply } => (
+                    Some(reply),
+                    r::session_request::Msg::Exec(r::SessionExec { command }),
+                ),
+                SessionCommand::Shell { reply } => (
+                    Some(reply),
+                    r::session_request::Msg::Shell(r::SessionShell {}),
+                ),
+                SessionCommand::Subsystem { name, reply } => (
+                    Some(reply),
+                    r::session_request::Msg::Subsystem(r::SessionSubsystem { name }),
+                ),
+                SessionCommand::Resize { cols, rows } => (
+                    None,
+                    r::session_request::Msg::Resize(r::SessionResize { cols, rows }),
+                ),
+                SessionCommand::Signal { signal } => (
+                    None,
+                    r::session_request::Msg::Signal(r::SessionSignal { signal }),
+                ),
+                SessionCommand::Eof => (None, r::session_request::Msg::Eof(r::SessionEof {})),
+                SessionCommand::Data { bytes } => (
+                    None,
+                    r::session_request::Msg::Data(r::SessionData { data: bytes }),
+                ),
             };
-            if req_tx
-                .send(r::SessionRequest { msg: Some(msg) })
-                .await
-                .is_err()
-            {
+            let sent = req_tx.send(r::SessionRequest { msg: Some(msg) }).await;
+            let sent_ok = sent.is_ok();
+            if let Some(reply) = reply {
+                let _ = reply.send(sent.map_err(|_| anyhow!("session stream closed")));
+            }
+            if !sent_ok {
                 break;
             }
         }
