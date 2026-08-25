@@ -23,16 +23,16 @@ use crate::types::{CopyDirection, CopyFrame, CopySpec};
 use super::TargetSession;
 
 /// Open an SFTP client over a `TargetSession`'s sftp subsystem.
-pub(crate) async fn open_sftp(mut sess: Box<dyn TargetSession>) -> Result<SftpSession> {
-    sess.subsystem("sftp").await?;
+pub(crate) async fn open_sftp(sess: Box<dyn TargetSession>) -> Result<SftpSession> {
+    let (writer, mut stream) = sess.split();
+    writer.subsystem("sftp").await?;
     let (client, server) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
-        let mut sess = sess;
         let (mut rd, mut wr) = tokio::io::split(server);
         let mut buf = vec![0u8; 8192];
         loop {
             tokio::select! {
-                ev = sess.next_event() => match ev {
+                ev = stream.next() => match ev {
                     Some(super::SessionEvent::Stdout(d)) | Some(super::SessionEvent::Stderr(d)) => {
                         if wr.write_all(&d).await.is_err() { break; }
                     }
@@ -45,9 +45,9 @@ pub(crate) async fn open_sftp(mut sess: Box<dyn TargetSession>) -> Result<SftpSe
                     }
                 },
                 n = rd.read(&mut buf) => match n {
-                    Ok(0) => { let _ = sess.eof().await; break; }
+                    Ok(0) => { let _ = writer.eof().await; break; }
                     Ok(n) => {
-                        if sess.write_stdin(&buf[..n]).await.is_err() { break; }
+                        if writer.write_stdin(&buf[..n]).await.is_err() { break; }
                     }
                     Err(_) => break,
                 },

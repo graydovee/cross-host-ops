@@ -25,8 +25,9 @@ pub mod tunnel;
 use anyhow::Result;
 use async_trait::async_trait;
 use russh::Pty;
+use tokio::sync::{mpsc, oneshot};
 
-/// An event produced by a backend session, polled via [`TargetSession::next_event`].
+/// An event produced by a backend session, polled via [`SessionStream::next`].
 #[derive(Debug)]
 pub enum SessionEvent {
     /// Bytes written to stdout by the remote program.
@@ -41,52 +42,291 @@ pub enum SessionEvent {
     Eof,
 }
 
+/// A request sent to a session's write half. "Start" operations (pty, env,
+/// exec, shell, subsystem) carry a oneshot reply so callers can observe
+/// transport failures; data/resize/signal/eof are fire-and-forget.
+pub(crate) enum SessionCommand {
+    Pty {
+        term: String,
+        cols: u32,
+        rows: u32,
+        modes: Vec<(Pty, u32)>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Env {
+        key: String,
+        value: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Exec {
+        command: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Shell {
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Subsystem {
+        name: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Resize {
+        cols: u32,
+        rows: u32,
+    },
+    Signal {
+        signal: String,
+    },
+    Data {
+        bytes: Vec<u8>,
+    },
+    Eof,
+}
+
+/// The write half of a session: sends requests (start, stdin, resize, signal)
+/// without owning the event stream, so the two halves can live in separate
+/// tasks. Backpressure applies only to this half.
+pub struct SessionWriter {
+    tx: mpsc::Sender<SessionCommand>,
+}
+
+impl SessionWriter {
+    fn check(send: Result<(), mpsc::error::SendError<SessionCommand>>) -> Result<()> {
+        send.map_err(|_| anyhow!("session closed"))
+    }
+
+    async fn request(
+        &self,
+        build: impl FnOnce(oneshot::Sender<Result<()>>) -> SessionCommand,
+    ) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        Self::check(self.tx.send(build(reply_tx)).await)?;
+        reply_rx
+            .await
+            .unwrap_or_else(|_| Err(anyhow!("session closed")))
+    }
+
+    pub(crate) async fn request_pty(
+        &self,
+        term: &str,
+        cols: u32,
+        rows: u32,
+        modes: &[(Pty, u32)],
+    ) -> Result<()> {
+        self.request(|reply| SessionCommand::Pty {
+            term: term.to_string(),
+            cols,
+            rows,
+            modes: modes.to_vec(),
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn set_env(&self, key: &str, value: &str) -> Result<()> {
+        self.request(|reply| SessionCommand::Env {
+            key: key.to_string(),
+            value: value.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn exec(&self, command: &str) -> Result<()> {
+        self.request(|reply| SessionCommand::Exec {
+            command: command.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn shell(&self) -> Result<()> {
+        self.request(|reply| SessionCommand::Shell { reply }).await
+    }
+
+    pub(crate) async fn subsystem(&self, name: &str) -> Result<()> {
+        self.request(|reply| SessionCommand::Subsystem {
+            name: name.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn window_change(&self, cols: u32, rows: u32) -> Result<()> {
+        Self::check(self.tx.send(SessionCommand::Resize { cols, rows }).await)
+    }
+
+    pub(crate) async fn signal(&self, signal: &str) -> Result<()> {
+        Self::check(
+            self.tx
+                .send(SessionCommand::Signal {
+                    signal: signal.to_string(),
+                })
+                .await,
+        )
+    }
+
+    pub(crate) async fn write_stdin(&self, data: &[u8]) -> Result<()> {
+        Self::check(
+            self.tx
+                .send(SessionCommand::Data {
+                    bytes: data.to_vec(),
+                })
+                .await,
+        )
+    }
+
+    pub(crate) async fn eof(&self) -> Result<()> {
+        Self::check(self.tx.send(SessionCommand::Eof).await)
+    }
+}
+
+/// The read half of a session: yields events until the session ends.
+pub struct SessionStream {
+    rx: mpsc::UnboundedReceiver<SessionEvent>,
+}
+
+impl SessionStream {
+    pub(crate) async fn next(&mut self) -> Option<SessionEvent> {
+        self.rx.recv().await
+    }
+}
+
 /// The unified session-channel contract.
 ///
-/// All methods are fallible; transport implementations that cannot realize a
-/// method (e.g. jumpserver `exec`) return an error classified via
-/// [`crate::daemon::session::unsupported`].
+/// The primary interface is [`TargetSession::split`], which separates the
+/// request (write) half from the event (read) half so streaming callers can
+/// run each direction in its own task — a send that parks on flow control in
+/// one direction never freezes the other. The method family below is the
+/// legacy single-object interface kept for stateful implementations (see
+/// [`AdapterSession`]); every method defaults to `unsupported`.
 #[async_trait]
 pub trait TargetSession: Send {
+    /// Consume the session and split it into independent halves.
+    fn split(self: Box<Self>) -> (SessionWriter, SessionStream);
+
     /// Request a pseudo-terminal before exec/shell. `modes` are SSH terminal
     /// modes (opcode, value). Implementations that do not use PTY modes may
     /// ignore them.
     async fn request_pty(
         &mut self,
-        term: &str,
-        cols: u32,
-        rows: u32,
-        modes: &[(Pty, u32)],
-    ) -> Result<()>;
+        _term: &str,
+        _cols: u32,
+        _rows: u32,
+        _modes: &[(Pty, u32)],
+    ) -> Result<()> {
+        Err(unsupported("request_pty"))
+    }
 
     /// Set an environment variable on the upcoming process.
-    async fn set_env(&mut self, key: &str, value: &str) -> Result<()>;
+    async fn set_env(&mut self, _key: &str, _value: &str) -> Result<()> {
+        Err(unsupported("set_env"))
+    }
 
     /// Execute a command (passed to a remote shell).
-    async fn exec(&mut self, command: &str) -> Result<()>;
+    async fn exec(&mut self, _command: &str) -> Result<()> {
+        Err(unsupported("exec"))
+    }
 
     /// Request an interactive login shell.
-    async fn shell(&mut self) -> Result<()>;
+    async fn shell(&mut self) -> Result<()> {
+        Err(unsupported("shell"))
+    }
 
     /// Request a subsystem by name (e.g. `"sftp"`).
-    async fn subsystem(&mut self, name: &str) -> Result<()>;
+    async fn subsystem(&mut self, _name: &str) -> Result<()> {
+        Err(unsupported("subsystem"))
+    }
 
     /// Notify the peer of a terminal window-size change.
-    async fn window_change(&mut self, cols: u32, rows: u32) -> Result<()>;
+    async fn window_change(&mut self, _cols: u32, _rows: u32) -> Result<()> {
+        Err(unsupported("window_change"))
+    }
 
     /// Send a signal (by name, e.g. `"INT"`) to the remote process.
-    async fn signal(&mut self, signal: &str) -> Result<()>;
+    async fn signal(&mut self, _signal: &str) -> Result<()> {
+        Err(unsupported("signal"))
+    }
 
     /// Forward stdin bytes to the remote process.
-    async fn write_stdin(&mut self, data: &[u8]) -> Result<()>;
+    async fn write_stdin(&mut self, _data: &[u8]) -> Result<()> {
+        Err(unsupported("write_stdin"))
+    }
 
     /// Signal end-of-file on the stdin side.
-    async fn eof(&mut self) -> Result<()>;
+    async fn eof(&mut self) -> Result<()> {
+        Err(unsupported("eof"))
+    }
 
     /// Poll the next event from the session, or `None` when the session has
-    /// ended (after the terminal `ExitStatus`/`ExitSignal`/`Eof` is returned,
-    /// subsequent calls return `None`).
-    async fn next_event(&mut self) -> Option<SessionEvent>;
+    /// ended.
+    async fn next_event(&mut self) -> Option<SessionEvent> {
+        None
+    }
+}
+
+/// Adapt a stateful method-family session (e.g. the jumpserver state machine,
+/// which is not channel-driven) to the split interface. A mediation task owns
+/// the inner session and translates commands into method calls.
+pub(crate) fn adapt_split(inner: Box<dyn TargetSession>) -> (SessionWriter, SessionStream) {
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<SessionCommand>(64);
+    let (ev_tx, ev_rx) = mpsc::unbounded_channel::<SessionEvent>();
+    tokio::spawn(async move {
+        let mut sess = inner;
+        loop {
+            tokio::select! {
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(c) => apply_command(&mut *sess, c).await,
+                    None => break,
+                },
+                ev = sess.next_event() => match ev {
+                    Some(e) => {
+                        if ev_tx.send(e).is_err() { break; }
+                    }
+                    None => break,
+                },
+            }
+        }
+    });
+    (SessionWriter { tx: cmd_tx }, SessionStream { rx: ev_rx })
+}
+
+/// Translate a unified command into method calls on a method-family session.
+async fn apply_command(sess: &mut dyn TargetSession, cmd: SessionCommand) {
+    match cmd {
+        SessionCommand::Pty {
+            term,
+            cols,
+            rows,
+            modes,
+            reply,
+        } => {
+            let _ = reply.send(sess.request_pty(&term, cols, rows, &modes).await);
+        }
+        SessionCommand::Env { key, value, reply } => {
+            let _ = reply.send(sess.set_env(&key, &value).await);
+        }
+        SessionCommand::Exec { command, reply } => {
+            let _ = reply.send(sess.exec(&command).await);
+        }
+        SessionCommand::Shell { reply } => {
+            let _ = reply.send(sess.shell().await);
+        }
+        SessionCommand::Subsystem { name, reply } => {
+            let _ = reply.send(sess.subsystem(&name).await);
+        }
+        SessionCommand::Resize { cols, rows } => {
+            let _ = sess.window_change(cols, rows).await;
+        }
+        SessionCommand::Signal { signal } => {
+            let _ = sess.signal(&signal).await;
+        }
+        SessionCommand::Data { bytes } => {
+            let _ = sess.write_stdin(&bytes).await;
+        }
+        SessionCommand::Eof => {
+            let _ = sess.eof().await;
+        }
+    }
 }
 
 /// Build an "unsupported" error for a transport that cannot realize an
@@ -98,7 +338,6 @@ pub fn unsupported(what: &str) -> anyhow::Error {
 
 use anyhow::anyhow;
 
-use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
 use crate::protocol::ServerEvent;
@@ -185,7 +424,7 @@ pub async fn open_exec_session(
 /// then pump events to `sender` and forward stdin until exit. Returns the exit
 /// code. Reused by the Execute RPC handler (replacing the old gateway.exec).
 pub async fn drive_exec(
-    mut sess: Box<dyn TargetSession>,
+    sess: Box<dyn TargetSession>,
     command: String,
     tty: bool,
     cols: u32,
@@ -193,19 +432,20 @@ pub async fn drive_exec(
     sender: tokio::sync::mpsc::UnboundedSender<ServerEvent>,
     mut stdin_rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
 ) -> Result<i32> {
+    let (writer, mut stream) = sess.split();
     if tty && cols > 0 && rows > 0 {
-        let _ = sess.request_pty("xterm-256color", cols, rows, &[]).await;
+        let _ = writer.request_pty("xterm-256color", cols, rows, &[]).await;
     }
-    sess.exec(&command).await?;
+    writer.exec(&command).await?;
     let mut stdin_done = stdin_rx.is_none();
     if stdin_done {
         // No stdin channel — signal EOF immediately so the session's spawned
         // exec task knows not to wait for stdin data.
-        let _ = sess.eof().await;
+        let _ = writer.eof().await;
     }
     loop {
         tokio::select! {
-            ev = sess.next_event() => match ev {
+            ev = stream.next() => match ev {
                 Some(SessionEvent::Stdout(d)) => {
                     let _ = sender.send(ServerEvent::Stdout { data: d });
                 }
@@ -228,10 +468,10 @@ pub async fn drive_exec(
                 }
             } => match stdin {
                 Some(d) => {
-                    let _ = sess.write_stdin(&d).await;
+                    let _ = writer.write_stdin(&d).await;
                 }
                 None => {
-                    let _ = sess.eof().await;
+                    let _ = writer.eof().await;
                     stdin_done = true;
                 }
             },
@@ -244,17 +484,20 @@ pub async fn drive_exec(
 /// then bridge stdin/stdout/resize/exit into a [`InteractiveHandle`] that the
 /// Execute RPC handler drives exactly as it did for the legacy gateway path.
 pub async fn drive_interactive(
-    mut sess: Box<dyn TargetSession>,
+    sess: Box<dyn TargetSession>,
     exec_command: Option<String>,
     cols: u32,
     rows: u32,
 ) -> Result<InteractiveHandle> {
     use tokio::sync::{mpsc, oneshot};
 
-    sess.request_pty("xterm-256color", cols, rows, &[]).await?;
+    let (writer, mut stream) = sess.split();
+    writer
+        .request_pty("xterm-256color", cols, rows, &[])
+        .await?;
     match exec_command {
-        Some(cmd) => sess.exec(&cmd).await?,
-        None => sess.shell().await?,
+        Some(cmd) => writer.exec(&cmd).await?,
+        None => writer.shell().await?,
     }
 
     let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(32);
@@ -262,10 +505,13 @@ pub async fn drive_interactive(
     let (stdout_tx, stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (exit_tx, exit_rx) = oneshot::channel::<i32>();
 
+    // Both halves live in one task here, but the halves are independent:
+    // a stalled terminal consumer pauses stdout delivery while stdin keeps
+    // flowing (and vice versa) — no mutual starvation.
     let task = tokio::spawn(async move {
         loop {
             tokio::select! {
-                ev = sess.next_event() => match ev {
+                ev = stream.next() => match ev {
                     Some(SessionEvent::Stdout(d)) => {
                         if stdout_tx.send(d).is_err() { break; }
                     }
@@ -277,11 +523,11 @@ pub async fn drive_interactive(
                     Some(SessionEvent::Eof) | None => { let _ = exit_tx.send(0); return; }
                 },
                 stdin = stdin_rx.recv() => match stdin {
-                    Some(d) => { let _ = sess.write_stdin(&d).await; }
-                    None => { let _ = sess.eof().await; }
+                    Some(d) => { let _ = writer.write_stdin(&d).await; }
+                    None => { let _ = writer.eof().await; }
                 },
                 resize = resize_rx.recv() => {
-                    if let Some((c, r)) = resize { let _ = sess.window_change(c, r).await; }
+                    if let Some((c, r)) = resize { let _ = writer.window_change(c, r).await; }
                 }
             }
         }

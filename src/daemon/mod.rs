@@ -998,7 +998,8 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                     .find_gateway_any(&route.gateway_name)
                     .await
                     .map(|g| g.kind());
-                let mut sess = session::open_target_session(&state, &route).await?;
+                let sess = session::open_target_session(&state, &route).await?;
+                let (writer, mut events) = sess.split();
 
                 // Acknowledge the open. Exec/shell/subsystem arrive as later
                 // requests and drive the session start.
@@ -1011,67 +1012,174 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                     bail!("open_session: client stream closed")
                 }
 
+                // Downlink: session events → response stream. Runs as its own
+                // task so a stalled gRPC consumer only pauses this direction —
+                // the uplink task below keeps reading client requests, which
+                // is what prevents the historical bidirectional deadlock.
+                let downlink_sender = sender.clone();
+                let downlink = {
+                    let caller = caller.clone();
+                    let route = route.clone();
+                    let target = target.clone();
+                    tokio::spawn(async move {
+                        while let Some(ev) = events.next().await {
+                            match ev {
+                                session::SessionEvent::Stdout(d) => {
+                                    if send_session_msg(
+                                        &downlink_sender,
+                                        proto_rpc::session_response::Msg::Data(
+                                            proto_rpc::SessionData { data: d },
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        break;
+                                    }
+                                }
+                                session::SessionEvent::Stderr(d) => {
+                                    if send_session_msg(
+                                        &downlink_sender,
+                                        proto_rpc::session_response::Msg::Stderr(
+                                            proto_rpc::SessionExtendedData { data: d },
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        break;
+                                    }
+                                }
+                                session::SessionEvent::ExitStatus(c) => {
+                                    audit::record(&audit_event_result(
+                                        OperationKind::Session,
+                                        &caller,
+                                        &route,
+                                        gateway_kind,
+                                        &Uuid::new_v4().to_string(),
+                                        Some(&target),
+                                        None,
+                                        "completed",
+                                        Some(c),
+                                        None,
+                                    ));
+                                    let _ = send_session_msg(
+                                        &downlink_sender,
+                                        proto_rpc::session_response::Msg::ExitStatus(
+                                            proto_rpc::SessionExitStatus { code: c },
+                                        ),
+                                    )
+                                    .await;
+                                    let _ = send_session_msg(
+                                        &downlink_sender,
+                                        proto_rpc::session_response::Msg::Eof(
+                                            proto_rpc::SessionEofIndication {},
+                                        ),
+                                    )
+                                    .await;
+                                    break;
+                                }
+                                session::SessionEvent::ExitSignal(s) => {
+                                    let _ = send_session_msg(
+                                        &downlink_sender,
+                                        proto_rpc::session_response::Msg::ExitSignal(
+                                            proto_rpc::SessionExitSignal { signal: s },
+                                        ),
+                                    )
+                                    .await;
+                                    break;
+                                }
+                                session::SessionEvent::Eof => {
+                                    let _ = send_session_msg(
+                                        &downlink_sender,
+                                        proto_rpc::session_response::Msg::Eof(
+                                            proto_rpc::SessionEofIndication {},
+                                        ),
+                                    )
+                                    .await;
+                                    break;
+                                }
+                            }
+                        }
+                    })
+                };
+
+                // Uplink: client requests → session writer. Start-op failures
+                // are reported best-effort with a non-blocking send (the
+                // downlink task owns orderly delivery).
                 loop {
-                    tokio::select! {
-                        req = inbound.message() => match req {
-                            Ok(Some(r)) => match r.msg {
-                                Some(proto_rpc::session_request::Msg::Pty(p)) => { let _ = sess.request_pty(&p.term, p.cols, p.rows, &[]).await; }
-                                Some(proto_rpc::session_request::Msg::Env(e)) => { let _ = sess.set_env(&e.key, &e.value).await; }
-                                Some(proto_rpc::session_request::Msg::Exec(e)) => {
-                                    audit_session_op(&caller, &route, gateway_kind, &target, SessionKind::Exec, &e.command, "started");
-                                    if let Err(er) = sess.exec(&e.command).await {
-                                        let _ = send_session_msg(&sender, proto_rpc::session_response::Msg::Error(proto_rpc::SessionError { message: er.to_string() })).await;
-                                    }
-                                }
-                                Some(proto_rpc::session_request::Msg::Shell(_)) => {
-                                    audit_session_op(&caller, &route, gateway_kind, &target, SessionKind::Shell, "(interactive)", "started");
-                                    if let Err(er) = sess.shell().await {
-                                        let _ = send_session_msg(&sender, proto_rpc::session_response::Msg::Error(proto_rpc::SessionError { message: er.to_string() })).await;
-                                    }
-                                }
-                                Some(proto_rpc::session_request::Msg::Subsystem(s)) => {
-                                    audit_session_op(&caller, &route, gateway_kind, &target, SessionKind::Subsystem, &s.name, "started");
-                                    if let Err(er) = sess.subsystem(&s.name).await {
-                                        let _ = send_session_msg(&sender, proto_rpc::session_response::Msg::Error(proto_rpc::SessionError { message: er.to_string() })).await;
-                                    }
-                                }
-                                Some(proto_rpc::session_request::Msg::Resize(r)) => { let _ = sess.window_change(r.cols, r.rows).await; }
-                                Some(proto_rpc::session_request::Msg::Signal(s)) => { let _ = sess.signal(&s.signal).await; }
-                                Some(proto_rpc::session_request::Msg::Data(d)) => { let _ = sess.write_stdin(&d.data).await; }
-                                Some(proto_rpc::session_request::Msg::Eof(_)) => { let _ = sess.eof().await; }
-                                Some(proto_rpc::session_request::Msg::Open(_)) | None => break,
-                            },
-                            Ok(None) => break,
-                            Err(_) => break,
-                        },
-                        ev = sess.next_event() => match ev {
-                            Some(session::SessionEvent::Stdout(d)) => {
-                                if send_session_msg(&sender, proto_rpc::session_response::Msg::Data(proto_rpc::SessionData { data: d })).await { break; }
+                    let req = match inbound.message().await {
+                        Ok(Some(r)) => r,
+                        Ok(None) => break,
+                        Err(_) => break,
+                    };
+                    match req.msg {
+                        Some(proto_rpc::session_request::Msg::Pty(p)) => {
+                            let _ = writer.request_pty(&p.term, p.cols, p.rows, &[]).await;
+                        }
+                        Some(proto_rpc::session_request::Msg::Env(e)) => {
+                            let _ = writer.set_env(&e.key, &e.value).await;
+                        }
+                        Some(proto_rpc::session_request::Msg::Exec(e)) => {
+                            audit_session_op(
+                                &caller,
+                                &route,
+                                gateway_kind,
+                                &target,
+                                SessionKind::Exec,
+                                &e.command,
+                                "started",
+                            );
+                            if let Err(er) = writer.exec(&e.command).await {
+                                try_send_session_error(&sender, &er.to_string());
                             }
-                            Some(session::SessionEvent::Stderr(d)) => {
-                                if send_session_msg(&sender, proto_rpc::session_response::Msg::Stderr(proto_rpc::SessionExtendedData { data: d })).await { break; }
+                        }
+                        Some(proto_rpc::session_request::Msg::Shell(_)) => {
+                            audit_session_op(
+                                &caller,
+                                &route,
+                                gateway_kind,
+                                &target,
+                                SessionKind::Shell,
+                                "(interactive)",
+                                "started",
+                            );
+                            if let Err(er) = writer.shell().await {
+                                try_send_session_error(&sender, &er.to_string());
                             }
-                            Some(session::SessionEvent::ExitStatus(c)) => {
-                                audit::record(&audit_event_result(
-                                    OperationKind::Session, &caller, &route, gateway_kind,
-                                    &Uuid::new_v4().to_string(), Some(&target), None,
-                                    "completed", Some(c), None,
-                                ));
-                                let _ = send_session_msg(&sender, proto_rpc::session_response::Msg::ExitStatus(proto_rpc::SessionExitStatus { code: c })).await;
-                                let _ = send_session_msg(&sender, proto_rpc::session_response::Msg::Eof(proto_rpc::SessionEofIndication {})).await;
-                                break;
+                        }
+                        Some(proto_rpc::session_request::Msg::Subsystem(s)) => {
+                            audit_session_op(
+                                &caller,
+                                &route,
+                                gateway_kind,
+                                &target,
+                                SessionKind::Subsystem,
+                                &s.name,
+                                "started",
+                            );
+                            if let Err(er) = writer.subsystem(&s.name).await {
+                                try_send_session_error(&sender, &er.to_string());
                             }
-                            Some(session::SessionEvent::ExitSignal(s)) => {
-                                let _ = send_session_msg(&sender, proto_rpc::session_response::Msg::ExitSignal(proto_rpc::SessionExitSignal { signal: s })).await;
-                                break;
-                            }
-                            Some(session::SessionEvent::Eof) | None => {
-                                let _ = send_session_msg(&sender, proto_rpc::session_response::Msg::Eof(proto_rpc::SessionEofIndication {})).await;
-                                break;
-                            }
-                        },
+                        }
+                        Some(proto_rpc::session_request::Msg::Resize(r)) => {
+                            let _ = writer.window_change(r.cols, r.rows).await;
+                        }
+                        Some(proto_rpc::session_request::Msg::Signal(s)) => {
+                            let _ = writer.signal(&s.signal).await;
+                        }
+                        Some(proto_rpc::session_request::Msg::Data(d)) => {
+                            let _ = writer.write_stdin(&d.data).await;
+                        }
+                        Some(proto_rpc::session_request::Msg::Eof(_)) => {
+                            let _ = writer.eof().await;
+                        }
+                        Some(proto_rpc::session_request::Msg::Open(_)) | None => break,
                     }
                 }
+                // Dropping the writer closes the session's stdin side; the
+                // downlink task drains trailing events (including the exit
+                // status) before the response stream ends.
+                drop(writer);
+                let _ = downlink.await;
                 Ok::<(), anyhow::Error>(())
             }
             .await;
@@ -2266,19 +2374,29 @@ async fn send_session_msg(
     sender: &mpsc::Sender<Result<proto_rpc::SessionResponse, Status>>,
     msg: proto_rpc::session_response::Msg,
 ) -> bool {
-    // The gRPC response stream can stall under HTTP/2 flow control when the
-    // peer stops reading. A plain `send` would park this task forever and,
-    // because it shares a `select!` with the inbound read loop, freeze the
-    // whole session (cascading deadlock with the client-side tunnel driver).
-    // Time out and tear the session down instead: the client can reconnect.
-    const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-    tokio::time::timeout(
-        SEND_TIMEOUT,
-        sender.send(Ok(proto_rpc::SessionResponse { msg: Some(msg) })),
-    )
-    .await
-    .map(|r| r.is_err())
-    .unwrap_or(true)
+    // Only the downlink task calls this. Parking here (gRPC flow control
+    // while the peer pauses reading) pauses event delivery only — the uplink
+    // task keeps consuming client requests, so this can never deadlock.
+    sender
+        .send(Ok(proto_rpc::SessionResponse { msg: Some(msg) }))
+        .await
+        .is_err()
+}
+
+/// Best-effort, non-blocking error delivery from the uplink task: the
+/// downlink task owns orderly sends; a full channel must never park the read
+/// loop (that is the deadlock this design eliminates).
+fn try_send_session_error(
+    sender: &mpsc::Sender<Result<proto_rpc::SessionResponse, Status>>,
+    message: &str,
+) {
+    let _ = sender.try_send(Ok(proto_rpc::SessionResponse {
+        msg: Some(proto_rpc::session_response::Msg::Error(
+            proto_rpc::SessionError {
+                message: message.to_string(),
+            },
+        )),
+    }));
 }
 
 async fn ensure_socket_parent(socket_path: &Path) -> Result<()> {

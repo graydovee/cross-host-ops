@@ -18,7 +18,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::daemon::jumpserver_engine::{PtyShell, make_marker};
 
-use super::{SessionEvent, TargetSession, unsupported};
+use super::{SessionEvent, SessionStream, SessionWriter, TargetSession, unsupported};
 
 /// Shell snippet that locates `sftp-server`, switches the PTY to raw mode, and
 /// execs the server so SFTP framing passes through untranslated.
@@ -131,6 +131,12 @@ impl JumpserverSession {
 
 #[async_trait]
 impl TargetSession for JumpserverSession {
+    fn split(self: Box<Self>) -> (SessionWriter, SessionStream) {
+        // The jumpserver session is a state machine rather than a
+        // channel-driven driver; adapt it behind the split interface.
+        super::adapt_split(self)
+    }
+
     async fn request_pty(
         &mut self,
         _term: &str,
@@ -309,7 +315,9 @@ impl TargetSession for JumpserverSession {
             return None;
         }
         match &mut self.backend {
-            Backend::None => None,
+            // No backend yet: hold (the trait contract says `None` means the
+            // session has ended, and adapters poll from the start).
+            Backend::None => std::future::pending::<Option<SessionEvent>>().await,
             Backend::Exec {
                 stdout_rx,
                 exit_rx,

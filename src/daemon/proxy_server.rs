@@ -144,8 +144,7 @@ fn spawn_bridge(
             .find_gateway_any(&route.gateway_name)
             .await
             .map(|g| g.kind());
-        let mut sess: Box<dyn TargetSession> = match session::open_target_session(&state, &route)
-            .await
+        let sess: Box<dyn TargetSession> = match session::open_target_session(&state, &route).await
         {
             Ok(s) => s,
             Err(e) => {
@@ -153,13 +152,14 @@ fn spawn_bridge(
                 return;
             }
         };
+        let (writer, mut events) = sess.split();
 
         // Apply buffered pty + env.
         if let Some(pty) = &entry.pty {
-            let _ = sess.request_pty(&pty.term, pty.cols, pty.rows, &[]).await;
+            let _ = writer.request_pty(&pty.term, pty.cols, pty.rows, &[]).await;
         }
         for (k, v) in &entry.env {
-            let _ = sess.set_env(k, v).await;
+            let _ = writer.set_env(k, v).await;
         }
 
         // Audit: proxy operation started.
@@ -190,9 +190,9 @@ fn spawn_bridge(
 
         // Start the backend.
         let started = match start {
-            SessionStart::Exec(cmd) => sess.exec(&cmd).await,
-            SessionStart::Shell => sess.shell().await,
-            SessionStart::Subsystem(name) => sess.subsystem(&name).await,
+            SessionStart::Exec(cmd) => writer.exec(&cmd).await,
+            SessionStart::Shell => writer.shell().await,
+            SessionStart::Subsystem(name) => writer.subsystem(&name).await,
         };
         if let Err(e) = started {
             warn!(target = %user, error = %format!("{e:#}"), "proxy: failed to start session");
@@ -201,18 +201,20 @@ fn spawn_bridge(
 
         let channel = entry.channel;
         let mut msg_rx = rx;
-        loop {
-            tokio::select! {
-                msg = msg_rx.recv() => match msg {
-                    Some(ProxyMsg::Data(d)) => { let _ = sess.write_stdin(&d).await; }
-                    Some(ProxyMsg::Resize(c, r)) => { let _ = sess.window_change(c, r).await; }
-                    Some(ProxyMsg::Signal(s)) => { let _ = sess.signal(&s).await; }
-                    Some(ProxyMsg::Eof) | None => { let _ = sess.eof().await; }
-                },
-                ev = sess.next_event() => match ev {
-                    Some(SessionEvent::Stdout(d)) => { let _ = channel.data(Cursor::new(d)).await; }
-                    Some(SessionEvent::Stderr(d)) => { let _ = channel.extended_data(1, Cursor::new(d)).await; }
-                    Some(SessionEvent::ExitStatus(c)) => {
+
+        // Downlink: session events → inbound SSH channel. Its own task so a
+        // slow SSH consumer never stalls the stdin direction (see the
+        // OpenSession handler for the symmetric rationale).
+        let downlink = tokio::spawn(async move {
+            while let Some(ev) = events.next().await {
+                match ev {
+                    SessionEvent::Stdout(d) => {
+                        let _ = channel.data(Cursor::new(d)).await;
+                    }
+                    SessionEvent::Stderr(d) => {
+                        let _ = channel.extended_data(1, Cursor::new(d)).await;
+                    }
+                    SessionEvent::ExitStatus(c) => {
                         let mut ev = crate::oversight::AuditEvent::new(
                             caller.source,
                             crate::oversight::OperationKind::Proxy.as_str(),
@@ -230,19 +232,41 @@ fn spawn_bridge(
                         let _ = channel.close().await;
                         return;
                     }
-                    Some(SessionEvent::ExitSignal(_)) => {
+                    SessionEvent::ExitSignal(_) => {
                         let _ = channel.exit_status(255).await;
                         let _ = channel.close().await;
                         return;
                     }
-                    Some(SessionEvent::Eof) | None => {
+                    SessionEvent::Eof => {
                         let _ = channel.eof().await;
                         let _ = channel.close().await;
                         return;
                     }
-                },
+                }
+            }
+        });
+
+        // Uplink: inbound SSH data/resize/signal → session writer. Ends when
+        // the SSH side closes (None), which drops the writer and lets the
+        // downlink drain trailing events.
+        while let Some(msg) = msg_rx.recv().await {
+            match msg {
+                ProxyMsg::Data(d) => {
+                    let _ = writer.write_stdin(&d).await;
+                }
+                ProxyMsg::Resize(c, r) => {
+                    let _ = writer.window_change(c, r).await;
+                }
+                ProxyMsg::Signal(s) => {
+                    let _ = writer.signal(&s).await;
+                }
+                ProxyMsg::Eof => {
+                    let _ = writer.eof().await;
+                }
             }
         }
+        drop(writer);
+        let _ = downlink.await;
     });
     bridges.insert(channel_id, tx);
 }

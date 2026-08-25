@@ -13,13 +13,11 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 
 use anyhow::Result;
-use async_trait::async_trait;
-use russh::Pty;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
-use super::{SessionEvent, TargetSession};
+use super::{SessionCommand, SessionEvent, SessionStream, SessionWriter, TargetSession};
 
 // -----------------------------------------------------------------------
 // PTY helpers
@@ -89,44 +87,8 @@ fn resolve_sftp_server(configured: Option<&str>) -> Option<PathBuf> {
 }
 
 // -----------------------------------------------------------------------
-// Control protocol
+// Session command handling
 // -----------------------------------------------------------------------
-
-enum Control {
-    Pty {
-        term: String,
-        cols: u32,
-        rows: u32,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    Env {
-        key: String,
-        value: String,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    Exec {
-        command: String,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    Shell {
-        reply: oneshot::Sender<Result<()>>,
-    },
-    Subsystem {
-        name: String,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    WindowChange {
-        cols: u32,
-        rows: u32,
-    },
-    Signal {
-        signal: String,
-    },
-    Eof,
-    Data {
-        bytes: Vec<u8>,
-    },
-}
 
 /// What the driver needs to drive a running backend.
 struct Backend {
@@ -172,8 +134,8 @@ impl WriteSide {
 }
 
 pub(crate) struct LocalSession {
-    control_tx: mpsc::Sender<Control>,
-    events_rx: mpsc::UnboundedReceiver<SessionEvent>,
+    writer: Option<SessionWriter>,
+    stream: Option<SessionStream>,
 }
 
 impl LocalSession {
@@ -181,20 +143,29 @@ impl LocalSession {
         // Control and stdin share ONE ordered channel so eof/data cannot
         // overtake the exec/subsystem start (see DirectSshSession for the
         // rationale); pre-start stdin is buffered by the driver.
-        let (control_tx, control_rx) = mpsc::channel::<Control>(64);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(64);
         let (events_tx, events_rx) = mpsc::unbounded_channel::<SessionEvent>();
-        tokio::spawn(driver(shell, sftp_server_path, control_rx, events_tx));
+        tokio::spawn(driver(shell, sftp_server_path, cmd_rx, events_tx));
         Self {
-            control_tx,
-            events_rx,
+            writer: Some(SessionWriter { tx: cmd_tx }),
+            stream: Some(SessionStream { rx: events_rx }),
         }
+    }
+}
+
+impl TargetSession for LocalSession {
+    fn split(mut self: Box<Self>) -> (SessionWriter, SessionStream) {
+        (
+            self.writer.take().expect("local session split twice"),
+            self.stream.take().expect("local session split twice"),
+        )
     }
 }
 
 async fn driver(
     shell: String,
     sftp_server_path: Option<String>,
-    mut control_rx: mpsc::Receiver<Control>,
+    mut cmd_rx: mpsc::Receiver<SessionCommand>,
     events_tx: mpsc::UnboundedSender<SessionEvent>,
 ) {
     let mut pty: Option<(String, u32, u32)> = None;
@@ -207,16 +178,16 @@ async fn driver(
 
     loop {
         tokio::select! {
-            ctrl = control_rx.recv() => match ctrl {
-                Some(Control::Pty { term, cols, rows, reply }) => {
+            cmd = cmd_rx.recv() => match cmd {
+                Some(SessionCommand::Pty { term, cols, rows, reply, .. }) => {
                     pty = Some((term, cols, rows));
                     let _ = reply.send(Ok(()));
                 }
-                Some(Control::Env { key, value, reply }) => {
+                Some(SessionCommand::Env { key, value, reply }) => {
                     env.push((key, value));
                     let _ = reply.send(Ok(()));
                 }
-                Some(Control::Exec { command, reply }) => {
+                Some(SessionCommand::Exec { command, reply }) => {
                     if backend.is_some() {
                         let _ = reply.send(Err(anyhow::anyhow!("session already running")));
                         continue;
@@ -231,7 +202,7 @@ async fn driver(
                         Err(e) => { let _ = reply.send(Err(e)); }
                     }
                 }
-                Some(Control::Shell { reply }) => {
+                Some(SessionCommand::Shell { reply }) => {
                     if backend.is_some() {
                         let _ = reply.send(Err(anyhow::anyhow!("session already running")));
                         continue;
@@ -246,7 +217,7 @@ async fn driver(
                         Err(e) => { let _ = reply.send(Err(e)); }
                     }
                 }
-                Some(Control::Subsystem { name, reply }) => {
+                Some(SessionCommand::Subsystem { name, reply }) => {
                     if name != "sftp" {
                         let _ = reply.send(Err(super::unsupported(&format!("subsystem {name}"))));
                         continue;
@@ -264,24 +235,24 @@ async fn driver(
                         Err(e) => { let _ = reply.send(Err(e)); }
                     }
                 }
-                Some(Control::WindowChange { cols, rows }) => {
+                Some(SessionCommand::Resize { cols, rows }) => {
                     if let Some(fd) = backend.as_ref().and_then(|b| b.pty_fd) {
                         pty_resize(fd, cols, rows);
                     }
                 }
-                Some(Control::Signal { signal }) => {
+                Some(SessionCommand::Signal { signal }) => {
                     if let Some(b) = backend.as_ref() {
                         signal_pid(b.pid, &signal);
                     }
                 }
-                Some(Control::Eof) => {
+                Some(SessionCommand::Eof) => {
                     if let Some(b) = backend.as_mut() {
                         b.write.eof().await;
                     } else {
                         pending_eof = true;
                     }
                 }
-                Some(Control::Data { bytes }) => {
+                Some(SessionCommand::Data { bytes }) => {
                     if let Some(b) = backend.as_mut() {
                         b.write.write(&bytes).await;
                     } else {
@@ -486,104 +457,52 @@ fn spawn_waiter(mut child: Child, events_tx: mpsc::UnboundedSender<SessionEvent>
     });
 }
 
-// -----------------------------------------------------------------------
-// TargetSession impl
-// -----------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-async fn request(
-    control_tx: &mpsc::Sender<Control>,
-    build: impl FnOnce(oneshot::Sender<Result<()>>) -> Control,
-) -> Result<()> {
-    let (rtx, rrx) = oneshot::channel();
-    control_tx
-        .send(build(rtx))
-        .await
-        .map_err(|_| anyhow::anyhow!("session closed"))?;
-    rrx.await
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("session closed")))
-}
-
-#[async_trait]
-impl TargetSession for LocalSession {
-    async fn request_pty(
-        &mut self,
-        term: &str,
-        cols: u32,
-        rows: u32,
-        _modes: &[(Pty, u32)],
-    ) -> Result<()> {
-        request(&self.control_tx, |reply| Control::Pty {
-            term: term.to_string(),
-            cols,
-            rows,
-            reply,
-        })
-        .await
-    }
-
-    async fn set_env(&mut self, key: &str, value: &str) -> Result<()> {
-        request(&self.control_tx, |reply| Control::Env {
-            key: key.to_string(),
-            value: value.to_string(),
-            reply,
-        })
-        .await
-    }
-
-    async fn exec(&mut self, command: &str) -> Result<()> {
-        request(&self.control_tx, |reply| Control::Exec {
-            command: command.to_string(),
-            reply,
-        })
-        .await
-    }
-
-    async fn shell(&mut self) -> Result<()> {
-        request(&self.control_tx, |reply| Control::Shell { reply }).await
-    }
-
-    async fn subsystem(&mut self, name: &str) -> Result<()> {
-        request(&self.control_tx, |reply| Control::Subsystem {
-            name: name.to_string(),
-            reply,
-        })
-        .await
-    }
-
-    async fn window_change(&mut self, cols: u32, rows: u32) -> Result<()> {
-        let _ = self
-            .control_tx
-            .send(Control::WindowChange { cols, rows })
-            .await;
-        Ok(())
-    }
-
-    async fn signal(&mut self, signal: &str) -> Result<()> {
-        let _ = self
-            .control_tx
-            .send(Control::Signal {
-                signal: signal.to_string(),
-            })
-            .await;
-        Ok(())
-    }
-
-    async fn write_stdin(&mut self, data: &[u8]) -> Result<()> {
-        self.control_tx
-            .send(Control::Data {
-                bytes: data.to_vec(),
-            })
+    #[tokio::test]
+    async fn split_exec_streams_output_and_exit_code() {
+        let sess: Box<dyn TargetSession> = Box::new(LocalSession::new("/bin/sh".to_string(), None));
+        let (writer, mut stream) = sess.split();
+        writer
+            .exec("printf hello; echo err 1>&2; exit 7")
             .await
-            .map_err(|_| anyhow::anyhow!("session closed"))?;
-        Ok(())
+            .unwrap();
+
+        let mut stdout = Vec::new();
+        let mut code = None;
+        while let Some(ev) = stream.next().await {
+            match ev {
+                SessionEvent::Stdout(d) => stdout.extend_from_slice(&d),
+                SessionEvent::Stderr(_) => {}
+                SessionEvent::ExitStatus(c) => {
+                    code = Some(c);
+                    break;
+                }
+                SessionEvent::ExitSignal(_) | SessionEvent::Eof => break,
+            }
+        }
+        assert_eq!(stdout, b"hello");
+        assert_eq!(code, Some(7));
     }
 
-    async fn eof(&mut self) -> Result<()> {
-        let _ = self.control_tx.send(Control::Eof).await;
-        Ok(())
-    }
+    #[tokio::test]
+    async fn split_carries_stdin_through_writer() {
+        let sess: Box<dyn TargetSession> = Box::new(LocalSession::new("/bin/sh".to_string(), None));
+        let (writer, mut stream) = sess.split();
+        writer.exec("cat").await.unwrap();
+        writer.write_stdin(b"ping").await.unwrap();
+        writer.eof().await.unwrap();
 
-    async fn next_event(&mut self) -> Option<SessionEvent> {
-        self.events_rx.recv().await
+        let mut stdout = Vec::new();
+        while let Some(ev) = stream.next().await {
+            match ev {
+                SessionEvent::Stdout(d) => stdout.extend_from_slice(&d),
+                SessionEvent::ExitStatus(_) | SessionEvent::Eof => break,
+                _ => {}
+            }
+        }
+        assert_eq!(stdout, b"ping");
     }
 }
