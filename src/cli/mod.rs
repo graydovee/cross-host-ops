@@ -57,7 +57,7 @@ pub(crate) fn classify_daemon_error(message: &str) -> XhoError {
     {
         XhoError::CannotExecute(message.to_string())
     } else if lower.contains("timed out") || lower.contains("timeout") {
-        XhoError::Timeout
+        XhoError::Timeout(message.to_string())
     } else if lower.contains("[transport]") || lower.contains("connection") {
         XhoError::Internal(message.to_string())
     } else {

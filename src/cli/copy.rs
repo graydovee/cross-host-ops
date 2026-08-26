@@ -62,58 +62,68 @@ pub(crate) async fn run_copy(
     } else {
         None
     };
-    while let Some(message) = stream.message().await? {
-        match message
-            .event
-            .ok_or_else(|| anyhow!("copy stream returned empty event"))?
-        {
-            rpc::copy_response::Event::AuthPrompt(prompt) => {
-                let value = prompt_for_auth_input(&prompt.message, prompt.secret)?;
-                tx.send(crate::protocol::copy_auth_input_request(
-                    prompt.prompt_id,
-                    value,
-                ))
-                .await
-                .map_err(|_| anyhow!("failed to send copy auth input request"))?;
-            }
-            rpc::copy_response::Event::Error(error) => {
-                return Err(super::classify_daemon_error(&error.message).into());
-            }
-            rpc::copy_response::Event::Complete(done) => {
-                if !quiet && !done.message.is_empty() {
-                    println!("{}", done.message);
+    let outcome = async {
+        while let Some(message) = stream.message().await? {
+            match message
+                .event
+                .ok_or_else(|| anyhow!("copy stream returned empty event"))?
+            {
+                rpc::copy_response::Event::AuthPrompt(prompt) => {
+                    let value = prompt_for_auth_input(&prompt.message, prompt.secret)?;
+                    tx.send(crate::protocol::copy_auth_input_request(
+                        prompt.prompt_id,
+                        value,
+                    ))
+                    .await
+                    .map_err(|_| anyhow!("failed to send copy auth input request"))?;
                 }
-                break;
-            }
-            rpc::copy_response::Event::Info(info) => {
-                if !quiet && !info.message.is_empty() {
-                    eprintln!("{}", info.message);
+                rpc::copy_response::Event::Error(error) => {
+                    return Err(super::classify_daemon_error(&error.message).into());
                 }
-            }
-            rpc::copy_response::Event::Frame(frame) => {
-                let frame = crate::protocol::copy_frame_from_rpc(frame)?;
-                if let Some(writer) = download_writer.as_mut() {
-                    writer.apply(frame).await?;
-                }
-            }
-            rpc::copy_response::Event::ReviewResult(_result) => {
-                // Review outcome surfaced for structured-output consumers; the
-                // human copy path relies on ConfirmRequired below for interaction.
-            }
-            rpc::copy_response::Event::ConfirmRequired(confirm) => {
-                let allow = super::prompt::prompt_for_confirmation(&confirm.reason, yes)?;
-                tx.send(crate::protocol::copy_confirm_request(
-                    crate::protocol::parse_execution_id(&confirm.execution_id)?,
-                    allow,
-                ))
-                .await
-                .map_err(|_| anyhow!("failed to send copy confirmation request"))?;
-                if !allow {
+                rpc::copy_response::Event::Complete(done) => {
+                    if !quiet && !done.message.is_empty() {
+                        println!("{}", done.message);
+                    }
                     break;
+                }
+                rpc::copy_response::Event::Info(info) => {
+                    if !quiet && !info.message.is_empty() {
+                        eprintln!("{}", info.message);
+                    }
+                }
+                rpc::copy_response::Event::Frame(frame) => {
+                    let frame = crate::protocol::copy_frame_from_rpc(frame)?;
+                    if let Some(writer) = download_writer.as_mut() {
+                        writer.apply(frame).await?;
+                    }
+                }
+                rpc::copy_response::Event::ReviewResult(_result) => {
+                    // Review outcome surfaced for structured-output consumers; the
+                    // human copy path relies on ConfirmRequired below for interaction.
+                }
+                rpc::copy_response::Event::ConfirmRequired(confirm) => {
+                    let allow = super::prompt::prompt_for_confirmation(&confirm.reason, yes)?;
+                    tx.send(crate::protocol::copy_confirm_request(
+                        crate::protocol::parse_execution_id(&confirm.execution_id)?,
+                        allow,
+                    ))
+                    .await
+                    .map_err(|_| anyhow!("failed to send copy confirmation request"))?;
+                    if !allow {
+                        break;
+                    }
                 }
             }
         }
+        Ok::<(), anyhow::Error>(())
     }
+    .await;
+    if let (Err(_), Some(writer)) = (&outcome, download_writer.as_mut()) {
+        // Remove the truncated in-progress file so a failed download does not
+        // leave a corrupt look-alike behind.
+        writer.cleanup_incomplete().await;
+    }
+    outcome?;
     Ok(0)
 }
 
@@ -291,6 +301,9 @@ struct CopyDownloadWriter {
     source_name: String,
     root: Option<PathBuf>,
     current_file: Option<tokio::fs::File>,
+    /// Path of the file currently being written; cleared on EndFile. Used to
+    /// remove a truncated transfer when the copy fails mid-file.
+    incomplete_path: Option<PathBuf>,
     progress: CopyProgressReporter,
 }
 
@@ -307,7 +320,18 @@ impl CopyDownloadWriter {
             source_name,
             root: None,
             current_file: None,
+            incomplete_path: None,
             progress,
+        }
+    }
+
+    /// Remove the in-progress (truncated) file, if any. Called on the error
+    /// path so a failed download leaves no corrupt look-alike behind. Files
+    /// that already received EndFile are complete and are kept.
+    async fn cleanup_incomplete(&mut self) {
+        self.current_file = None;
+        if let Some(path) = self.incomplete_path.take() {
+            let _ = tokio::fs::remove_file(&path).await;
         }
     }
 
@@ -339,6 +363,7 @@ impl CopyDownloadWriter {
                 self.progress
                     .begin_file(download_progress_name(&path, &relative_path), size);
                 self.current_file = Some(file);
+                self.incomplete_path = Some(path);
             }
             CopyFrame::FileData { data } => {
                 let file = self
@@ -352,6 +377,7 @@ impl CopyDownloadWriter {
                 if let Some(mut file) = self.current_file.take() {
                     file.flush().await?;
                 }
+                self.incomplete_path = None;
                 self.progress.finish_file();
             }
             CopyFrame::BeginDirectory {

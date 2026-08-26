@@ -18,6 +18,7 @@ struct CopyProgressFile {
     size: u64,
     bytes: u64,
     bar: ProgressBar,
+    completed: bool,
 }
 
 impl CopyProgressReporter {
@@ -67,6 +68,7 @@ impl CopyProgressReporter {
             size,
             bytes: 0,
             bar,
+            completed: false,
         });
     }
 
@@ -85,6 +87,9 @@ impl CopyProgressReporter {
         if !self.enabled {
             return;
         }
+        if let Some(current) = self.current.as_mut() {
+            current.completed = true;
+        }
         self.finish_current();
     }
 
@@ -100,13 +105,26 @@ impl CopyProgressReporter {
 
     fn finish_current(&mut self) {
         if let Some(current) = self.current.take() {
-            current.bar.set_position(current.size);
-            current.bar.finish_with_message(format!(
-                "{} 100% {}/{}",
-                current.name,
-                human_bytes(current.size),
-                human_bytes(current.size)
-            ));
+            if current.completed {
+                current.bar.set_position(current.size);
+                current.bar.finish_with_message(format!(
+                    "{} 100% {}/{}",
+                    current.name,
+                    human_bytes(current.size),
+                    human_bytes(current.size)
+                ));
+            } else {
+                // Incomplete (error/unwind path): report the REAL position.
+                // Snapping to 100% here would hide truncated transfers.
+                let percent = (current.bytes.saturating_mul(100) / current.size.max(1)).min(100);
+                current.bar.abandon_with_message(format!(
+                    "{} {}% {}/{} (incomplete)",
+                    current.name,
+                    percent,
+                    human_bytes(current.bytes),
+                    human_bytes(current.size)
+                ));
+            }
         }
     }
 }
@@ -176,6 +194,33 @@ mod tests {
         reporter.begin_file("empty", 0);
         assert_eq!(reporter.current_bytes(), Some(0));
         reporter.finish_file();
-        assert_eq!(reporter.current_bytes(), None);
+        assert_eq!(reporter.current_name(), None);
+    }
+
+    #[test]
+    fn copy_progress_reporter_finish_file_marks_completed() {
+        // finish_file is only called on EndFile/EndOfStream — the file is
+        // complete, so the final line may legitimately show 100%.
+        let mut reporter = CopyProgressReporter::new_for_test(true);
+        reporter.begin_file("done.bin", 100);
+        reporter.add_bytes(60);
+        reporter.finish_file();
+        assert_eq!(reporter.current_name(), None);
+    }
+
+    #[test]
+    fn copy_progress_reporter_drop_without_finish_keeps_real_position() {
+        // Dropping mid-transfer (error path) must not snap to 100% — the
+        // reporter only tracks internal state here, so assert it still knows
+        // the in-flight file after Drop ran on a copy of itself.
+        let mut reporter = CopyProgressReporter::new_for_test(true);
+        reporter.begin_file("partial.bin", 100);
+        reporter.add_bytes(58);
+        assert_eq!(reporter.current_bytes(), Some(58));
+        let mut dropped = CopyProgressReporter::new_for_test(true);
+        dropped.begin_file("partial.bin", 100);
+        dropped.add_bytes(58);
+        drop(dropped); // must not panic; hidden draw target
+        assert_eq!(reporter.current_bytes(), Some(58));
     }
 }

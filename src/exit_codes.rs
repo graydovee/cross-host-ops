@@ -55,8 +55,10 @@ pub fn cap_remote_exit_code(c: i32) -> i32 {
 /// The `exit_code()` method provides the deterministic mapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum XhoError {
-    /// Operation timed out (`--timeout` deadline expired).
-    Timeout,
+    /// Operation timed out (`--timeout` deadline expired, or the daemon
+    /// reported a timeout-class failure). Carries the underlying message so
+    /// the user can tell a CLI deadline from a daemon-side stall.
+    Timeout(String),
 
     /// Internal/daemon error: config error, daemon unreachable, resolver failure,
     /// transport error, missing operand.
@@ -79,7 +81,7 @@ impl XhoError {
     /// Map this error to its documented exit code.
     pub fn exit_code(&self) -> i32 {
         match self {
-            XhoError::Timeout => EXIT_TIMEOUT,
+            XhoError::Timeout(_) => EXIT_TIMEOUT,
             XhoError::Internal(_) => EXIT_INTERNAL,
             XhoError::UsageError(_) => EXIT_USAGE_ERROR,
             XhoError::CannotExecute(_) => EXIT_CANNOT_EXECUTE,
@@ -89,14 +91,20 @@ impl XhoError {
     }
 
     /// Get the human-readable message for this error.
-    pub fn message(&self) -> &str {
+    pub fn message(&self) -> String {
         match self {
-            XhoError::Timeout => "operation timed out",
-            XhoError::Internal(msg) => msg,
-            XhoError::UsageError(msg) => msg,
-            XhoError::CannotExecute(msg) => msg,
-            XhoError::TargetNotFound(msg) => msg,
-            XhoError::General(msg) => msg,
+            XhoError::Timeout(detail) => {
+                if detail.trim().is_empty() {
+                    "operation timed out".to_string()
+                } else {
+                    format!("operation timed out: {detail}")
+                }
+            }
+            XhoError::Internal(msg) => msg.clone(),
+            XhoError::UsageError(msg) => msg.clone(),
+            XhoError::CannotExecute(msg) => msg.clone(),
+            XhoError::TargetNotFound(msg) => msg.clone(),
+            XhoError::General(msg) => msg.clone(),
         }
     }
 }
@@ -140,7 +148,7 @@ mod tests {
 
     #[test]
     fn test_xho_error_exit_codes() {
-        assert_eq!(XhoError::Timeout.exit_code(), 124);
+        assert_eq!(XhoError::Timeout(String::new()).exit_code(), 124);
         assert_eq!(
             XhoError::Internal("daemon unreachable".into()).exit_code(),
             125
