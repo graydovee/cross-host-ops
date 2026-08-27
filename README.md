@@ -13,7 +13,7 @@ Remote command execution, file copy, and **transparent SSH proxy**. Manages SSH 
 - **Multiple Gateways** — Direct SSH, enterprise jumpserver (MFA), remote xhod daemon — unified behind `Gateway` trait with capability flags; partial backends (e.g. jumpserver without `list_servers`) report errors clearly
 - **Unified Target Resolution** — server.toml aliases, explicit routing, IP derivation, fallback chain
 - **Command Review** — Optional LLM security review, local allowlist + AI semantic analysis
-- **File Copy** — `xho cp` aligns with scp semantics, supports recursion and mode preservation
+- **File Copy** — `xho cp` aligns with scp semantics: recursion, mode preservation, directory destinations, and opt-in resumable single-file transfers (`--resume`)
 - **Zero Configuration** — Works with just `~/.ssh/config`, no configuration files required
 
 ## Quick Start
@@ -30,6 +30,9 @@ xho exec --tty host1 -- vim README.md
 
 # File copy
 xho cp local.txt host1:/tmp/
+
+# Interrupted large transfer? Re-run with --resume to continue from the offset
+xho cp --resume big.tar.gz host1:/tmp/
 
 # List all reachable servers
 xho ls
@@ -197,6 +200,7 @@ cargo fmt --all
 
 ## Documentation
 
+- [changelog](CHANGELOG.md) — Release history ([中文](CHANGELOG.zh-CN.md))
 - [architecture](docs/en/architecture.md) — System design, TargetSession abstraction, proxy, multi-hop tunnel
 - [usage](docs/en/usage.md) — Installation, configuration, command reference, troubleshooting
 - [config.example.toml](config.example.toml) — Complete configuration reference

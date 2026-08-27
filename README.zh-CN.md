@@ -13,7 +13,7 @@
 - **多种跳板** — 直连 SSH、企业 jumpserver（MFA）、远程 xhod daemon — 统一在 `Gateway` trait 下，通过 capability 标志声明功能；部分后端（如 jumpserver 不支持 `list_servers`）明确报错
 - **统一目标解析** — server.toml 别名、显式路由、IP 推导、fallback 链
 - **命令审查** — 可选 LLM 安全审查，本地白名单 + AI 语义分析
-- **文件复制** — `xho cp` 对齐 scp 语义，支持递归和 mode 保留
+- **文件复制** — `xho cp` 对齐 scp 语义：递归、mode 保留、目录目的地，以及可选开启的断点续传（`--resume`，单文件双向）
 - **零配置可用** — 只要有 `~/.ssh/config`，无需任何配置文件
 
 ## 快速开始
@@ -30,6 +30,9 @@ xho exec --tty host1 -- vim README.md
 
 # 文件复制
 xho cp local.txt host1:/tmp/
+
+# 大文件传中断了？加 --resume 重跑同一命令即可从断点继续
+xho cp --resume big.tar.gz host1:/tmp/
 
 # 列出所有可达服务器
 xho ls
@@ -196,6 +199,7 @@ cargo fmt --all
 
 ## 文档
 
+- [更新日志](CHANGELOG.zh-CN.md) — 版本发布记录（[English](CHANGELOG.md)）
 - [架构设计](docs/cn/architecture.md) — 系统设计、TargetSession 抽象、透明代理、多跳隧道
 - [使用指南](docs/cn/usage.md) — 安装、配置、命令参考、故障排查
 - [config.example.toml](config.example.toml) — 完整配置参考

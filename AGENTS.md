@@ -60,37 +60,39 @@ v0.4.0 moved control plane `2222 → 12222` to free 2222 for the proxy. If you s
 
 ## Changelog
 
-`CHANGELOG.md`（仓库根）是本项目的变更记录，**仅向前维护，不回填历史**。
+The changelog exists in **two languages**, both at the repo root: `CHANGELOG.md` (English) and `CHANGELOG.zh-CN.md` (Chinese mirror). Content maps one-to-one between them; **whenever you change one, sync the other**. Each README links to its language's changelog in the Documentation section.
 
-- **每次 commit 前必须先更新 `CHANGELOG.md`**：在对应分组的最上方追加一条条目，简短描述本次变更。
-- **条目一律用英文撰写**，简明描述变更实质，不得使用中文。
-- 每条条目必须是**一个 Markdown 列表项**（`- ` 开头，保证 GitHub 渲染时正确分行），格式严格为：
-  `- yyyy-MM-dd [tag] content`，例如 `- 2026-08-06 [feat] jumpserver supports -i stdin forwarding`。
-- 条目**按发布版本分组**，组内倒序（新条目在上）：
-  - 每个已发布的 git tag（`v*`）对应一个 `## v0.x.y` 小节，只收录该版本区间内的变更。
-  - **已发布版本的小节是冻结的**：之后不得再追加或改写其中条目。
-  - 下一版未定稿时，新条目一律写入最顶部的 `## latest` 小节（不存在则创建）；打 tag 发布时把 `## latest` 重命名为 `## v0.x.y`。
-- tag 只有 4 种，**按本次变更的实质归类，而非 commit 前缀**：
+- **Before every commit, update both changelogs**: prepend one entry to the topmost open section of each.
+- **Summarize each entry in one or two sentences**: state what changed and the user-visible effect — no implementation detail (that belongs in the commit message); semantic correspondence between the languages is enough, no word-for-word translation required.
+- Entries in `CHANGELOG.md` are **English only**; entries in `CHANGELOG.zh-CN.md` are **Chinese only**.
+- Every entry MUST be a **single markdown list item** (starts with `- ` so GitHub renders one line per entry), formatted exactly as:
+  `- yyyy-MM-dd [tag] content`, e.g. `- 2026-08-06 [feat] jumpserver supports -i stdin forwarding`.
+- The changelog is **forward-maintained only — never backfill history**; released sections stay frozen (except bulk rewrites explicitly requested by the user).
+- Entries are **grouped per released version**, newest first within a group:
+  - Each released git tag (`v*`) gets one `## v0.x.y` section covering only the changes within that release range.
+  - **Released sections are frozen**: never append to or rewrite their entries afterwards.
+  - While the next release is undecided, new entries go into the topmost `## latest` section (create it if missing); when the tag is cut, rename `## latest` to `## v0.x.y`.
+- Only 4 tags exist; **classify by the substance of the change, not the commit prefix**:
 
-  | tag         | 何时使用 |
-  |-------------|---------|
-  | `[feat]`    | 新增功能或能力（含独立新增的测试/工具） |
-  | `[bug]`     | 修复缺陷 |
-  | `[refactor]`| 不改变外部行为的重构、内部清理、依赖升级、CI/构建调整 |
-  | `[docs]`    | 文档变更 |
+  | tag         | When to use |
+  |-------------|-------------|
+  | `[feat]`    | New feature or capability (incl. independently added tests/tools) |
+  | `[bug]`     | Bug fix |
+  | `[refactor]`| Behavior-preserving refactor, internal cleanup, dependency upgrade, CI/build adjustments |
+  | `[docs]`    | Documentation changes |
 
-- 伴随某次 `fix`/`feat` 的测试、格式化、小清理等改动**不单独记一行**，并入对应那条；Merge / Revert 提交不单独记录。
-- **changelog 行与代码改动放同一个 commit**，不要单独提一个 changelog commit。
+- Tests, formatting, and minor cleanup bundled with a `fix`/`feat` are **not logged separately** — fold them into that entry; Merge/Revert commits get no entry.
+- **Keep the changelog lines in the same commit as the code change** — never a standalone changelog commit.
 
-## 交互与文档规范
+## Interaction & documentation conventions
 
-### 语言规范
+### Language
 
-所有面向用户的输出、解释、说明、问题回答，一律使用**中文**。
+All user-facing output — explanations, descriptions, answers — must be written in **Chinese**.
 
-代码注释（包括行内注释、函数注释、包注释）全部使用**英文**，不得混用中文。
+Code comments (inline comments, function docs, package docs) must be entirely in **English**; never mix languages.
 
-正确的做法：
+Correct:
 ```rust
 // Calculate the sum of two numbers
 fn add(a: i32, b: i32) -> i32 {
@@ -98,21 +100,22 @@ fn add(a: i32, b: i32) -> i32 {
 }
 ```
 
-错误的做法：
+Incorrect:
 ```rust
 // 计算两个数字的和
 fn 加法(a: i32, b: i32) -> i32 {
     a + b
 }
 ```
+(The negative example is quoted verbatim to show the violation.)
 
-### 文档生成规范
+### Documentation generation
 
-不要主动生成任何文档文件（包括但不限于 `.md`、`.txt`、`README`、API 文档、设计文档等），除非用户明确要求。
+Do not proactively create any documentation files (.md, .txt, README, API docs, design docs, etc.) unless the user explicitly asks.
 
-如果在完成任务过程中判断某个文档**非常必要**，必须先用中文向用户说明原因并征得同意，再生成。
+If a document seems truly necessary mid-task, first explain why (in Chinese) and get the user's consent before creating it.
 
-> 原则：文档是用户的决策，不是默认行为。
+> Principle: documentation is the user's decision, not a default behavior.
 
 ## Platform compatibility (real gotchas here)
 
