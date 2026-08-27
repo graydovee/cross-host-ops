@@ -245,27 +245,41 @@ Behavior: reuse idle → create new → wait at limit → auto-reconnect on tran
 
 ## Command Review
 
-Optional LLM-based command safety review before execution.
+Optional LLM-based safety review before execution, configured **per operation
+kind** (`[review.exec]`, `[review.copy]`) under shared LLM connection settings.
+All reviews are disabled by default.
 
 ```toml
 [review]
-enable = true
 endpoint = "https://api.openai.com/v1/chat/completions"
 model = "gpt-4.1-mini"
 timeout = "10s"
 failure_action = "deny"
 
-[review.fast_allowlist]
+[review.exec]
+enable = true
+
+[review.exec.fast_allowlist]
 enable = true
 commands = ["ls", "ls *", "cat *", "grep *"]
 
-[review.policy]
+[review.copy]
+enable = true
+blocklist = [".ssh", ".aws", ".gnupg", "/etc/shadow"]
+allowlist = ["/var/log/*", "/tmp/*"]
+
+[review.exec.policy]        # same shape for [review.copy.policy]
 safe = "allow"
 risky = "confirm"
 dangerous = "deny"
 ```
 
-API key: `XHO_REVIEW_API_KEY` or `OPENAI_API_KEY` env var.
+API key: `[review].api_key` accepts a secret reference (`vault:` / `env:` /
+`file:`); when omitted, xho tries `XHO_REVIEW_API_KEY` then `OPENAI_API_KEY`.
+
+Related: every machine operation also lands in the JSON-Lines audit log
+(`~/.xho/audit.jsonl`; see the `[audit]` section of `config.example.toml`)
+with caller identity — peer address, SSH user, key fingerprint.
 
 ## Troubleshooting
 

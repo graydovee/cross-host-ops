@@ -9,7 +9,8 @@
 
 ## latest
 
-- 2026-08-27 [docs] 将发布流程从 AGENTS.md 抽离为独立的 `xho-release` skill（`.agents/skills/xho-release/`），覆盖 changelog 定稿、annotated tag 切版、release 工作流监控与失败处理；AGENTS.md 改为链接指向该 skill。
+- 2026-08-27 [docs] 全量刷新文档与配置示例，使其匹配当前代码行为。
+- 2026-08-27 [docs] 将发布清单从 AGENTS.md 抽离为独立的 `xho-release` skill。
 
 ## v0.5.6
 

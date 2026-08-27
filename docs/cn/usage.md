@@ -14,8 +14,8 @@ cargo build --release
 ### 从 GitHub Release 下载
 
 每次推送 `v*` tag 会自动发布以下平台的二进制：
-- `x86_64-unknown-linux-gnu`
-- `aarch64-unknown-linux-gnu`
+- `x86_64-unknown-linux-musl`
+- `aarch64-unknown-linux-musl`
 - `x86_64-apple-darwin`
 - `aarch64-apple-darwin`
 
@@ -23,7 +23,7 @@ cargo build --release
 
 ```bash
 docker build -t xhod:latest .
-docker run --rm -p 2222:2222 -v /etc/xho:/etc/xho xhod:latest
+docker run --rm -p 2222:2222 -p 12222:12222 -v /etc/xho:/etc/xho xhod:latest
 ```
 
 ## 快速开始
@@ -68,11 +68,11 @@ xho exec web1 -- uname -a
 以下选项可用于所有子命令（放在子命令名之前）：
 
 - `--output text|json` — 输出格式，默认 `text`；`json` 输出 NDJSON（每行一个 JSON 对象，便于脚本解析）
-- `--non-interactive` — 禁用所有交互提示（认证、命令确认），需要输入时直接失败而非等待
+- `-y/--yes` — 自动确认审查提示，不再弹出交互式 `[y/N]` 询问
 
 ```bash
 xho --output json ls
-xho --non-interactive exec web1 -- hostname
+xho -y exec web1 -- hostname
 ```
 
 ### 执行远程命令
@@ -125,6 +125,9 @@ xho exec --tty host1 -- bash
 
 ### 文件复制
 
+目的地遵循 scp 语义：目录目的地会把文件放到目录内部、沿用源文件名
+（`host1:/opt/` + `./project` → `/opt/project`）。
+
 ```bash
 # 上传
 xho cp local.txt host1:/tmp/
@@ -140,7 +143,17 @@ xho cp -q local.txt host1:/tmp/
 
 # 设置超时
 xho cp --timeout 60s -r ./project host1:/opt/
+
+# 断点续传（双向单文件）：中断后保留已传部分，
+# 重跑同一命令即从断点继续，不再从头重来
+xho cp --resume big.tar.gz host1:/data/big.tar.gz
 ```
+
+续传细节（`--resume/-c`，按次开启；不带该标志时失败的复制会清理残留部分文件）：
+
+- 下载保留 `<dest>.part` 加 `.meta` sidecar；上传保留远端临时文件直到完成。传输成功后原子发布。
+- 续传前 daemon 校验远端部分文件大小，CLI 再比对部分数据全量 sha256 与本地源同长度前缀——追加生长的源能正确续传，仅共享旧头部的改写源会自动从头重传而不是静默拼出损坏文件。
+- 仅限单文件；递归目录复制重跑即重传。
 
 ### 服务器列表
 
@@ -173,19 +186,19 @@ xho daemon restart
 
 ```bash
 # 添加 xhod jump host
-xho host add prod xho@bastion.example.com:2222
+xho host add prod xho@bastion.example.com:12222
 
 # 添加时指定 identity file
-xho host add prod xho@bastion.example.com:2222 --identity-file ~/.ssh/id_ed25519
+xho host add prod xho@bastion.example.com:12222 --identity-file ~/.ssh/id_ed25519
 
 # 指定 known_hosts 文件
-xho host add prod xho@bastion.example.com:2222 --known-hosts ~/.xho/known_hosts
+xho host add prod xho@bastion.example.com:12222 --known-hosts ~/.xho/known_hosts
 
 # 自动接受首次连接的未知主机 key（与 --fingerprint 互斥）
-xho host add prod xho@bastion.example.com:2222 --accept-new-host-key
+xho host add prod xho@bastion.example.com:12222 --accept-new-host-key
 
 # 或显式校验指定指纹（与 --accept-new-host-key 互斥）
-xho host add prod xho@bastion.example.com:2222 --fingerprint SHA256:abcdef...
+xho host add prod xho@bastion.example.com:12222 --fingerprint SHA256:abcdef...
 
 # 列出已配置的 jump hosts
 xho host list
@@ -223,7 +236,7 @@ token 仅保存在 daemon 内存中，重启即失效；`[server.remote].bootstr
 xho token gen --ttl 5m
 
 # 2. 客户端：带 token 添加 gateway，自动完成公钥注册
-xho host add prod xho@bastion.example.com:2222 --token <TOKEN>
+xho host add prod xho@bastion.example.com:12222 --token <TOKEN>
 # 不带 --token 则交互提示；空输入跳过 bootstrap（仅信任 host key 并写入 config）
 
 # 3. authorized_keys 被清空、或换客户端机器后，对已配置的 gateway 重新注册
@@ -263,7 +276,8 @@ log_level = "info"
 
 [server.remote]
 enable = true
-listen_addr = "0.0.0.0:2222"
+# 控制面：daemon↔daemon RPC + 反向代理 + OpenSession（v0.4.0：2222 → 12222）
+listen_addr = "0.0.0.0:12222"
 user = "xho"
 host_key_path = "~/.xho/host_key"
 authorized_keys_path = "~/.xho/authorized_keys"
@@ -284,7 +298,7 @@ max_connections_per_ip = 10
 [[gateways]]
 name = "prod-xhod"
 kind = "xhod"
-address = "xho@bastion.example.com:2222"
+address = "xho@bastion.example.com:12222"
 identity_file = "~/.ssh/id_ed25519"
 known_hosts_path = "~/.xho/known_hosts"
 
@@ -302,22 +316,16 @@ totp_period = 30
 # 设为 false 可保留历史。
 suppress_history = true
 
-# 命令审查（可选）
+# 命令审查（可选）——共享 LLM 连接配置 + 按操作类型的子表。
+# 默认全部关闭；完整的 policy / allowlist 选项见「命令审查 (AI)」一节。
 [review]
-enable = true
 endpoint = "https://api.openai.com/v1/chat/completions"
 model = "gpt-4.1-mini"
 timeout = "10s"
 failure_action = "deny"
 
-[review.fast_allowlist]
+[review.exec]
 enable = true
-commands = ["ls", "ls *", "cat *", "grep *"]
-
-[review.policy]
-safe = "allow"
-risky = "confirm"
-dangerous = "deny"
 ```
 
 ### 服务器清单 (`server.toml`)
@@ -446,7 +454,7 @@ fallback = ["local", "prod-xhod", "corp-jump"]
 ```toml
 [server.remote]
 enable = true
-listen_addr = "0.0.0.0:2222"
+listen_addr = "0.0.0.0:12222"
 user = "xho"
 host_key_path = "~/.xho/host_key"
 authorized_keys_path = "~/.xho/authorized_keys"
@@ -457,7 +465,7 @@ server_config_path = "~/.xho/server.toml"
 
 3. **注册客户端公钥** —— 两种方式二选一：
    - **手动**：把客户端 `~/.ssh/id_ed25519.pub` 追加到 `~/.xho/authorized_keys`
-   - **自动（推荐）**：本机运行 `xho token gen`，客户端用 `xho host add prod xho@your-server:2222 --token <T>` 添加 gateway 时会自动注册（详见「Token 自动注册公钥」）
+   - **自动（推荐）**：本机运行 `xho token gen`，客户端用 `xho host add prod xho@your-server:12222 --token <T>` 添加 gateway 时会自动注册（详见「Token 自动注册公钥」）
 4. 创建 `~/.xho/server.toml` 定义可达目标
 5. 启动：`xho daemon start --config ~/.xho/config.toml`
 
@@ -467,7 +475,7 @@ server_config_path = "~/.xho/server.toml"
 [[gateways]]
 name = "prod"
 kind = "xhod"
-address = "xho@your-server.com:2222"
+address = "xho@your-server.com:12222"
 identity_file = "~/.ssh/id_ed25519"
 known_hosts_path = "~/.xho/known_hosts"
 
@@ -504,8 +512,21 @@ systemd 模式下 daemon 标记为 `external`，`xho daemon stop` 会被拒绝�
 ### Docker
 
 ```bash
-docker run --rm -p 2222:2222 -v /etc/xho:/etc/xho xhod:latest
+docker run --rm -p 2222:2222 -p 12222:12222 -v /etc/xho:/etc/xho xhod:latest
 ```
+
+## 退出码
+
+退出码是所有子命令的稳定契约：
+
+| 码 | 含义 |
+|----|------|
+| 0 | 成功 |
+| 1-123 | 远程命令自身退出码 |
+| 124 | 超时（`--timeout` 到期） |
+| 125 | xho / daemon 故障 |
+| 126 | 认证或命令审查拒绝 |
+| 127 | 目标不存在 |
 
 ## 连接池
 
@@ -522,38 +543,67 @@ docker run --rm -p 2222:2222 -v /etc/xho:/etc/xho xhod:latest
 - 达到上限 → 等待
 - Transport error → 自动重连一次
 
-## 命令审查
+## 命令审查 (AI)
 
-### 启用
+基于 LLM 的安全审查，按操作类型分别配置。`[review]` 放共享的 LLM 连接配置；每种操作类型有自己的子表，独立开关、提示词、策略与黑白名单。**默认全部关闭**。
 
 ```toml
 [review]
+endpoint = "https://api.openai.com/v1/chat/completions"
+model = "gpt-4.1-mini"
+# api_key 接受密钥引用（vault:/env:/file:）或字面量；
+# 不写时依次尝试环境变量 XHO_REVIEW_API_KEY、OPENAI_API_KEY
+timeout = "10s"
+failure_action = "deny"   # LLM 服务本身出错时的动作
+
+# --- exec 审查 ---
+[review.exec]
 enable = true
-```
 
-API key 通过环境变量提供：`XHO_REVIEW_API_KEY` 或 `OPENAI_API_KEY`
-
-### 两层过滤
-
-1. **本地白名单**（零延迟）：
-
-```toml
-[review.fast_allowlist]
+[review.exec.fast_allowlist]
 enable = true
-commands = ["ls", "ls *", "cat *", "kubectl get *"]
-```
+commands = ["ls", "ls *", "cat *", "grep *", "kubectl get *"]
 
-规则：含 `*` 为通配匹配，否则精确匹配。
-
-2. **LLM 审查**：复杂命令（含 `&&`、`||`、`$()`、`bash -c` 等）发送到 LLM。
-
-### 策略
-
-```toml
-[review.policy]
+[review.exec.policy]
 safe = "allow"       # 直接执行
-risky = "confirm"    # 需要用户确认
-dangerous = "deny"   # 拒绝
+risky = "confirm"    # 交互式 [y/N] 确认（--yes 可自动应答）
+dangerous = "deny"
+
+# --- copy 审查 ---
+[review.copy]
+enable = true
+blocklist = [".ssh", ".aws", ".gnupg", ".kube", "/etc/shadow", "/etc/ssh"]
+allowlist = ["/var/log/*", "/tmp/*"]
+
+[review.copy.policy]
+safe = "allow"
+risky = "confirm"
+dangerous = "deny"
+```
+
+过滤顺序：
+
+1. **copy 黑白名单** — 对远端路径做模式匹配，命中即秒判（blocklist 拒绝、allowlist 放行），不经过 LLM。glob 模式，条目可匹配路径本身或源文件名。
+2. **exec fast allowlist** — 对命令行做 glob 匹配（零延迟）；未命中的交给 LLM。
+3. **LLM 审查** — 分类为 `safe | risky | dangerous`，再由 `[review.*.policy]` 映射为 `allow | confirm | deny`。策略还可以配 `warn`。
+
+被拒绝的操作以退出码 `126` 失败，并透出审查理由。
+
+## 审计日志
+
+每个机器操作——exec、copy、OpenSession 隧道、透明代理——都会记录成一条 JSON-Lines 事件，包含：
+
+- 调用方身份：对端地址、SSH 用户、公钥指纹
+- 操作细节：目标、网关链、argv（exec）、路径（copy）
+- 结果状态与事件 id / 时间戳对（RFC3339 + epoch ms）
+
+**默认开启**；日志位于 `~/.xho/audit.jsonl`（root daemon 为 `/var/log/xho/audit.jsonl`）。它是独立的非阻塞 appender，与 tracing 调试日志完全解耦，同样跟随 SIGHUP 轮转。
+
+```toml
+[audit]
+enabled = true                      # 设 false 整体关闭
+path = "/var/log/xho/audit.jsonl"   # 可选覆盖
+include_identity = true             # 记录调用方身份字段
 ```
 
 ## 故障排查
@@ -588,4 +638,4 @@ ssh root@server "/root/xho/xho status"
 
 - 终端没恢复：`reset` 命令可手动恢复
 - 不进入交互模式：确认 `--tty` 已设置且 stdin/stdout 都是 TTY
-- 通过管道使用时自动降级为非交互模式
+- 审查确认提示即使 stdin 不是 TTY 也会从 stdin 读答案；管道关闭等价于空输入，即方括号里的默认项（`[y/N]`）

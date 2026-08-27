@@ -7,10 +7,11 @@ Cross Host Ops（xho）是一个基于 Rust 的远程命令执行与文件复制
 - **`xho`**（`src/bin/xho.rs`）— 客户端，负责用户交互、参数解析、终端 raw mode、流式输出展示。
 - **`xhod`**（`src/bin/xhod.rs`）— 守护进程，负责目标解析、命令审查、连接池管理、命令执行与文件传输。
 
-CLI 不直接连接目标机器，而是通过 gRPC 把请求交给本地 daemon，由 daemon 统一调度。daemon 有**两个入口**，共用同一套 RPC 处理逻辑：
+CLI 不直接连接目标机器，而是通过 gRPC 把请求交给本地 daemon，由 daemon 统一调度。daemon 有**三个监听器**，共用同一套 RPC 处理逻辑：
 
 - **本地入口**：Unix Socket（`~/.xho/xhod.sock`），供本机 `xho` 连接。
-- **远程入口**：SSH Server（默认 TCP:2222），供另一台机器上的 `xhod` 作为跳板接入。
+- **控制面**：SSH Server（默认 TCP:**12222**），供另一台机器的 `xhod` 作跳板接入、反向代理节点注册、多跳隧道使用。
+- **透明代理**：SSH Server（默认 TCP:**2222**），供人类用标准 `ssh`/`scp`/`sftp` 直连 —— 见下文「透明 SSH 代理」一节。
 
 daemon 通过 **Gateway** 抽象统一三种到达目标的方式：直连 SSH、远程 xhod（SSH subsystem + gRPC）、jumpserver（交互式菜单跳板）。
 
@@ -75,7 +76,7 @@ daemon 通过 **Gateway** 抽象统一三种到达目标的方式：直连 SSH�
 **`DaemonState`** 持有：
 - `config: Arc<RwLock<AppConfig>>` — 可热更新的配置
 - `gateways: Vec<(String, Arc<dyn Gateway>)>` — 按声明顺序排列的网关列表（首个恒为 `"local"`）
-- `reviewer` — 命令审查器
+- `oversight` — 统一的审查 + 审计门面
 - `shutdown_tx` — 关闭信号
 
 **启动流程**：
@@ -86,7 +87,7 @@ daemon 通过 **Gateway** 抽象统一三种到达目标的方式：直连 SSH�
 5. 注册 SIGHUP 处理（配置热重载 + 日志重开）
 6. 用 `XhoRpcService` 提供 gRPC 服务
 
-**`XhoRpcService`** 实现 proto 定义的全部 RPC（Execute / Copy / Status / ListServers / Shutdown / UpdateConfig / ListGateways）。
+**`XhoRpcService`** 实现 proto 定义的全部 RPC（Execute / Copy / Status / ListServers / Shutdown / UpdateConfig / ListGateways / TokenGen / TokenList / TokenInvalidate / BootstrapAuthorize，以及 `OpenSession` 流式 RPC）。
 
 ### 3. Resolver（`src/daemon/resolver.rs`）
 
@@ -107,15 +108,18 @@ pub struct Route {
 
 **`derive_target_ip`**：从主机名后缀推导 IP，例如 `foo-192-0-2-163` → `192.0.2.163`（取末 4 段数字以 `.` 连接）。
 
-### 4. Reviewer（`src/daemon/review.rs`）
+### 4. Oversight（`src/oversight/`）— v0.5.5
 
-可选的 LLM 命令安全审查，在命令执行前拦截。
+统一的 oversight 层，把两个关注点合到一个门面后面。所有机器操作——exec、copy、OpenSession 隧道、透明代理——都经过它：
+
+1. **审计日志**（`oversight/audit.rs`）——默认开启的 JSON-Lines 审计流水，含调用方身份（对端地址、SSH 用户、密钥指纹），配置见 `[audit]`。
+2. **AI 命令审查**（`oversight/review.rs`）——可选，按操作类型分别配置，在执行前拦截。
 
 **两层过滤**：
-1. **本地快速白名单** — glob 模式匹配（如 `ls *`、`cat *`），复杂脚本（bash/python 等）直接走 LLM。
+1. **本地快速白名单 / copy 黑白名单** — glob 模式匹配（如 `ls *`、`cat *`；copy 路径对 blocklist/allowlist 模式匹配），复杂脚本（bash/python 等）直接走 LLM。
 2. **LLM 语义审查** — 发送到 OpenAI 兼容接口，分类风险等级。
 
-**风险等级与动作**（定义于 `src/config/review.rs`）：
+**风险等级与动作**（定义于 `src/config/review.rs`；LLM 连接配置共享于 `[review]`，按操作类型的子表为 `[review.exec]` / `[review.copy]`）：
 
 | `RiskLevel` | 说明 | 默认 `ReviewAction` |
 |-------------|------|---------------------|
@@ -123,7 +127,7 @@ pub struct Route {
 | `Risky` | 有风险 | `Confirm` |
 | `Dangerous` | 危险 | `Deny` |
 
-`ReviewAction` 共四种：`Allow` / `Warn` / `Confirm` / `Deny`，由 `[review.policy]` 配置每种风险等级对应的动作。
+`ReviewAction` 共四种：`Allow` / `Warn` / `Confirm` / `Deny`，由每个操作的 `[review.*.policy]` 配置每种风险等级对应的动作。
 
 Reviewer 只审查原始命令（`build_remote_command(argv)`），不看 shell 包装后的命令。
 
@@ -186,6 +190,7 @@ pub trait Gateway: Send + Sync {
    - `kind = "jumpserver"` → `JumpserverGateway`
    - `kind = "direct"` → **`DirectGateway`**（用条目自己的 name，共享 `server.toml` 解析逻辑）
 3. `_self`（localhost）在 `server.proxy.enable` 或 `reverse_proxy.allow_host_access` 时注册为 `LocalhostGateway`。
+4. **反向代理节点不做静态配置**：当无公网的 xhod 通过 `xho-reverse:<node_name>` 子系统外连上来时，hub 端的 `ReverseProxyRegistry`（`src/daemon/reverse_proxy.rs`）把预建立的 gRPC 客户端包成 `ReverseProxyGateway` 并以 `<node_name>` 注册，该节点上的目标即可按 `<gateway>:<node>:<target>` 解析。
 
 ### 五种 Gateway 实现
 
@@ -194,12 +199,12 @@ pub trait Gateway: Send + Sync {
 | **DirectGateway**（`direct.rs`） | EXEC\|COPY\|PROXY\|LIST | 直连 SSH | `ManagedPool<key, PooledHandle>` — 池化已认证的 `client::Handle`；一次 SSH 握手，多个 session channel |
 | **LocalhostGateway**（`localhost.rs`） | EXEC\|COPY\|PROXY\|LIST | 本地 PTY + sftp-server | 无池化（每次新建本地进程） |
 | **XhodGateway**（`xhod.rs`） | EXEC\|COPY\|PROXY\|LIST | SSH subsystem → gRPC | `ManagedSingleton<XhoRpcClient>` — 单个共享客户端。`open_session` 构建 `TunneledSession` |
-| **ReverseProxyGateway**（`reverse_proxy.rs`） | EXEC\|COPY\|PROXY\|LIST | 反向代理 gRPC 客户端 | 节点主动连接，预建通道。`open_session` 构建 `TunneledSession` |
+| **ReverseProxyGateway**（`src/daemon/reverse_proxy.rs`） | EXEC\|COPY\|PROXY\|LIST | 节点主动外连、携带 `xho-reverse` 子系统的 SSH 连接 | 预建通道上的 gRPC 客户端，运行时动态注册。`open_session` 构建 `TunneledSession` |
 | **JumpserverGateway**（`jumpserver.rs`） | EXEC\|COPY\|PROXY | SSH + PTY shell + 菜单 | `ManagedSingleton<JumpserverTransport>` — 每次操作导航到目标资产；`open_session` 返回 `JumpserverSession` |
 
-## 会话层 Session Layer（`src/daemon/session/`）— v0.5.0
+## 会话层 Session Layer（`src/daemon/session/`）
 
-**统一 `TargetSession` 抽象**是所有操作的唯一低层契约 — CLI `xho exec`/`cp`、透明 SSH 代理、多跳 `OpenSession` 隧道都通过它驱动。
+**统一 `TargetSession` 抽象**是所有操作的唯一低层契约 — CLI `xho exec`/`cp`、透明 SSH 代理、多跳 `OpenSession` 隧道都通过它驱动。每个 session 拆分为独立的 **writer / event-stream 两半**，所有流式消费端都按方向各跑一个任务，流控背压不再可能把会话双向死锁。
 
 ```rust
 #[async_trait]
@@ -224,7 +229,7 @@ pub trait TargetSession: Send {
 | `DirectSshSession`（`direct.rs`） | russh 池化客户端通道 | byte-perfect scp/sftp/exec/pty。池化的 `client::Handle` 通过 `on_done` 回调返还 lease。 |
 | `LocalSession`（`local.rs`） | 本地 PTY + spawn `sftp-server` | `_self` 目标的完整 shell/exec/sftp。 |
 | `TunneledSession`（`tunnel.rs`） | 控制面 OpenSession RPC | 多跳：`ssh → 本地代理 → 控制面 → 远程 xhod → 机器`。递归。 |
-| `JumpserverSession`（`jumpserver.rs`） | 拥有导航后的 `PtyShell` | exec 通过 prompt 检测流式输出；shell/sftp 走原始双向透传。退出码=0（菜单堡垒机 PTY 无原生 exit code）。 |
+| `JumpserverSession`（`jumpserver.rs`） | 拥有导航后的 `PtyShell` | exec 通过 prompt 检测流式输出（退出码=0）；文件复制走 PTY shell，载荷**只使用换行分行的 base64**（`shell_copy.rs` + `b64.rs`），UUID 哨兵定界——结构化裸二进制会楔死堡垒机的内容审计；copy 退出码随 END 标记回传。 |
 
 **工厂**：`open_target_session(state, route)` → 委托给 `gateway.open_session(end_target)`。所有分发在 Gateway impl 内部；自由函数泛用 `Capabilities::PROXY` 检查。  
 **Copy**：`copy_via_session(state, route, spec)` → 检查 `Capabilities::COPY`，调用 `gateway.open_session()` → `subsystem("sftp")` + `russh-sftp` 客户端走 duplex 桥接（`sftp_copy.rs`）。
@@ -315,14 +320,14 @@ Jumpserver 专用 PTY 引擎 — 拥有 `PtyShell`、菜单导航、资产表解
 
 xhod 可作为 SSH 服务端接受远程 xhod 的连接。
 
-- **监听**：`TCP:2222`（`server.remote.listen_addr` 可配置）。
+- **监听**：默认 `TCP:12222`（`server.remote.listen_addr` 可配置）。
 - **认证**：两条路径都接受 ——
   - `auth_publickey()` 校验 `~/.xho/authorized_keys`（常规路径）
   - `auth_password()` 校验动态 token（`xho token gen` 签发，in-memory）或配置里的 `bootstrap_token`（走 SecretResolver，支持 `vault:`/`env:`/`file:`）。token 校验通过后客户端可在同一 SSH 会话上调用 `BootstrapAuthorize` RPC，让 daemon 自动把它的公钥追加进 `authorized_keys`，免手动分发。
-- **唯一接受的操作**：`subsystem_request("xho-rpc")` — 把 SSH channel 的字节流当作 gRPC 连接交给 tonic Server（同一个 `XhoRpcService`）。
+- **接受的子系统**：`xho-rpc` —— 把 SSH channel 的字节流当作 gRPC 连接交给 tonic Server（同一个 `XhoRpcService`）；以及 `xho-reverse[:<node_name>]` —— 把来连节点注册为动态反向代理网关（见下）。
 - **拒绝的操作**：`shell_request`、`exec_request`、`tcpip_forward` / `streamlocal_forward`（不允许 shell 登录、直接 exec、端口转发）。
 
-连接经 `IncomingConn::Remote`（携带对端 addr / user / key 指纹）进入 RPC 处理。
+连接经 `IncomingConn::Remote`（携带对端 addr / user / key 指纹）进入 RPC 处理——这些身份信息随后写入审计事件。
 
 ## 通信协议（`proto/xho.proto`）
 
@@ -337,6 +342,9 @@ CLI ↔ daemon、daemon ↔ 远程 daemon 共用同一套协议。
 | `Shutdown` | Unary | 关闭 daemon |
 | `UpdateConfig` | Unary | 热更新配置 |
 | `ListGateways` | Unary | 列出已配置的 Gateway |
+| `TokenGen` / `TokenList` / `TokenInvalidate` | Unary | 管理短期引导 token |
+| `BootstrapAuthorize` | Unary | 把通过认证的客户端公钥追加进 `authorized_keys`（token 引导） |
+| `OpenSession` | 双向流 | 多跳会话隧道 |
 
 **Execute 流消息**：
 - Client → Daemon：`StartRequest`、`ConfirmRequest`、`AuthInputRequest`、`StdinData`、`WindowResize`
@@ -409,7 +417,7 @@ socket_path = "~/.xho/xhod.sock"
 
 [server.remote]
 enable = true
-listen_addr = "0.0.0.0:2222"
+listen_addr = "0.0.0.0:12222"
 user = "xho"
 host_key_path = "~/.xho/host_key"
 authorized_keys_path = "~/.xho/authorized_keys"
@@ -425,7 +433,7 @@ max_connections_per_ip = 10
 [[gateways]]
 kind = "xhod"
 name = "remote-xhod"
-address = "xho@203.0.113.10:2222"
+address = "xho@203.0.113.10:12222"
 identity_file = "~/.ssh/id_ed25519"
 known_hosts_path = "~/.xho/known_hosts"
 
@@ -479,14 +487,23 @@ src/
 │   ├── exec.rs  host.rs  output.rs  progress.rs  prompt.rs
 ├── config.rs               # AppConfig（通用库入口）
 ├── config/                 # 配置类型
-│   ├── client.rs  copy.rs  duration.rs  gateway.rs  inventory.rs
-│   ├── path.rs  review.rs  server.rs  ssh.rs
+│   ├── audit.rs  client.rs  copy.rs  duration.rs  gateway.rs
+│   ├── inventory.rs  mfa.rs  path.rs  review.rs  reverse_proxy.rs
+│   ├── secret.rs  server.rs  ssh.rs
+├── oversight/              # 统一 oversight 层 (v0.5.5)
+│   ├── mod.rs              # Oversight 门面，覆盖所有操作入口
+│   ├── audit.rs            # JSON-Lines 审计流水（每个操作的调用方身份 + 结果）
+│   └── review.rs           # LLM 命令/复制审查（按操作类型配置）
 ├── daemon/                 # daemon 业务逻辑
 │   ├── mod.rs              # 启动、监听、shutdown、DaemonState、XhoRpcService
 │   ├── rpc.rs              # Gateway 分发、process_list_servers
 │   ├── resolver.rs         # target → Vec<Route>
-│   ├── review.rs           # LLM 命令审查
-│   ├── ssh_server.rs       # RemoteSshServer、IncomingConn
+│   ├── ssh_server.rs       # RemoteSshServer（控制面）、IncomingConn
+│   ├── proxy_server.rs     # ProxySshServer（透明代理，端口 2222）
+│   ├── authorized_keys.rs  # authorized_keys 解析/匹配（两套存储共用）
+│   ├── token_store.rs      # 内存态短期引导 token
+│   ├── reverse_client.rs   # 节点侧：经 xho-reverse 子系统外连 hub
+│   ├── reverse_proxy.rs    # hub 侧：ReverseProxyRegistry + ReverseProxyGateway
 │   ├── connection_manager.rs  # ManagedPool / ManagedSingleton
 │   ├── gateway/            # Gateway 抽象与实现
 │   │   ├── mod.rs          # Gateway trait、Capabilities、GatewayKind、Route、GatewayError、build_gateways
@@ -501,7 +518,9 @@ src/
 │   │   ├── local.rs        # LocalSession（PTY + sftp-server for _self）
 │   │   ├── tunnel.rs       # TunneledSession（OpenSession RPC 多跳隧道）
 │   │   ├── jumpserver.rs   # JumpserverSession（导航后 PTY + raw/shell/sftp）
-│   │   └── sftp_copy.rs    # SFTP copy 驱动（走 subsystem("sftp")）
+│   │   ├── sftp_copy.rs    # SFTP copy 驱动（走 subsystem("sftp")）
+│   │   ├── shell_copy.rs   # jumpserver shell copy：base64 载荷、续传账本
+│   │   └── b64.rs          # shell copy 用的增量 base64 编解码器
 │   ├── shell.rs            # 纯 shell 引用/构建工具（所有后端复用）
 │   └── jumpserver_engine.rs # Jumpserver 专用 PtyShell、菜单导航、提示符检测
 ├── copy_frames.rs          # 文件复制帧编解码（通用库）
@@ -555,19 +574,8 @@ CLI → gRPC ListServers → Daemon
   → rpc::process_list_servers()：按声明顺序遍历 gateways
       ├─ DirectGateway.list_servers()        → 读 server.toml（零 I/O）
       ├─ XhodGateway.list_servers()         → gRPC ListServers（远程聚合）
+      ├─ ReverseProxyGateway.list_servers() → 经注册节点的客户端远程聚合
       └─ JumpserverGateway.list_servers()   → Err(Unsupported) → 跳过并标记
   → 合并所有 ServerListRow，带上来源标签（local / <gateway-name>）
-  → CLI 格式化显示
-```
-
-### `xho ls`（merged view 聚合）
-
-```
-CLI → gRPC ListServers → Daemon
-  → rpc::process_list_servers(): 按声明顺序遍历 gateway
-      ├─ DirectGateway.list_servers()        → 读 server.toml（零 I/O）
-      ├─ XhodGateway.list_servers()          → gRPC ListServers（远程聚合）
-      └─ JumpserverGateway.list_servers()    → Err(Unsupported, trait 默认实现) → 标记
-  → 合并所有 ServerListRow，附加 source 标签（local / <gateway-name>）
   → CLI 格式化显示
 ```

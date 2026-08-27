@@ -14,8 +14,8 @@ Generated binaries: `target/release/xho` and `target/release/xhod`
 ### Download from GitHub Release
 
 Each push of a `v*` tag automatically publishes binaries for the following platforms:
-- `x86_64-unknown-linux-gnu`
-- `aarch64-unknown-linux-gnu`
+- `x86_64-unknown-linux-musl`
+- `aarch64-unknown-linux-musl`
 - `x86_64-apple-darwin`
 - `aarch64-apple-darwin`
 
@@ -23,7 +23,7 @@ Each push of a `v*` tag automatically publishes binaries for the following platf
 
 ```bash
 docker build -t xhod:latest .
-docker run --rm -p 2222:2222 -v /etc/xho:/etc/xho xhod:latest
+docker run --rm -p 2222:2222 -p 12222:12222 -v /etc/xho:/etc/xho xhod:latest
 ```
 
 ## Quick Start
@@ -68,11 +68,11 @@ xho exec web1 -- uname -a
 The following options apply to all subcommands (placed before the subcommand name):
 
 - `--output text|json` — Output format, default `text`; `json` outputs NDJSON (one JSON object per line, convenient for script parsing)
-- `--non-interactive` — Disable all interactive prompts (authentication, command confirmation); fail immediately instead of waiting when input is required
+- `-y/--yes` — Auto-confirm review prompts without showing the interactive `[y/N]` question
 
 ```bash
 xho --output json ls
-xho --non-interactive exec web1 -- hostname
+xho -y exec web1 -- hostname
 ```
 
 ### Executing Remote Commands
@@ -125,6 +125,9 @@ Interactive mode features:
 
 ### File Copy
 
+Destinations follow scp semantics: a directory destination places the file
+inside it under its source name (`host1:/opt/` + `./project` → `/opt/project`).
+
 ```bash
 # Upload
 xho cp local.txt host1:/tmp/
@@ -140,7 +143,23 @@ xho cp -q local.txt host1:/tmp/
 
 # Set timeout
 xho cp --timeout 60s -r ./project host1:/opt/
+
+# Resumable single-file transfer (both directions):
+# interrupted attempts keep their partial data, and re-running the SAME
+# command continues from the recorded offset instead of starting over
+xho cp --resume big.tar.gz host1:/data/big.tar.gz
 ```
+
+Resume details (`--resume/-c`, opt-in per invocation; without it failed copies
+clean up their partial files):
+
+- Downloads keep `<dest>.part` plus a `.meta` sidecar; uploads keep the remote
+  temp file until completion. A finished transfer is published atomically.
+- Before resuming, the daemon validates the partial (size) and the CLI compares
+  a full sha256 of the partial against its own source prefix — so append-grown
+  sources resume correctly, while rewritten sources sharing old headers restart
+  from scratch instead of corrupting silently.
+- Single files only; recursive directory copies restart when re-run.
 
 ### Server List
 
@@ -173,19 +192,19 @@ xho daemon restart
 
 ```bash
 # Add an xhod jump host
-xho host add prod xho@bastion.example.com:2222
+xho host add prod xho@bastion.example.com:12222
 
 # Specify identity file when adding
-xho host add prod xho@bastion.example.com:2222 --identity-file ~/.ssh/id_ed25519
+xho host add prod xho@bastion.example.com:12222 --identity-file ~/.ssh/id_ed25519
 
 # Specify known_hosts file
-xho host add prod xho@bastion.example.com:2222 --known-hosts ~/.xho/known_hosts
+xho host add prod xho@bastion.example.com:12222 --known-hosts ~/.xho/known_hosts
 
 # Automatically accept unknown host key on first connection (mutually exclusive with --fingerprint)
-xho host add prod xho@bastion.example.com:2222 --accept-new-host-key
+xho host add prod xho@bastion.example.com:12222 --accept-new-host-key
 
 # Or explicitly verify a specific fingerprint (mutually exclusive with --accept-new-host-key)
-xho host add prod xho@bastion.example.com:2222 --fingerprint SHA256:abcdef...
+xho host add prod xho@bastion.example.com:12222 --fingerprint SHA256:abcdef...
 
 # List configured jump hosts
 xho host list
@@ -232,7 +251,7 @@ xho token gen --ttl 5m
 
 # 2. On the client: add the gateway with the token; the public key is
 #    appended automatically
-xho host add prod xho@bastion.example.com:2222 --token <TOKEN>
+xho host add prod xho@bastion.example.com:12222 --token <TOKEN>
 # Without --token the CLI prompts interactively; empty input skips bootstrap
 # (only trusts the host key and writes the config).
 
@@ -274,7 +293,8 @@ log_level = "info"
 
 [server.remote]
 enable = true
-listen_addr = "0.0.0.0:2222"
+# Control plane: daemon↔daemon RPC + reverse proxy + OpenSession (v0.4.0: moved 2222 → 12222)
+listen_addr = "0.0.0.0:12222"
 user = "xho"
 host_key_path = "~/.xho/host_key"
 authorized_keys_path = "~/.xho/authorized_keys"
@@ -297,7 +317,7 @@ max_connections_per_ip = 10
 [[gateways]]
 name = "prod-xhod"
 kind = "xhod"
-address = "xho@bastion.example.com:2222"
+address = "xho@bastion.example.com:12222"
 identity_file = "~/.ssh/id_ed25519"
 known_hosts_path = "~/.xho/known_hosts"
 
@@ -315,22 +335,17 @@ totp_period = 30
 # pollute ~/.bash_history (default: true). Set to false to keep history.
 suppress_history = true
 
-# Command review (optional)
+# Command review (optional) — shared LLM settings + per-operation sub-tables.
+# All reviews are disabled by default; see "Command Review (AI)" for the full
+# policy / allowlist options.
 [review]
-enable = true
 endpoint = "https://api.openai.com/v1/chat/completions"
 model = "gpt-4.1-mini"
 timeout = "10s"
 failure_action = "deny"
 
-[review.fast_allowlist]
+[review.exec]
 enable = true
-commands = ["ls", "ls *", "cat *", "grep *"]
-
-[review.policy]
-safe = "allow"
-risky = "confirm"
-dangerous = "deny"
 ```
 
 ### Server Inventory (`server.toml`)
@@ -486,7 +501,7 @@ fallback = ["local", "prod-xhod", "corp-jump"]
 ```toml
 [server.remote]
 enable = true
-listen_addr = "0.0.0.0:2222"
+listen_addr = "0.0.0.0:12222"
 user = "xho"
 host_key_path = "~/.xho/host_key"
 authorized_keys_path = "~/.xho/authorized_keys"
@@ -497,7 +512,7 @@ server_config_path = "~/.xho/server.toml"
 
 3. **Register the client public key** — pick one of:
    - **Manual**: append the client's `~/.ssh/id_ed25519.pub` to `~/.xho/authorized_keys`
-   - **Automatic (recommended)**: run `xho token gen` here, then from the client use `xho host add prod xho@your-server:2222 --token <T>` to auto-register during gateway add (see "Auto-registering the public key")
+   - **Automatic (recommended)**: run `xho token gen` here, then from the client use `xho host add prod xho@your-server:12222 --token <T>` to auto-register during gateway add (see "Auto-registering the public key")
 4. Create `~/.xho/server.toml` to define reachable targets
 5. Start: `xho daemon start --config ~/.xho/config.toml`
 
@@ -507,7 +522,7 @@ server_config_path = "~/.xho/server.toml"
 [[gateways]]
 name = "prod"
 kind = "xhod"
-address = "xho@your-server.com:2222"
+address = "xho@your-server.com:12222"
 identity_file = "~/.ssh/id_ed25519"
 known_hosts_path = "~/.xho/known_hosts"
 
@@ -544,8 +559,21 @@ In systemd mode, the daemon is marked as `external` and `xho daemon stop` will b
 ### Docker
 
 ```bash
-docker run --rm -p 2222:2222 -v /etc/xho:/etc/xho xhod:latest
+docker run --rm -p 2222:2222 -p 12222:12222 -v /etc/xho:/etc/xho xhod:latest
 ```
+
+## Exit Codes
+
+Exit codes are a stable contract across all subcommands:
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 1-123 | Remote command exit code |
+| 124 | Timeout (`--timeout` expired) |
+| 125 | xho / daemon failure |
+| 126 | Denied by auth or command review |
+| 127 | Target not found |
 
 ## Connection Pool
 
@@ -562,38 +590,79 @@ Behavior:
 - Limit reached → Wait
 - Transport error → Auto-reconnect once
 
-## Command Review
+## Command Review (AI)
 
-### Enabling
+LLM-based safety review, configured per operation kind. The `[review]` table
+holds the shared LLM connection settings; each operation kind gets its own
+sub-table with an independent enable flag, prompts, policy, and lists. All
+reviews are **disabled by default**.
 
 ```toml
 [review]
+endpoint = "https://api.openai.com/v1/chat/completions"
+model = "gpt-4.1-mini"
+# api_key accepts a secret reference (vault:/env:/file:) or a literal;
+# when omitted xho tries XHO_REVIEW_API_KEY then OPENAI_API_KEY
+timeout = "10s"
+failure_action = "deny"   # applied when the LLM service itself errors
+
+# --- exec review ---
+[review.exec]
 enable = true
+
+[review.exec.fast_allowlist]
+enable = true
+commands = ["ls", "ls *", "cat *", "grep *", "kubectl get *"]
+
+[review.exec.policy]
+safe = "allow"       # execute directly
+risky = "confirm"    # interactive [y/N] prompt (auto-answer with --yes)
+dangerous = "deny"
+
+# --- copy review ---
+[review.copy]
+enable = true
+blocklist = [".ssh", ".aws", ".gnupg", ".kube", "/etc/shadow", "/etc/ssh"]
+allowlist = ["/var/log/*", "/tmp/*"]
+
+[review.copy.policy]
+safe = "allow"
+risky = "confirm"
+dangerous = "deny"
 ```
 
-API key is provided via environment variable: `XHO_REVIEW_API_KEY` or `OPENAI_API_KEY`
+Filtering order:
 
-### Two-Layer Filtering
+1. **copy allow/blocklists** — pattern matches against the remote path are
+   decided instantly (`blocklist` denies, `allowlist` allows) without the LLM.
+   Glob patterns; an entry matches the path itself or its source file name.
+2. **exec fast allowlist** — glob match on the command line (zero latency);
+   anything unmatched goes to the LLM.
+3. **LLM review** — classifies into `safe | risky | dangerous`, then
+   `[review.*.policy]` maps each level to `allow | confirm | deny`. The policy
+   may also emit `warn`.
 
-1. **Local allowlist** (zero latency):
+Denied operations fail with exit code `126` and surface the reviewer's reason.
+
+## Audit Logging
+
+Every machine operation — exec, copy, OpenSession tunnel, and the transparent
+2222 proxy — is recorded as one JSON-Lines event with:
+
+- caller identity: peer address, SSH user, public-key fingerprint
+- operation details: target, gateway chain, argv (exec), paths (copy)
+- result status and an event id / timestamp pair (RFC3339 + epoch ms)
+
+Enabled **by default**; log lives at `~/.xho/audit.jsonl`
+(`/var/log/xho/audit.jsonl` for root daemons). It is an independent,
+non-blocking appender, decoupled from the tracing debug log and rotating on
+SIGHUP just like it.
 
 ```toml
-[review.fast_allowlist]
-enable = true
-commands = ["ls", "ls *", "cat *", "kubectl get *"]
-```
-
-Rules: Entries containing `*` are wildcard matches, otherwise exact matches.
-
-2. **LLM Review**: Complex commands (containing `&&`, `||`, `$()`, `bash -c`, etc.) are sent to the LLM.
-
-### Policy
-
-```toml
-[review.policy]
-safe = "allow"       # Execute directly
-risky = "confirm"    # Requires user confirmation
-dangerous = "deny"   # Deny
+[audit]
+enabled = true                      # set false to disable entirely
+path = "/var/log/xho/audit.jsonl"   # optional override
+include_identity = true             # record caller identity fields
 ```
 
 ## Troubleshooting
@@ -628,4 +697,5 @@ ssh root@server "/root/xho/xho status"
 
 - Terminal not restored: the `reset` command can manually restore it
 - Not entering interactive mode: verify `--tty` is set and both stdin/stdout are TTYs
-- Automatically degrades to non-interactive mode when used through a pipe
+- Review confirmation prompts read answers from stdin even when it is not a TTY;
+  a closed pipe counts as an empty answer, i.e. the bracketed default (`[y/N]`)

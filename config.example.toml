@@ -137,11 +137,13 @@
 # ~/.bash_history. Only affects the jumpserver PTY path.
 # suppress_history = true
 
-# Example: a remote xhod daemon reachable over SSH
+# Example: a remote xhod daemon reachable over SSH.
+# NOTE: address must point at the remote daemon's CONTROL PLANE port
+# (default 12222), not the human-facing transparent proxy on 2222.
 # [[gateways]]
 # kind = "xhod"
 # name = "prod"
-# address = "xho@prod-bastion.example.com:2222"
+# address = "xho@prod-bastion.example.com:12222"
 # identity_file = "~/.ssh/id_ed25519"
 # known_hosts_path = "~/.xho/known_hosts"
 
@@ -160,8 +162,8 @@
 # a public IP and registers itself as a dynamic gateway. This allows xho
 # clients on other machines to reach this node through the server.
 #
-# The connection reuses the server xhod's existing SSH port (e.g. 2222) and
-# authenticates via the same authorized_keys mechanism.
+# The connection dials the SERVER's CONTROL PLANE listener (default 12222)
+# and requests the `xho-reverse:<node_name>` subsystem over it.
 #
 # Example topology:
 #   xho client → local xhod → server xhod (公网IP) → node xhod (本机, 无公网IP)
@@ -174,7 +176,7 @@
 
 # [reverse_proxy]
 # enable = true
-# server_address = "xho@public-server.example.com:2222"
+# server_address = "xho@public-server.example.com:12222"
 # identity_file = "~/.ssh/id_ed25519"
 # known_hosts_path = "~/.xho/known_hosts"
 # node_name = "node-1"
