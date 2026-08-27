@@ -57,21 +57,24 @@ v0.4.0 moved control plane `2222 → 12222` to free 2222 for the proxy. If you s
 - **Machine output:** `xho --output=json` emits **NDJSON** (one JSON object per line). Keep human text on stdout parseable; property tests assert on NDJSON shape.
 - **Exit codes** are part of the contract (see `src/exit_codes.rs`): `124`=timeout, `125`=daemon failure, `126`=auth/review denied, `127`=target not found. Don't repurpose.
 - **Secrets:** encrypted vault in `src/secret/`; password/MFA material is brokered by the daemon. Use `zeroize`; never log secrets.
+- **Jumpserver shell copy is base64-only by design:** structured raw binary over the PTY wedges bastion content inspection mid-channel. Every payload sent through `jumpserver_engine.rs` must be wrapped as newline-delimited base64 (`session/b64.rs` + `session/shell_copy.rs`) — do not reintroduce raw-binary paths.
 
 ## Changelog
 
 The changelog exists in **two languages**, both at the repo root: `CHANGELOG.md` (English) and `CHANGELOG.zh-CN.md` (Chinese mirror). Content maps one-to-one between them; **whenever you change one, sync the other**. Each README links to its language's changelog in the Documentation section.
 
 - **Before every commit, update both changelogs**: prepend one entry to the topmost open section of each.
-- **Summarize each entry in one or two sentences**: state what changed and the user-visible effect — no implementation detail (that belongs in the commit message); semantic correspondence between the languages is enough, no word-for-word translation required.
+- **Each entry is ONE short sentence** (two at most): what changed + user-visible effect. Never enumerate every component/file/topic touched — that level of detail belongs in the commit message.
+  - Good: `- 2026-08-27 [docs] Refreshed all guides and config examples to match current code behavior.`
+  - Bad: `- 2026-08-27 [docs] Refreshed en/cn usage & architecture docs: audit logging, per-op AI review config, cp --resume, ports moved to 12222, oversight layout, RPC surface...`
 - Entries in `CHANGELOG.md` are **English only**; entries in `CHANGELOG.zh-CN.md` are **Chinese only**.
 - Every entry MUST be a **single markdown list item** (starts with `- ` so GitHub renders one line per entry), formatted exactly as:
   `- yyyy-MM-dd [tag] content`, e.g. `- 2026-08-06 [feat] jumpserver supports -i stdin forwarding`.
-- The changelog is **forward-maintained only — never backfill history**; released sections stay frozen (except bulk rewrites explicitly requested by the user).
+- The changelog is **forward-maintained only — never backfill history**. Released (`## v0.x.y`) sections are **absolutely frozen**: not even style/wording cleanups. Even when the user asks for shorter or clearer entries, that applies ONLY to unreleased sections unless they explicitly name the released version. Bulk history rewrites happen solely on an explicit user request naming it.
 - Entries are **grouped per released version**, newest first within a group:
   - Each released git tag (`v*`) gets one `## v0.x.y` section covering only the changes within that release range.
   - **Released sections are frozen**: never append to or rewrite their entries afterwards.
-  - While the next release is undecided, new entries go into the topmost `## latest` section (create it if missing); when the tag is cut, rename `## latest` to `## v0.x.y`.
+  - While the next release is undecided, new entries go into the topmost `## latest` section; **check whether it exists before adding an entry — create it only if missing, and never allow a second open section**. When the tag is cut, rename `## latest` to `## v0.x.y`.
 - Only 4 tags exist; **classify by the substance of the change, not the commit prefix**:
 
   | tag         | When to use |

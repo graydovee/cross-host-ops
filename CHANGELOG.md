@@ -19,7 +19,7 @@
 
 ## latest
 
-- 2026-08-27 [docs] Refreshed all guides and config examples to match current code behavior.
+- 2026-08-27 [docs] Refreshed guides, config examples, and agent conventions to match current behavior.
 - 2026-08-27 [docs] Extracted the release checklist from AGENTS.md into a dedicated `xho-release` skill.
 
 ## v0.5.6
