@@ -32,6 +32,7 @@ use crate::daemon::jumpserver_engine::{
 use crate::daemon::resolver::derive_target_ip;
 use crate::daemon::session::TargetSession;
 use crate::daemon::session::jumpserver::JumpserverSession;
+use crate::daemon::session::shell_copy;
 use crate::daemon::shell::{build_remote_command, resolve_shell};
 
 use super::auth::{AuthPrompt, AuthPrompter, ClientHandler, authenticate_with_key, connect_handle};
@@ -355,7 +356,10 @@ impl JumpserverGateway {
     }
 
     /// Acquire a navigated PtyShell for `target`, using cache if available.
-    /// Returns the shell and its transport lease. On transport error, retries once.
+    /// Cached shells must pass a short liveness probe before reuse — a shell
+    /// left behind by a wedged relay produces no output at all, and without
+    /// the probe every reuse would burn the full read timeout. Returns the
+    /// shell and its transport lease. On transport error, retries once.
     async fn acquire_shell(
         &self,
         target: &str,
@@ -364,11 +368,17 @@ impl JumpserverGateway {
         for attempt in 0..=1 {
             let lease = self.ensure_transport().await?;
 
-            // Try cache first (sync lock, no await while held).
-            if let Some(shell) = self.session_cache.lock().checkout(&ip) {
+            // Try cache first. The guard is dropped before any await — the
+            // liveness probe must not hold the sync cache lock.
+            let cached = self.session_cache.lock().checkout(&ip);
+            if let Some(mut shell) = cached {
+                if shell.probe_alive().await {
+                    debug!(gateway = %self.gateway_name, ip = %ip,
+                        "session cache HIT — reusing navigated shell");
+                    return Ok((shell, lease));
+                }
                 debug!(gateway = %self.gateway_name, ip = %ip,
-                    "session cache HIT — reusing navigated shell");
-                return Ok((shell, lease));
+                    "cached shell failed liveness probe — discarding");
             }
 
             // Cache miss — open a fresh PTY channel and navigate the menu.
@@ -598,19 +608,42 @@ impl Gateway for JumpserverGateway {
         mut spec: crate::types::CopySpec,
     ) -> Result<(), GatewayError> {
         let ip = derive_target_ip(target);
-        let (mut shell, lease) = self.acquire_shell(target).await?;
 
-        let result = crate::daemon::session::shell_copy::run(&mut shell, &mut spec).await;
+        // A stall-class failure (relay wedge: PTY silent, channel open) is
+        // retried once on a fresh session after invalidating the bastion
+        // transport — the wedge follows the SSH connection, and reconnecting
+        // often lands on a healthy relay worker.
+        for attempt in 0..=1 {
+            let (shell, lease) = self.acquire_shell(target).await?;
 
-        if result.is_ok() {
-            // Shell is still at the prompt after shell-based copy — return it
-            // to the cache for reuse by future operations.
-            let return_fn = self.make_return_fn(ip, lease.clone());
-            return_fn(shell);
+            match crate::daemon::session::shell_copy::run(shell, &mut spec).await {
+                Ok(shell) => {
+                    // Shell restored to a verified-clean state (the `stty
+                    // sane` round-trip succeeded) — safe to cache for reuse.
+                    let return_fn = self.make_return_fn(ip.clone(), lease.clone());
+                    return_fn(shell);
+                    return Ok(());
+                }
+                Err(e) => {
+                    // Only downloads can resume cleanly: the daemon re-streams
+                    // from the remote, and the CLI writer restarts on the
+                    // fresh BeginFile. An upload's frame stream is push-based
+                    // and partially consumed — a retry would desync.
+                    let retryable = attempt == 0
+                        && spec.direction == crate::types::CopyDirection::Download
+                        && shell_copy::is_stall_class(&e);
+                    if retryable {
+                        info!(gateway = %self.gateway_name, error = %e,
+                            "shell copy stalled — invalidating bastion transport, retrying");
+                        self.invalidate_transport(lease.generation()).await;
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    return Err(GatewayError::execution(e));
+                }
+            }
         }
-        // On error the shell is dropped (not cached).
-
-        result.map_err(|e| GatewayError::execution(e))
+        unreachable!("jumpserver copy retry loop is bounded")
     }
 
     async fn prune_idle(&self) {

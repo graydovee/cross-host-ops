@@ -15,6 +15,7 @@
 // Third-party gateways (e.g. jumpserver) implement the trait but return
 // `Unsupported` errors for methods they cannot realize.
 
+pub mod b64;
 pub mod direct;
 pub mod jumpserver;
 pub mod local;

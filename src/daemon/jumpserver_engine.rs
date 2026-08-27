@@ -21,6 +21,15 @@ use russh::client;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
+use crate::daemon::session::b64;
+
+/// Payload framing for the raw-mode command runner: raw passthrough, or a
+/// base64-encoded region between the begin and end markers.
+enum RawPayload {
+    Plain,
+    Base64 { decode_len: u64 },
+}
+
 pub(crate) const MENU_PROMPT_CONTAINS: &str = "Opt";
 pub(crate) const MFA_PROMPT_CONTAINS: &str = "MFA";
 pub(crate) const SHELL_PROMPT_SUFFIXES: &[&str] = &["$ ", "# "];
@@ -281,6 +290,28 @@ impl PtyShell {
         let _ = self.channel.window_change(cols, rows, 0, 0).await;
     }
 
+    /// Temporarily override the PTY read timeout. Used by cheap liveness
+    /// probes that prefer a fast failure over waiting out the full shell
+    /// timeout (which defaults to the SSH connect timeout, e.g. 30s).
+    pub(crate) fn set_read_timeout(&mut self, timeout: Duration) {
+        self.shell_timeout = timeout;
+    }
+
+    /// Cheap liveness check: run `true` through the cooked-mode machinery
+    /// and expect the exit marker + prompt back. A wedged relay produces no
+    /// output at all, so with a shortened read timeout this fails in seconds
+    /// instead of burning a full operation on a dead shell.
+    pub(crate) async fn probe_alive(&mut self) -> bool {
+        let saved = self.shell_timeout;
+        self.shell_timeout = Duration::from_secs(5);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let result = self.run_command_plain("true", &tx).await;
+        drop(tx);
+        while rx.recv().await.is_some() {}
+        self.shell_timeout = saved;
+        result.is_ok()
+    }
+
     /// Execute `command`, stream stdout to `sender` until the prompt reappears,
     /// then return the exit code captured via a unique marker. The command is
     /// wrapped as `{ command; }; status=$?; printf '{marker}:%s\n' "$status"`.
@@ -345,10 +376,39 @@ impl PtyShell {
     /// Output is only forwarded AFTER the begin marker — this discards any
     /// shell prompt/noise that precedes the command output in raw mode.
     /// Completion is detected SOLELY by the end sentinel.
+    /// Like [`Self::run_command_raw`], but the payload between the begin and
+    /// end markers is base64 text (see [`crate::daemon::session::b64`]): it
+    /// is decoded incrementally and forwarded to `sender` as binary, while
+    /// the raw stream is scanned for the end marker. The marker's leading `_`
+    /// is outside the base64 alphabet, giving a natural payload boundary;
+    /// `decode_len` (the expected decoded byte count) catches short/overlong
+    /// payloads instead of passing corruption silently.
+    pub(crate) async fn run_command_raw_b64(
+        &mut self,
+        command: &str,
+        decode_len: u64,
+        sender: &mpsc::UnboundedSender<Vec<u8>>,
+    ) -> Result<i32> {
+        self.run_command_raw_impl(command, sender, RawPayload::Base64 { decode_len })
+            .await
+    }
+
     pub(crate) async fn run_command_raw(
         &mut self,
         command: &str,
         sender: &mpsc::UnboundedSender<Vec<u8>>,
+    ) -> Result<i32> {
+        self.run_command_raw_impl(command, sender, RawPayload::Plain)
+            .await
+    }
+
+    /// Shared raw-mode command runner: begin marker, optionally base64
+    /// payload, then the end sentinel.
+    async fn run_command_raw_impl(
+        &mut self,
+        command: &str,
+        sender: &mpsc::UnboundedSender<Vec<u8>>,
+        payload: RawPayload,
     ) -> Result<i32> {
         let begin_marker = make_marker();
         let end_marker = make_marker();
@@ -383,37 +443,75 @@ impl PtyShell {
             }
         }
 
-        // Phase 2: scan pending for the end sentinel, forwarding real output.
+        // Phase 2: emit the payload (raw passthrough or base64-decoded), then
+        // scan for the end sentinel. In base64 mode the scanner still sees
+        // the raw stream (for marker detection) but its output is discarded —
+        // the decoder is the payload source.
+        let mut decoder = match payload {
+            RawPayload::Plain => None,
+            RawPayload::Base64 { decode_len } => Some(b64::B64Decoder::new(decode_len)),
+        };
         let mut scanner = SentinelScanner::new(end_bytes);
-        // Feed any bytes we already have (between begin and end markers).
         let pending = std::mem::take(&mut self.pending);
         if !pending.is_empty() {
-            let (forward, done) = scanner.feed(&pending);
-            if !forward.is_empty() {
-                let _ = sender.send(forward);
-            }
-            if done {
+            if let Some(code) = self.feed_raw_chunk(&pending, sender, &mut decoder, &mut scanner)? {
                 let leftover = scanner.take_leftover();
                 if !leftover.is_empty() {
                     self.pending.extend_from_slice(&leftover);
                 }
-                return Ok(scanner.exit_code());
+                if let Some(d) = decoder.as_ref() {
+                    d.finish()?;
+                }
+                return Ok(code);
             }
         }
         loop {
             let chunk = self.read_chunk().await?;
-            let (forward, done) = scanner.feed(&chunk);
-            if !forward.is_empty() {
-                let _ = sender.send(forward);
-            }
-            if done {
+            if let Some(code) = self.feed_raw_chunk(&chunk, sender, &mut decoder, &mut scanner)? {
                 let leftover = scanner.take_leftover();
                 if !leftover.is_empty() {
                     self.pending.extend_from_slice(&leftover);
                 }
-                return Ok(scanner.exit_code());
+                if let Some(d) = decoder.as_ref() {
+                    d.finish()?;
+                }
+                return Ok(code);
             }
         }
+    }
+
+    /// Feed one raw-mode chunk through the payload/scanner split. Returns
+    /// `Some(exit_code)` when the end sentinel matched.
+    fn feed_raw_chunk(
+        &mut self,
+        chunk: &[u8],
+        sender: &mpsc::UnboundedSender<Vec<u8>>,
+        decoder: &mut Option<b64::B64Decoder>,
+        scanner: &mut SentinelScanner,
+    ) -> Result<Option<i32>> {
+        if let Some(d) = decoder.as_mut() {
+            // Base64 payload: decode and forward; the scanner only detects
+            // the end marker, so its "forward" output is dropped.
+            let decoded = d.feed(chunk)?;
+            if !decoded.is_empty() {
+                let _ = sender.send(decoded);
+            }
+            let (_, done) = scanner.feed(chunk);
+            if done {
+                return Ok(Some(scanner.exit_code()));
+            }
+            return Ok(None);
+        }
+        // Plain payload: the scanner IS the payload source (it holds back
+        // potential marker prefixes and forwards the rest).
+        let (forward, done) = scanner.feed(chunk);
+        if !forward.is_empty() {
+            let _ = sender.send(forward);
+        }
+        if done {
+            return Ok(Some(scanner.exit_code()));
+        }
+        Ok(None)
     }
 
     /// Upload binary data via a three-phase protocol designed for raw PTY mode:
