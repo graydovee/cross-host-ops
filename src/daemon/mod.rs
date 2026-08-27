@@ -677,7 +677,7 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                 // partial state and tell it the effective offsets BEFORE it
                 // streams frames (the CLI waits for this ack).
                 if spec.direction == CopyDirection::Upload && !spec.resume.is_empty() {
-                    let effective = match session::probe_upload_resume(&state, &route, &spec).await
+                    let effective = match session::probe_upload_resume(&state, &route, &mut spec).await
                     {
                         Ok(entries) => entries,
                         Err(e) => {

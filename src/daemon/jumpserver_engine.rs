@@ -514,6 +514,37 @@ impl PtyShell {
         Ok(None)
     }
 
+    /// Non-blocking drain of immediately-available output, fed through the
+    /// scanner. Returns `Some(exit_code)` when the end sentinel already
+    /// matched (used during the upload write phase to fast-fail a dead
+    /// receiver). Buffered leftover bytes are stashed in `pending`.
+    async fn drain_and_scan_early(&mut self, scanner: &mut SentinelScanner) -> Result<Option<i32>> {
+        loop {
+            let message =
+                match tokio::time::timeout(Duration::from_millis(0), self.channel.wait()).await {
+                    Ok(message) => message,
+                    Err(_) => return Ok(None), // nothing immediately available
+                };
+            let Some(message) = message else {
+                bail!("shell closed unexpectedly");
+            };
+            match message {
+                ChannelMsg::Data { data } => {
+                    let (_, done) = scanner.feed(&data);
+                    if done {
+                        let leftover = scanner.take_leftover();
+                        if !leftover.is_empty() {
+                            self.pending.extend_from_slice(&leftover);
+                        }
+                        return Ok(Some(scanner.exit_code()));
+                    }
+                }
+                ChannelMsg::Close | ChannelMsg::Eof => bail!("shell closed unexpectedly"),
+                _ => {}
+            }
+        }
+    }
+
     /// Upload binary data via a three-phase protocol designed for raw PTY mode:
     ///
     /// 1. Send `command` (e.g. `head -c <size> > tmp`), which starts reading
@@ -552,13 +583,31 @@ impl PtyShell {
             }
         }
 
-        // Phase 2: feed binary data chunks to the PTY (receiver reads them).
+        // Phase 2: feed data chunks to the PTY (receiver reads them) while
+        // opportunistically draining output. Two hazards this guards against:
+        //   - A wedged relay stops draining the SSH window: the write blocks
+        //     forever unless bounded. The timeout surfaces it as an error so
+        //     the transfer fails fast (the remote partial stays for --resume)
+        //     instead of hanging at a frozen progress bar.
+        //   - The receiver pipeline dies mid-stream (e.g. `base64 -d` rejects
+        //     the wire): the end marker arrives EARLY, while data is still
+        //     being written. Detecting it stops the pointless remaining
+        //     writes and reports the exit code immediately.
+        let mut scanner = SentinelScanner::new(end_marker.to_vec());
         while let Some(chunk) = data_rx.recv().await {
-            self.write_raw(&chunk).await?;
+            tokio::time::timeout(Duration::from_secs(60), self.write_raw(&chunk))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("upload stalled: bastion stopped accepting data for 60s")
+                })??;
+            if let Some(code) = self.drain_and_scan_early(&mut scanner).await? {
+                bail!(
+                    "remote receiver exited early with code {code} (wire rejected or receiver died)"
+                );
+            }
         }
 
         // Phase 3: wait for the end sentinel (UUID-based, strict match).
-        let mut scanner = SentinelScanner::new(end_marker.to_vec());
         let pending = std::mem::take(&mut self.pending);
         if !pending.is_empty() {
             let (_, done) = scanner.feed(&pending);

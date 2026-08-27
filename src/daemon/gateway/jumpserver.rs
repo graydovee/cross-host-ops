@@ -654,7 +654,7 @@ impl Gateway for JumpserverGateway {
     async fn probe_upload_resume(
         &self,
         target: &str,
-        spec: &crate::types::CopySpec,
+        spec: &mut crate::types::CopySpec,
     ) -> Result<Vec<crate::types::ResumeEntry>, GatewayError> {
         if spec.resume.is_empty() || spec.recursive {
             return Ok(super::fresh_resume_entries(&spec.resume));

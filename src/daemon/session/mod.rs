@@ -397,7 +397,7 @@ pub async fn copy_via_session(state: &DaemonState, route: &Route, spec: CopySpec
 pub async fn probe_upload_resume(
     state: &DaemonState,
     route: &Route,
-    spec: &CopySpec,
+    spec: &mut CopySpec,
 ) -> Result<Vec<crate::types::ResumeEntry>> {
     let gateway = gateway_with_capability(state, route, Capabilities::COPY).await?;
     gateway

@@ -246,6 +246,60 @@ async fn e2e_download_resume_restarts_when_source_changed() {
 // Upload e2e
 // ---------------------------------------------------------------------------
 
+/// scp semantics: uploading to an existing directory destination must land
+/// INSIDE it under the source name (regression: the shell path targeted the
+/// directory itself, producing an unwritable `<dir>.xho_tmp` and a dead
+/// receiver that hung the upload).
+#[tokio::test]
+async fn e2e_upload_into_directory_destination_lands_inside() {
+    let dir = scratch("up-dir");
+    let remote_dir = dir.join("incoming");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    let original = payload(80_000);
+    let name = "payload.bin";
+
+    let mut start = rpc::CopyStartRequest {
+        target: "_self".to_string(),
+        remote_path: remote_dir.to_str().unwrap().to_string(),
+        recursive: false,
+        direction: rpc::CopyDirection::Upload as i32,
+        timeout_ms: 0,
+        source_name: name.to_string(),
+        ..Default::default()
+    };
+    start.resume.push(rpc::CopyResumeEntry {
+        relative_path: name.to_string(),
+        offset: 0,
+        size: original.len() as u64,
+        mtime: 1_700_000_000,
+        partial_sha256: String::new(),
+    });
+
+    let mut harness = InProcessRpcHarness::new().await;
+    let probe_events = harness.copy_upload(start.clone(), vec![]).await;
+    let errored = first_error(&probe_events);
+    assert!(errored.is_none(), "probe error: {errored:?}");
+
+    let events = harness
+        .copy_upload(
+            start,
+            upload_frame_stream_from(name, original.len() as u64, 1_700_000_000, &original, 0),
+        )
+        .await;
+    let errored = first_error(&events);
+    assert!(errored.is_none(), "upload error: {errored:?}");
+    assert_eq!(
+        std::fs::read(remote_dir.join(name)).unwrap(),
+        original,
+        "file must land inside the directory under the source name"
+    );
+    assert!(
+        !dir.join(format!("{}.xho_tmp", remote_dir.to_str().unwrap()))
+            .exists()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[tokio::test]
 async fn e2e_upload_via_self_gateway_writes_file_atomically() {
     let dir = scratch("up-whole");

@@ -126,6 +126,33 @@ impl RawGuard {
 // Upload
 // ---------------------------------------------------------------------------
 
+/// Resolve a single-file upload destination the way scp and the sftp copy
+/// path do: when the remote root is an existing directory, the file lands
+/// INSIDE it under the source name. Without this, uploading to `host:/tmp`
+/// would target `/tmp` itself and its `.xho_tmp` partial would be
+/// unwritable (`/tmp.xho_tmp`). Cooked-mode probe; rewrites `spec.remote_path`.
+pub(crate) async fn resolve_upload_dest(shell: &mut PtyShell, spec: &mut CopySpec) -> Result<()> {
+    if spec.recursive {
+        return Ok(());
+    }
+    let out = run_and_capture(
+        shell,
+        &format!("test -d {} && echo XHO_DIR", shell_quote(&spec.remote_path)),
+    )
+    .await?;
+    if String::from_utf8_lossy(&out).contains("XHO_DIR") {
+        let name = spec
+            .source_name
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|n| !n.is_empty())
+            .unwrap_or("upload");
+        spec.remote_path = join_remote(&spec.remote_path, name);
+    }
+    Ok(())
+}
+
 async fn upload(shell: PtyShell, spec: &mut CopySpec) -> Result<PtyShell> {
     let mut shell = shell;
     let upload_rx = spec
@@ -133,6 +160,7 @@ async fn upload(shell: PtyShell, spec: &mut CopySpec) -> Result<PtyShell> {
         .take()
         .ok_or_else(|| anyhow!("upload copy frame stream missing"))?;
 
+    resolve_upload_dest(&mut shell, spec).await?;
     let mut guard = RawGuard::enter(&mut shell).await?;
 
     // Effective resume offsets were already probed by the gateway (the CLI
@@ -806,8 +834,11 @@ pub(crate) async fn probe_upload_partial(
 /// prefix can).
 pub(crate) async fn probe_upload_resume(
     shell: &mut PtyShell,
-    spec: &CopySpec,
+    spec: &mut CopySpec,
 ) -> Vec<crate::types::ResumeEntry> {
+    if let Err(e) = resolve_upload_dest(shell, spec).await {
+        tracing::debug!(error = %e, "upload dest resolution failed; probing raw path");
+    }
     let mut out = Vec::with_capacity(spec.resume.len());
     for entry in &spec.resume {
         let mut effective = entry.clone();

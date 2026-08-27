@@ -257,8 +257,25 @@ async fn download_inner(
 /// streams from. Single-file uploads only in v1.
 pub(crate) async fn probe_upload_resume(
     sftp: &SftpSession,
-    spec: &CopySpec,
+    spec: &mut CopySpec,
 ) -> Vec<crate::types::ResumeEntry> {
+    // Same dest semantics as the upload itself: a directory root means the
+    // file (and its `.xho_tmp` partial) live INSIDE under the SOURCE name
+    // (idempotent: the resolved path is a file, so re-resolution during the
+    // copy after the probe is a no-op).
+    if !spec.recursive {
+        let root = PathBuf::from(&spec.remote_path);
+        if remote_path_is_dir(sftp, &root).await {
+            let name = spec
+                .source_name
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .filter(|n| !n.is_empty())
+                .unwrap_or("upload");
+            spec.remote_path = path_to_string(&root.join(name)).unwrap_or(spec.remote_path.clone());
+        }
+    }
     let mut out = Vec::with_capacity(spec.resume.len());
     for entry in &spec.resume {
         let mut effective = entry.clone();
