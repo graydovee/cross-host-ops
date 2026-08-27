@@ -135,7 +135,17 @@ async fn upload(shell: PtyShell, spec: &mut CopySpec) -> Result<PtyShell> {
 
     let mut guard = RawGuard::enter(&mut shell).await?;
 
-    let result = upload_loop(&mut shell, upload_rx, &spec.remote_path, spec.recursive).await;
+    // Effective resume offsets were already probed by the gateway (the CLI
+    // waits for the resume_ack before streaming, so incoming frames start at
+    // `offset` and the remote receiver appends to the partial).
+    let result = upload_loop(
+        &mut shell,
+        upload_rx,
+        &spec.remote_path,
+        spec.recursive,
+        &spec.resume,
+    )
+    .await;
 
     match result {
         Ok(()) => {
@@ -157,6 +167,7 @@ async fn upload_loop(
     mut upload_rx: mpsc::Receiver<CopyFrame>,
     remote_root: &str,
     recursive: bool,
+    resume: &[crate::types::ResumeEntry],
 ) -> Result<()> {
     while let Some(frame) = upload_rx.recv().await {
         match frame {
@@ -165,12 +176,19 @@ async fn upload_loop(
                 mode,
                 size,
                 mtime,
+                start_offset,
             } => {
                 let dest = resolve_upload_path(remote_root, &relative_path, recursive);
+                // Resume offset comes from the frame itself: the client
+                // verified the remote partial against its source prefix
+                // (resume_ack handshake) and streams only the remaining
+                // suffix; the receiver appends instead of truncating.
+                let skip = start_offset.min(size);
+                let _ = resume; // decisions live in the frames + ack now
                 // upload_single_file_streaming takes ownership of upload_rx
                 // (moves it into the feeder task) and returns it afterwards.
                 upload_rx =
-                    upload_single_file_streaming(shell, &dest, size, mode, mtime, upload_rx)
+                    upload_single_file_streaming(shell, &dest, size, mode, mtime, upload_rx, skip)
                         .await?;
             }
             CopyFrame::FileData { .. } => {
@@ -231,18 +249,23 @@ async fn upload_single_file_streaming(
     mode: u32,
     mtime: i64,
     upload_rx: mpsc::Receiver<CopyFrame>,
+    skip: u64,
 ) -> Result<mpsc::Receiver<CopyFrame>> {
     let tmp = format!("{}.xho_tmp", dest);
+    let remaining = size - skip;
 
     // Generate unique markers for this transfer.
     let ready_marker = format!("__XHO_CP_READY_{}__", uuid::Uuid::new_v4().simple());
     let end_marker = format!("__XHO_CP_END_{}__", uuid::Uuid::new_v4().simple());
 
     // Remote command: print ready marker, run the receiver, print end marker.
-    let wire_len = b64::wire_len_for(size);
+    // Resuming appends to the partial; a fresh transfer truncates it.
+    let wire_len = b64::wire_len_for(remaining);
+    let redirect = if skip > 0 { ">>" } else { ">" };
     let receiver = format!(
-        "head -c {} | base64 -d > {} 2>/dev/null",
+        "head -c {} | base64 -d {} {} 2>/dev/null",
         wire_len,
+        redirect,
         shell_quote(&tmp)
     );
     let cmd = format!(
@@ -309,10 +332,10 @@ async fn upload_single_file_streaming(
     if code != 0 {
         bail!("remote receiver failed (exit code {code})");
     }
-    if total_sent != size {
+    if total_sent != remaining {
         bail!(
-            "upload size mismatch: declared {} bytes, sent {} bytes",
-            size,
+            "upload size mismatch: expected {} remaining bytes, sent {}",
+            remaining,
             total_sent
         );
     }
@@ -358,6 +381,54 @@ async fn finalize_upload(
 // Download
 // ---------------------------------------------------------------------------
 
+/// Per-file download progress ledger: updated by forwarders as decoded bytes
+/// stream out, written back into `spec.resume` on failure so a retry (within
+/// the invocation or a fresh `--resume` run) continues from the forwarded
+/// byte count. Entries carry the source size/mtime so a retry re-validates
+/// the remote file has not changed.
+#[derive(Default)]
+struct ResumeLedger {
+    entries: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, crate::types::ResumeEntry>>,
+    >,
+}
+
+impl ResumeLedger {
+    fn from(entries: &[crate::types::ResumeEntry]) -> Self {
+        let map: std::collections::HashMap<String, crate::types::ResumeEntry> = entries
+            .iter()
+            .cloned()
+            .map(|e| (e.relative_path.clone(), e))
+            .collect();
+        Self {
+            entries: std::sync::Arc::new(std::sync::Mutex::new(map)),
+        }
+    }
+
+    fn hint(&self, name: &str) -> Option<crate::types::ResumeEntry> {
+        self.entries.lock().unwrap().get(name).cloned()
+    }
+
+    fn update(&self, name: &str, offset: u64, size: u64, mtime: i64) {
+        self.entries.lock().unwrap().insert(
+            name.to_string(),
+            crate::types::ResumeEntry {
+                relative_path: name.to_string(),
+                offset,
+                size,
+                mtime,
+                partial_sha256: String::new(),
+            },
+        );
+    }
+
+    fn into_entries(self) -> Vec<crate::types::ResumeEntry> {
+        let mut entries: Vec<_> = self.entries.lock().unwrap().values().cloned().collect();
+        entries.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        entries
+    }
+}
+
 async fn download(shell: PtyShell, spec: &mut CopySpec) -> Result<PtyShell> {
     let mut shell = shell;
     let download_tx = spec
@@ -365,52 +436,69 @@ async fn download(shell: PtyShell, spec: &mut CopySpec) -> Result<PtyShell> {
         .take()
         .ok_or_else(|| anyhow!("download copy frame stream closed"))?;
 
-    tracing::info!(encoding = "base64", remote_path = %spec.remote_path, "shell copy starting");
-    // Determine if the remote path is a file or directory.
-    let kind_output = run_and_capture(
-        &mut shell,
-        &format!(
-            "test -d {} && echo XHO_DIR || echo XHO_FILE",
-            shell_quote(&spec.remote_path)
-        ),
-    )
-    .await?;
-    let kind_str = String::from_utf8_lossy(&kind_output);
-    let is_dir = kind_str.contains("XHO_DIR");
-
-    // Enter raw mode for the actual data transfer.
-    let mut guard = RawGuard::enter(&mut shell).await?;
-
-    let result = if is_dir {
-        if !spec.recursive {
-            guard.cleanup_and_close(&mut shell).await;
-            bail!("copying a remote directory requires -r");
-        }
-        download_recursive(&mut shell, &spec.remote_path, &download_tx).await
-    } else {
-        download_single_file(
+    // Everything after the take() runs inside one block so the error path
+    // below restores the frame sender for gateway retries on ANY failure —
+    // an early `?` escape would otherwise leave the channel consumed and the
+    // retry would die with "frame stream closed".
+    let ledger = ResumeLedger::from(&spec.resume);
+    let result = async {
+        tracing::info!(encoding = "base64", remote_path = %spec.remote_path, "shell copy starting");
+        // Determine if the remote path is a file or directory.
+        let kind_output = run_and_capture(
             &mut shell,
-            &spec.remote_path,
-            &spec.source_name,
-            &download_tx,
+            &format!(
+                "test -d {} && echo XHO_DIR || echo XHO_FILE",
+                shell_quote(&spec.remote_path)
+            ),
         )
-        .await
-    };
+        .await?;
+        let kind_str = String::from_utf8_lossy(&kind_output);
+        let is_dir = kind_str.contains("XHO_DIR");
+
+        // Enter raw mode for the actual data transfer.
+        let mut guard = RawGuard::enter(&mut shell).await?;
+
+        let inner = if is_dir {
+            if !spec.recursive {
+                guard.cleanup_and_close(&mut shell).await;
+                bail!("copying a remote directory requires -r");
+            }
+            download_recursive(&mut shell, &spec.remote_path, &download_tx, &ledger).await
+        } else {
+            download_single_file(
+                &mut shell,
+                &spec.remote_path,
+                &spec.source_name,
+                &download_tx,
+                &ledger,
+            )
+            .await
+        };
+
+        match inner {
+            Ok(()) => {
+                download_tx
+                    .send(CopyFrame::EndOfStream)
+                    .await
+                    .map_err(|_| anyhow!("download copy frame stream closed"))?;
+                guard.complete(&mut shell).await?;
+                Ok(shell)
+            }
+            Err(e) => {
+                guard.cleanup_and_close(&mut shell).await;
+                Err(e)
+            }
+        }
+    }
+    .await;
 
     match result {
-        Ok(()) => {
-            download_tx
-                .send(CopyFrame::EndOfStream)
-                .await
-                .map_err(|_| anyhow!("download copy frame stream closed"))?;
-            guard.complete(&mut shell).await?;
-            Ok(shell)
-        }
+        Ok(shell) => Ok(shell),
         Err(e) => {
-            guard.cleanup_and_close(&mut shell).await;
-            // Give the frame sender back so a stall-class retry in the
-            // gateway can stream into the same channel again.
+            // Give the frame sender back (and record per-file progress) so a
+            // stall-class retry in the gateway resumes instead of restarting.
             spec.download_tx = Some(download_tx);
+            spec.resume = ledger.into_entries();
             Err(e)
         }
     }
@@ -419,12 +507,14 @@ async fn download(shell: PtyShell, spec: &mut CopySpec) -> Result<PtyShell> {
 /// Download a single file: stream via the raw runner's base64 decoder into
 /// FileData frames. A concurrent forwarder relays decoded chunks as they
 /// arrive — the CLI sees real-time progress and memory stays proportional to
-/// in-flight chunks.
+/// in-flight chunks. A validated resume hint skips the already-delivered
+/// prefix (`tail -c +N | base64`) and reports it via `BeginFile.start_offset`.
 async fn download_single_file(
     shell: &mut PtyShell,
     remote_path: &str,
     source_name: &str,
     tx: &mpsc::Sender<CopyFrame>,
+    ledger: &ResumeLedger,
 ) -> Result<()> {
     // Get mode/mtime/size via stat. We're in raw mode, so use run_and_capture_raw
     // (skips drain_echo_line which would eat the output in raw mode).
@@ -454,19 +544,33 @@ async fn download_single_file(
         .unwrap_or(source_name)
         .to_string();
 
+    // A resume hint is honored only when the remote source is unchanged
+    // (size + mtime match) and the offset is sane; otherwise restart at 0.
+    let start = ledger
+        .hint(&name)
+        .filter(|h| h.size == size && h.mtime == mtime && h.offset > 0 && h.offset <= size)
+        .map(|h| h.offset)
+        .unwrap_or(0);
+
     // Send BeginFile with the real mode/mtime/size so the CLI's progress bar
-    // has an accurate total for percentage/ETA.
+    // has an accurate total, and the effective start offset so it knows to
+    // append rather than truncate.
     tx.send(CopyFrame::BeginFile {
-        relative_path: name,
+        relative_path: name.clone(),
         mode,
         size,
         mtime,
+        start_offset: start,
     })
     .await
     .map_err(|_| anyhow!("download copy frame stream closed"))?;
 
-    let code = stream_remote_file(shell, remote_path, size, 0, tx).await?;
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(start));
+    let code = stream_remote_file(shell, remote_path, size, start, tx, &progress).await;
+    let forwarded = *progress.lock().unwrap();
+    ledger.update(&name, forwarded.min(size), size, mtime);
 
+    let code = code?;
     if code != 0 {
         bail!("remote read of {} failed (exit code {code})", remote_path);
     }
@@ -479,34 +583,35 @@ async fn download_single_file(
 
 /// Drive the raw-mode base64 reader and forward decoded payload chunks to
 /// `tx` concurrently with the read. `skip` is the decoded byte offset to
-/// start from (0 for a fresh transfer; >0 when resuming).
+/// start from (0 for a fresh transfer; >0 when resuming); `progress` is
+/// updated with the total forwarded byte count (initialized to `skip`).
 async fn stream_remote_file(
     shell: &mut PtyShell,
     remote_path: &str,
     size: u64,
     skip: u64,
     tx: &mpsc::Sender<CopyFrame>,
+    progress: &std::sync::Arc<std::sync::Mutex<u64>>,
 ) -> Result<i32> {
     let (ptx, mut prx) = mpsc::unbounded_channel::<Vec<u8>>();
     let forward_tx = tx.clone();
+    let forward_progress = progress.clone();
     let forwarder = tokio::spawn(async move {
         while let Some(chunk) = prx.recv().await {
             if forward_tx
-                .send(CopyFrame::FileData { data: chunk })
+                .send(CopyFrame::FileData {
+                    data: chunk.clone(),
+                })
                 .await
                 .is_err()
             {
                 break;
             }
+            *forward_progress.lock().unwrap() += chunk.len() as u64;
         }
     });
 
-    let reader = if skip > 0 {
-        format!("tail -c +{} {}", skip + 1, shell_quote(remote_path))
-    } else {
-        shell_quote(remote_path)
-    };
-    let cmd = format!("base64 {reader} 2>/dev/null");
+    let cmd = base64_read_command(remote_path, skip);
     let read_result = shell
         .run_command_raw_b64(&cmd, size.saturating_sub(skip), &ptx)
         .await;
@@ -522,6 +627,7 @@ async fn download_recursive(
     shell: &mut PtyShell,
     remote_path: &str,
     tx: &mpsc::Sender<CopyFrame>,
+    ledger: &ResumeLedger,
 ) -> Result<()> {
     // List the tree: type, mode, mtime, size, relative-path.
     //   f = regular file, d = directory, l = symlink (target in extra field)
@@ -587,18 +693,32 @@ async fn download_recursive(
                 .await
                 .map_err(|_| anyhow!("download copy frame stream closed"))?;
             }
-            // Regular file: download via streaming reader.
+            // Regular file: download via streaming reader. Resume hints by
+            // relative path (in-invocation retries; a fresh CLI run with
+            // `--resume` does not send recursive hints in v1).
             _ => {
+                let start = ledger
+                    .hint(&relative)
+                    .filter(|h| {
+                        h.size == size && h.mtime == mtime && h.offset > 0 && h.offset <= size
+                    })
+                    .map(|h| h.offset)
+                    .unwrap_or(0);
                 tx.send(CopyFrame::BeginFile {
-                    relative_path: relative,
+                    relative_path: relative.clone(),
                     mode,
                     size,
                     mtime,
+                    start_offset: start,
                 })
                 .await
                 .map_err(|_| anyhow!("download copy frame stream closed"))?;
 
-                let code = stream_remote_file(shell, full_path, size, 0, tx).await?;
+                let progress = std::sync::Arc::new(std::sync::Mutex::new(start));
+                let code = stream_remote_file(shell, full_path, size, start, tx, &progress).await;
+                let forwarded = *progress.lock().unwrap();
+                ledger.update(&relative, forwarded.min(size), size, mtime);
+                let code = code?;
                 if code != 0 {
                     bail!("remote read of {} failed (exit code {code})", full_path);
                 }
@@ -650,6 +770,62 @@ async fn run_and_capture_raw(shell: &mut PtyShell, command: &str) -> Result<Vec<
     Ok(output)
 }
 
+// ---------------------------------------------------------------------------
+// Upload resume probe (used by the gateway before the CLI streams frames)
+// ---------------------------------------------------------------------------
+
+/// Probe a remote upload partial `<dest>.xho_tmp`: returns `(size,
+/// sha256-of-the-whole-partial)` when it exists. The hash is computed on the
+/// remote host (`sha256sum`) — no partial bytes cross the link. Cooked-mode
+/// commands, safe to run on a cached shell.
+pub(crate) async fn probe_upload_partial(
+    shell: &mut PtyShell,
+    dest: &str,
+) -> Option<(u64, String)> {
+    let tmp = format!("{}.xho_tmp", dest);
+    let quoted = shell_quote(&tmp);
+    let output = run_and_capture(
+        shell,
+        &format!("stat -c %s {quoted} 2>/dev/null && sha256sum {quoted} 2>/dev/null"),
+    )
+    .await
+    .ok()?;
+    let text = String::from_utf8_lossy(&output);
+    let mut fields = text.split_whitespace();
+    let size = fields.next()?.parse::<u64>().ok()?;
+    let hash = fields.next()?.to_string();
+    Some((size, hash))
+}
+
+/// Report remote partial state for the CLI's resume decision (single-file
+/// uploads; recursive uploads transfer fresh in v1). Entries carry the
+/// partial's size and FULL sha256; the client verifies its own source
+/// prefix against the hash and chooses the offset it streams from — the
+/// daemon does not decide append-vs-fresh here (a head fingerprint cannot
+/// distinguish append-growth from a same-header rewrite; only the whole
+/// prefix can).
+pub(crate) async fn probe_upload_resume(
+    shell: &mut PtyShell,
+    spec: &CopySpec,
+) -> Vec<crate::types::ResumeEntry> {
+    let mut out = Vec::with_capacity(spec.resume.len());
+    for entry in &spec.resume {
+        let mut effective = entry.clone();
+        effective.offset = 0;
+        effective.partial_sha256 = String::new();
+        if !spec.recursive {
+            if let Some((tmp_size, hash)) = probe_upload_partial(shell, &spec.remote_path).await {
+                if tmp_size > 0 && tmp_size <= entry.size {
+                    effective.offset = tmp_size;
+                    effective.partial_sha256 = hash;
+                }
+            }
+        }
+        out.push(effective);
+    }
+    out
+}
+
 fn resolve_upload_path(remote_root: &str, relative_path: &str, recursive: bool) -> String {
     if !recursive || relative_path.is_empty() {
         return remote_root.to_string();
@@ -662,10 +838,42 @@ fn join_remote(root: &str, relative: &str) -> String {
     format!("{root}/{relative}")
 }
 
+/// Remote command that streams `remote_path` base64-encoded, starting at
+/// decoded byte `skip` (`tail -c +N` emits from byte N, 1-based).
+pub(crate) fn base64_read_command(remote_path: &str, skip: u64) -> String {
+    if skip > 0 {
+        format!(
+            "tail -c +{} {} | base64 2>/dev/null",
+            skip + 1,
+            shell_quote(remote_path)
+        )
+    } else {
+        format!("base64 {} 2>/dev/null", shell_quote(remote_path))
+    }
+}
+
 fn shell_quote(arg: &str) -> String {
     if arg.is_empty() {
         return "''".to_string();
     }
     let escaped = arg.replace('\'', "'\\''");
     format!("'{escaped}'")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::base64_read_command;
+
+    #[test]
+    fn base64_read_command_shapes() {
+        assert_eq!(
+            base64_read_command("/tmp/a b.bin", 0),
+            "base64 '/tmp/a b.bin' 2>/dev/null"
+        );
+        // Resume: `tail -c +N` starts at byte N (1-based), piped INTO base64.
+        assert_eq!(
+            base64_read_command("/tmp/a b.bin", 10),
+            "tail -c +11 '/tmp/a b.bin' | base64 2>/dev/null"
+        );
+    }
 }

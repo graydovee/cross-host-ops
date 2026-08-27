@@ -673,6 +673,32 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                     }
                 }
 
+                // Upload resume: validate the CLI's hints against remote
+                // partial state and tell it the effective offsets BEFORE it
+                // streams frames (the CLI waits for this ack).
+                if spec.direction == CopyDirection::Upload && !spec.resume.is_empty() {
+                    let effective = match session::probe_upload_resume(&state, &route, &spec).await
+                    {
+                        Ok(entries) => entries,
+                        Err(e) => {
+                            warn!(error = %format!("{e:#}"),
+                                "upload resume probe failed; transferring fresh");
+                            spec.resume
+                                .iter()
+                                .map(|e| crate::types::ResumeEntry {
+                                    offset: 0,
+                                    ..e.clone()
+                                })
+                                .collect()
+                        }
+                    };
+                    spec.resume = effective.clone();
+                    sender
+                        .send(Ok(protocol::copy_resume_ack_response(effective)))
+                        .await
+                        .map_err(|_| anyhow!("copy client stream closed"))?;
+                }
+
                 let mut download_relay_task: Option<tokio::task::JoinHandle<()>> = None;
                 match spec.direction {
                     CopyDirection::Upload => {
@@ -2534,12 +2560,22 @@ pub mod test_support {
         // Build gateways from config for test.
         let auth_prompter: Arc<AuthPrompter> =
             Arc::new(|_req| Box::pin(async { Ok(String::new()) }));
-        let gateways = gateway::build_gateways(
+        let mut gateways = gateway::build_gateways(
             config.clone(),
             &config_clone.ssh.server_config_path,
             &config_clone.gateways,
             auth_prompter,
         );
+        // Register the localhost gateway so e2e tests can drive copy against
+        // the daemon's own host through the real LocalSession/sftp path.
+        gateways.push((
+            gateway::localhost::SELF_GATEWAY_NAME.to_string(),
+            std::sync::Arc::new(gateway::localhost::LocalhostGateway::new(
+                config_clone.reverse_proxy.shell.clone(),
+                config_clone.reverse_proxy.user.clone(),
+                config_clone.server.proxy.sftp_server_path.clone(),
+            )),
+        ));
 
         let state = DaemonState {
             config_path,

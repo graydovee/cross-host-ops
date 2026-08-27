@@ -380,12 +380,28 @@ async fn gateway_with_capability(
 
 /// Run a copy (`xho cp`) over the gateway. Each gateway decides its own copy
 /// strategy: the default uses the sftp subsystem; jumpserver overrides with
-/// shell-based copy (base64/tar over the navigated PTY). Gateways that do not
+/// shell-based copy (base64 over the navigated PTY). Gateways that do not
 /// advertise [`Capabilities::COPY`] return a clear `unsupported` error.
 pub async fn copy_via_session(state: &DaemonState, route: &Route, spec: CopySpec) -> Result<()> {
     let gateway = gateway_with_capability(state, route, Capabilities::COPY).await?;
     gateway
         .copy(&route.end_target, spec)
+        .await
+        .map_err(|e| anyhow!("{}", e.user_message()))
+}
+
+/// Validate CLI resume hints against remote partial-upload state; returns
+/// entries with effective offsets (0 = fresh). Used by the daemon's copy
+/// handler to build the `resume_ack` the CLI waits for before streaming
+/// upload frames. Requires [`Capabilities::COPY`].
+pub async fn probe_upload_resume(
+    state: &DaemonState,
+    route: &Route,
+    spec: &CopySpec,
+) -> Result<Vec<crate::types::ResumeEntry>> {
+    let gateway = gateway_with_capability(state, route, Capabilities::COPY).await?;
+    gateway
+        .probe_upload_resume(&route.end_target, spec)
         .await
         .map_err(|e| anyhow!("{}", e.user_message()))
 }

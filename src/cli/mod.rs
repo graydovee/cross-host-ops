@@ -134,6 +134,7 @@ pub async fn run_cli(cli: ArunCli) -> Result<i32> {
         }
         ArunCommand::Cp {
             recursive,
+            resume,
             quiet,
             source,
             dest,
@@ -142,7 +143,7 @@ pub async fn run_cli(cli: ArunCli) -> Result<i32> {
             let Some(timeout_ms) = parse_timeout_ms(timeout.as_deref())? else {
                 return Ok(125);
             };
-            run_copy(recursive, quiet, yes, source, dest, timeout_ms).await
+            run_copy(recursive, resume, quiet, yes, source, dest, timeout_ms).await
         }
         ArunCommand::Status => status().await,
         ArunCommand::Ls { refresh } => list_servers(refresh).await,

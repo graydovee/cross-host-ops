@@ -17,6 +17,8 @@ pub enum CopyFrame {
         mode: u32,
         size: u64,
         mtime: i64,
+        /// Byte offset the transfer starts from (resume); 0 = whole file.
+        start_offset: u64,
     },
     FileData {
         data: Vec<u8>,
@@ -34,6 +36,21 @@ pub enum CopyFrame {
     EndOfStream,
 }
 
+/// Resume state for one file of a copy operation (see `proto/xho.proto`
+/// `CopyResumeEntry` for the wire contract).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResumeEntry {
+    pub relative_path: String,
+    pub offset: u64,
+    pub size: u64,
+    pub mtime: i64,
+    /// Upload ack only: sha256 (hex) of the ENTIRE remote partial. The client
+    /// verifies it against its own source prefix before appending — a head
+    /// fingerprint cannot distinguish append-growth from a same-header
+    /// rewrite, so the full prefix is the correctness criterion.
+    pub partial_sha256: String,
+}
+
 /// Specification for a remote side copy operation.
 ///
 /// The CLI and gateways adapt their local filesystems into `CopyFrame` streams.
@@ -46,6 +63,10 @@ pub struct CopySpec {
     pub source_name: String,
     pub upload_rx: Option<tokio::sync::mpsc::Receiver<CopyFrame>>,
     pub download_tx: Option<tokio::sync::mpsc::Sender<CopyFrame>>,
+    /// Resume hints (opt-in `--resume`): validated against remote state
+    /// before use; entries may be updated by failed attempts so an
+    /// in-invocation retry continues from the forwarded byte count.
+    pub resume: Vec<ResumeEntry>,
 }
 
 impl Clone for CopySpec {
@@ -59,6 +80,7 @@ impl Clone for CopySpec {
             source_name: self.source_name.clone(),
             upload_rx: None,
             download_tx: None,
+            resume: self.resume.clone(),
         }
     }
 }
@@ -72,6 +94,7 @@ impl std::fmt::Debug for CopySpec {
             .field("source_name", &self.source_name)
             .field("upload_rx", &self.upload_rx.is_some())
             .field("download_tx", &self.download_tx.is_some())
+            .field("resume", &self.resume)
             .finish()
     }
 }

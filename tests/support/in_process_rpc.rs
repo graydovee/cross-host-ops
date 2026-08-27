@@ -206,6 +206,65 @@ impl InProcessRpcHarness {
         events
     }
 
+    /// Call `Copy` for a DOWNLOAD with a fully-specified start request
+    /// (including resume hints) and collect all response events.
+    pub async fn copy_download(&mut self, start: rpc::CopyStartRequest) -> Vec<rpc::CopyResponse> {
+        let request = rpc::CopyRequest {
+            request: Some(rpc::copy_request::Request::Start(start)),
+        };
+        let response = self
+            .client
+            .copy(tokio_stream::once(request))
+            .await
+            .expect("Copy RPC failed");
+        let mut stream = response.into_inner();
+        let mut events = Vec::new();
+        while let Some(msg) = stream
+            .message()
+            .await
+            .expect("failed to read Copy response stream")
+        {
+            events.push(msg);
+        }
+        events
+    }
+
+    /// Call `Copy` for an UPLOAD: send the start request, then the given
+    /// frames (as the CLI's feeder would), and collect all response events.
+    pub async fn copy_upload(
+        &mut self,
+        start: rpc::CopyStartRequest,
+        frames: Vec<rpc::CopyFrame>,
+    ) -> Vec<rpc::CopyResponse> {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let request = rpc::CopyRequest {
+            request: Some(rpc::copy_request::Request::Start(start)),
+        };
+        tx.send(request).await.expect("send start");
+        for frame in frames {
+            let request = rpc::CopyRequest {
+                request: Some(rpc::copy_request::Request::Frame(frame)),
+            };
+            tx.send(request).await.expect("send frame");
+        }
+        drop(tx);
+        let response = self
+            .client
+            .copy(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await
+            .expect("Copy RPC failed");
+        let mut stream = response.into_inner();
+        let mut events = Vec::new();
+        while let Some(msg) = stream
+            .message()
+            .await
+            .expect("failed to read Copy response stream")
+        {
+            events.push(msg);
+        }
+        events
+    }
+
     /// Call `Status` on the remote daemon.
     pub async fn status(&mut self) -> rpc::StatusResponse {
         let response = self

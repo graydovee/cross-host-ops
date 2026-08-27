@@ -91,12 +91,12 @@ proptest! {
             let mut harness = InProcessRpcHarness::new().await;
             let servers = harness.list_servers().await;
 
-            // The stub harness has exactly one server entry
-            prop_assert_eq!(
-                servers.len(), 1,
-                "harness should return exactly 1 stub server entry"
+            // The stub entry is always present; the `_self` localhost
+            // gateway (registered for the copy e2e tests) adds one row.
+            prop_assert!(
+                servers.iter().any(|s| s.alias == "stub-target"),
+                "stub-target entry must be listed"
             );
-            prop_assert_eq!(&servers[0].alias, "stub-target");
 
             Ok(())
         })?;

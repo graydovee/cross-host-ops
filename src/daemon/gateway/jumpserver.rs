@@ -651,6 +651,24 @@ impl Gateway for JumpserverGateway {
         self.session_cache.lock().prune(self.session_idle_timeout);
     }
 
+    async fn probe_upload_resume(
+        &self,
+        target: &str,
+        spec: &crate::types::CopySpec,
+    ) -> Result<Vec<crate::types::ResumeEntry>, GatewayError> {
+        if spec.resume.is_empty() || spec.recursive {
+            return Ok(super::fresh_resume_entries(&spec.resume));
+        }
+        let ip = derive_target_ip(target);
+        let (mut shell, lease) = self.acquire_shell(target).await?;
+        let entries =
+            crate::daemon::session::shell_copy::probe_upload_resume(&mut shell, spec).await;
+        // Probe commands ran in cooked mode — the shell stays clean.
+        let return_fn = self.make_return_fn(ip, lease);
+        return_fn(shell);
+        Ok(entries)
+    }
+
     async fn pool_status(&self) -> Vec<ConnectionStatusSnapshot> {
         let generation = self.transport.current_generation().await.unwrap_or(0);
         let idle = self.session_cache.lock().len();

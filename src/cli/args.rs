@@ -77,6 +77,11 @@ pub enum ArunCommand {
     Cp {
         #[arg(short = 'r', long = "recursive")]
         recursive: bool,
+        /// Resume an interrupted single-file transfer: reuse the partial data
+        /// from a previous `--resume` attempt (the source must be unchanged,
+        /// size + mtime, or the transfer restarts from scratch).
+        #[arg(short = 'c', long = "resume")]
+        resume: bool,
         /// Suppress progress bars and non-error copy messages.
         #[arg(short = 'q', long = "quiet")]
         quiet: bool,
@@ -311,6 +316,7 @@ mod tests {
             ArunCommand::Cp {
                 quiet,
                 recursive,
+                resume,
                 timeout,
                 source,
                 dest,

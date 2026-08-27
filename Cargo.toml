@@ -61,6 +61,7 @@ zeroize = { version = "1.8", features = ["zeroize_derive"] }
 
 [dev-dependencies]
 proptest = "1"
+sha2 = "0.10"
 tempfile = "3"
 
 [build-dependencies]

@@ -140,6 +140,33 @@ message CopyStartRequest {
   CopyDirection direction = 4;
   uint64 timeout_ms = 5;
   string source_name = 6;
+  // Resume hints from the CLI (opt-in via `xho cp --resume`): per-file
+  // already-transferred offsets plus the source fingerprint used to
+  // validate them. The daemon re-verifies against the remote and may
+  // ignore entries (falling back to a fresh transfer).
+  repeated CopyResumeEntry resume = 7;
+}
+
+// Resume state for one file of a copy operation.
+//
+// Download (request): `offset` is the locally received byte count;
+// `size`/`mtime` identify the remote source the partial came from.
+// Upload (request): only `relative_path`/`size`/`mtime` of the LOCAL source
+// are meaningful; the daemon replies in the resume_ack with the remote
+// partial's state.
+//
+// Upload (ack): `offset` is the remote partial's byte count and
+// `partial_sha256` hashes the ENTIRE partial. The client compares it against
+// sha256 of its own source prefix of the same length and only then resumes
+// from `offset` — full-prefix verification is the only sound proof that
+// appending yields the source (head fingerprints cannot distinguish an
+// append-grown file from a rewritten file sharing the same header).
+message CopyResumeEntry {
+  string relative_path = 1;
+  uint64 offset = 2;
+  uint64 size = 3;
+  int64 mtime = 4;
+  string partial_sha256 = 5;
 }
 
 message CopyFrame {
@@ -158,6 +185,9 @@ message CopyBeginFile {
   uint32 mode = 2;
   uint64 size = 3;
   int64 mtime = 4;
+  // Byte offset this transfer actually starts from (resume). The CLI uses it
+  // to decide append vs truncate; 0 means a fresh transfer of the whole file.
+  uint64 start_offset = 5;
 }
 
 message CopyFileData {
@@ -202,7 +232,18 @@ message CopyResponse {
     CopyFrame frame = 5;
     ReviewResult review_result = 6;
     ConfirmRequired confirm_required = 7;
+    // Effective resume offsets after the daemon validated remote state.
+    // Sent for uploads BEFORE the client streams frames (the client cannot
+    // know remote partial state itself); downloads self-describe via
+    // CopyBeginFile.start_offset instead.
+    CopyResumeAck resume_ack = 8;
   }
+}
+
+// Per-file effective resume decision: `offset` is where the client's frame
+// stream should start (0 = fresh transfer, remote partial discarded).
+message CopyResumeAck {
+  repeated CopyResumeEntry entries = 1;
 }
 
 message ReviewResult {

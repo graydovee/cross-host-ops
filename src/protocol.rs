@@ -53,7 +53,12 @@ pub struct AuthPromptMessage {
     pub message: String,
 }
 
-pub fn copy_spec_to_rpc(target: String, spec: &CopySpec, timeout_ms: u64) -> rpc::CopyRequest {
+pub fn copy_spec_to_rpc(
+    target: String,
+    spec: &CopySpec,
+    timeout_ms: u64,
+    resume: &[crate::types::ResumeEntry],
+) -> rpc::CopyRequest {
     rpc::CopyRequest {
         request: Some(rpc::copy_request::Request::Start(rpc::CopyStartRequest {
             target,
@@ -65,7 +70,28 @@ pub fn copy_spec_to_rpc(target: String, spec: &CopySpec, timeout_ms: u64) -> rpc
             },
             timeout_ms,
             source_name: spec.source_name.clone(),
+            resume: resume.iter().cloned().map(resume_entry_to_rpc).collect(),
         })),
+    }
+}
+
+fn resume_entry_to_rpc(entry: crate::types::ResumeEntry) -> rpc::CopyResumeEntry {
+    rpc::CopyResumeEntry {
+        relative_path: entry.relative_path,
+        offset: entry.offset,
+        size: entry.size,
+        mtime: entry.mtime,
+        partial_sha256: entry.partial_sha256,
+    }
+}
+
+fn resume_entry_from_rpc(entry: rpc::CopyResumeEntry) -> crate::types::ResumeEntry {
+    crate::types::ResumeEntry {
+        relative_path: entry.relative_path,
+        offset: entry.offset,
+        size: entry.size,
+        mtime: entry.mtime,
+        partial_sha256: entry.partial_sha256,
     }
 }
 
@@ -88,6 +114,11 @@ pub fn copy_spec_from_rpc(request: rpc::CopyStartRequest) -> Result<(String, Cop
             source_name: request.source_name,
             upload_rx: None,
             download_tx: None,
+            resume: request
+                .resume
+                .into_iter()
+                .map(resume_entry_from_rpc)
+                .collect(),
         },
         request.timeout_ms,
     ))
@@ -101,11 +132,13 @@ pub fn copy_frame_to_rpc(frame: CopyFrame) -> rpc::CopyFrame {
             mode,
             size,
             mtime,
+            start_offset,
         } => Frame::BeginFile(rpc::CopyBeginFile {
             relative_path,
             mode,
             size,
             mtime,
+            start_offset,
         }),
         CopyFrame::FileData { data } => Frame::FileData(rpc::CopyFileData { data }),
         CopyFrame::EndFile => Frame::EndFile(rpc::CopyEndFile {}),
@@ -135,6 +168,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn copy_resume_entries_round_trip() {
+        let mut spec = crate::types::CopySpec {
+            direction: crate::types::CopyDirection::Download,
+            remote_path: "/tmp/x".into(),
+            recursive: false,
+            source_name: "x".into(),
+            upload_rx: None,
+            download_tx: None,
+            resume: Vec::new(),
+        };
+        let entries = vec![crate::types::ResumeEntry {
+            relative_path: "x".into(),
+            offset: 4096,
+            size: 1 << 20,
+            mtime: 1234567,
+            partial_sha256: "ab".repeat(32),
+        }];
+        let request = match copy_spec_to_rpc("t".into(), &spec, 0, &entries)
+            .request
+            .unwrap()
+        {
+            rpc::copy_request::Request::Start(start) => start,
+            other => panic!("unexpected request: {other:?}"),
+        };
+        assert_eq!(request.resume.len(), 1);
+        spec.resume = Vec::new();
+        let (_, parsed, _) = copy_spec_from_rpc(request).unwrap();
+        assert_eq!(parsed.resume, entries);
+    }
+
+    #[test]
     fn flag_intent_round_trips_through_rpc_enum() {
         for intent in [FlagIntent::Default, FlagIntent::Enable, FlagIntent::Disable] {
             let rpc_intent = rpc::FlagIntent::from(intent);
@@ -152,6 +216,7 @@ pub fn copy_frame_from_rpc(frame: rpc::CopyFrame) -> Result<CopyFrame> {
             mode: frame.mode,
             size: frame.size,
             mtime: frame.mtime,
+            start_offset: frame.start_offset,
         }),
         Frame::FileData(frame) => Ok(CopyFrame::FileData { data: frame.data }),
         Frame::EndFile(_) => Ok(CopyFrame::EndFile),
@@ -331,6 +396,16 @@ pub fn copy_complete_response(message: impl Into<String>) -> rpc::CopyResponse {
     rpc::CopyResponse {
         event: Some(rpc::copy_response::Event::Complete(rpc::CopyComplete {
             message: message.into(),
+        })),
+    }
+}
+
+/// Build a `resume_ack` event carrying the effective per-file offsets after
+/// the daemon validated remote partial state (upload resume only).
+pub fn copy_resume_ack_response(entries: Vec<crate::types::ResumeEntry>) -> rpc::CopyResponse {
+    rpc::CopyResponse {
+        event: Some(rpc::copy_response::Event::ResumeAck(rpc::CopyResumeAck {
+            entries: entries.into_iter().map(resume_entry_to_rpc).collect(),
         })),
     }
 }
