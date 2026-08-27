@@ -17,6 +17,10 @@
      Entries are grouped per released version (## v0.x.y matching a git tag); released sections are frozen.
      While the next tag is undecided, write new entries under ## latest and rename it when the tag is cut. -->
 
+## latest
+
+- 2026-08-27 [docs] Extracted the release procedure from AGENTS.md into a dedicated `xho-release` skill (`.agents/skills/xho-release/`) covering changelog finalization, annotated tag cut, release-workflow monitoring, and failure handling; AGENTS.md now links to it.
+
 ## v0.5.6
 
 - 2026-08-27 [docs] Condensed every changelog entry into short summaries and split the changelog into English/Chinese mirrors (`CHANGELOG.md` / `CHANGELOG.zh-CN.md`) linked from each README; rewrote AGENTS.md in English and refreshed the bundled skills and READMEs to match current behavior (`cp --resume`, scp-style destinations, jumpserver base64 transport).

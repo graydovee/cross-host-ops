@@ -7,6 +7,10 @@
      条目按发布版本分组（## v0.x.y 对应 git tag），已发布小节冻结；下一版未定稿时写入 ## latest。
      完整规则见 AGENTS.md 与 CHANGELOG.md 头部注释。 -->
 
+## latest
+
+- 2026-08-27 [docs] 将发布流程从 AGENTS.md 抽离为独立的 `xho-release` skill（`.agents/skills/xho-release/`），覆盖 changelog 定稿、annotated tag 切版、release 工作流监控与失败处理；AGENTS.md 改为链接指向该 skill。
+
 ## v0.5.6
 
 - 2026-08-27 [docs] 变更日志条目全部精简为简短概括，并拆分为中英文双份（`CHANGELOG.md` / `CHANGELOG.zh-CN.md`），README 各自链接对应语言版本；AGENTS.md 改为纯英文，并同步刷新自带 skill 与 README 以符合当前行为（`cp --resume`、scp 式目录目的地、jumpserver base64 传输）。
