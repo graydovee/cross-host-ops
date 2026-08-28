@@ -26,6 +26,10 @@ cargo clippy --all-targets                    # lint (note: lib.rs globally allo
 - **Releasing** = pushing an annotated `v*` tag, which triggers `.github/workflows/release.yml` (multi-platform musl/macOS binaries + GHCR Docker image). Never tag casually or on your own initiative — the full release checklist lives in [.agents/skills/xho-release/SKILL.md](.agents/skills/xho-release/SKILL.md).
 - `build.rs` derives `--version` from `git describe`; there is no Cargo.toml version to bump at release time. After a tag-only change, `cargo clean` or touch `build.rs` to pick it up locally.
 
+## Git discipline (hard rule)
+
+**Never run `git commit`, `git push`, or create/push tags without the user's explicit approval for that specific change.** An approval given for one change does not carry over to later ones. When work is ready, report what changed and let the user decide whether/how to commit and push. This rule overrides any conflicting instruction elsewhere in this file.
+
 ## Architecture — the two layers (do not bypass)
 
 Everything goes through two traits. This is the core invariant; edits must respect it.

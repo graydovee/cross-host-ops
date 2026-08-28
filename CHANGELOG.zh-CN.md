@@ -4,7 +4,7 @@
      每条条目必须是 Markdown 列表项：- yyyy-MM-dd [tag] 概括。
      每条用一两句话概括"改了什么、对使用者的直接影响"，不展开实现细节（细节写进 commit message）。
      本文件条目一律中文；英文版条目一律英文。tag 取值 feat | bug | refactor | docs，按变更实质归类。
-     条目按发布版本分组（## v0.x.y 对应 git tag），已发布小节冻结；下一版未定稿时写入 ## latest。
+     条目按发布版本分组（## v0.x.y 对应 git tag），已发布小节冻结；下一版未定稿时写入 ## v0.5.7。
      完整规则见 AGENTS.md 与 CHANGELOG.md 头部注释。 -->
 
 ## latest

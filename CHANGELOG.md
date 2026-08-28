@@ -15,7 +15,7 @@
        documentation change -> [docs]
      Tests/formatting/minor cleanup bundled with a fix/feat are NOT logged separately; fold them into that entry.
      Entries are grouped per released version (## v0.x.y matching a git tag); released sections are frozen.
-     While the next tag is undecided, write new entries under ## latest and rename it when the tag is cut. -->
+     While the next tag is undecided, write new entries under ## v0.5.7 and rename it when the tag is cut. -->
 
 ## latest
 
