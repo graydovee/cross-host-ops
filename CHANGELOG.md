@@ -19,7 +19,7 @@
 
 ## latest
 
-- 2026-08-28 [bug] fix the last mutual-freeze path in session streaming: the direct SSH driver kept channel writes and reads in one select, so a remote program that stopped reading stdin while its output was unconsumed could park both directions forever (seen as a 2222 proxy shell freezing after big output, e.g. git log); writes and reads now run as independent tasks in the direct driver, and exec/interactive/sftp stdin forwarding moved to dedicated tasks to match
+- 2026-08-28 [bug] tunnel sessions no longer end early when the client closes its stdin side: the tunnel driver kept draining remote output and the exit status after the uplink finishes, so piped exec (-i) returns all output instead of returning an empty result- 2026-08-28 [bug] fix the last mutual-freeze path in session streaming: the direct SSH driver kept channel writes and reads in one select, so a remote program that stopped reading stdin while its output was unconsumed could park both directions forever (seen as a 2222 proxy shell freezing after big output, e.g. git log); writes and reads now run as independent tasks in the direct driver, and exec/interactive/sftp stdin forwarding moved to dedicated tasks to match
 - 2026-08-28 [feat] Added `[reverse_proxy] workdir`: sessions on the daemon host (transparent-proxy shells, `xho exec`) now start there, defaulting to the home directory instead of the daemon's cwd.
 - 2026-08-27 [docs] Refreshed guides, config examples, and agent conventions to match current behavior.
 - 2026-08-27 [docs] Extracted the release checklist from AGENTS.md into a dedicated `xho-release` skill.

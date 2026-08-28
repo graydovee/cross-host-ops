@@ -13,8 +13,8 @@
 // gRPC request stream (parking on flow control only pauses stdin), the other
 // drains responses into the event stream. Neither can starve the other.
 
-use anyhow::{Result, anyhow};
-use tokio::sync::{mpsc, oneshot};
+use anyhow::anyhow;
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 
@@ -148,6 +148,10 @@ async fn driver(
     });
 
     // Downlink: drain responses into the event stream until the remote closes.
+    // When the uplink task ends (local session halves dropped — stdin is
+    // finished), the session must keep draining: the remote still owes output
+    // and an exit status. Only the remote closing the stream ends this loop.
+    let mut uplink_done = false;
     loop {
         tokio::select! {
             msg = response.message() => match msg {
@@ -186,14 +190,10 @@ async fn driver(
                     break;
                 }
             },
-            _ = &mut uplink => {
-                // Uplink ended: the local session halves were dropped. Give
-                // the remote a moment to flush trailing events, then stop.
-                if let Ok(Some(trailing)) = response.message().await {
-                    forward_trailing(trailing, &events_tx);
-                }
-                let _ = events_tx.send(SessionEvent::Eof);
-                break;
+            _ = &mut uplink, if !uplink_done => {
+                // Uplink ended: stdin side is complete. Keep consuming
+                // responses below until the remote closes the stream.
+                uplink_done = true;
             }
         }
     }
