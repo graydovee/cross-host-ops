@@ -184,6 +184,12 @@
 # reconnect_delay = "10s"
 # keepalive_interval = "30s"
 # max_idle_time = "10m"
+#
+# workdir — starting directory for sessions executed on this node
+# (interactive shells and `xho exec` on the `_self`/localhost target,
+# including sessions entering via the transparent proxy on 2222).
+# `~` is expanded. When unset, sessions start in the user's home directory.
+# workdir = "~"
 
 # --- AI Review ---
 # LLM-based safety review. The connection settings (endpoint/model/api_key/

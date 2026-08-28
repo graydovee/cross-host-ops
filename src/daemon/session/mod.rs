@@ -90,6 +90,17 @@ pub struct SessionWriter {
     tx: mpsc::Sender<SessionCommand>,
 }
 
+/// Cloning is safe and preserves FIFO ordering: all clones share one
+/// command channel, so concurrent holders (e.g. separate stdin/resize tasks)
+/// cannot reorder relative to a previously established sequence.
+impl Clone for SessionWriter {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+        }
+    }
+}
+
 impl SessionWriter {
     fn check(send: Result<(), mpsc::error::SendError<SessionCommand>>) -> Result<()> {
         send.map_err(|_| anyhow!("session closed"))
@@ -454,46 +465,42 @@ pub async fn drive_exec(
         let _ = writer.request_pty("xterm-256color", cols, rows, &[]).await;
     }
     writer.exec(&command).await?;
-    let mut stdin_done = stdin_rx.is_none();
-    if stdin_done {
+    // Stdin forwarding runs as its own task: a parked `write_stdin` (remote
+    // stopped reading stdin) must not stop event consumption below, or the
+    // remote can never drain its output and resume.
+    if let Some(mut stdin_rx) = stdin_rx.take() {
+        tokio::spawn(async move {
+            while let Some(d) = stdin_rx.recv().await {
+                if writer.write_stdin(&d).await.is_err() {
+                    return;
+                }
+            }
+            let _ = writer.eof().await;
+        });
+    } else {
         // No stdin channel — signal EOF immediately so the session's spawned
         // exec task knows not to wait for stdin data.
         let _ = writer.eof().await;
     }
-    loop {
-        tokio::select! {
-            ev = stream.next() => match ev {
-                Some(SessionEvent::Stdout(d)) => {
-                    let _ = sender.send(ServerEvent::Stdout { data: d });
-                }
-                Some(SessionEvent::Stderr(d)) => {
-                    let _ = sender.send(ServerEvent::Stderr { data: d });
-                }
-                Some(SessionEvent::ExitStatus(c)) => return Ok(c),
-                Some(SessionEvent::ExitSignal(s)) => {
-                    let _ = sender.send(ServerEvent::Stderr {
-                        data: format!("killed by signal {s}\n").into_bytes(),
-                    });
-                    return Ok(255);
-                }
-                Some(SessionEvent::Eof) | None => return Ok(0),
-            },
-            stdin = async {
-                match &mut stdin_rx {
-                    Some(r) if !stdin_done => r.recv().await,
-                    _ => std::future::pending::<Option<Vec<u8>>>().await,
-                }
-            } => match stdin {
-                Some(d) => {
-                    let _ = writer.write_stdin(&d).await;
-                }
-                None => {
-                    let _ = writer.eof().await;
-                    stdin_done = true;
-                }
-            },
+    while let Some(ev) = stream.next().await {
+        match ev {
+            SessionEvent::Stdout(d) => {
+                let _ = sender.send(ServerEvent::Stdout { data: d });
+            }
+            SessionEvent::Stderr(d) => {
+                let _ = sender.send(ServerEvent::Stderr { data: d });
+            }
+            SessionEvent::ExitStatus(c) => return Ok(c),
+            SessionEvent::ExitSignal(s) => {
+                let _ = sender.send(ServerEvent::Stderr {
+                    data: format!("killed by signal {s}\n").into_bytes(),
+                });
+                return Ok(255);
+            }
+            SessionEvent::Eof => return Ok(0),
         }
     }
+    Ok(0)
 }
 
 /// Drive a `TargetSession` for an interactive (`xho exec -it`) session: request
@@ -522,26 +529,16 @@ pub async fn drive_interactive(
     let (stdout_tx, stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (exit_tx, exit_rx) = oneshot::channel::<i32>();
 
-    // Both halves live in one task here, but the halves are independent:
-    // a stalled terminal consumer pauses stdout delivery while stdin keeps
-    // flowing (and vice versa) — no mutual starvation.
-    let task = tokio::spawn(async move {
+    // Input forwarding (stdin + resize) runs as its own task so a parked
+    // `write_stdin` cannot stall the output pump — the same directional
+    // independence the transport drivers guarantee.
+    let writer2 = writer.clone();
+    let input_task = tokio::spawn(async move {
         loop {
             tokio::select! {
-                ev = stream.next() => match ev {
-                    Some(SessionEvent::Stdout(d)) => {
-                        if stdout_tx.send(d).is_err() { break; }
-                    }
-                    Some(SessionEvent::Stderr(d)) => {
-                        let _ = stdout_tx.send(d);
-                    }
-                    Some(SessionEvent::ExitStatus(c)) => { let _ = exit_tx.send(c); return; }
-                    Some(SessionEvent::ExitSignal(_)) => { let _ = exit_tx.send(255); return; }
-                    Some(SessionEvent::Eof) | None => { let _ = exit_tx.send(0); return; }
-                },
                 stdin = stdin_rx.recv() => match stdin {
-                    Some(d) => { let _ = writer.write_stdin(&d).await; }
-                    None => { let _ = writer.eof().await; }
+                    Some(d) => { if writer.write_stdin(&d).await.is_err() { break; } }
+                    None => { let _ = writer.eof().await; break; }
                 },
                 resize = resize_rx.recv() => {
                     if let Some((c, r)) = resize { let _ = writer.window_change(c, r).await; }
@@ -549,6 +546,35 @@ pub async fn drive_interactive(
             }
         }
     });
+    let task = tokio::spawn(async move {
+        let _ = writer2;
+        while let Some(ev) = stream.next().await {
+            match ev {
+                SessionEvent::Stdout(d) => {
+                    if stdout_tx.send(d).is_err() {
+                        break;
+                    }
+                }
+                SessionEvent::Stderr(d) => {
+                    let _ = stdout_tx.send(d);
+                }
+                SessionEvent::ExitStatus(c) => {
+                    let _ = exit_tx.send(c);
+                    return;
+                }
+                SessionEvent::ExitSignal(_) => {
+                    let _ = exit_tx.send(255);
+                    return;
+                }
+                SessionEvent::Eof => {
+                    let _ = exit_tx.send(0);
+                    return;
+                }
+            }
+        }
+        let _ = exit_tx.send(0);
+    });
+    let _ = input_task;
 
     Ok(InteractiveHandle {
         stdin_tx,

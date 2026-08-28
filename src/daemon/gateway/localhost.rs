@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use std::path::PathBuf;
 
 use crate::config::DirectAuth;
 use crate::daemon::session::TargetSession;
@@ -28,6 +29,9 @@ pub struct LocalhostGateway {
     hostname: String,
     /// Optional explicit sftp-server path (from config); probed when None.
     sftp_server_path: Option<String>,
+    /// Working directory for spawned shell/exec children; `None` inherits the
+    /// daemon's cwd (used by tests).
+    workdir: Option<PathBuf>,
 }
 
 impl LocalhostGateway {
@@ -35,6 +39,7 @@ impl LocalhostGateway {
         shell: Option<String>,
         user: Option<String>,
         sftp_server_path: Option<String>,
+        workdir: Option<PathBuf>,
     ) -> Self {
         Self {
             shell: shell
@@ -46,6 +51,7 @@ impl LocalhostGateway {
                 .unwrap_or_else(|| "unknown".to_string()),
             hostname: get_hostname(),
             sftp_server_path,
+            workdir,
         }
     }
 
@@ -53,6 +59,7 @@ impl LocalhostGateway {
         Box::new(LocalSession::new(
             self.shell.clone(),
             self.sftp_server_path.clone(),
+            self.workdir.clone(),
         )) as Box<dyn TargetSession>
     }
 }

@@ -139,13 +139,17 @@ pub(crate) struct LocalSession {
 }
 
 impl LocalSession {
-    pub(crate) fn new(shell: String, sftp_server_path: Option<String>) -> Self {
+    pub(crate) fn new(
+        shell: String,
+        sftp_server_path: Option<String>,
+        workdir: Option<PathBuf>,
+    ) -> Self {
         // Control and stdin share ONE ordered channel so eof/data cannot
         // overtake the exec/subsystem start (see DirectSshSession for the
         // rationale); pre-start stdin is buffered by the driver.
         let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(64);
         let (events_tx, events_rx) = mpsc::unbounded_channel::<SessionEvent>();
-        tokio::spawn(driver(shell, sftp_server_path, cmd_rx, events_tx));
+        tokio::spawn(driver(shell, sftp_server_path, workdir, cmd_rx, events_tx));
         Self {
             writer: Some(SessionWriter { tx: cmd_tx }),
             stream: Some(SessionStream { rx: events_rx }),
@@ -165,6 +169,7 @@ impl TargetSession for LocalSession {
 async fn driver(
     shell: String,
     sftp_server_path: Option<String>,
+    workdir: Option<PathBuf>,
     mut cmd_rx: mpsc::Receiver<SessionCommand>,
     events_tx: mpsc::UnboundedSender<SessionEvent>,
 ) {
@@ -193,7 +198,7 @@ async fn driver(
                         continue;
                     }
                     let argv = vec![shell.clone(), "-c".to_string(), command];
-                    match spawn(&pty, &env, &argv, &events_tx).await {
+                    match spawn(&pty, &env, &argv, &workdir, &events_tx).await {
                         Ok(b) => {
                             backend = Some(b);
                             flush_pending_stdin(&mut backend, &mut pending_stdin, &mut pending_eof).await;
@@ -208,7 +213,7 @@ async fn driver(
                         continue;
                     }
                     let argv = vec![shell.clone()];
-                    match spawn(&pty, &env, &argv, &events_tx).await {
+                    match spawn(&pty, &env, &argv, &workdir, &events_tx).await {
                         Ok(b) => {
                             backend = Some(b);
                             flush_pending_stdin(&mut backend, &mut pending_stdin, &mut pending_eof).await;
@@ -303,6 +308,7 @@ async fn spawn(
     pty: &Option<(String, u32, u32)>,
     env: &[(String, String)],
     argv: &[String],
+    workdir: &Option<PathBuf>,
     events_tx: &mpsc::UnboundedSender<SessionEvent>,
 ) -> Result<Backend> {
     let program = argv
@@ -327,6 +333,9 @@ async fn spawn(
         let stderr = std::process::Stdio::from(slave_file);
         let mut cmd = Command::new(&program);
         cmd.args(args).stdin(stdin).stdout(stdout).stderr(stderr);
+        if let Some(dir) = workdir {
+            cmd.current_dir(dir);
+        }
         cmd.env(
             "TERM",
             if term.is_empty() {
@@ -360,6 +369,9 @@ async fn spawn(
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        if let Some(dir) = workdir {
+            cmd.current_dir(dir);
+        }
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -463,7 +475,8 @@ mod tests {
 
     #[tokio::test]
     async fn split_exec_streams_output_and_exit_code() {
-        let sess: Box<dyn TargetSession> = Box::new(LocalSession::new("/bin/sh".to_string(), None));
+        let sess: Box<dyn TargetSession> =
+            Box::new(LocalSession::new("/bin/sh".to_string(), None, None));
         let (writer, mut stream) = sess.split();
         writer
             .exec("printf hello; echo err 1>&2; exit 7")
@@ -489,7 +502,8 @@ mod tests {
 
     #[tokio::test]
     async fn split_carries_stdin_through_writer() {
-        let sess: Box<dyn TargetSession> = Box::new(LocalSession::new("/bin/sh".to_string(), None));
+        let sess: Box<dyn TargetSession> =
+            Box::new(LocalSession::new("/bin/sh".to_string(), None, None));
         let (writer, mut stream) = sess.split();
         writer.exec("cat").await.unwrap();
         writer.write_stdin(b"ping").await.unwrap();
@@ -504,5 +518,99 @@ mod tests {
             }
         }
         assert_eq!(stdout, b"ping");
+    }
+
+    #[tokio::test]
+    async fn exec_runs_in_configured_workdir() {
+        let dir = std::env::temp_dir().join(format!("xho-local-workdir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sess: Box<dyn TargetSession> = Box::new(LocalSession::new(
+            "/bin/sh".to_string(),
+            None,
+            Some(dir.clone()),
+        ));
+        let (writer, mut stream) = sess.split();
+        writer.exec("pwd -P").await.unwrap();
+
+        let mut stdout = Vec::new();
+        while let Some(ev) = stream.next().await {
+            match ev {
+                SessionEvent::Stdout(d) => stdout.extend_from_slice(&d),
+                SessionEvent::ExitStatus(_) | SessionEvent::Eof => break,
+                _ => {}
+            }
+        }
+        // Compare against the canonicalized path: temp dirs are symlinked
+        // (/var → /private/var on macOS) and `pwd -P` prints the physical one.
+        let expected = std::fs::canonicalize(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            String::from_utf8_lossy(&stdout).trim(),
+            expected.to_str().unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod deadlock_tests {
+    use super::*;
+    use std::time::Duration;
+
+    // Regression: a remote process that never reads stdin while its stdout is
+    // consumed must not freeze the session. The stdin flood parks the write
+    // direction (pipe + channel buffers fill); the event stream must still
+    // deliver output and the exit status.
+    #[tokio::test]
+    async fn stdin_backpressure_does_not_stall_output() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+
+        // Flood stdin far beyond every buffer in the path. Run in the
+        // background so the assertion path below always executes.
+        let flood = tokio::spawn(async move {
+            let stdin_tx = stdin_tx;
+            for _ in 0..64 {
+                if stdin_tx.send(vec![b'x'; 65536]).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let sess: Box<dyn TargetSession> =
+            Box::new(LocalSession::new("/bin/sh".to_string(), None, None));
+        let handle = tokio::spawn(super::super::drive_exec(
+            sess,
+            "echo alive-during-flood; exit 9".to_string(),
+            false,
+            0,
+            0,
+            event_tx,
+            Some(stdin_rx),
+        ));
+
+        let mut saw_alive = false;
+        let deadline = tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(ev) = event_rx.recv().await {
+                match ev {
+                    crate::protocol::ServerEvent::Stdout { data } => {
+                        if String::from_utf8_lossy(&data).contains("alive-during-flood") {
+                            saw_alive = true;
+                        }
+                    }
+                    crate::protocol::ServerEvent::ExitStatus { .. } => break,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        assert!(deadline.is_ok(), "session froze under stdin backpressure");
+        assert!(saw_alive, "output never arrived while stdin was saturated");
+        let code = tokio::time::timeout(Duration::from_secs(20), handle)
+            .await
+            .expect("drive_exec never finished")
+            .unwrap()
+            .unwrap();
+        assert_eq!(code, 9);
+        let _ = flood.await;
     }
 }

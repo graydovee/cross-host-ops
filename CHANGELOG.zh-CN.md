@@ -9,6 +9,7 @@
 
 ## latest
 
+- 2026-08-28 [feat] 新增 `[reverse_proxy] workdir` 配置：daemon 本机会话（透明代理 shell、`xho exec`）从该目录启动，未配置时默认为 home 目录而非 daemon 的 cwd。
 - 2026-08-27 [docs] 刷新文档、配置示例与 agent 协作约定以匹配当前行为。
 - 2026-08-27 [docs] 将发布清单从 AGENTS.md 抽离为独立的 `xho-release` skill。
 

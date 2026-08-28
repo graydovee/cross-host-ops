@@ -27,32 +27,44 @@ pub(crate) async fn open_sftp(sess: Box<dyn TargetSession>) -> Result<SftpSessio
     let (writer, mut stream) = sess.split();
     writer.subsystem("sftp").await?;
     let (client, server) = tokio::io::duplex(64 * 1024);
+    // The upload direction runs as its own task: a parked `write_stdin`
+    // (remote sftp-server stopped reading) must not stall the download
+    // direction above it.
     tokio::spawn(async move {
         let (mut rd, mut wr) = tokio::io::split(server);
-        let mut buf = vec![0u8; 8192];
-        loop {
-            tokio::select! {
-                ev = stream.next() => match ev {
-                    Some(super::SessionEvent::Stdout(d)) | Some(super::SessionEvent::Stderr(d)) => {
-                        if wr.write_all(&d).await.is_err() { break; }
-                    }
-                    Some(super::SessionEvent::ExitStatus(_))
-                    | Some(super::SessionEvent::ExitSignal(_))
-                    | Some(super::SessionEvent::Eof)
-                    | None => {
-                        let _ = wr.shutdown().await;
+        let upload = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                match rd.read(&mut buf).await {
+                    Ok(0) => {
+                        let _ = writer.eof().await;
                         break;
                     }
-                },
-                n = rd.read(&mut buf) => match n {
-                    Ok(0) => { let _ = writer.eof().await; break; }
                     Ok(n) => {
-                        if writer.write_stdin(&buf[..n]).await.is_err() { break; }
+                        if writer.write_stdin(&buf[..n]).await.is_err() {
+                            break;
+                        }
                     }
                     Err(_) => break,
-                },
+                }
+            }
+        });
+        while let Some(ev) = stream.next().await {
+            match ev {
+                super::SessionEvent::Stdout(d) | super::SessionEvent::Stderr(d) => {
+                    if wr.write_all(&d).await.is_err() {
+                        break;
+                    }
+                }
+                super::SessionEvent::ExitStatus(_)
+                | super::SessionEvent::ExitSignal(_)
+                | super::SessionEvent::Eof => {
+                    let _ = wr.shutdown().await;
+                    break;
+                }
             }
         }
+        let _ = upload.await;
     });
     SftpSession::new(client).await.context("sftp init")
 }

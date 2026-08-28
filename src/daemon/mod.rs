@@ -291,12 +291,30 @@ pub async fn run_with_overrides(
     if (loaded.reverse_proxy.enable && loaded.reverse_proxy.allow_host_access)
         || loaded.server.proxy.enable
     {
+        // Sessions on this node start in the configured workdir, falling back
+        // to the user's home directory (sshd parity) rather than inheriting
+        // the daemon's cwd.
+        let workdir = loaded
+            .reverse_proxy
+            .workdir
+            .clone()
+            .map(PathBuf::from)
+            .or_else(|| home::home_dir());
+        if let Some(dir) = &workdir {
+            if !dir.is_dir() {
+                warn!(
+                    workdir = %dir.display(),
+                    "reverse_proxy.workdir does not exist; local sessions will fail to start"
+                );
+            }
+        }
         gateways.push((
             gateway::localhost::SELF_GATEWAY_NAME.to_string(),
             Arc::new(gateway::localhost::LocalhostGateway::new(
                 loaded.reverse_proxy.shell.clone(),
                 loaded.reverse_proxy.user.clone(),
                 loaded.server.proxy.sftp_server_path.clone(),
+                workdir,
             )),
         ));
         info!("_self (localhost) gateway registered");
@@ -2574,6 +2592,8 @@ pub mod test_support {
                 config_clone.reverse_proxy.shell.clone(),
                 config_clone.reverse_proxy.user.clone(),
                 config_clone.server.proxy.sftp_server_path.clone(),
+                // Keep tests hermetic: children inherit the test process cwd.
+                None,
             )),
         ));
 

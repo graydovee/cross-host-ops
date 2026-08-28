@@ -150,6 +150,9 @@ impl AppConfig {
 
         self.reverse_proxy.identity_file = expand_tilde(&self.reverse_proxy.identity_file)?;
         self.reverse_proxy.known_hosts_path = expand_tilde(&self.reverse_proxy.known_hosts_path)?;
+        if let Some(w) = &self.reverse_proxy.workdir {
+            self.reverse_proxy.workdir = Some(expand_tilde(w)?);
+        }
         Ok(())
     }
 
@@ -316,6 +319,29 @@ enable = false
         .expect("parse");
         assert!(config.review.exec.enable);
         assert!(!config.review.copy.enable);
+    }
+
+    #[test]
+    fn reverse_proxy_workdir_defaults_and_overrides() {
+        // Absent → None (resolved to the home directory at gateway setup).
+        assert_eq!(AppConfig::default().reverse_proxy.workdir, None);
+        // Explicit override is honored.
+        let config: AppConfig =
+            toml::from_str("[reverse_proxy]\nworkdir = \"/tmp/xho-sessions\"\n").expect("parse");
+        assert_eq!(
+            config.reverse_proxy.workdir.as_deref(),
+            Some("/tmp/xho-sessions")
+        );
+    }
+
+    #[test]
+    fn reverse_proxy_workdir_tilde_expansion() {
+        let mut config = AppConfig::default();
+        config.reverse_proxy.workdir = Some("~/xho-sessions".to_string());
+        config.expand_paths().expect("expand");
+        let workdir = config.reverse_proxy.workdir.unwrap();
+        assert!(!workdir.contains('~'), "tilde should be expanded");
+        assert!(workdir.ends_with("xho-sessions"));
     }
 
     #[test]
