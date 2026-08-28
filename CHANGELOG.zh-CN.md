@@ -9,6 +9,8 @@
 
 ## latest
 
+- 2026-08-28 [bug] 隧道会话不再因客户端关闭 stdin 侧而提前结束：tunnel 驱动在上行结束后继续排空远端输出与退出状态，管道式 exec（-i）能拿到全部输出而不是空结果。
+- 2026-08-28 [bug] 修复会话流式传输的最后一个互冻路径：direct SSH 驱动的通道写与读原先共用一个 select，远端程序停止读 stdin 而输出又未被消费时两个方向可能同时永久停摆（表现为 2222 代理 shell 在大输出后冻结，如 git log）；现在 direct 驱动读写各自独立任务，exec/交互/sftp 的 stdin 转发同样移入独立任务。
 - 2026-08-28 [feat] 新增 `[reverse_proxy] workdir` 配置：daemon 本机会话（透明代理 shell、`xho exec`）从该目录启动，未配置时默认为 home 目录而非 daemon 的 cwd。
 - 2026-08-27 [docs] 刷新文档、配置示例与 agent 协作约定以匹配当前行为。
 - 2026-08-27 [docs] 将发布清单从 AGENTS.md 抽离为独立的 `xho-release` skill。
