@@ -17,7 +17,7 @@
      Entries are grouped per released version (## v0.x.y matching a git tag); released sections are frozen.
      While the next tag is undecided, write new entries under ## v0.5.7 and rename it when the tag is cut. -->
 
-## latest
+## v0.5.8
 
 - 2026-09-01 [bug] fix the 2222 transparent proxy freezing permanently under sustained interactive output (vim, top); sessions now keep flowing and dead gateway links fail fast instead of hanging
 
