@@ -270,7 +270,17 @@ pub async fn run_with_overrides(
     if let Some(level) = log_level_override {
         loaded.server.log_level = level;
     }
-    let _log_guard = init_logging(loaded.server.log_path.clone(), &loaded.server.log_level)?;
+    // TOKIO_CONSOLE=1 swaps file logging for the tokio-console task inspector
+    // (both want the global tracing subscriber; diagnostics only).
+    let console_mode = std::env::var("TOKIO_CONSOLE").as_deref() == Ok("1");
+    let _log_guard = if console_mode {
+        console_subscriber::init();
+        eprintln!("tokio-console: task inspector active on 127.0.0.1:6669");
+        None
+    } else {
+        init_logging(loaded.server.log_path.clone(), &loaded.server.log_level)?
+    };
+
     info!(config_path = %config_path.display(), "starting xhod");
 
     let config = Arc::new(RwLock::new(loaded.clone()));
@@ -397,6 +407,9 @@ pub async fn run_with_overrides(
             auth_rejection_time_initial: Some(Duration::from_secs(0)),
             keys: host_keys,
             inactivity_timeout: server_cfg.inactivity_timeout,
+            // Probe clients so half-open connections are reaped (and reverse
+            // node registrations freed) instead of lingering forever.
+            keepalive_interval: Some(state.config.read().await.ssh.keepalive_interval),
             ..Default::default()
         });
         info!(listen_addr = %remote_config.listen_addr, "listening on remote SSH");
@@ -427,6 +440,7 @@ pub async fn run_with_overrides(
                         auth_rejection_time_initial: Some(Duration::from_secs(0)),
                         keys: host_keys,
                         inactivity_timeout: server_cfg.inactivity_timeout,
+                        keepalive_interval: Some(state.config.read().await.ssh.keepalive_interval),
                         ..Default::default()
                     });
                     info!(

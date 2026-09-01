@@ -87,7 +87,7 @@ pub(crate) enum SessionCommand {
 /// without owning the event stream, so the two halves can live in separate
 /// tasks. Backpressure applies only to this half.
 pub struct SessionWriter {
-    tx: mpsc::Sender<SessionCommand>,
+    pub(crate) tx: mpsc::Sender<SessionCommand>,
 }
 
 /// Cloning is safe and preserves FIFO ordering: all clones share one
@@ -143,7 +143,7 @@ impl SessionWriter {
         .await
     }
 
-    pub(crate) async fn exec(&self, command: &str) -> Result<()> {
+    pub async fn exec(&self, command: &str) -> Result<()> {
         self.request(|reply| SessionCommand::Exec {
             command: command.to_string(),
             reply,
@@ -177,7 +177,7 @@ impl SessionWriter {
         )
     }
 
-    pub(crate) async fn write_stdin(&self, data: &[u8]) -> Result<()> {
+    pub async fn write_stdin(&self, data: &[u8]) -> Result<()> {
         Self::check(
             self.tx
                 .send(SessionCommand::Data {
@@ -187,18 +187,18 @@ impl SessionWriter {
         )
     }
 
-    pub(crate) async fn eof(&self) -> Result<()> {
+    pub async fn eof(&self) -> Result<()> {
         Self::check(self.tx.send(SessionCommand::Eof).await)
     }
 }
 
 /// The read half of a session: yields events until the session ends.
 pub struct SessionStream {
-    rx: mpsc::UnboundedReceiver<SessionEvent>,
+    pub(crate) rx: mpsc::UnboundedReceiver<SessionEvent>,
 }
 
 impl SessionStream {
-    pub(crate) async fn next(&mut self) -> Option<SessionEvent> {
+    pub async fn next(&mut self) -> Option<SessionEvent> {
         self.rx.recv().await
     }
 }

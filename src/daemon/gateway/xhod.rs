@@ -128,8 +128,17 @@ impl XhodGateway {
     /// subsystem every time tonic needs a new underlying transport.
     async fn connect_client(&self) -> Result<XhoRpcClient> {
         let connector_config = Arc::new(self.connector_config());
+        let keepalive_interval = connector_config.keepalive_interval;
 
-        let endpoint = Endpoint::from_static("http://[::]:50051");
+        let endpoint = Endpoint::from_static("http://[::]:50051")
+            // h2-level liveness: without this, a silently dead SSH transport
+            // leaves in-flight OpenSession streams parked forever (the user's
+            // terminal freezes instead of erroring) because nothing below h2
+            // notices the death until russh's slow keepalives fire.
+            .http2_keep_alive_interval(keepalive_interval)
+            .keep_alive_while_idle(true)
+            .keep_alive_timeout(keepalive_interval * 2)
+            .connect_timeout(std::time::Duration::from_secs(10));
         let tonic_channel: Channel = endpoint
             .connect_with_connector(service_fn(move |_: Uri| {
                 let connector_config = connector_config.clone();
@@ -149,8 +158,17 @@ impl XhodGateway {
     }
 
     async fn open_rpc_stream(config: Arc<XhodConnectorConfig>) -> std::io::Result<XhoRpcStream> {
-        Self::open_rpc_stream_inner(config)
+        // Bound the whole connect/auth/subsystem sequence: a half-dead
+        // network otherwise parks the connector indefinitely.
+        let timeout = std::time::Duration::from_secs(10);
+        tokio::time::timeout(timeout, Self::open_rpc_stream_inner(config))
             .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "xho-rpc stream setup timed out",
+                )
+            })?
             .map(TokioIo::new)
             .map_err(std::io::Error::other)
     }

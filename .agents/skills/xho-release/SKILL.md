@@ -30,7 +30,17 @@ and consumes a version number. Only act on an explicit user request ("release
    (`git rev-list --left-right --count origin/master...master` → `0 N`).
 4. **Both changelogs finalized** (`CHANGELOG.md`, `CHANGELOG.zh-CN.md`):
    - Any entries missing for this cycle prepended under the open section.
-   - Section renamed `## latest` → `## vX.Y.Z`.
+   - Section renamed `## latest` → `## vX.Y.Z`. Careful: the literal string
+     `## latest` appears TWICE in each file — once inside the HTML comment at
+     the top, once as the actual section header. A naive "replace first
+     occurrence" hits the comment and leaves the real section untouched
+     (this is exactly how the v0.5.7 tag shipped with an unrenamed section).
+     Edit the section header itself, then verify.
+   - Verification (must pass for BOTH files before committing):
+     ```bash
+     grep -n '^## ' CHANGELOG.md CHANGELOG.zh-CN.md
+     ```
+     The output must contain `## vX.Y.Z` and must NOT contain `## latest`.
    - English and Chinese still map one-to-one: same dates, same tags, same order.
    - Entry format rules live in AGENTS.md § Changelog — follow them exactly.
 
@@ -40,18 +50,20 @@ Abort and report if any check fails; do not "fix forward" silently mid-release.
 
 ```bash
 # 1. Commit anything still pending (the latest→vX.Y.Z rename rides along)
-git add -A && git commit -m "docs: finalize v0.5.7 changelog"
+git add -A && git commit -m "docs: finalize vX.Y.Z changelog"
 
 # 2. Push master BEFORE tagging
 git push origin master
 
 # 3. Cut an ANNOTATED tag and push it — this triggers the release workflow
-git tag -a v0.5.7 -m "v0.5.7"
-git push origin v0.5.7
+git tag -a vX.Y.Z -m "vX.Y.Z"
+git push origin vX.Y.Z
 ```
 
 Always annotated tags, message = the bare version string, matching prior
-releases (v0.5.4…v0.5.6).
+releases (v0.5.4…v0.5.6). After the finalize commit, re-run the section
+verification from precondition 4 — the committed files are what the release
+page's changelog link shows, so a missed rename here ships frozen wrong.
 
 ## Watch & verify
 

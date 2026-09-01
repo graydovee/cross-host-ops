@@ -67,7 +67,7 @@ pub(super) struct ProxySshHandler {
     accepted_fingerprint: Option<String>,
     channels: HashMap<ChannelId, ChannelEntry>,
     /// Senders to running bridge tasks, keyed by channel id.
-    bridges: HashMap<ChannelId, mpsc::Sender<ProxyMsg>>,
+    bridges: HashMap<ChannelId, tokio::sync::mpsc::UnboundedSender<ProxyMsg>>,
 }
 
 impl server::Server for ProxySshServer {
@@ -91,13 +91,18 @@ impl server::Server for ProxySshServer {
 // -----------------------------------------------------------------------
 
 async fn forward_or_buffer(
-    bridges: &mut HashMap<ChannelId, mpsc::Sender<ProxyMsg>>,
+    bridges: &mut HashMap<ChannelId, tokio::sync::mpsc::UnboundedSender<ProxyMsg>>,
     channels: &mut HashMap<ChannelId, ChannelEntry>,
     channel: ChannelId,
     msg: ProxyMsg,
 ) {
     if let Some(tx) = bridges.get(&channel) {
-        let _ = tx.send(msg).await;
+        // Unbounded: handler.data() runs INSIDE the russh session loop, so it
+        // must never park (a parked data() stops the loop from reading the
+        // socket and answering keepalives - the historical terminal freeze).
+        // Backpressure is enforced downstream by the pump -> writer -> PTY
+        // chain instead.
+        let _ = tx.send(msg);
     } else if let Some(entry) = channels.get_mut(&channel) {
         entry.pending.push(msg);
     }
@@ -110,15 +115,15 @@ fn spawn_bridge(
     channel_id: ChannelId,
     start: SessionStart,
     caller: crate::oversight::Caller,
-    bridges: &mut HashMap<ChannelId, mpsc::Sender<ProxyMsg>>,
+    bridges: &mut HashMap<ChannelId, tokio::sync::mpsc::UnboundedSender<ProxyMsg>>,
 ) {
-    let (tx, rx) = mpsc::channel::<ProxyMsg>(64);
+    let (tx, rx) = mpsc::unbounded_channel::<ProxyMsg>();
     // Flush buffered messages in order before the task begins consuming.
     let mut pending = entry.pending;
     let tx_for_flush = tx.clone();
     tokio::spawn(async move {
         for msg in pending.drain(..) {
-            if tx_for_flush.send(msg).await.is_err() {
+            if tx_for_flush.send(msg).is_err() {
                 return;
             }
         }
@@ -199,8 +204,20 @@ fn spawn_bridge(
             return;
         }
 
-        let channel = entry.channel;
+        let (channel_read, channel) = entry.channel.split();
         let mut msg_rx = rx;
+
+        // Drain the channel's inbound event queue. russh pushes a copy of
+        // every channel message (data/eof/close/...) into a bounded queue
+        // consumed only by `Channel::wait()`; with no reader, that queue
+        // fills after `channel_buffer_size` messages and the session loop
+        // then parks forever inside `chan.send(...)` — freezing keepalive
+        // replies and wedging the whole connection. The bridge consumes the
+        // same bytes through `handler.data`, so this half is discarded.
+        let _drainer = tokio::spawn(async move {
+            let mut channel = channel_read;
+            while channel.wait().await.is_some() {}
+        });
 
         // Downlink: session events → inbound SSH channel. Its own task so a
         // slow SSH consumer never stalls the stdin direction (see the

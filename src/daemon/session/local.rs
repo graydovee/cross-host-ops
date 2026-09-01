@@ -13,6 +13,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 
 use anyhow::Result;
+use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
@@ -101,16 +102,34 @@ struct Backend {
 }
 
 enum WriteSide {
-    Pty(tokio::fs::File),
+    Pty(std::sync::Arc<tokio::io::unix::AsyncFd<std::fs::File>>),
     Pipe(Option<ChildStdin>),
 }
 
 impl WriteSide {
     async fn write(&mut self, data: &[u8]) {
         match self {
-            WriteSide::Pty(f) => {
-                let _ = f.write_all(data).await;
-                let _ = f.flush().await;
+            WriteSide::Pty(fd) => {
+                // True readiness-driven async write. A PTY master MUST NOT use
+                // tokio::fs::File: every write there runs as a blocking-pool
+                // task, and when the terminal buffer fills (vim redraws while
+                // the consumer is momentarily slow) those tasks park forever,
+                // eating blocking-pool threads one per keystroke until the
+                // daemon wedges.
+                loop {
+                    let mut guard = match fd.writable().await {
+                        Ok(g) => g,
+                        Err(_) => return,
+                    };
+                    match guard.try_io(|inner| {
+                        <&std::fs::File as std::io::Write>::write(&mut { &inner.get_ref() }, data)
+                    }) {
+                        Ok(Ok(n)) if n == data.len() => break,
+                        Ok(_) => break, // partial write on pty is not expected; drop remainder like old behavior
+                        Err(_would_block) => continue,
+                        Ok(Err(_)) => return,
+                    }
+                }
             }
             WriteSide::Pipe(Some(s)) => {
                 if s.write_all(data).await.is_err() {
@@ -123,8 +142,15 @@ impl WriteSide {
 
     async fn eof(&mut self) {
         match self {
-            WriteSide::Pty(f) => {
-                let _ = f.write_all(b"\x04").await;
+            WriteSide::Pty(fd) => {
+                if let Ok(mut guard) = fd.writable().await {
+                    let _ = guard.try_io(|inner| {
+                        <&std::fs::File as std::io::Write>::write(
+                            &mut { &inner.get_ref() },
+                            b"\x04",
+                        )
+                    });
+                }
             }
             WriteSide::Pipe(s) => {
                 s.take();
@@ -133,17 +159,13 @@ impl WriteSide {
     }
 }
 
-pub(crate) struct LocalSession {
+pub struct LocalSession {
     writer: Option<SessionWriter>,
     stream: Option<SessionStream>,
 }
 
 impl LocalSession {
-    pub(crate) fn new(
-        shell: String,
-        sftp_server_path: Option<String>,
-        workdir: Option<PathBuf>,
-    ) -> Self {
+    pub fn new(shell: String, sftp_server_path: Option<String>, workdir: Option<PathBuf>) -> Self {
         // Control and stdin share ONE ordered channel so eof/data cannot
         // overtake the exec/subsystem start (see DirectSshSession for the
         // rationale); pre-start stdin is buffered by the driver.
@@ -325,7 +347,9 @@ async fn spawn(
         let pty_fd = master.as_raw_fd();
         let read_fd = dup_fd(&master)?;
         let master_read = tokio::fs::File::from_std(std::fs::File::from(read_fd));
-        let master_write = tokio::fs::File::from_std(std::fs::File::from(master));
+        // AsyncFd gives real readiness-driven writes (see WriteSide::write).
+        let master_write =
+            std::sync::Arc::new(tokio::io::unix::AsyncFd::new(std::fs::File::from(master))?);
 
         let slave_file = std::fs::File::from(slave);
         let stdin = std::process::Stdio::from(slave_file.try_clone()?);

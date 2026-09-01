@@ -19,6 +19,10 @@
 
 ## latest
 
+- 2026-09-01 [bug] fix the 2222 transparent proxy freezing permanently under sustained interactive output (vim, top); sessions now keep flowing and dead gateway links fail fast instead of hanging
+
+## v0.5.7
+
 - 2026-08-28 [bug] tunnel sessions no longer end early when the client closes its stdin side: the tunnel driver kept draining remote output and the exit status after the uplink finishes, so piped exec (-i) returns all output instead of returning an empty result
 - 2026-08-28 [bug] fix the last mutual-freeze path in session streaming: the direct SSH driver kept channel writes and reads in one select, so a remote program that stopped reading stdin while its output was unconsumed could park both directions forever (seen as a 2222 proxy shell freezing after big output, e.g. git log); writes and reads now run as independent tasks in the direct driver, and exec/interactive/sftp stdin forwarding moved to dedicated tasks to match
 - 2026-08-28 [feat] Added `[reverse_proxy] workdir`: sessions on the daemon host (transparent-proxy shells, `xho exec`) now start there, defaulting to the home directory instead of the daemon's cwd.

@@ -58,6 +58,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 tower = { version = "0.5", features = ["util"] }
 uuid = { version = "1.19", features = ["serde", "v4"] }
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
+console-subscriber = { version = "0.5.0", features = ["env-filter"] }
 
 [dev-dependencies]
 proptest = "1"
