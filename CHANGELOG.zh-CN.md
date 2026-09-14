@@ -7,6 +7,10 @@
      条目按发布版本分组（## v0.x.y 对应 git tag），已发布小节冻结；下一版未定稿时写入 ## v0.5.7。
      完整规则见 AGENTS.md 与 CHANGELOG.md 头部注释。 -->
 
+## latest
+
+- 2026-09-15 [refactor] release CI 弃用 QEMU 模拟：docker 镜像改在 linux/amd64 + linux/arm64 原生 runner 上构建（合并为单一 manifest），aarch64-musl 二进制也改在 arm64 原生 runner 编译（去掉 `cross`）——发布流水线提速数倍
+
 ## v0.5.10
 
 - 2026-09-14 [feat] Windows ARM64 构建：release 新增 `aarch64-pc-windows-msvc` zip 包（与 x64 并列），Git Bash 下 `deploy.sh` 自动识别 ARM64 Windows

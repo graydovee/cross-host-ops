@@ -17,6 +17,10 @@
      Entries are grouped per released version (## v0.x.y matching a git tag); released sections are frozen.
      While the next tag is undecided, write new entries under ## v0.5.7 and rename it when the tag is cut. -->
 
+## latest
+
+- 2026-09-15 [refactor] release CI drops QEMU emulation: docker images build natively on linux/amd64 + linux/arm64 runners (merged into one manifest), and the aarch64-musl binaries compile natively on an arm64 runner instead of via `cross` — the release pipeline gets several times faster
+
 ## v0.5.10
 
 - 2026-09-14 [feat] Windows ARM64 builds: releases now ship an `aarch64-pc-windows-msvc` zip alongside x64, and `deploy.sh` auto-detects ARM64 Windows under Git Bash

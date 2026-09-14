@@ -19,22 +19,16 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
-            use-cross: false
           - target: aarch64-unknown-linux-musl
-            runner: ubuntu-latest
-            use-cross: true
+            runner: ubuntu-24.04-arm
           - target: x86_64-apple-darwin
             runner: macos-latest
-            use-cross: false
           - target: aarch64-apple-darwin
             runner: macos-latest
-            use-cross: false
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
-            use-cross: false
           - target: aarch64-pc-windows-msvc
             runner: windows-latest
-            use-cross: false
 
     steps:
       - name: Checkout
@@ -46,21 +40,12 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install musl tools
-        if: ${{ !matrix.use-cross && runner.os == 'Linux' }}
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-
-      - name: Install cross
-        if: matrix.use-cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Build release binaries
         shell: bash
-        run: |
-          if [ "${{ matrix.use-cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }} --bin xho --bin xhod
-          else
-            cargo build --release --target ${{ matrix.target }} --bin xho --bin xhod
-          fi
+        run: cargo build --release --target ${{ matrix.target }} --bin xho --bin xhod
 
       - name: Package release archive (Unix)
         if: runner.os != 'Windows'
@@ -97,14 +82,67 @@ jobs:
             cross-host-ops-${{ github.ref_name }}-${{ matrix.target }}.zip
 
   docker-ghcr:
-    name: docker ghcr
-    runs-on: ubuntu-latest
+    name: docker ghcr (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: true
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/cross-host-ops,push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        shell: bash
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v5
+        with:
+          name: digests-${{ matrix.platform }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-merge:
+    name: docker ghcr (merge manifest)
+    runs-on: ubuntu-latest
+    needs: docker-ghcr
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v5
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -125,23 +163,23 @@ jobs:
             type=raw,value=${{ github.ref_name }}
             type=raw,value=latest
 
-      - name: Build and push image
-        uses: docker/build-push-action@v6
-        env:
-          DOCKER_BUILD_RECORD_UPLOAD: "false"
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+      - name: Create manifest list and push
+        shell: bash
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'ghcr.io/${{ github.repository_owner }}/cross-host-ops@sha256:%s ' *)
+
+      - name: Inspect image
+        shell: bash
+        run: docker buildx imagetools inspect "ghcr.io/${{ github.repository_owner }}/cross-host-ops:${{ github.ref_name }}"
 
   github-release:
     name: github release
     runs-on: ubuntu-latest
     needs:
       - build-release-binaries
-      - docker-ghcr
+      - docker-merge
     steps:
       - name: Checkout
         uses: actions/checkout@v6
