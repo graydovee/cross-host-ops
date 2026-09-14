@@ -17,6 +17,10 @@
      Entries are grouped per released version (## v0.x.y matching a git tag); released sections are frozen.
      While the next tag is undecided, write new entries under ## v0.5.7 and rename it when the tag is cut. -->
 
+## v0.5.10
+
+- 2026-09-14 [feat] Windows ARM64 builds: releases now ship an `aarch64-pc-windows-msvc` zip alongside x64, and `deploy.sh` auto-detects ARM64 Windows under Git Bash
+
 ## v0.5.9
 
 - 2026-09-14 [feat] Windows support: the xho client and xhod daemon now run natively on Windows — local `_self` sessions use ConPTY, the CLI↔daemon control channel uses a TCP loopback lock file, and path/permission/mtime handling is OS-agnostic; gateway routing, the transparent proxy, and copy work as on Unix

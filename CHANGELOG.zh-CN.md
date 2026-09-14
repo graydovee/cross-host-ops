@@ -7,6 +7,10 @@
      条目按发布版本分组（## v0.x.y 对应 git tag），已发布小节冻结；下一版未定稿时写入 ## v0.5.7。
      完整规则见 AGENTS.md 与 CHANGELOG.md 头部注释。 -->
 
+## v0.5.10
+
+- 2026-09-14 [feat] Windows ARM64 构建：release 新增 `aarch64-pc-windows-msvc` zip 包（与 x64 并列），Git Bash 下 `deploy.sh` 自动识别 ARM64 Windows
+
 ## v0.5.9
 
 - 2026-09-14 [feat] Windows 原生支持：xho 客户端与 xhod 守护进程可在 Windows 上原生运行——本地 `_self` 会话使用 ConPTY，CLI↔daemon 控制通道改用 TCP 回环锁文件，路径/权限/mtime 处理与操作系统无关；网关路由、透明代理、文件复制与 Unix 行为一致

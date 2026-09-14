@@ -18,7 +18,7 @@
 # The release ships:
 #   - Docker image:  ghcr.io/graydovee/cross-host-ops:<tag>  (amd64 + arm64)
 #   - Tarball:       cross-host-ops-<tag>-<target>.tar.gz    (xho, xhod, unit)
-#   - Windows zip:   cross-host-ops-<tag>-x86_64-pc-windows-msvc.zip (xho.exe, xhod.exe)
+#   - Windows zip:   cross-host-ops-<tag>-<x86_64|aarch64>-pc-windows-msvc.zip (xho.exe, xhod.exe)
 
 set -euo pipefail
 
@@ -168,6 +168,7 @@ if [[ -z "${TARGET:-}" ]]; then
     Darwin-x86_64)             TARGET=x86_64-apple-darwin ;;
     Darwin-arm64)              TARGET=aarch64-apple-darwin ;;
     MINGW*-x86_64|MSYS*-x86_64|CYGWIN*-x86_64) TARGET=x86_64-pc-windows-msvc ;;
+    MINGW*-aarch64|MSYS*-aarch64|CYGWIN*-aarch64) TARGET=aarch64-pc-windows-msvc ;;
     *) echo "error: unsupported $os/$arch — pass --target" >&2; exit 1 ;;
   esac
 fi
@@ -272,8 +273,9 @@ build_locally() {
   target="${TARGET:-}"
   if [[ -z "$target" ]]; then
     case "$(uname -s)-$(uname -m)" in
-      MINGW*-x86_64|MSYS*-x86_64|CYGWIN*-x86_64) target=x86_64-pc-windows-msvc ;;
-      *)                                         target=x86_64-unknown-linux-musl ;;
+      MINGW*-x86_64|MSYS*-x86_64|CYGWIN*-x86_64)   target=x86_64-pc-windows-msvc ;;
+      MINGW*-aarch64|MSYS*-aarch64|CYGWIN*-aarch64) target=aarch64-pc-windows-msvc ;;
+      *)                                            target=x86_64-unknown-linux-musl ;;
     esac
   fi
   echo "==> Building release binaries (target ${target})" >&2

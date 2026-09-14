@@ -49,7 +49,7 @@ bash ../scripts/deploy.sh --local
 | `--method` | `docker` | `docker` \| `systemd` \| `bare` (remote only) |
 | `--version` | latest (GitHub API) | Release / image tag, e.g. `v0.2.0` |
 | `--registry` | `ghcr.io` | Image registry host. Set to a ghcr mirror when the target can't reach ghcr.io directly (e.g. `ghcr.nju.edu.cn`); the ref becomes `<host>/graydovee/cross-host-ops:<tag>`. Docker only |
-| `--target` | auto (`uname -m`/`-s`) | Rust triple for systemd/bare/local: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `*-apple-darwin`, `x86_64-pc-windows-msvc` (Windows) |
+| `--target` | auto (`uname -m`/`-s`) | Rust triple for systemd/bare/local: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `*-apple-darwin`, `x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc` (Windows) |
 | `--prefix` | `/usr/local/bin` (remote), `~/.bin` (local) | Binary dir for systemd/bare |
 | `--config` | `/etc/xho/config.toml` (remote), `~/.xho/config.toml` (local) | Daemon config path. For docker, its parent dir is mounted into the container at `/etc/xho` |
 | `--name` | `xhod` | Docker container name |
@@ -76,7 +76,7 @@ Release asset pattern (for systemd/bare/local; target is auto-detected):
 ```
 https://github.com/graydovee/cross-host-ops/releases/download/<tag>/cross-host-ops-<tag>-<target>.tar.gz
 ```
-Windows ships a zip (`cross-host-ops-<tag>-x86_64-pc-windows-msvc.zip`) with `xho.exe`/`xdhod.exe`; `deploy.sh --local` handles it automatically under Git Bash.
+Windows ships a zip (`cross-host-ops-<tag>-<x86_64|aarch64>-pc-windows-msvc.zip`) with `xho.exe`/`xdhod.exe`; `deploy.sh --local` handles it automatically under Git Bash.
 
 ## Token-based bootstrap
 
