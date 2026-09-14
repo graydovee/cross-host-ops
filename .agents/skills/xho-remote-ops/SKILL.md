@@ -154,6 +154,39 @@ xho daemon start|stop|restart
 
 Combined `-it` = allocate PTY + forward stdin (interactive mode when both are TTY).
 
+A global `-y/--yes` auto-confirms review prompts (exec/cp) instead of asking.
+
+## cp Flags
+
+Destinations follow scp semantics: a directory destination (e.g. `host:/tmp`)
+places the file inside it under its source name. Directories require `-r`.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--recursive` | `-r` | Recurse into directories |
+| `--resume` | `-c` | Resume an interrupted single-file transfer (see below) |
+| `--quiet` | `-q` | Suppress progress bars and non-error messages |
+| `--timeout` | | Abort after duration (e.g. `30s`, `2m`) |
+
+### Resumable transfer (`--resume`)
+
+Opt-in per invocation; without it a failed copy cleans up its partial file.
+When enabled, an interrupted attempt keeps the transferred data and re-running
+the same command continues from the recorded offset:
+
+```bash
+xho cp --resume big.tar.gz prod-xhod:web1:/data/big.tar.gz
+```
+
+- Downloads keep `<dest>.part` (+ a `.meta` sidecar); uploads keep the remote
+  temp file. Successful completion publishes atomically and removes them.
+- Safety checks decide resume vs restart: the source must be unchanged
+  (size + mtime), and the remote partial must hash identically (full sha256 of
+  its length). Append-grown sources resume correctly; rewritten files that
+  merely share old headers restart rather than silently corrupt.
+- Single files in both directions; recursive directory copies are not resumable
+  (re-run restarts them).
+
 ## Exit Codes
 
 | Code | Meaning |
@@ -181,6 +214,9 @@ xho exec prod-xhod:web1 -- ls -la /opt/app
 # Recursive directory copy
 xho cp -r ./dist prod-xhod:web1:/var/www/html/
 
+# Resume an interrupted large single-file transfer (re-run the same command)
+xho cp --resume big.tar.gz prod-xhod:web1:/data/big.tar.gz
+
 # Timeout protection
 xho exec --timeout 60s web1 -- ./long-task.sh
 ```
@@ -196,6 +232,10 @@ xho exec --timeout 60s web1 -- ./long-task.sh
   `xho` clients connect to this daemon
 - v0.4.0 moved the control plane 2222→12222; old `[[gateways]]` addresses or
   `reverse_proxy.server_address` ending in `:2222` must be updated to `:12222`
+- Jumpserver targets have no sftp subsystem: file copy runs over the interactive
+  PTY shell as line-wrapped base64, so the target only needs coreutils/busybox
+  `base64`/`head`/`tail`. Stall-class failures retry automatically on a fresh
+  bastion session; a broken upload fails fast and keeps its partial for `--resume`
 
 ## Configuration & Troubleshooting
 

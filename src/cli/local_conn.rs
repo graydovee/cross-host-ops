@@ -33,17 +33,22 @@ impl LocalEndpoint {
     pub(crate) fn from_config(client_config: &ClientConfig) -> Result<Self> {
         match client_config.local.transport {
             #[cfg(unix)]
-            LocalTransport::Unix => Ok(Self::Unix(PathBuf::from(
-                &client_config.local.socket_path,
-            ))),
+            LocalTransport::Unix => Ok(Self::Unix(PathBuf::from(&client_config.local.socket_path))),
             #[cfg(not(unix))]
             LocalTransport::Unix => Err(anyhow!(
                 "local transport \"unix\" is not supported on Windows; \
                  set transport = \"tcp\" in client.toml"
             )),
-            LocalTransport::Tcp => Ok(Self::Tcp(PathBuf::from(
-                &client_config.local.tcp_lock_file,
-            ))),
+            LocalTransport::Tcp => Ok(Self::Tcp(PathBuf::from(&client_config.local.tcp_lock_file))),
+        }
+    }
+
+    /// The filesystem artifact backing this endpoint (socket path or lock file).
+    pub(crate) fn path(&self) -> &PathBuf {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(p) => p,
+            Self::Tcp(p) => p,
         }
     }
 
@@ -58,7 +63,9 @@ impl LocalEndpoint {
 }
 
 /// Connect to the local daemon control channel, returning a tonic gRPC client.
-pub(crate) async fn connect(endpoint: &LocalEndpoint) -> Result<rpc::xho_rpc_client::XhoRpcClient<Channel>> {
+pub(crate) async fn connect(
+    endpoint: &LocalEndpoint,
+) -> Result<rpc::xho_rpc_client::XhoRpcClient<Channel>> {
     match endpoint {
         #[cfg(unix)]
         LocalEndpoint::Unix(path) => connect_unix(path).await,
@@ -71,9 +78,13 @@ async fn connect_unix(path: &Path) -> Result<rpc::xho_rpc_client::XhoRpcClient<C
     let path = path.to_path_buf();
     let endpoint = Endpoint::from_static("http://[::]:50051");
     let channel = endpoint
-        .connect_with_connector(service_fn(move |_: tonic::Uri| {
+        .connect_with_connector(service_fn(move |_: http::Uri| {
             let path = path.clone();
-            async move { tokio::net::UnixStream::connect(path).await.map(TokioIo::new) }
+            async move {
+                tokio::net::UnixStream::connect(path)
+                    .await
+                    .map(TokioIo::new)
+            }
         }))
         .await?;
     Ok(rpc::xho_rpc_client::XhoRpcClient::new(channel))
@@ -146,9 +157,7 @@ fn is_process_alive(pid: u32) -> bool {
 #[cfg(not(unix))]
 fn is_process_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
     unsafe {
         let handle: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);

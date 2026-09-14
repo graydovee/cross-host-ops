@@ -10,11 +10,11 @@ use std::io;
 
 use anyhow::{Result, anyhow};
 use tokio::sync::mpsc;
-use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::System::Console::{
-    ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_INSERT_MODE, ENABLE_LINE_INPUT,
-    ENABLE_PROCESSED_INPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
-    GetConsoleMode, GetStdHandle, SetConsoleMode, STD_INPUT_HANDLE, CONSOLE_MODE,
+    CONSOLE_MODE, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_INSERT_MODE, ENABLE_LINE_INPUT,
+    ENABLE_PROCESSED_INPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT, GetConsoleMode,
+    GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
 };
 
 /// RAII guard that restores the original console input mode on drop.
@@ -40,7 +40,10 @@ pub fn set_raw_mode() -> Result<RawModeGuard> {
     unsafe {
         let handle = GetStdHandle(STD_INPUT_HANDLE);
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-            return Err(anyhow!("failed to get stdin handle: {}", io::Error::last_os_error()));
+            return Err(anyhow!(
+                "failed to get stdin handle: {}",
+                io::Error::last_os_error()
+            ));
         }
 
         let mut original_mode: CONSOLE_MODE = 0;
@@ -62,7 +65,10 @@ pub fn set_raw_mode() -> Result<RawModeGuard> {
         raw |= ENABLE_VIRTUAL_TERMINAL_INPUT;
 
         if SetConsoleMode(handle, raw) == 0 {
-            return Err(anyhow!("SetConsoleMode failed: {}", io::Error::last_os_error()));
+            return Err(anyhow!(
+                "SetConsoleMode failed: {}",
+                io::Error::last_os_error()
+            ));
         }
 
         Ok(RawModeGuard {

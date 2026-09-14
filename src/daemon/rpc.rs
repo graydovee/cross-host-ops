@@ -12,7 +12,7 @@ use crate::protocol::ServerListSourceStatus;
 use crate::types::ServerListSource;
 
 use super::DaemonState;
-use super::gateway::{ErrorKind, GatewayKind};
+use super::gateway::{Capabilities, ErrorKind, GatewayKind};
 
 /// Timeout for each gateway's list_servers call.
 const LIST_SERVERS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -56,6 +56,13 @@ pub async fn process_list_servers(
         // They would call back to a remote that has a reverse proxy to us,
         // creating an infinite loop.
         if no_recurse && gateway.kind() == GatewayKind::Xhod {
+            continue;
+        }
+
+        // Skip gateways that don't declare LIST (e.g. Jumpserver bastion) —
+        // calling list_servers would just return Unsupported, so we never
+        // surface it to the client in the first place.
+        if !gateway.capabilities().contains(Capabilities::LIST) {
             continue;
         }
 

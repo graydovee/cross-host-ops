@@ -6,6 +6,7 @@
 - [Main Config (config.toml)](#main-config)
 - [Server List (server.toml)](#server-list)
 - [Transparent SSH Proxy](#transparent-ssh-proxy)
+- [File Copy](#file-copy)
 - [Jump Host Types](#jump-host-types)
 - [Target Resolution Rules](#target-resolution)
 - [Connection Pool](#connection-pool)
@@ -138,6 +139,43 @@ It is deliberately separate from the control-plane `[server.remote]` (port
 > multi-hop username containing a colon (`gateway:server`). Pass it separately:
 > `ssh -p 2222 -o User=gateway:server bastion.example.com`.
 
+## File Copy
+
+`xho cp` follows scp semantics: directories need `-r`, and a directory
+destination places files inside it under their source name.
+
+| Flag | Short | Meaning |
+|------|-------|---------|
+| `--recursive` | `-r` | Directory recursion |
+| `--resume` | `-c` | Resume an interrupted single-file transfer |
+| `--quiet` | `-q` | No progress bar / non-error messages |
+| `--timeout <dur>` | | Abort after duration |
+
+### Resume (`--resume`)
+
+Opt-in per invocation; without the flag a failed copy cleans up its partial
+file. With it, an interrupted attempt keeps the data and re-running the same
+command continues from the recorded offset:
+
+- Downloads keep `<dest>.part` plus a `.meta` sidecar; uploads keep the remote
+  temp file. Successful completion publishes atomically and removes them.
+- The source must be unchanged (size + mtime) and the remote partial must hash
+  identically (full sha256 of its length), otherwise the transfer restarts from
+  scratch — append-grown sources resume correctly, rewrites sharing old headers
+  restart instead of corrupting.
+- Single files in both directions; recursive copies are not resumable (re-run
+  restarts them).
+
+### Jumpserver transport
+
+Targets behind a `jumpserver` gateway have no sftp subsystem, so file copy runs
+over the interactive PTY shell with payloads encoded as line-wrapped base64 —
+structured raw binary can wedge some bastions' content inspection mid-channel.
+The target only needs coreutils/busybox `base64`/`head`/`tail`. Stall-class
+failures invalidate the bastion connection and retry once on a fresh session;
+an upload whose remote receiver dies fails fast and keeps its partial for
+`--resume`.
+
 ## Jump Host Types
 
 ### xhod (remote daemon)
@@ -207,27 +245,41 @@ Behavior: reuse idle → create new → wait at limit → auto-reconnect on tran
 
 ## Command Review
 
-Optional LLM-based command safety review before execution.
+Optional LLM-based safety review before execution, configured **per operation
+kind** (`[review.exec]`, `[review.copy]`) under shared LLM connection settings.
+All reviews are disabled by default.
 
 ```toml
 [review]
-enable = true
 endpoint = "https://api.openai.com/v1/chat/completions"
 model = "gpt-4.1-mini"
 timeout = "10s"
 failure_action = "deny"
 
-[review.fast_allowlist]
+[review.exec]
+enable = true
+
+[review.exec.fast_allowlist]
 enable = true
 commands = ["ls", "ls *", "cat *", "grep *"]
 
-[review.policy]
+[review.copy]
+enable = true
+blocklist = [".ssh", ".aws", ".gnupg", "/etc/shadow"]
+allowlist = ["/var/log/*", "/tmp/*"]
+
+[review.exec.policy]        # same shape for [review.copy.policy]
 safe = "allow"
 risky = "confirm"
 dangerous = "deny"
 ```
 
-API key: `XHO_REVIEW_API_KEY` or `OPENAI_API_KEY` env var.
+API key: `[review].api_key` accepts a secret reference (`vault:` / `env:` /
+`file:`); when omitted, xho tries `XHO_REVIEW_API_KEY` then `OPENAI_API_KEY`.
+
+Related: every machine operation also lands in the JSON-Lines audit log
+(`~/.xho/audit.jsonl`; see the `[audit]` section of `config.example.toml`)
+with caller identity — peer address, SSH user, key fingerprint.
 
 ## Troubleshooting
 
@@ -256,6 +308,7 @@ xho exec --no-tty <target> -- echo ok  # Minimal connectivity test
 | "host key rejected" | Missing or mismatched known_hosts | `xho host add` or update known_hosts |
 | "transport error" | SSH connection dropped | Auto-retries; check network |
 | "token rejected" | Token expired, already consumed, or unknown | Run `xho token gen` for a fresh token |
+| Upload fails fast with "receiver exited early" / "stalled" (jumpserver path) | Remote side couldn't create/write its temp file, e.g. unwritable destination | Fix permissions; re-run with `--resume` to continue from the partial |
 
 ### Terminal not restored after interactive session
 

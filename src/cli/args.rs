@@ -22,9 +22,9 @@ pub struct ArunCli {
     #[arg(long = "output", default_value = "text")]
     pub output_format: OutputFormat,
 
-    /// Disable all interactive prompts; fail instead of waiting for human input.
-    #[arg(long = "non-interactive")]
-    pub non_interactive: bool,
+    /// Automatically confirm review prompts (skip interactive [y/N] prompt).
+    #[arg(short = 'y', long = "yes")]
+    pub yes: bool,
 
     #[command(subcommand)]
     pub command: ArunCommand,
@@ -77,6 +77,11 @@ pub enum ArunCommand {
     Cp {
         #[arg(short = 'r', long = "recursive")]
         recursive: bool,
+        /// Resume an interrupted single-file transfer: reuse the partial data
+        /// from a previous `--resume` attempt (the source must be unchanged,
+        /// size + mtime, or the transfer restarts from scratch).
+        #[arg(short = 'c', long = "resume")]
+        resume: bool,
         /// Suppress progress bars and non-error copy messages.
         #[arg(short = 'q', long = "quiet")]
         quiet: bool,
@@ -256,7 +261,7 @@ mod tests {
     fn argv_element_strategy() -> impl Strategy<Value = String> {
         prop_oneof![
             "[a-zA-Z0-9_./]{1,20}",
-            Just("--non-interactive".to_string()),
+            Just("--yes".to_string()),
             Just("--tty".to_string()),
             Just("--no-tty".to_string()),
             Just("--stdin".to_string()),
@@ -311,6 +316,7 @@ mod tests {
             ArunCommand::Cp {
                 quiet,
                 recursive,
+                resume,
                 timeout,
                 source,
                 dest,

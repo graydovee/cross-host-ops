@@ -16,7 +16,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use russh::Pty;
-use russh::keys::ssh_key;
+use russh::keys::ssh_key::{self, HashAlg};
 use russh::server::{self, Auth, Msg};
 use russh::{Channel, ChannelId, Sig};
 use tokio::sync::mpsc;
@@ -63,9 +63,11 @@ pub(super) struct ProxySshHandler {
     authorized_keys_path: String,
     peer: Option<SocketAddr>,
     user: Option<String>,
+    /// SHA-256 fingerprint of the accepted public key (for audit logging).
+    accepted_fingerprint: Option<String>,
     channels: HashMap<ChannelId, ChannelEntry>,
     /// Senders to running bridge tasks, keyed by channel id.
-    bridges: HashMap<ChannelId, mpsc::Sender<ProxyMsg>>,
+    bridges: HashMap<ChannelId, tokio::sync::mpsc::UnboundedSender<ProxyMsg>>,
 }
 
 impl server::Server for ProxySshServer {
@@ -77,6 +79,7 @@ impl server::Server for ProxySshServer {
             authorized_keys_path: self.authorized_keys_path.clone(),
             peer: peer_addr,
             user: None,
+            accepted_fingerprint: None,
             channels: HashMap::new(),
             bridges: HashMap::new(),
         }
@@ -88,13 +91,18 @@ impl server::Server for ProxySshServer {
 // -----------------------------------------------------------------------
 
 async fn forward_or_buffer(
-    bridges: &mut HashMap<ChannelId, mpsc::Sender<ProxyMsg>>,
+    bridges: &mut HashMap<ChannelId, tokio::sync::mpsc::UnboundedSender<ProxyMsg>>,
     channels: &mut HashMap<ChannelId, ChannelEntry>,
     channel: ChannelId,
     msg: ProxyMsg,
 ) {
     if let Some(tx) = bridges.get(&channel) {
-        let _ = tx.send(msg).await;
+        // Unbounded: handler.data() runs INSIDE the russh session loop, so it
+        // must never park (a parked data() stops the loop from reading the
+        // socket and answering keepalives - the historical terminal freeze).
+        // Backpressure is enforced downstream by the pump -> writer -> PTY
+        // chain instead.
+        let _ = tx.send(msg);
     } else if let Some(entry) = channels.get_mut(&channel) {
         entry.pending.push(msg);
     }
@@ -106,15 +114,16 @@ fn spawn_bridge(
     entry: ChannelEntry,
     channel_id: ChannelId,
     start: SessionStart,
-    bridges: &mut HashMap<ChannelId, mpsc::Sender<ProxyMsg>>,
+    caller: crate::oversight::Caller,
+    bridges: &mut HashMap<ChannelId, tokio::sync::mpsc::UnboundedSender<ProxyMsg>>,
 ) {
-    let (tx, rx) = mpsc::channel::<ProxyMsg>(64);
+    let (tx, rx) = mpsc::unbounded_channel::<ProxyMsg>();
     // Flush buffered messages in order before the task begins consuming.
     let mut pending = entry.pending;
     let tx_for_flush = tx.clone();
     tokio::spawn(async move {
         for msg in pending.drain(..) {
-            if tx_for_flush.send(msg).await.is_err() {
+            if tx_for_flush.send(msg).is_err() {
                 return;
             }
         }
@@ -136,8 +145,11 @@ fn spawn_bridge(
                 return;
             }
         };
-        let mut sess: Box<dyn TargetSession> = match session::open_target_session(&state, &route)
+        let gateway_kind = state
+            .find_gateway_any(&route.gateway_name)
             .await
+            .map(|g| g.kind());
+        let sess: Box<dyn TargetSession> = match session::open_target_session(&state, &route).await
         {
             Ok(s) => s,
             Err(e) => {
@@ -145,58 +157,133 @@ fn spawn_bridge(
                 return;
             }
         };
+        let (writer, mut events) = sess.split();
 
         // Apply buffered pty + env.
         if let Some(pty) = &entry.pty {
-            let _ = sess.request_pty(&pty.term, pty.cols, pty.rows, &[]).await;
+            let _ = writer.request_pty(&pty.term, pty.cols, pty.rows, &[]).await;
         }
         for (k, v) in &entry.env {
-            let _ = sess.set_env(k, v).await;
+            let _ = writer.set_env(k, v).await;
         }
+
+        // Audit: proxy operation started.
+        let (session_kind, command_or_name): (&str, String) = match &start {
+            SessionStart::Exec(cmd) => ("exec", cmd.clone()),
+            SessionStart::Shell => ("shell", "(interactive)".to_string()),
+            SessionStart::Subsystem(name) => ("subsystem", name.clone()),
+        };
+        let mut started_event = crate::oversight::AuditEvent::new(
+            caller.source,
+            crate::oversight::OperationKind::Proxy.as_str(),
+            "started",
+        );
+        started_event.target_input = Some(user.clone());
+        started_event.gateway = Some(route.gateway_name.clone());
+        started_event.end_target = Some(route.end_target.clone());
+        started_event.gateway_kind = gateway_kind.map(|k| k.to_string());
+        started_event.session_kind = Some(session_kind.to_string());
+        started_event.command = Some(command_or_name);
+        if crate::oversight::audit::include_identity() {
+            started_event.caller_source = Some(caller.source.to_string());
+            started_event.caller_peer = caller.peer_addr.clone();
+            started_event.caller_ssh_user = caller.ssh_user.clone();
+            started_event.caller_key_fingerprint = caller.key_fingerprint.clone();
+            started_event.caller_via_token = Some(caller.via_token);
+        }
+        crate::oversight::audit::record(&started_event);
 
         // Start the backend.
         let started = match start {
-            SessionStart::Exec(cmd) => sess.exec(&cmd).await,
-            SessionStart::Shell => sess.shell().await,
-            SessionStart::Subsystem(name) => sess.subsystem(&name).await,
+            SessionStart::Exec(cmd) => writer.exec(&cmd).await,
+            SessionStart::Shell => writer.shell().await,
+            SessionStart::Subsystem(name) => writer.subsystem(&name).await,
         };
         if let Err(e) = started {
             warn!(target = %user, error = %format!("{e:#}"), "proxy: failed to start session");
             return;
         }
 
-        let channel = entry.channel;
+        let (channel_read, channel) = entry.channel.split();
         let mut msg_rx = rx;
-        loop {
-            tokio::select! {
-                msg = msg_rx.recv() => match msg {
-                    Some(ProxyMsg::Data(d)) => { let _ = sess.write_stdin(&d).await; }
-                    Some(ProxyMsg::Resize(c, r)) => { let _ = sess.window_change(c, r).await; }
-                    Some(ProxyMsg::Signal(s)) => { let _ = sess.signal(&s).await; }
-                    Some(ProxyMsg::Eof) | None => { let _ = sess.eof().await; }
-                },
-                ev = sess.next_event() => match ev {
-                    Some(SessionEvent::Stdout(d)) => { let _ = channel.data(Cursor::new(d)).await; }
-                    Some(SessionEvent::Stderr(d)) => { let _ = channel.extended_data(1, Cursor::new(d)).await; }
-                    Some(SessionEvent::ExitStatus(c)) => {
+
+        // Drain the channel's inbound event queue. russh pushes a copy of
+        // every channel message (data/eof/close/...) into a bounded queue
+        // consumed only by `Channel::wait()`; with no reader, that queue
+        // fills after `channel_buffer_size` messages and the session loop
+        // then parks forever inside `chan.send(...)` — freezing keepalive
+        // replies and wedging the whole connection. The bridge consumes the
+        // same bytes through `handler.data`, so this half is discarded.
+        let _drainer = tokio::spawn(async move {
+            let mut channel = channel_read;
+            while channel.wait().await.is_some() {}
+        });
+
+        // Downlink: session events → inbound SSH channel. Its own task so a
+        // slow SSH consumer never stalls the stdin direction (see the
+        // OpenSession handler for the symmetric rationale).
+        let downlink = tokio::spawn(async move {
+            while let Some(ev) = events.next().await {
+                match ev {
+                    SessionEvent::Stdout(d) => {
+                        let _ = channel.data(Cursor::new(d)).await;
+                    }
+                    SessionEvent::Stderr(d) => {
+                        let _ = channel.extended_data(1, Cursor::new(d)).await;
+                    }
+                    SessionEvent::ExitStatus(c) => {
+                        let mut ev = crate::oversight::AuditEvent::new(
+                            caller.source,
+                            crate::oversight::OperationKind::Proxy.as_str(),
+                            "completed",
+                        );
+                        ev.target_input = Some(user.clone());
+                        ev.gateway = Some(route.gateway_name.clone());
+                        ev.end_target = Some(route.end_target.clone());
+                        ev.gateway_kind = gateway_kind.map(|k| k.to_string());
+                        ev.session_kind = Some(session_kind.to_string());
+                        ev.exit_code = Some(c);
+                        crate::oversight::audit::record(&ev);
                         let _ = channel.exit_status(c as u32).await;
                         let _ = channel.eof().await;
                         let _ = channel.close().await;
                         return;
                     }
-                    Some(SessionEvent::ExitSignal(_)) => {
+                    SessionEvent::ExitSignal(_) => {
                         let _ = channel.exit_status(255).await;
                         let _ = channel.close().await;
                         return;
                     }
-                    Some(SessionEvent::Eof) | None => {
+                    SessionEvent::Eof => {
                         let _ = channel.eof().await;
                         let _ = channel.close().await;
                         return;
                     }
-                },
+                }
+            }
+        });
+
+        // Uplink: inbound SSH data/resize/signal → session writer. Ends when
+        // the SSH side closes (None), which drops the writer and lets the
+        // downlink drain trailing events.
+        while let Some(msg) = msg_rx.recv().await {
+            match msg {
+                ProxyMsg::Data(d) => {
+                    let _ = writer.write_stdin(&d).await;
+                }
+                ProxyMsg::Resize(c, r) => {
+                    let _ = writer.window_change(c, r).await;
+                }
+                ProxyMsg::Signal(s) => {
+                    let _ = writer.signal(&s).await;
+                }
+                ProxyMsg::Eof => {
+                    let _ = writer.eof().await;
+                }
             }
         }
+        drop(writer);
+        let _ = downlink.await;
     });
     bridges.insert(channel_id, tx);
 }
@@ -225,6 +312,7 @@ impl server::Handler for ProxySshHandler {
                 .unwrap_or(false);
         if ok {
             self.user = Some(user.to_string());
+            self.accepted_fingerprint = Some(key.fingerprint(HashAlg::Sha256).to_string());
             info!(peer = ?self.peer, ssh_user = %user, "proxy: accepted publickey");
             Ok(Auth::Accept)
         } else {
@@ -401,10 +489,23 @@ impl ProxySshHandler {
             Some(u) => u.clone(),
             None => return false,
         };
+        let caller = crate::oversight::Caller::proxy(
+            self.peer.map(|a| a.to_string()),
+            user.clone(),
+            self.accepted_fingerprint.clone(),
+        );
         let Some(entry) = self.channels.remove(&channel) else {
             return false;
         };
-        spawn_bridge(&self.state, &user, entry, channel, start, &mut self.bridges);
+        spawn_bridge(
+            &self.state,
+            &user,
+            entry,
+            channel,
+            start,
+            caller,
+            &mut self.bridges,
+        );
         true
     }
 }

@@ -66,10 +66,13 @@ async fn connect_and_serve(config: &ReverseProxyClientConfig, state: &DaemonStat
         "connecting reverse proxy to server xhod"
     );
 
-    // SSH connect.
-    let ssh_config = client::Config::default();
+    // SSH connect. Apply keepalive so half-open links (sleep, network switch)
+    // are detected and the outer reconnect loop can re-establish the tunnel.
+    let mut ssh_config = client::Config::default();
+    ssh_config.keepalive_interval = Some(config.keepalive_interval);
+    let ssh_config = Arc::new(ssh_config);
     let mut handle = client::connect(
-        Arc::new(ssh_config),
+        ssh_config,
         (target.host.as_str(), target.port),
         ClientHandler,
     )

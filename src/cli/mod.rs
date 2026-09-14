@@ -25,6 +25,8 @@ pub use tty::{RawModeGuard, set_raw_mode_stdin};
 #[cfg(unix)]
 pub use exec::set_raw_mode;
 
+use crate::exit_codes::XhoError;
+
 use crate::config::{AppConfig, parse_duration};
 use crate::types::{
     ExecStdinFlags, ExecTtyFlags, effective_stdin_decision, effective_tty_decision,
@@ -39,7 +41,38 @@ use self::output::{list_servers, status};
 use self::secret::run_secret_command;
 use self::token::run_token_command;
 
+/// Classify a daemon error message into a typed [`XhoError`] with the correct
+/// exit code. The daemon's `GatewayError` prefixes messages with `[kind]`
+/// (e.g. `[transport] channel closed`, `[resolution] target not found`).
+/// This maps those prefixes (and common phrasings) to the documented exit-code
+/// taxonomy so callers can distinguish failure modes without parsing prose.
+pub(crate) fn classify_daemon_error(message: &str) -> XhoError {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("[resolution]")
+        || lower.contains("not found")
+        || lower.contains("unknown target")
+        || lower.contains("[unsupported]")
+        || lower.contains("no route")
+    {
+        XhoError::TargetNotFound(message.to_string())
+    } else if lower.contains("auth")
+        || lower.contains("denied")
+        || lower.contains("review")
+        || lower.contains("host key")
+        || lower.contains("permission denied")
+    {
+        XhoError::CannotExecute(message.to_string())
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        XhoError::Timeout(message.to_string())
+    } else if lower.contains("[transport]") || lower.contains("connection") {
+        XhoError::Internal(message.to_string())
+    } else {
+        XhoError::General(message.to_string())
+    }
+}
+
 pub async fn run_cli(cli: ArunCli) -> Result<i32> {
+    let yes = cli.yes;
     match cli.command {
         ArunCommand::Exec {
             target,
@@ -85,8 +118,7 @@ pub async fn run_cli(cli: ArunCli) -> Result<i32> {
                         .ok()
                         .filter(|s| !s.is_empty())
                         .unwrap_or_else(|| {
-                            std::env::var("COMSPEC")
-                                .unwrap_or_else(|_| "cmd.exe".to_string())
+                            std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
                         });
                     // Match the flag to the shell: bash/sh take -c, cmd.exe /c.
                     let lower = shell.to_ascii_lowercase();
@@ -124,11 +156,13 @@ pub async fn run_cli(cli: ArunCli) -> Result<i32> {
                 shell,
                 no_shell,
                 &config,
+                yes,
             )
             .await
         }
         ArunCommand::Cp {
             recursive,
+            resume,
             quiet,
             source,
             dest,
@@ -137,7 +171,7 @@ pub async fn run_cli(cli: ArunCli) -> Result<i32> {
             let Some(timeout_ms) = parse_timeout_ms(timeout.as_deref())? else {
                 return Ok(125);
             };
-            run_copy(recursive, quiet, source, dest, timeout_ms).await
+            run_copy(recursive, resume, quiet, yes, source, dest, timeout_ms).await
         }
         ArunCommand::Status => status().await,
         ArunCommand::Ls { refresh } => list_servers(refresh).await,

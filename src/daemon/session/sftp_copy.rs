@@ -10,9 +10,11 @@
 use anyhow::{Context, Result, anyhow, bail};
 use russh_sftp::client::SftpSession;
 use russh_sftp::client::fs::Metadata as SftpMetadata;
+use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
+use crate::copy_frames::path_to_string;
 use crate::filepath::NormalizedPath;
 use crate::filepath::copy_entry_name;
 use crate::types::{CopyDirection, CopyFrame, CopySpec};
@@ -20,45 +22,59 @@ use crate::types::{CopyDirection, CopyFrame, CopySpec};
 use super::TargetSession;
 
 /// Open an SFTP client over a `TargetSession`'s sftp subsystem.
-pub(crate) async fn open_sftp(mut sess: Box<dyn TargetSession>) -> Result<SftpSession> {
-    sess.subsystem("sftp").await?;
+pub(crate) async fn open_sftp(sess: Box<dyn TargetSession>) -> Result<SftpSession> {
+    let (writer, mut stream) = sess.split();
+    writer.subsystem("sftp").await?;
     let (client, server) = tokio::io::duplex(64 * 1024);
+    // The upload direction runs as its own task: a parked `write_stdin`
+    // (remote sftp-server stopped reading) must not stall the download
+    // direction above it.
     tokio::spawn(async move {
-        let mut sess = sess;
         let (mut rd, mut wr) = tokio::io::split(server);
-        let mut buf = vec![0u8; 8192];
-        loop {
-            tokio::select! {
-                ev = sess.next_event() => match ev {
-                    Some(super::SessionEvent::Stdout(d)) | Some(super::SessionEvent::Stderr(d)) => {
-                        if wr.write_all(&d).await.is_err() { break; }
-                    }
-                    Some(super::SessionEvent::ExitStatus(_))
-                    | Some(super::SessionEvent::ExitSignal(_))
-                    | Some(super::SessionEvent::Eof)
-                    | None => {
-                        let _ = wr.shutdown().await;
+        let upload = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                match rd.read(&mut buf).await {
+                    Ok(0) => {
+                        let _ = writer.eof().await;
                         break;
                     }
-                },
-                n = rd.read(&mut buf) => match n {
-                    Ok(0) => { let _ = sess.eof().await; break; }
                     Ok(n) => {
-                        if sess.write_stdin(&buf[..n]).await.is_err() { break; }
+                        if writer.write_stdin(&buf[..n]).await.is_err() {
+                            break;
+                        }
                     }
                     Err(_) => break,
-                },
+                }
+            }
+        });
+        while let Some(ev) = stream.next().await {
+            match ev {
+                super::SessionEvent::Stdout(d) | super::SessionEvent::Stderr(d) => {
+                    if wr.write_all(&d).await.is_err() {
+                        break;
+                    }
+                }
+                super::SessionEvent::ExitStatus(_)
+                | super::SessionEvent::ExitSignal(_)
+                | super::SessionEvent::Eof => {
+                    let _ = wr.shutdown().await;
+                    break;
+                }
             }
         }
+        let _ = upload.await;
     });
     SftpSession::new(client).await.context("sftp init")
 }
 
 /// Run a copy (upload or download) over an already-open SFTP session.
-pub(crate) async fn run(sftp: &SftpSession, mut spec: CopySpec) -> Result<()> {
+/// Consumes the frame channels from `spec`; on failure the download frame
+/// sender is restored so a transport retry can stream into the same relay.
+pub(crate) async fn run(sftp: &SftpSession, spec: &mut CopySpec) -> Result<()> {
     match spec.direction {
-        CopyDirection::Upload => upload(sftp, &mut spec).await,
-        CopyDirection::Download => download(sftp, &mut spec).await,
+        CopyDirection::Upload => upload(sftp, spec).await,
+        CopyDirection::Download => download(sftp, spec).await,
     }
 }
 
@@ -74,10 +90,20 @@ async fn upload(sftp: &SftpSession, spec: &mut CopySpec) -> Result<()> {
         .take()
         .ok_or_else(|| anyhow!("upload copy frame stream missing"))?;
     let mut current_file: Option<russh_sftp::client::fs::File> = None;
+    // Final path of the file being written. Data goes to `<dest>.xho_tmp`
+    // and is published by rename on EndFile — a failed transfer never leaves
+    // a partial at the destination, and a `--resume` retry can continue the
+    // tmp partial via a positioned write.
+    let mut current_dest: Option<String> = None;
 
     while let Some(frame) = upload_rx.recv().await {
         match frame {
-            CopyFrame::BeginFile { relative_path, .. } => {
+            CopyFrame::BeginFile {
+                relative_path,
+                size,
+                start_offset,
+                ..
+            } => {
                 if current_file.is_some() {
                     bail!("copy stream began a new file before ending the previous file");
                 }
@@ -95,13 +121,40 @@ async fn upload(sftp: &SftpSession, spec: &mut CopySpec) -> Result<()> {
                 if let Some(parent) = remote_path.parent() {
                     create_remote_dirs(sftp, &parent).await?;
                 }
-                current_file = Some(
-                    sftp.create(remote_path.to_string_normalized())
+                let dest = remote_path.to_string_normalized();
+                let tmp = format!("{}.xho_tmp", dest);
+                // Resume offset comes from the frame (the client verified
+                // the partial against its source prefix via the ack
+                // handshake); cross-check the partial still has exactly that
+                // many bytes before appending, else transfer fresh.
+                let mut skip = start_offset.min(size);
+                if skip > 0 {
+                    match sftp.metadata(&tmp).await {
+                        Ok(meta) if meta.len() == skip => {}
+                        _ => skip = 0,
+                    }
+                }
+                let file = if skip > 0 {
+                    use tokio::io::AsyncSeekExt;
+                    let mut file = sftp
+                        .open_with_flags(
+                            &tmp,
+                            russh_sftp::protocol::OpenFlags::CREATE
+                                | russh_sftp::protocol::OpenFlags::WRITE,
+                        )
                         .await
-                        .with_context(|| {
-                            format!("failed to create remote {}", remote_path.to_string_normalized())
-                        })?,
-                );
+                        .with_context(|| format!("failed to open remote partial {tmp}"))?;
+                    file.seek(std::io::SeekFrom::Start(skip))
+                        .await
+                        .with_context(|| format!("failed to seek remote partial {tmp}"))?;
+                    file
+                } else {
+                    sftp.create(&tmp)
+                        .await
+                        .with_context(|| format!("failed to create remote {tmp}"))?
+                };
+                current_dest = Some(dest);
+                current_file = Some(file);
             }
             CopyFrame::FileData { data } => {
                 let file = current_file
@@ -114,6 +167,16 @@ async fn upload(sftp: &SftpSession, spec: &mut CopySpec) -> Result<()> {
                     .take()
                     .ok_or_else(|| anyhow!("copy stream sent EndFile before BeginFile"))?;
                 file.shutdown().await?;
+                let dest = current_dest
+                    .take()
+                    .ok_or_else(|| anyhow!("copy stream sent EndFile before BeginFile"))?;
+                let tmp = format!("{}.xho_tmp", dest);
+                // SFTP rename does not overwrite: drop a stale destination
+                // first (ignore absence), then publish the completed file.
+                let _ = sftp.remove_file(&dest).await;
+                sftp.rename(&tmp, &dest)
+                    .await
+                    .with_context(|| format!("failed to publish remote {dest}"))?;
             }
             CopyFrame::BeginDirectory { relative_path, .. } => {
                 if !spec.recursive {
@@ -144,7 +207,10 @@ async fn upload(sftp: &SftpSession, spec: &mut CopySpec) -> Result<()> {
                 sftp.symlink(remote_path.to_string_normalized(), target)
                     .await
                     .with_context(|| {
-                        format!("failed to create remote symlink {}", remote_path.to_string_normalized())
+                        format!(
+                            "failed to create remote symlink {}",
+                            remote_path.to_string_normalized()
+                        )
                     })?;
             }
             CopyFrame::EndOfStream => break,
@@ -163,23 +229,52 @@ async fn download(sftp: &SftpSession, spec: &mut CopySpec) -> Result<()> {
         .symlink_metadata(remote_str.clone())
         .await
         .with_context(|| format!("failed to stat remote path {remote_str}"))?;
-    let tx = spec
+    let download_tx = spec
         .download_tx
         .take()
         .ok_or_else(|| anyhow!("download copy frame stream missing"))?;
+    let result = download_inner(sftp, spec, &metadata, &download_tx).await;
+    if result.is_err() {
+        // Restore the sender so a gateway retry reuses the same relay.
+        spec.download_tx = Some(download_tx);
+    }
+    result
+}
+
+async fn download_inner(
+    sftp: &SftpSession,
+    spec: &mut CopySpec,
+    metadata: &SftpMetadata,
+    tx: &mpsc::Sender<CopyFrame>,
+) -> Result<()> {
+    let remote = NormalizedPath::from_str(&spec.remote_path);
     if metadata.is_dir() {
         if !spec.recursive {
             bail!("copying a remote directory requires -r");
         }
-        send_remote_dir_frames(sftp, &remote, &NormalizedPath::from_str(""), &tx).await?;
+        send_remote_dir_frames(sftp, &remote, &NormalizedPath::from_str(""), tx).await?;
     } else {
         let relative_path = copy_entry_name("", &spec.source_name, "copy");
+        // Resume hint honored only when the remote source is unchanged.
+        let start = spec
+            .resume
+            .iter()
+            .find(|e| e.relative_path == relative_path)
+            .filter(|e| {
+                e.size == metadata.len()
+                    && e.mtime == metadata.mtime.map(i64::from).unwrap_or(0)
+                    && e.offset > 0
+                    && e.offset <= metadata.len()
+            })
+            .map(|e| e.offset)
+            .unwrap_or(0);
         send_remote_entry_frame(
             sftp,
             &remote,
             &NormalizedPath::from_str(&relative_path),
-            &metadata,
-            &tx,
+            metadata,
+            tx,
+            start,
         )
         .await?;
     }
@@ -187,6 +282,77 @@ async fn download(sftp: &SftpSession, spec: &mut CopySpec) -> Result<()> {
         .await
         .map_err(|_| anyhow!("download copy frame stream closed"))?;
     Ok(())
+}
+
+/// Report remote partial-upload state (`<dest>.xho_tmp`) for the CLI's
+/// resume decision: the partial's size and FULL sha256 (streamed through
+/// the hasher — the bytes are read once and never buffered whole). The
+/// client compares against its own source prefix and chooses the offset it
+/// streams from. Single-file uploads only in v1.
+pub(crate) async fn probe_upload_resume(
+    sftp: &SftpSession,
+    spec: &mut CopySpec,
+) -> Vec<crate::types::ResumeEntry> {
+    // Same dest semantics as the upload itself: a directory root means the
+    // file (and its `.xho_tmp` partial) live INSIDE under the SOURCE name
+    // (idempotent: the resolved path is a file, so re-resolution during the
+    // copy after the probe is a no-op).
+    if !spec.recursive {
+        let root = PathBuf::from(&spec.remote_path);
+        if remote_path_is_dir(sftp, &NormalizedPath::from_str(&spec.remote_path)).await {
+            let name = spec
+                .source_name
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .filter(|n| !n.is_empty())
+                .unwrap_or("upload");
+            spec.remote_path = path_to_string(&root.join(name)).unwrap_or(spec.remote_path.clone());
+        }
+    }
+    let mut out = Vec::with_capacity(spec.resume.len());
+    for entry in &spec.resume {
+        let mut effective = entry.clone();
+        effective.offset = 0;
+        effective.partial_sha256 = String::new();
+        if !spec.recursive {
+            let tmp = format!("{}.xho_tmp", spec.remote_path);
+            if let Ok(meta) = sftp.metadata(&tmp).await {
+                let tmp_size = meta.len();
+                if tmp_size > 0 && tmp_size <= entry.size {
+                    if let Ok(mut file) = sftp.open(&tmp).await {
+                        use sha2::{Digest, Sha256};
+                        let mut hasher = Sha256::new();
+                        let mut buf = vec![0u8; 64 * 1024];
+                        let mut read = 0u64;
+                        loop {
+                            match file.read(&mut buf).await {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    hasher.update(&buf[..n]);
+                                    read += n as u64;
+                                }
+                                Err(_) => {
+                                    read = u64::MAX;
+                                    break;
+                                }
+                            }
+                        }
+                        if read == tmp_size {
+                            effective.offset = tmp_size;
+                            effective.partial_sha256 = hasher
+                                .finalize()
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect();
+                        }
+                    }
+                }
+            }
+        }
+        out.push(effective);
+    }
+    out
 }
 
 async fn remote_path_is_dir(sftp: &SftpSession, remote_path: &NormalizedPath) -> bool {
@@ -239,7 +405,12 @@ async fn send_remote_dir_frames(
     let mut entries = sftp
         .read_dir(remote_root.to_string_normalized())
         .await
-        .with_context(|| format!("failed to read remote dir {}", remote_root.to_string_normalized()))?;
+        .with_context(|| {
+            format!(
+                "failed to read remote dir {}",
+                remote_root.to_string_normalized()
+            )
+        })?;
     while let Some(entry) = entries.next() {
         let file_name = entry.file_name();
         if file_name == "." || file_name == ".." {
@@ -248,7 +419,7 @@ async fn send_remote_dir_frames(
         let remote_path = remote_root.clone().join(&file_name);
         let relative_path = relative_root.clone().join(&file_name);
         let metadata = entry.metadata();
-        send_remote_entry_frame(sftp, &remote_path, &relative_path, &metadata, tx).await?;
+        send_remote_entry_frame(sftp, &remote_path, &relative_path, &metadata, tx, 0).await?;
     }
     Ok(())
 }
@@ -259,6 +430,7 @@ async fn send_remote_entry_frame(
     relative_path: &NormalizedPath,
     metadata: &SftpMetadata,
     tx: &mpsc::Sender<CopyFrame>,
+    start_offset: u64,
 ) -> Result<()> {
     if metadata.is_dir() {
         return Box::pin(send_remote_dir_frames(sftp, remote_path, relative_path, tx)).await;
@@ -267,7 +439,12 @@ async fn send_remote_entry_frame(
         let target = sftp
             .read_link(remote_path.to_string_normalized())
             .await
-            .with_context(|| format!("failed to read remote symlink {}", remote_path.to_string_normalized()))?;
+            .with_context(|| {
+                format!(
+                    "failed to read remote symlink {}",
+                    remote_path.to_string_normalized()
+                )
+            })?;
         tx.send(CopyFrame::Symlink {
             relative_path: relative_path.to_string_normalized(),
             target,
@@ -288,6 +465,7 @@ async fn send_remote_entry_frame(
         mode: metadata.permissions.unwrap_or(0),
         size: metadata.len(),
         mtime: metadata.mtime.map(i64::from).unwrap_or(0),
+        start_offset,
     })
     .await
     .map_err(|_| anyhow!("download copy frame stream closed"))?;
@@ -295,7 +473,23 @@ async fn send_remote_entry_frame(
     let mut file = sftp
         .open(remote_path.to_string_normalized())
         .await
-        .with_context(|| format!("failed to open remote {}", remote_path.to_string_normalized()))?;
+        .with_context(|| {
+            format!(
+                "failed to open remote {}",
+                remote_path.to_string_normalized()
+            )
+        })?;
+    if start_offset > 0 {
+        use tokio::io::AsyncSeekExt;
+        file.seek(std::io::SeekFrom::Start(start_offset))
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to seek remote {}",
+                    remote_path.to_string_normalized()
+                )
+            })?;
+    }
     const CHUNK_SIZE: usize = 64 * 1024;
     let mut buf = vec![0u8; CHUNK_SIZE];
     loop {

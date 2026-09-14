@@ -3,11 +3,18 @@ use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 
+use anyhow::Result;
 #[cfg(unix)]
 use anyhow::anyhow;
-use anyhow::Result;
 
-pub(crate) fn prompt_for_confirmation(reason: &str) -> Result<bool> {
+/// Prompt the user to confirm a review-required operation. When `auto_yes`
+/// is true (e.g. `-y`/`--yes` flag), skips the interactive prompt and returns
+/// `Ok(true)` immediately.
+pub(crate) fn prompt_for_confirmation(reason: &str, auto_yes: bool) -> Result<bool> {
+    if auto_yes {
+        eprintln!("confirmation required (auto-confirmed): {}", reason);
+        return Ok(true);
+    }
     eprintln!("confirmation required: {}", reason);
     eprint!("Continue? [y/N] ");
     io::stderr().flush()?;

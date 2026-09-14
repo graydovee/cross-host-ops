@@ -140,12 +140,19 @@
 # Eliminates ~3-5s menu navigation overhead on cache hit.
 # max_cached_sessions = 8          # optional, default: unlimited
 # session_idle_timeout = "5m"      # default: 5 minutes
+# Suppress shell history on the target after navigation (default: true). When
+# enabled, xho sends `HISTFILE=/dev/null; HISTSIZE=0; ...` once per navigated
+# shell so its own exec/copy commands don't pollute the target's
+# ~/.bash_history. Only affects the jumpserver PTY path.
+# suppress_history = true
 
-# Example: a remote xhod daemon reachable over SSH
+# Example: a remote xhod daemon reachable over SSH.
+# NOTE: address must point at the remote daemon's CONTROL PLANE port
+# (default 12222), not the human-facing transparent proxy on 2222.
 # [[gateways]]
 # kind = "xhod"
 # name = "prod"
-# address = "xho@prod-bastion.example.com:2222"
+# address = "xho@prod-bastion.example.com:12222"
 # identity_file = "~/.ssh/id_ed25519"
 # known_hosts_path = "~/.xho/known_hosts"
 
@@ -164,8 +171,8 @@
 # a public IP and registers itself as a dynamic gateway. This allows xho
 # clients on other machines to reach this node through the server.
 #
-# The connection reuses the server xhod's existing SSH port (e.g. 2222) and
-# authenticates via the same authorized_keys mechanism.
+# The connection dials the SERVER's CONTROL PLANE listener (default 12222)
+# and requests the `xho-reverse:<node_name>` subsystem over it.
 #
 # Example topology:
 #   xho client → local xhod → server xhod (公网IP) → node xhod (本机, 无公网IP)
@@ -178,7 +185,7 @@
 
 # [reverse_proxy]
 # enable = true
-# server_address = "xho@public-server.example.com:2222"
+# server_address = "xho@public-server.example.com:12222"
 # identity_file = "~/.ssh/id_ed25519"
 # known_hosts_path = "~/.xho/known_hosts"
 # node_name = "node-1"
@@ -186,34 +193,64 @@
 # reconnect_delay = "10s"
 # keepalive_interval = "30s"
 # max_idle_time = "10m"
+#
+# workdir — starting directory for sessions executed on this node
+# (interactive shells and `xho exec` on the `_self`/localhost target,
+# including sessions entering via the transparent proxy on 2222).
+# `~` is expanded. When unset, sessions start in the user's home directory.
+# workdir = "~"
 
-# Enable this only when you want LLM command review before execution.
-# If api_key is omitted, xho will try XHO_REVIEW_API_KEY first, then OPENAI_API_KEY.
-# endpoint, model, prompts, policy, and semantic_whitelist all have code defaults.
+# --- AI Review ---
+# LLM-based safety review. The connection settings (endpoint/model/api_key/
+# timeout/headers/failure_action) are shared; each operation kind has its own
+# sub-table with an independent enable flag, prompts, policy, and lists.
 # api_key accepts a secret reference (env:/file:/vault:) or a literal.
+# If api_key is omitted, xho tries XHO_REVIEW_API_KEY then OPENAI_API_KEY.
 # [review]
-# enable = true
 # endpoint = "https://api.openai.com/v1/chat/completions"
 # model = "gpt-4.1-mini"
 # api_key = "vault:review.api_key"
 # timeout = "10s"
-# failure_action = "deny"
-
-# [review.fast_allowlist]
-# enable = true
-# commands = ["ls", "ls *", "cat *", "grep *", "kubectl get *"]
+# failure_action = "deny"   # action when the LLM service itself errors
 
 # [review.headers]
 # Authorization = "vault:review.header.Authorization"
 
-# [review.prompts]
-# system = "You are a command safety reviewer. Return JSON only."
-# template = """
-# Classify the command into exactly one risk level: safe, risky, or dangerous.
-# Return compact JSON with keys: risk_level, reason, matched_whitelist_reason.
-# """
-
-# [review.policy]
+# --- exec review ---
+# Reviews shell commands before execution. Disabled by default.
+# [review.exec]
+# enable = true
+# [review.exec.fast_allowlist]
+# enable = true
+# commands = ["ls", "ls *", "cat *", "grep *", "kubectl get *"]
+# [review.exec.policy]
 # safe = "allow"
 # risky = "confirm"
 # dangerous = "deny"
+# [review.exec.prompts]
+# system = "You are a Unix command safety reviewer. Return JSON only."
+# template = """
+# Classify the command into exactly one risk level: safe, risky, or dangerous.
+# """
+
+# --- copy review ---
+# Reviews file-copy operations (upload/download) before transfer. Copies
+# matching blocklist patterns are denied; allowlist patterns are allowed;
+# everything else is classified by the LLM. Disabled by default.
+# [review.copy]
+# enable = true
+# blocklist = [".ssh", ".aws", ".gnupg", ".kube", "/etc/shadow", "/etc/ssh"]
+# allowlist = ["/var/log/*", "/tmp/*"]
+# [review.copy.policy]
+# safe = "allow"
+# risky = "confirm"
+# dangerous = "deny"
+
+# --- Audit ---
+# Records every machine operation (exec, copy, session tunnel, transparent
+# proxy) as a JSON-Lines record with source-identity metadata (peer address,
+# SSH user, key fingerprint). Enabled by default.
+# [audit]
+# enabled = true
+# path = "/var/log/xho/audit.jsonl"   # default: root→/var/log/xho/audit.jsonl, non-root→~/.xho/audit.jsonl
+# include_identity = true

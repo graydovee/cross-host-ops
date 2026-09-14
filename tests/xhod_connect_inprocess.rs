@@ -21,11 +21,15 @@ async fn connect_end_to_end_list_servers() {
     let mut harness = InProcessRpcHarness::new().await;
     let servers = harness.list_servers().await;
 
-    assert_eq!(servers.len(), 1, "stub returns 1 server entry");
-    assert_eq!(servers[0].alias, "stub-target");
-    assert_eq!(servers[0].host, "127.0.0.1");
-    assert_eq!(servers[0].port, 22);
-    assert_eq!(servers[0].user, "testuser");
+    // The `_self` localhost gateway (copy e2e support) adds one extra row
+    // beyond the stub entry.
+    let stub = servers
+        .iter()
+        .find(|s| s.alias == "stub-target")
+        .expect("stub entry present");
+    assert_eq!(stub.host, "127.0.0.1");
+    assert_eq!(stub.port, 22);
+    assert_eq!(stub.user, "testuser");
 }
 
 /// Validates that execute returns an error for a non-existent target

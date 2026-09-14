@@ -31,11 +31,7 @@ pub fn entry_mode(metadata: &Metadata) -> u32 {
     }
     #[cfg(not(unix))]
     {
-        if metadata.is_dir() {
-            0o755
-        } else {
-            0o644
-        }
+        if metadata.is_dir() { 0o755 } else { 0o644 }
     }
 }
 
@@ -50,11 +46,7 @@ pub fn entry_mtime(metadata: &Metadata) -> i64 {
     }
     #[cfg(not(unix))]
     {
-        metadata
-            .modified()
-            .ok()
-            .and_then(epoch_secs)
-            .unwrap_or(0)
+        metadata.modified().ok().and_then(epoch_secs).unwrap_or(0)
     }
 }
 

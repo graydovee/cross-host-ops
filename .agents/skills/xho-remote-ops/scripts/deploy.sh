@@ -18,6 +18,7 @@
 # The release ships:
 #   - Docker image:  ghcr.io/graydovee/cross-host-ops:<tag>  (amd64 + arm64)
 #   - Tarball:       cross-host-ops-<tag>-<target>.tar.gz    (xho, xhod, unit)
+#   - Windows zip:   cross-host-ops-<tag>-x86_64-pc-windows-msvc.zip (xho.exe, xhod.exe)
 
 set -euo pipefail
 
@@ -166,28 +167,50 @@ if [[ -z "${TARGET:-}" ]]; then
     Linux-aarch64|Linux-arm64) TARGET=aarch64-unknown-linux-musl ;;
     Darwin-x86_64)             TARGET=x86_64-apple-darwin ;;
     Darwin-arm64)              TARGET=aarch64-apple-darwin ;;
+    MINGW*-x86_64|MSYS*-x86_64|CYGWIN*-x86_64) TARGET=x86_64-pc-windows-msvc ;;
     *) echo "error: unsupported $os/$arch — pass --target" >&2; exit 1 ;;
   esac
 fi
 
-url="https://github.com/${REPO}/releases/download/${VERSION}/cross-host-ops-${VERSION}-${TARGET}.tar.gz"
+# Windows releases ship a zip with .exe binaries; every other target a tar.gz.
+case "$TARGET" in
+  *windows-msvc) PKG_EXT=zip; EXE=.exe ;;
+  *)             PKG_EXT=tar.gz; EXE= ;;
+esac
+
+url="https://github.com/${REPO}/releases/download/${VERSION}/cross-host-ops-${VERSION}-${TARGET}.${PKG_EXT}"
 echo "==> Downloading ${url}"
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-curl -fsSL "$url" | tar -xz -C "$tmp"
+if [[ "$PKG_EXT" == zip ]]; then
+  curl -fsSL -o "$tmp/release.zip" "$url"
+  # Git for Windows ships no unzip; fall back to PowerShell's Expand-Archive.
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q "$tmp/release.zip" -d "$tmp"
+  else
+    powershell.exe -NoProfile -Command \
+      "Expand-Archive -Force '$(cygpath -w "$tmp/release.zip")' '$(cygpath -w "$tmp")'"
+  fi
+else
+  curl -fsSL "$url" | tar -xz -C "$tmp"
+fi
 src="$tmp/cross-host-ops-${VERSION}-${TARGET}"
-[[ -x "$src/xho" ]] || { echo "error: $src/xho not found after extract" >&2; exit 1; }
+[[ -x "$src/xho${EXE}" ]] || { echo "error: $src/xho${EXE} not found after extract" >&2; exit 1; }
 
 echo "==> Stopping existing xhod (systemd / cli / process)…"
 systemctl stop xhod 2>/dev/null || true
-if [[ -x "$PREFIX/xho" ]]; then
-  "$PREFIX/xho" daemon stop --config "$CONFIG_PATH" 2>/dev/null || true
+if [[ -x "$PREFIX/xho${EXE}" ]]; then
+  "$PREFIX/xho${EXE}" daemon stop --config "$CONFIG_PATH" 2>/dev/null || true
 fi
-pkill -x xhod 2>/dev/null || true
+if command -v pkill >/dev/null 2>&1; then
+  pkill -x xhod 2>/dev/null || true
+else
+  taskkill //F //IM xhod.exe >/dev/null 2>&1 || true
+fi
 sleep 1
 
 echo "==> Installing xho/xhod to ${PREFIX}"
 mkdir -p "$PREFIX"
-install -m 0755 "$src/xho" "$src/xhod" "$PREFIX/"
+install -m 0755 "$src/xho${EXE}" "$src/xhod${EXE}" "$PREFIX/"
 
 # Install the systemd unit too (harmless for bare; needed for systemd).
 if [[ -f "$src/xhod.service" ]]; then
@@ -246,7 +269,13 @@ DOCKER_EOF
 build_locally() {
   local project_root target
   project_root="$(git rev-parse --show-toplevel)"
-  target="${TARGET:-x86_64-unknown-linux-musl}"
+  target="${TARGET:-}"
+  if [[ -z "$target" ]]; then
+    case "$(uname -s)-$(uname -m)" in
+      MINGW*-x86_64|MSYS*-x86_64|CYGWIN*-x86_64) target=x86_64-pc-windows-msvc ;;
+      *)                                         target=x86_64-unknown-linux-musl ;;
+    esac
+  fi
   echo "==> Building release binaries (target ${target})" >&2
   cargo build --release --target "$target" --bin xho --bin xhod \
     --manifest-path "$project_root/Cargo.toml" >&2
@@ -260,7 +289,12 @@ if [[ "$MODE" == "local" ]]; then
   if [[ "$BUILD" == true ]]; then
     bindir="$(build_locally)"
     echo "==> Installing built binaries to ${PREFIX}"
-    mkdir -p "$PREFIX"; install -m 0755 "$bindir/xho" "$bindir/xhod" "$PREFIX/"
+    mkdir -p "$PREFIX"
+    if [[ -f "$bindir/xho.exe" ]]; then
+      install -m 0755 "$bindir/xho.exe" "$bindir/xdhod.exe" "$PREFIX/"
+    else
+      install -m 0755 "$bindir/xho" "$bindir/xdhod" "$PREFIX/"
+    fi
   else
     # Run INSTALL_CORE locally (it downloads + installs; systemd steps are inert locally).
     env VERSION="$VERSION" REPO="$REPO" TARGET="$TARGET" \

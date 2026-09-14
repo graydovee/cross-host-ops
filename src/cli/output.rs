@@ -292,8 +292,23 @@ fn print_merged_server_list(merged: &rpc::MergedServerList) {
         );
     }
 
-    // Skip non-Ok source status output — unsupported gateways (e.g. jumpserver)
-    // are expected and don't need to clutter the listing.
+    // Print source status for non-Ok sources that are NOT expected failures.
+    // Unsupported gateways (e.g. jumpserver without LIST capability) are
+    // expected and silently skipped. Real failures (transport, auth, config
+    // errors) are printed to stderr so the user knows a gateway is broken.
+    for status in &merged.source_status {
+        if status.status == "ok" {
+            continue;
+        }
+        let detail_lower = status.detail.to_ascii_lowercase();
+        if detail_lower.contains("unsupported") || detail_lower.contains("does not support") {
+            continue;
+        }
+        eprintln!(
+            "warning: gateway '{}' list failed: {} — {}",
+            status.source, status.status, status.detail
+        );
+    }
 }
 
 fn print_flat_server_list(servers: &[rpc::ServerEntry]) {

@@ -7,10 +7,11 @@ Cross Host Ops (xho) is a Rust-based remote command execution and file copy tool
 - **`xho`** (`src/bin/xho.rs`) — The client, responsible for user interaction, argument parsing, terminal raw mode, and streaming output display.
 - **`xhod`** (`src/bin/xhod.rs`) — The daemon, responsible for target resolution, command review, connection pool management, command execution, and file transfer.
 
-The CLI does not connect to target machines directly. Instead, it submits requests to the local daemon via gRPC, and the daemon handles all scheduling. The daemon has **two entry points** sharing the same RPC handling logic:
+The CLI does not connect to target machines directly. Instead, it submits requests to the local daemon via gRPC, and the daemon handles all scheduling. The daemon has **three listeners** sharing the same RPC handling logic:
 
 - **Local entry**: Unix Socket (`~/.xho/xhod.sock`), used by the local `xho` client.
-- **Remote entry**: SSH Server (default TCP:2222), used by `xhod` on another machine as a stepping-stone.
+- **Control plane**: SSH Server (default TCP:**12222**), used by another machine's `xhod` as a stepping stone, by reverse-proxy node registration, and by multi-hop tunnels.
+- **Transparent proxy**: SSH Server (default TCP:**2222**), used directly by humans with plain `ssh`/`scp`/`sftp` (see the Transparent SSH Proxy section below).
 
 The daemon uses the **Gateway** abstraction to unify three ways of reaching targets: direct SSH, remote xhod (SSH subsystem + gRPC), and jumpserver (interactive menu bastion).
 
@@ -75,7 +76,7 @@ The core execution engine, listening for both local and remote connections, shar
 **`DaemonState`** holds:
 - `config: Arc<RwLock<AppConfig>>` — Hot-reloadable configuration
 - `gateways: Vec<(String, Arc<dyn Gateway>)>` — Gateway list in declaration order (the first is always `"local"`)
-- `reviewer` — Command reviewer
+- `oversight` — Unified review + audit facade
 - `shutdown_tx` — Shutdown signal
 
 **Startup flow**:
@@ -86,7 +87,7 @@ The core execution engine, listening for both local and remote connections, shar
 5. Register SIGHUP handler (configuration hot-reload + log rotation)
 6. Serve gRPC via `XhoRpcService`
 
-**`XhoRpcService`** implements all RPCs defined in the proto (Execute / Copy / Status / ListServers / Shutdown / UpdateConfig / ListGateways).
+**`XhoRpcService`** implements all RPCs defined in the proto (Execute / Copy / Status / ListServers / Shutdown / UpdateConfig / ListGateways / TokenGen / TokenList / TokenInvalidate / BootstrapAuthorize, plus the `OpenSession` streaming RPC).
 
 ### 3. Resolver (`src/daemon/resolver.rs`)
 
@@ -107,15 +108,19 @@ pub struct Route {
 
 **`derive_target_ip`**: Derives an IP address from a hostname suffix, e.g., `foo-192-0-2-163` → `192.0.2.163` (takes the last 4 numeric segments joined by `.`).
 
-### 4. Reviewer (`src/daemon/review.rs`)
+### 4. Oversight (`src/oversight/`) — v0.5.5
 
-Optional LLM-based command security review, intercepting before command execution.
+A unified layer combining two concerns behind one facade, routing every
+machine operation — exec, copy, OpenSession tunnel, transparent proxy — through it:
+
+1. **Audit logging** (`oversight/audit.rs`) — always-on JSON-Lines trail with caller identity (peer address, SSH user, key fingerprint). See its config in `[audit]`.
+2. **AI command review** (`oversight/review.rs`) — optional, configured per operation kind, intercepting before execution.
 
 **Two-layer filtering**:
-1. **Local fast allowlist** — glob pattern matching (e.g., `ls *`, `cat *`); complex scripts (bash/python etc.) go directly to the LLM.
+1. **Local fast allowlist / copy blocklists** — glob pattern matching (e.g., `ls *`, `cat *`; copy paths against blocklist/allowlist patterns); complex scripts (bash/python etc.) go directly to the LLM.
 2. **LLM semantic review** — Sent to an OpenAI-compatible API, classifying the risk level.
 
-**Risk levels and actions** (defined in `src/config/review.rs`):
+**Risk levels and actions** (defined in `src/config/review.rs`, shared connection settings under `[review]`, per-operation sub-tables `[review.exec]` / `[review.copy]`):
 
 | `RiskLevel` | Description | Default `ReviewAction` |
 |-------------|-------------|------------------------|
@@ -123,9 +128,9 @@ Optional LLM-based command security review, intercepting before command executio
 | `Risky` | Risky | `Confirm` |
 | `Dangerous` | Dangerous | `Deny` |
 
-There are four `ReviewAction` variants: `Allow` / `Warn` / `Confirm` / `Deny`. The `[review.policy]` configuration maps each risk level to its corresponding action.
+There are four `ReviewAction` variants: `Allow` / `Warn` / `Confirm` / `Deny`. Each operation's `[review.*.policy]` maps each risk level to its corresponding action.
 
-The Reviewer only reviews the raw command (`build_remote_command(argv)`), not the shell-wrapped command.
+The reviewer only reviews the raw command (`build_remote_command(argv)`), not the shell-wrapped command.
 
 ## Gateway Layer (`src/daemon/gateway/`)
 
@@ -186,6 +191,7 @@ Factory function that constructs the Gateway list according to the following rul
    - `kind = "jumpserver"` → `JumpserverGateway`
    - `kind = "direct"` → **`DirectGateway`** (uses the entry's own name, shares `server.toml` resolution logic)
 3. `_self` (localhost) is registered as `LocalhostGateway` when `server.proxy.enable` or `reverse_proxy.allow_host_access` is set.
+4. **Reverse-proxy nodes are not configured statically**: when a NAT-ed xhod dials out via the `xho-reverse:<node_name>` subsystem, the hub's `ReverseProxyRegistry` (`src/daemon/reverse_proxy.rs`) wraps the pre-established gRPC client in a `ReverseProxyGateway` and registers it under `<node_name>`, so targets on that node resolve as `<gateway>:<node>:<target>`.
 
 ### Five Gateway implementations
 
@@ -194,16 +200,16 @@ Factory function that constructs the Gateway list according to the following rul
 | **DirectGateway** (`direct.rs`) | EXEC\|COPY\|PROXY\|LIST | Direct SSH | `ManagedPool<key, PooledHandle>` — pools authenticated `client::Handle` by host/port/user/auth; one SSH handshake, many session channels |
 | **LocalhostGateway** (`localhost.rs`) | EXEC\|COPY\|PROXY\|LIST | Local PTY + sftp-server | No pooling (fresh local proc per session) |
 | **XhodGateway** (`xhod.rs`) | EXEC\|COPY\|PROXY\|LIST | SSH subsystem → gRPC | `ManagedSingleton<XhoRpcClient>` — single shared client. `open_session` builds `TunneledSession` |
-| **ReverseProxyGateway** (`reverse_proxy.rs`) | EXEC\|COPY\|PROXY\|LIST | Reverse-proxy gRPC client | Pre-built channel from node-initiated connection. `open_session` builds `TunneledSession` |
+| **ReverseProxyGateway** (`src/daemon/reverse_proxy.rs`) | EXEC\|COPY\|PROXY\|LIST | Node-initiated SSH connection carrying the `xho-reverse` subsystem | gRPC client over the pre-established channel, registered dynamically at runtime. `open_session` builds `TunneledSession` |
 | **JumpserverGateway** (`jumpserver.rs`) | EXEC\|COPY\|PROXY | SSH + PTY shell + menu | `ManagedSingleton<JumpserverTransport>` — navigates to the asset per-session; `open_session` returns `JumpserverSession` |
 
 ### Authentication (`auth.rs`)
 
 Authentication is handled during internal connection establishment within each Gateway, transparent to the exec/copy caller.
 
-## Session Layer (`src/daemon/session/`) — v0.4.0
+## Session Layer (`src/daemon/session/`)
 
-The **unified `TargetSession` abstraction** is the single low-level contract every operation drives through — CLI `xho exec`/`cp`, the transparent SSH proxy, and the multi-hop `OpenSession` tunnel.
+The **unified `TargetSession` abstraction** is the single low-level contract every operation drives through — CLI `xho exec`/`cp`, the transparent SSH proxy, and the multi-hop `OpenSession` tunnel. Each session splits into independent **writer / event-stream halves**, and every streaming consumer runs one task per direction so flow-control backpressure can no longer deadlock a session.
 
 ```rust
 #[async_trait]
@@ -228,7 +234,7 @@ Four implementations (one per transport, not per feature):
 | `DirectSshSession` (`direct.rs`) | Raw russh client channel | Byte-perfect scp/sftp/exec/pty. Exit status via `Handler::exit_status` callback (russh drops it from `channel.wait()`). |
 | `LocalSession` (`local.rs`) | Local PTY + spawned `sftp-server` | Full shell/exec/sftp for `_self` targets. |
 | `TunneledSession` (`tunnel.rs`) | OpenSession RPC over control plane | Multi-hop: `ssh → local proxy → control plane → remote xhod → machine`. Recursive. |
-| `JumpserverSession` (`jumpserver.rs`) | Wraps `JumpserverGateway` menu engine | Sentinel-free exec (prompt-based, exit code = 0); interactive shell via `exec_interactive`. |
+| `JumpserverSession` (`jumpserver.rs`) | Wraps `JumpserverGateway` menu engine | Exec streams via prompt detection (exit code = 0); file copy over the PTY shell uses UUID-sentinel framing with **line-wrapped base64 payloads only** (`shell_copy.rs` + `b64.rs`) — structured raw binary can wedge bastion content inspection; copy exit codes travel in the END marker. |
 
 **Factory**: `open_target_session(state, route)` → delegates to `gateway.open_session(end_target)`. All dispatch lives inside the Gateway impl; the free function checks `Capabilities::PROXY` generically.  
 **Copy**: `copy_via_session(state, route, spec)` → checks `Capabilities::COPY`, calls `gateway.open_session()` → `subsystem("sftp")` + `russh-sftp` client over a duplex bridge (`sftp_copy.rs`).
@@ -319,14 +325,14 @@ Centralized connection pool/singleton management, reused by each Gateway:
 
 xhod can act as an SSH server to accept connections from remote xhod instances.
 
-- **Listen**: `TCP:2222` (configurable via `server.remote.listen_addr`).
+- **Listen**: default `TCP:12222` (configurable via `server.remote.listen_addr`).
 - **Authentication**: two paths are accepted —
   - `auth_publickey()` validates against `~/.xho/authorized_keys` (the normal path)
   - `auth_password()` validates a dynamic token (issued by `xho token gen`, in-memory) or the configured `bootstrap_token` (resolved via SecretResolver, supports `vault:`/`env:`/`file:`). After token auth the client can call the `BootstrapAuthorize` RPC on the same SSH session to have the daemon auto-append its public key to `authorized_keys`, avoiding manual key distribution.
-- **Only accepted operation**: `subsystem_request("xho-rpc")` — treats the SSH channel's byte stream as a gRPC connection and passes it to the tonic Server (the same `XhoRpcService`).
+- **Accepted subsystems**: `xho-rpc` — treats the SSH channel's byte stream as a gRPC connection and passes it to the tonic Server (the same `XhoRpcService`) — and `xho-reverse[:<node_name>]`, which registers the connecting node as a dynamic reverse-proxy gateway (see below).
 - **Rejected operations**: `shell_request`, `exec_request`, `tcpip_forward` / `streamlocal_forward` (no shell login, direct exec, or port forwarding allowed).
 
-Connections enter RPC processing via `IncomingConn::Remote` (carrying peer addr / user / key fingerprint).
+Connections enter RPC processing via `IncomingConn::Remote` (carrying peer addr / user / key fingerprint — the identity later recorded in audit events).
 
 ## Communication Protocol (`proto/xho.proto`)
 
@@ -341,6 +347,9 @@ CLI ↔ daemon and daemon ↔ remote daemon share the same protocol.
 | `Shutdown` | Unary | Shut down daemon |
 | `UpdateConfig` | Unary | Hot-reload configuration |
 | `ListGateways` | Unary | List configured Gateways |
+| `TokenGen` / `TokenList` / `TokenInvalidate` | Unary | Manage short-lived bootstrap tokens |
+| `BootstrapAuthorize` | Unary | Append the authenticated client's public key to `authorized_keys` (token bootstrap) |
+| `OpenSession` | Bidirectional stream | Multi-hop session tunnel |
 
 **Execute stream messages**:
 - Client → Daemon: `StartRequest`, `ConfirmRequest`, `AuthInputRequest`, `StdinData`, `WindowResize`
@@ -413,7 +422,7 @@ socket_path = "~/.xho/xhod.sock"
 
 [server.remote]
 enable = true
-listen_addr = "0.0.0.0:2222"
+listen_addr = "0.0.0.0:12222"
 user = "xho"
 host_key_path = "~/.xho/host_key"
 authorized_keys_path = "~/.xho/authorized_keys"
@@ -429,7 +438,7 @@ max_connections_per_ip = 10
 [[gateways]]
 kind = "xhod"
 name = "remote-xhod"
-address = "xho@203.0.113.10:2222"
+address = "xho@203.0.113.10:12222"
 identity_file = "~/.ssh/id_ed25519"
 known_hosts_path = "~/.xho/known_hosts"
 
@@ -447,7 +456,7 @@ endpoint = "https://api.deepseek.com/v1/chat/completions"
 model = "deepseek-v4-flash"
 ```
 
-`AppConfig` fields: `server` (`ServerConfig`), `ssh` (`SshConfig`), `copy` (`CopyConfig`), `review` (`ReviewConfig`), `gateways` (`Vec<GatewayConfig>`).
+`AppConfig` fields: `server` (`ServerConfig`), `ssh` (`SshConfig`), `copy` (`CopyConfig`), `review` (`ReviewConfig`), `audit` (`AuditConfig`), `secret` (`SecretConfig`), `reverse_proxy` (`ReverseProxyClientConfig`), `gateways` (`Vec<GatewayConfig>`).
 
 ### `~/.xho/server.toml` — Server inventory (`src/config/inventory.rs`)
 
@@ -483,14 +492,23 @@ src/
 │   ├── exec.rs  host.rs  output.rs  progress.rs  prompt.rs
 ├── config.rs               # AppConfig (shared library entry)
 ├── config/                 # Configuration types
-│   ├── client.rs  copy.rs  duration.rs  gateway.rs  inventory.rs
-│   ├── path.rs  review.rs  server.rs  ssh.rs
+│   ├── audit.rs  client.rs  copy.rs  duration.rs  gateway.rs
+│   ├── inventory.rs  mfa.rs  path.rs  review.rs  reverse_proxy.rs
+│   ├── secret.rs  server.rs  ssh.rs
+├── oversight/              # Unified oversight layer (v0.5.5)
+│   ├── mod.rs              # Oversight facade over all operation surfaces
+│   ├── audit.rs            # JSON-Lines audit trail (identity + result per op)
+│   └── review.rs           # LLM command/copy review (per-operation configs)
 ├── daemon/                 # Daemon business logic
 │   ├── mod.rs              # Startup, listeners, shutdown, DaemonState, XhoRpcService
 │   ├── rpc.rs              # Gateway dispatch, process_list_servers
 │   ├── resolver.rs         # target → Vec<Route>
-│   ├── review.rs           # LLM command review
-│   ├── ssh_server.rs       # RemoteSshServer, IncomingConn
+│   ├── ssh_server.rs       # RemoteSshServer (control plane), IncomingConn
+│   ├── proxy_server.rs     # ProxySshServer (transparent proxy, port 2222)
+│   ├── authorized_keys.rs  # authorized_keys parsing/matching (both stores)
+│   ├── token_store.rs      # in-memory short-lived bootstrap tokens
+│   ├── reverse_client.rs   # node side: dials hub via xho-reverse subsystem
+│   ├── reverse_proxy.rs    # hub side: ReverseProxyRegistry + ReverseProxyGateway
 │   ├── connection_manager.rs  # ManagedPool / ManagedSingleton
 │   ├── gateway/            # Gateway abstraction and implementations
 │   │   ├── mod.rs          # Gateway trait, Capabilities, GatewayKind, Route, GatewayError, build_gateways
@@ -505,7 +523,9 @@ src/
 │   │   ├── local.rs        # LocalSession (PTY + sftp-server for _self)
 │   │   ├── tunnel.rs       # TunneledSession (OpenSession RPC multi-hop tunnel)
 │   │   ├── jumpserver.rs   # JumpserverSession (navigated PTY + raw/shell/sftp)
-│   │   └── sftp_copy.rs    # SFTP copy driver over subsystem("sftp")
+│   │   ├── sftp_copy.rs    # SFTP copy driver over subsystem("sftp")
+│   │   ├── shell_copy.rs   # jumpserver shell copy: base64 payloads, resume ledger
+│   │   └── b64.rs          # incremental base64 codec for shell copy
 │   ├── shell.rs            # Pure shell quoting/building utilities (reused by all backends)
 │   └── jumpserver_engine.rs # Jumpserver-specific PtyShell, menu navigation, prompt detection
 ├── copy_frames.rs          # File copy frame encode/decode (shared library)
@@ -559,19 +579,8 @@ CLI → gRPC ListServers → Daemon
   → rpc::process_list_servers(): iterate gateways in declaration order
       ├─ DirectGateway.list_servers()        → Reads server.toml (zero I/O)
       ├─ XhodGateway.list_servers()         → gRPC ListServers (remote aggregation)
+      ├─ ReverseProxyGateway.list_servers() → Remote aggregation via the registered node's client
       └─ JumpserverGateway.list_servers()   → Err(Unsupported) → skip and mark
-  → Merge all ServerListRow, attach source label (local / <gateway-name>)
-  → CLI formats and displays
-```
-
-### `xho ls` (merged view aggregation)
-
-```
-CLI → gRPC ListServers → Daemon
-  → rpc::process_list_servers(): iterate gateways in declaration order
-      ├─ DirectGateway.list_servers()       → Reads server.toml (zero I/O)
-      ├─ XhodGateway.list_servers()         → gRPC ListServers (remote aggregation)
-      └─ JumpserverGateway.list_servers()   → Err(Unsupported, default trait impl) → mark
   → Merge all ServerListRow, attach source label (local / <gateway-name>)
   → CLI formats and displays
 ```

@@ -1,16 +1,19 @@
 // TunneledSession — a `TargetSession` driven over the control-plane
 // `OpenSession` RPC to a remote xhod.
 //
-// Realises the multi-hop path `ssh → 本机xhod → 控制面 12222 → 远程xhod → 机器`:
-// every request (pty/exec/shell/subsystem/data/resize/signal) is forwarded as a
-// `SessionRequest` over the gRPC stream opened against the remote daemon's
-// control plane, and every `SessionResponse` is surfaced as a `SessionEvent`.
-// The remote xhod services `OpenSession` by recursively opening its own
-// `TargetSession`, so arbitrary-depth hops are uniform.
+// Realises the multi-hop path `ssh → local xhod → control plane 12222 →
+// remote xhod → machine`: every request (pty/exec/shell/subsystem/data/
+// resize/signal) is forwarded as a `SessionRequest` over the gRPC stream
+// opened against the remote daemon's control plane, and every
+// `SessionResponse` is surfaced as a `SessionEvent`. The remote xhod services
+// `OpenSession` by recursively opening its own `TargetSession`, so
+// arbitrary-depth hops are uniform.
+//
+// The two directions run as separate tasks: one forwards commands onto the
+// gRPC request stream (parking on flow control only pauses stdin), the other
+// drains responses into the event stream. Neither can starve the other.
 
-use anyhow::{Result, anyhow};
-use async_trait::async_trait;
-use russh::Pty;
+use anyhow::anyhow;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
@@ -18,46 +21,40 @@ use tonic::Request;
 use crate::protocol::rpc as r;
 use crate::protocol::rpc::xho_rpc_client::XhoRpcClient;
 
-use super::{SessionEvent, TargetSession};
+use super::{SessionCommand, SessionEvent, SessionStream, SessionWriter, TargetSession};
 
 type RpcClient = XhoRpcClient<tonic::transport::Channel>;
 
-enum Control {
-    Pty { term: String, cols: u32, rows: u32 },
-    Env { key: String, value: String },
-    Exec { command: String },
-    Shell,
-    Subsystem { name: String },
-    WindowChange { cols: u32, rows: u32 },
-    Signal { signal: String },
-    Eof,
-}
-
 pub(crate) struct TunneledSession {
-    control_tx: mpsc::Sender<Control>,
-    stdin_tx: mpsc::Sender<Vec<u8>>,
-    events_rx: mpsc::UnboundedReceiver<SessionEvent>,
+    writer: Option<SessionWriter>,
+    stream: Option<SessionStream>,
 }
 
 impl TunneledSession {
     pub(crate) fn new(client: RpcClient, target: String) -> Self {
-        let (control_tx, control_rx) = mpsc::channel::<Control>(32);
-        let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(64);
         let (events_tx, events_rx) = mpsc::unbounded_channel::<SessionEvent>();
-        tokio::spawn(driver(client, target, control_rx, stdin_rx, events_tx));
+        tokio::spawn(driver(client, target, cmd_rx, events_tx));
         Self {
-            control_tx,
-            stdin_tx,
-            events_rx,
+            writer: Some(SessionWriter { tx: cmd_tx }),
+            stream: Some(SessionStream { rx: events_rx }),
         }
+    }
+}
+
+impl TargetSession for TunneledSession {
+    fn split(mut self: Box<Self>) -> (SessionWriter, SessionStream) {
+        (
+            self.writer.take().expect("tunnel session split twice"),
+            self.stream.take().expect("tunnel session split twice"),
+        )
     }
 }
 
 async fn driver(
     mut client: RpcClient,
     target: String,
-    mut control_rx: mpsc::Receiver<Control>,
-    mut stdin_rx: mpsc::Receiver<Vec<u8>>,
+    cmd_rx: mpsc::Receiver<SessionCommand>,
     events_tx: mpsc::UnboundedSender<SessionEvent>,
 ) {
     let (req_tx, req_rx) = mpsc::channel::<r::SessionRequest>(64);
@@ -77,53 +74,86 @@ async fn driver(
     let mut response = response;
 
     // Kick off: open the session on the remote end_target.
-    if send_req(
-        &req_tx,
-        r::session_request::Msg::Open(r::SessionOpen { target }),
-    )
-    .await
-    .is_err()
+    if req_tx
+        .send(r::SessionRequest {
+            msg: Some(r::session_request::Msg::Open(r::SessionOpen { target })),
+        })
+        .await
+        .is_err()
     {
         return;
     }
 
+    // Uplink: forward commands onto the gRPC request stream. Commands and
+    // stdin share ONE ordered stream so eof/data cannot overtake the
+    // exec/subsystem start on the remote side. When this task ends (session
+    // halves dropped or the stream broke), `req_tx` drops and the remote sees
+    // end-of-stream.
+    let mut uplink = tokio::spawn(async move {
+        let mut cmd_rx = cmd_rx;
+        while let Some(cmd) = cmd_rx.recv().await {
+            // "Start" commands carry a reply: acknowledge once the request is
+            // handed to the gRPC stream. Transport failures surface later as
+            // an Error event on the response stream, as in the old design.
+            let (reply, msg) = match cmd {
+                SessionCommand::Pty {
+                    term,
+                    cols,
+                    rows,
+                    reply,
+                    ..
+                } => (
+                    Some(reply),
+                    r::session_request::Msg::Pty(r::SessionPty { term, cols, rows }),
+                ),
+                SessionCommand::Env { key, value, reply } => (
+                    Some(reply),
+                    r::session_request::Msg::Env(r::SessionEnv { key, value }),
+                ),
+                SessionCommand::Exec { command, reply } => (
+                    Some(reply),
+                    r::session_request::Msg::Exec(r::SessionExec { command }),
+                ),
+                SessionCommand::Shell { reply } => (
+                    Some(reply),
+                    r::session_request::Msg::Shell(r::SessionShell {}),
+                ),
+                SessionCommand::Subsystem { name, reply } => (
+                    Some(reply),
+                    r::session_request::Msg::Subsystem(r::SessionSubsystem { name }),
+                ),
+                SessionCommand::Resize { cols, rows } => (
+                    None,
+                    r::session_request::Msg::Resize(r::SessionResize { cols, rows }),
+                ),
+                SessionCommand::Signal { signal } => (
+                    None,
+                    r::session_request::Msg::Signal(r::SessionSignal { signal }),
+                ),
+                SessionCommand::Eof => (None, r::session_request::Msg::Eof(r::SessionEof {})),
+                SessionCommand::Data { bytes } => (
+                    None,
+                    r::session_request::Msg::Data(r::SessionData { data: bytes }),
+                ),
+            };
+            let sent = req_tx.send(r::SessionRequest { msg: Some(msg) }).await;
+            let sent_ok = sent.is_ok();
+            if let Some(reply) = reply {
+                let _ = reply.send(sent.map_err(|_| anyhow!("session stream closed")));
+            }
+            if !sent_ok {
+                break;
+            }
+        }
+    });
+
+    // Downlink: drain responses into the event stream until the remote closes.
+    // When the uplink task ends (local session halves dropped — stdin is
+    // finished), the session must keep draining: the remote still owes output
+    // and an exit status. Only the remote closing the stream ends this loop.
+    let mut uplink_done = false;
     loop {
         tokio::select! {
-            ctrl = control_rx.recv() => match ctrl {
-                Some(Control::Pty { term, cols, rows }) => {
-                    let _ = send_req(&req_tx, r::session_request::Msg::Pty(r::SessionPty { term, cols, rows })).await;
-                }
-                Some(Control::Env { key, value }) => {
-                    let _ = send_req(&req_tx, r::session_request::Msg::Env(r::SessionEnv { key, value })).await;
-                }
-                Some(Control::Exec { command }) => {
-                    let _ = send_req(&req_tx, r::session_request::Msg::Exec(r::SessionExec { command })).await;
-                }
-                Some(Control::Shell) => {
-                    let _ = send_req(&req_tx, r::session_request::Msg::Shell(r::SessionShell {})).await;
-                }
-                Some(Control::Subsystem { name }) => {
-                    let _ = send_req(&req_tx, r::session_request::Msg::Subsystem(r::SessionSubsystem { name })).await;
-                }
-                Some(Control::WindowChange { cols, rows }) => {
-                    let _ = send_req(&req_tx, r::session_request::Msg::Resize(r::SessionResize { cols, rows })).await;
-                }
-                Some(Control::Signal { signal }) => {
-                    let _ = send_req(&req_tx, r::session_request::Msg::Signal(r::SessionSignal { signal })).await;
-                }
-                Some(Control::Eof) => {
-                    let _ = send_req(&req_tx, r::session_request::Msg::Eof(r::SessionEof {})).await;
-                }
-                None => break,
-            },
-            stdin = stdin_rx.recv() => match stdin {
-                Some(data) => {
-                    let _ = send_req(&req_tx, r::session_request::Msg::Data(r::SessionData { data })).await;
-                }
-                None => {
-                    let _ = send_req(&req_tx, r::session_request::Msg::Eof(r::SessionEof {})).await;
-                }
-            },
             msg = response.message() => match msg {
                 Ok(Some(resp)) => match resp.msg {
                     Some(r::session_response::Msg::Started(_)) => {}
@@ -160,110 +190,27 @@ async fn driver(
                     break;
                 }
             },
+            _ = &mut uplink, if !uplink_done => {
+                // Uplink ended: stdin side is complete. Keep consuming
+                // responses below until the remote closes the stream.
+                uplink_done = true;
+            }
         }
     }
+    uplink.abort();
 }
 
-async fn send_req(
-    tx: &mpsc::Sender<r::SessionRequest>,
-    msg: r::session_request::Msg,
-) -> Result<()> {
-    tx.send(r::SessionRequest { msg: Some(msg) })
-        .await
-        .map_err(|_| anyhow!("session stream closed"))
-}
-
-#[async_trait]
-impl TargetSession for TunneledSession {
-    async fn request_pty(
-        &mut self,
-        term: &str,
-        cols: u32,
-        rows: u32,
-        _modes: &[(Pty, u32)],
-    ) -> Result<()> {
-        let _ = self
-            .control_tx
-            .send(Control::Pty {
-                term: term.to_string(),
-                cols,
-                rows,
-            })
-            .await;
-        Ok(())
-    }
-
-    async fn set_env(&mut self, key: &str, value: &str) -> Result<()> {
-        let _ = self
-            .control_tx
-            .send(Control::Env {
-                key: key.to_string(),
-                value: value.to_string(),
-            })
-            .await;
-        Ok(())
-    }
-
-    async fn exec(&mut self, command: &str) -> Result<()> {
-        self.control_tx
-            .send(Control::Exec {
-                command: command.to_string(),
-            })
-            .await
-            .map_err(|_| anyhow!("session closed"))?;
-        Ok(())
-    }
-
-    async fn shell(&mut self) -> Result<()> {
-        self.control_tx
-            .send(Control::Shell)
-            .await
-            .map_err(|_| anyhow!("session closed"))?;
-        Ok(())
-    }
-
-    async fn subsystem(&mut self, name: &str) -> Result<()> {
-        self.control_tx
-            .send(Control::Subsystem {
-                name: name.to_string(),
-            })
-            .await
-            .map_err(|_| anyhow!("session closed"))?;
-        Ok(())
-    }
-
-    async fn window_change(&mut self, cols: u32, rows: u32) -> Result<()> {
-        let _ = self
-            .control_tx
-            .send(Control::WindowChange { cols, rows })
-            .await;
-        Ok(())
-    }
-
-    async fn signal(&mut self, signal: &str) -> Result<()> {
-        let _ = self
-            .control_tx
-            .send(Control::Signal {
-                signal: signal.to_string(),
-            })
-            .await;
-        Ok(())
-    }
-
-    async fn write_stdin(&mut self, data: &[u8]) -> Result<()> {
-        self.stdin_tx
-            .send(data.to_vec())
-            .await
-            .map_err(|_| anyhow!("session closed"))?;
-        Ok(())
-    }
-
-    async fn eof(&mut self) -> Result<()> {
-        let _ = self.control_tx.send(Control::Eof).await;
-        Ok(())
-    }
-
-    async fn next_event(&mut self) -> Option<SessionEvent> {
-        self.events_rx.recv().await
+fn forward_trailing(resp: r::SessionResponse, events_tx: &mpsc::UnboundedSender<SessionEvent>) {
+    match resp.msg {
+        Some(r::session_response::Msg::Data(d)) => {
+            let _ = events_tx.send(SessionEvent::Stdout(d.data));
+        }
+        Some(r::session_response::Msg::Stderr(d)) => {
+            let _ = events_tx.send(SessionEvent::Stderr(d.data));
+        }
+        Some(r::session_response::Msg::ExitStatus(s)) => {
+            let _ = events_tx.send(SessionEvent::ExitStatus(s.code));
+        }
+        _ => {}
     }
 }

@@ -124,6 +124,7 @@ pub(crate) async fn run_command(
     shell: Option<String>,
     no_shell: bool,
     _config: &AppConfig,
+    yes: bool,
 ) -> Result<i32> {
     // Pass raw CLI flags to daemon; daemon resolves effective shell from server.toml.
     let cli_shell = shell.unwrap_or_default();
@@ -141,6 +142,7 @@ pub(crate) async fn run_command(
             no_shell,
             tty_intent,
             stdin_intent,
+            yes,
         )
         .await;
     }
@@ -229,8 +231,9 @@ pub(crate) async fn run_command(
             Ok(Some(msg)) => msg,
             Ok(None) => break,
             Err(e) => {
-                eprintln!("error: connection lost: {e}");
-                break;
+                return Err(
+                    crate::exit_codes::XhoError::Internal(format!("connection lost: {e}")).into(),
+                );
             }
         };
         match message
@@ -247,7 +250,7 @@ pub(crate) async fn run_command(
             }
             rpc::execute_response::Event::ReviewResult(_result) => {}
             rpc::execute_response::Event::ConfirmRequired(confirm) => {
-                let allow = prompt_for_confirmation(&confirm.reason)?;
+                let allow = prompt_for_confirmation(&confirm.reason, yes)?;
                 let Some(ref response_tx) = response_tx else {
                     return Err(anyhow!(
                         "received ConfirmRequired but no response channel available"
@@ -288,8 +291,7 @@ pub(crate) async fn run_command(
                 eprintln!("{}", info.message);
             }
             rpc::execute_response::Event::Error(error) => {
-                eprintln!("error: {}", error.message);
-                return Ok(1);
+                return Err(super::classify_daemon_error(&error.message).into());
             }
         }
     }
@@ -306,6 +308,7 @@ pub(crate) async fn run_command(
 
 /// Run a command in interactive PTY mode with raw terminal, bidirectional
 /// byte streaming, and SIGWINCH forwarding.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_interactive(
     target: String,
     argv: Vec<String>,
@@ -314,6 +317,7 @@ pub(crate) async fn run_interactive(
     no_shell: bool,
     tty_intent: FlagIntent,
     stdin_intent: FlagIntent,
+    yes: bool,
 ) -> Result<i32> {
     // Step 1: Get initial terminal size.
     let (cols, rows) = get_terminal_size();
@@ -399,11 +403,13 @@ pub(crate) async fn run_interactive(
             Ok(None) => break,
             Err(e) => {
                 // gRPC stream broke (daemon restart, SSH connection lost, etc.).
-                // Show a clean diagnostic instead of the raw h2/hyper error.
-                write_raw_mode_diagnostic(&format!(
-                    "\n\x1b[31mConnection lost: {e}\x1b[0m\n"
-                ))?;
-                break;
+                // Return a typed error — the RawModeGuard restores the terminal
+                // on return, then main's eprintln prints cleanly.
+                stdin_task.abort();
+                sigwinch_task.abort();
+                return Err(
+                    crate::exit_codes::XhoError::Internal(format!("connection lost: {e}")).into(),
+                );
             }
         };
         match message
@@ -419,10 +425,12 @@ pub(crate) async fn run_interactive(
                 break;
             }
             rpc::execute_response::Event::Error(error) => {
-                write_raw_mode_diagnostic(&format!("error: {}", error.message))?;
+                // Return a typed error — the RawModeGuard (_guard) restores the
+                // terminal on return, then main's eprintln prints the message
+                // cleanly. This avoids double-printing.
                 stdin_task.abort();
                 sigwinch_task.abort();
-                return Ok(1);
+                return Err(super::classify_daemon_error(&error.message).into());
             }
             rpc::execute_response::Event::Info(info) => {
                 write_raw_mode_diagnostic(&info.message)?;
@@ -437,7 +445,7 @@ pub(crate) async fn run_interactive(
                 .map_err(|_| anyhow!("failed to send auth input request"))?;
             }
             rpc::execute_response::Event::ConfirmRequired(confirm) => {
-                let allow = prompt_for_confirmation(&confirm.reason)?;
+                let allow = prompt_for_confirmation(&confirm.reason, yes)?;
                 tx.send(rpc::ExecuteRequest {
                     request: Some(rpc::execute_request::Request::Confirm(
                         rpc::ConfirmRequest {

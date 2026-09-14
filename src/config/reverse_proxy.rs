@@ -47,6 +47,13 @@ pub struct ReverseProxyClientConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 
+    /// Default working directory for sessions executed on this node
+    /// (interactive shells and exec on the `_self`/localhost target,
+    /// including sessions entering via the transparent proxy).
+    /// `~` is expanded. When `None`, defaults to the user's home directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+
     #[serde(
         deserialize_with = "deserialize_duration",
         serialize_with = "serialize_duration"
@@ -77,6 +84,7 @@ impl Default for ReverseProxyClientConfig {
             allow_host_access: false,
             shell: None,
             user: None,
+            workdir: None,
             reconnect_delay: Duration::from_secs(10),
             keepalive_interval: Duration::from_secs(30),
             max_idle_time: Duration::from_secs(600),

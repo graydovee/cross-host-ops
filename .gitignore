@@ -13,3 +13,4 @@ config.toml
 server.toml
 # TCP control-channel lock file (daemon runtime artifact, not config).
 xhod.tcp
+.DS_Store

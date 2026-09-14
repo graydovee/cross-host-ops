@@ -15,20 +15,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::Result;
-use async_trait::async_trait;
 use russh::Channel;
 use russh::ChannelId;
 use russh::ChannelMsg;
-use russh::Pty;
 use russh::Sig;
 use russh::client::{self};
 use russh::keys::{PrivateKeyWithHashAlg, load_secret_key};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::config::{AppConfig, DirectAuth};
 
-use super::{SessionEvent, TargetSession};
+use super::{SessionCommand, SessionEvent, SessionStream, SessionWriter, TargetSession};
 
 /// Sentinel value meaning "no exit status captured yet".
 pub(crate) const NO_EXIT: u32 = u32::MAX;
@@ -154,161 +152,178 @@ async fn authenticate_with_password(
 }
 
 // -----------------------------------------------------------------------
-// Internal control protocol
+// Session: writer/stream halves over a pooled channel
 // -----------------------------------------------------------------------
 
-#[derive(Debug)]
-enum Control {
-    Pty {
-        term: String,
-        cols: u32,
-        rows: u32,
-        modes: Vec<(Pty, u32)>,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    Env {
-        key: String,
-        value: String,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    Exec {
-        command: String,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    Shell {
-        reply: oneshot::Sender<Result<()>>,
-    },
-    Subsystem {
-        name: String,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    WindowChange {
-        cols: u32,
-        rows: u32,
-    },
-    Signal {
-        signal: String,
-    },
-    Eof,
-}
-
-/// A `TargetSession` backed by a raw outbound russh client channel.
+/// A `TargetSession` backed by a raw outbound russh client channel, split into
+/// its writer/stream halves.
+///
+/// The channel is split into read/write halves driven by two independent
+/// tasks. This matters for flow control: when the remote stalls reading stdin
+/// (e.g. a shell blocked writing output), a parked `data()` send must not
+/// stop the reader from consuming output — a single `select!` over both
+/// directions re-creates the mutual deadlock the split architecture removes.
 pub(crate) struct DirectSshSession {
-    control_tx: mpsc::Sender<Control>,
-    stdin_tx: mpsc::Sender<Vec<u8>>,
-    events_rx: mpsc::UnboundedReceiver<SessionEvent>,
+    writer: Option<SessionWriter>,
+    stream: Option<SessionStream>,
 }
 
 impl DirectSshSession {
     /// Wrap a channel opened on a *pooled* handle. `exit_code` is reset to
     /// `NO_EXIT` (the handle is reused across execs, so a stale code from a
-    /// prior exec must not leak). `on_done` is invoked after the driver
-    /// terminates — the gateway uses it to return or discard the handle lease.
+    /// prior exec must not leak). `on_done` is invoked after both driver
+    /// tasks terminate — the gateway uses it to return or discard the handle
+    /// lease.
     pub(crate) fn new(
         channel: Channel<client::Msg>,
         exit_code: Arc<AtomicU32>,
         on_done: Box<dyn FnOnce() + Send>,
     ) -> Self {
         exit_code.store(NO_EXIT, Ordering::Relaxed);
-        let (control_tx, control_rx) = mpsc::channel::<Control>(32);
-        let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(64);
+        // Commands and stdin payload deliberately share ONE ordered channel:
+        // the API contract is "start before data, data before eof". Two
+        // separate channels consumed by `select!` reorder messages at random —
+        // data or eof can reach the SSH channel before the exec / subsystem
+        // request, hanging the session or dropping stdin.
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(64);
         let (events_tx, events_rx) = mpsc::unbounded_channel::<SessionEvent>();
 
+        let (read_half, write_half) = channel.split();
+        let writer = tokio::spawn(write_driver(write_half, cmd_rx));
+        let reader = tokio::spawn(read_driver(read_half, events_tx, exit_code));
         tokio::spawn(async move {
-            driver(channel, control_rx, stdin_rx, events_tx, exit_code).await;
+            let _ = writer.await;
+            let _ = reader.await;
             on_done();
         });
 
         Self {
-            control_tx,
-            stdin_tx,
-            events_rx,
+            writer: Some(SessionWriter { tx: cmd_tx }),
+            stream: Some(SessionStream { rx: events_rx }),
         }
     }
 }
 
-async fn driver(
-    mut channel: Channel<client::Msg>,
-    mut control_rx: mpsc::Receiver<Control>,
-    mut stdin_rx: mpsc::Receiver<Vec<u8>>,
+impl TargetSession for DirectSshSession {
+    fn split(mut self: Box<Self>) -> (SessionWriter, SessionStream) {
+        (
+            self.writer.take().expect("direct session split twice"),
+            self.stream.take().expect("direct session split twice"),
+        )
+    }
+}
+
+/// Write half: consume commands in FIFO order and forward them to the SSH
+/// channel. Parking here (remote window exhausted because the peer stopped
+/// reading stdin) pauses stdin only — the read driver keeps consuming output,
+/// which is exactly what lets the peer eventually resume.
+async fn write_driver(
+    mut write_half: russh::ChannelWriteHalf<client::Msg>,
+    mut cmd_rx: mpsc::Receiver<SessionCommand>,
+) {
+    let mut stdin_open = true;
+    while let Some(cmd) = cmd_rx.recv().await {
+        match cmd {
+            SessionCommand::Pty {
+                term,
+                cols,
+                rows,
+                modes,
+                reply,
+            } => {
+                let r = write_half
+                    .request_pty(true, &term, cols, rows, 0, 0, &modes)
+                    .await;
+                let _ = reply.send(r.map_err(Into::into));
+            }
+            SessionCommand::Env { key, value, reply } => {
+                let r = write_half.set_env(true, key, value).await;
+                let _ = reply.send(r.map_err(Into::into));
+            }
+            SessionCommand::Exec { command, reply } => {
+                let r = write_half.exec(true, command).await;
+                let _ = reply.send(r.map_err(Into::into));
+            }
+            SessionCommand::Shell { reply } => {
+                let r = write_half.request_shell(true).await;
+                let _ = reply.send(r.map_err(Into::into));
+            }
+            SessionCommand::Subsystem { name, reply } => {
+                let r = write_half.request_subsystem(true, name).await;
+                let _ = reply.send(r.map_err(Into::into));
+            }
+            SessionCommand::Resize { cols, rows } => {
+                let _ = write_half.window_change(cols, rows, 0, 0).await;
+            }
+            SessionCommand::Signal { signal } => {
+                let _ = write_half.signal(parse_sig(&signal)).await;
+            }
+            SessionCommand::Eof => {
+                let _ = write_half.eof().await;
+                stdin_open = false;
+            }
+            SessionCommand::Data { bytes } if stdin_open => {
+                if write_half.data(Cursor::new(bytes)).await.is_err() {
+                    break;
+                }
+            }
+            SessionCommand::Data { .. } => {}
+        }
+    }
+}
+
+/// Read half: surface channel messages as session events until the channel
+/// closes.
+async fn read_driver(
+    mut read_half: russh::ChannelReadHalf,
     events_tx: mpsc::UnboundedSender<SessionEvent>,
     exit_code: Arc<AtomicU32>,
 ) {
-    let mut stdin_open = true;
     let mut exit_sent = false;
-    loop {
-        tokio::select! {
-            stdin = stdin_rx.recv(), if stdin_open => match stdin {
-                Some(bytes) => {
-                    if channel.data(Cursor::new(bytes)).await.is_err() { break; }
-                }
-                None => {
-                    let _ = channel.eof().await;
-                    stdin_open = false;
-                }
-            },
-            ctrl = control_rx.recv() => match ctrl {
-                Some(Control::Pty { term, cols, rows, modes, reply }) => {
-                    let r = channel.request_pty(true, &term, cols, rows, 0, 0, &modes).await;
-                    let _ = reply.send(r.map_err(Into::into));
-                }
-                Some(Control::Env { key, value, reply }) => {
-                    let r = channel.set_env(true, key, value).await;
-                    let _ = reply.send(r.map_err(Into::into));
-                }
-                Some(Control::Exec { command, reply }) => {
-                    let r = channel.exec(true, command).await;
-                    let _ = reply.send(r.map_err(Into::into));
-                }
-                Some(Control::Shell { reply }) => {
-                    let r = channel.request_shell(true).await;
-                    let _ = reply.send(r.map_err(Into::into));
-                }
-                Some(Control::Subsystem { name, reply }) => {
-                    let r = channel.request_subsystem(true, name).await;
-                    let _ = reply.send(r.map_err(Into::into));
-                }
-                Some(Control::WindowChange { cols, rows }) => {
-                    let _ = channel.window_change(cols, rows, 0, 0).await;
-                }
-                Some(Control::Signal { signal }) => {
-                    let _ = channel.signal(parse_sig(&signal)).await;
-                }
-                Some(Control::Eof) => {
-                    let _ = channel.eof().await;
-                }
-                None => break,
-            },
-            msg = channel.wait() => match msg {
-                Some(ChannelMsg::Data { data }) => {
-                    if events_tx.send(SessionEvent::Stdout(data.to_vec())).is_err() { break; }
-                }
-                Some(ChannelMsg::ExtendedData { data, .. }) => {
-                    if events_tx.send(SessionEvent::Stderr(data.to_vec())).is_err() { break; }
-                }
-                Some(ChannelMsg::ExitStatus { exit_status }) => {
-                    exit_sent = true;
-                    let _ = events_tx.send(SessionEvent::ExitStatus(exit_status as i32));
-                }
-                Some(ChannelMsg::ExitSignal { signal_name, .. }) => {
-                    exit_sent = true;
-                    let _ = events_tx.send(SessionEvent::ExitSignal(format!("{signal_name:?}")));
-                }
-                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
-                    // ExitStatus may have been dropped by russh's bounded channel
-                    // receiver. Fall back to the Handler callback's captured code.
-                    if !exit_sent {
-                        let code = exit_code.load(Ordering::Relaxed);
-                        if code != NO_EXIT {
-                            let _ = events_tx.send(SessionEvent::ExitStatus(code as i32));
-                        } else {
-                            let _ = events_tx.send(SessionEvent::Eof);
-                        }
-                    }
+    while let Some(msg) = read_half.wait().await {
+        match msg {
+            ChannelMsg::Data { data } => {
+                if events_tx.send(SessionEvent::Stdout(data.to_vec())).is_err() {
                     break;
                 }
-                _ => {}
-            },
+            }
+            ChannelMsg::ExtendedData { data, .. } => {
+                if events_tx.send(SessionEvent::Stderr(data.to_vec())).is_err() {
+                    break;
+                }
+            }
+            ChannelMsg::ExitStatus { exit_status } => {
+                exit_sent = true;
+                let _ = events_tx.send(SessionEvent::ExitStatus(exit_status as i32));
+            }
+            ChannelMsg::ExitSignal { signal_name, .. } => {
+                exit_sent = true;
+                let _ = events_tx.send(SessionEvent::ExitSignal(format!("{signal_name:?}")));
+            }
+            ChannelMsg::Eof | ChannelMsg::Close => {
+                // ExitStatus may have been dropped by russh's bounded channel
+                // receiver. Fall back to the Handler callback's captured code.
+                if !exit_sent {
+                    let code = exit_code.load(Ordering::Relaxed);
+                    if code != NO_EXIT {
+                        let _ = events_tx.send(SessionEvent::ExitStatus(code as i32));
+                    } else {
+                        let _ = events_tx.send(SessionEvent::Eof);
+                    }
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+    if !exit_sent {
+        // wait() returned None (channel closed without Eof/Close) — still
+        // resolve the session with the best exit info we have.
+        let code = exit_code.load(Ordering::Relaxed);
+        if code != NO_EXIT {
+            let _ = events_tx.send(SessionEvent::ExitStatus(code as i32));
+        } else {
+            let _ = events_tx.send(SessionEvent::Eof);
         }
     }
 }
@@ -331,103 +346,5 @@ fn parse_sig(name: &str) -> russh::Sig {
         "SEGV" => SEGV,
         "USR1" => USR1,
         other => Custom(other.to_string()),
-    }
-}
-
-/// Send a control message that carries a reply channel and await its result.
-async fn request(
-    control_tx: &mpsc::Sender<Control>,
-    build: impl FnOnce(oneshot::Sender<Result<()>>) -> Control,
-) -> Result<()> {
-    let (rtx, rrx) = oneshot::channel();
-    control_tx
-        .send(build(rtx))
-        .await
-        .map_err(|_| anyhow::anyhow!("session closed"))?;
-    rrx.await
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("session closed")))
-}
-
-#[async_trait]
-impl TargetSession for DirectSshSession {
-    async fn request_pty(
-        &mut self,
-        term: &str,
-        cols: u32,
-        rows: u32,
-        modes: &[(Pty, u32)],
-    ) -> Result<()> {
-        request(&self.control_tx, |reply| Control::Pty {
-            term: term.to_string(),
-            cols,
-            rows,
-            modes: modes.to_vec(),
-            reply,
-        })
-        .await
-    }
-
-    async fn set_env(&mut self, key: &str, value: &str) -> Result<()> {
-        request(&self.control_tx, |reply| Control::Env {
-            key: key.to_string(),
-            value: value.to_string(),
-            reply,
-        })
-        .await
-    }
-
-    async fn exec(&mut self, command: &str) -> Result<()> {
-        request(&self.control_tx, |reply| Control::Exec {
-            command: command.to_string(),
-            reply,
-        })
-        .await
-    }
-
-    async fn shell(&mut self) -> Result<()> {
-        request(&self.control_tx, |reply| Control::Shell { reply }).await
-    }
-
-    async fn subsystem(&mut self, name: &str) -> Result<()> {
-        request(&self.control_tx, |reply| Control::Subsystem {
-            name: name.to_string(),
-            reply,
-        })
-        .await
-    }
-
-    async fn window_change(&mut self, cols: u32, rows: u32) -> Result<()> {
-        let _ = self
-            .control_tx
-            .send(Control::WindowChange { cols, rows })
-            .await;
-        Ok(())
-    }
-
-    async fn signal(&mut self, signal: &str) -> Result<()> {
-        let _ = self
-            .control_tx
-            .send(Control::Signal {
-                signal: signal.to_string(),
-            })
-            .await;
-        Ok(())
-    }
-
-    async fn write_stdin(&mut self, data: &[u8]) -> Result<()> {
-        self.stdin_tx
-            .send(data.to_vec())
-            .await
-            .map_err(|_| anyhow::anyhow!("session closed"))?;
-        Ok(())
-    }
-
-    async fn eof(&mut self) -> Result<()> {
-        let _ = self.control_tx.send(Control::Eof).await;
-        Ok(())
-    }
-
-    async fn next_event(&mut self) -> Option<SessionEvent> {
-        self.events_rx.recv().await
     }
 }

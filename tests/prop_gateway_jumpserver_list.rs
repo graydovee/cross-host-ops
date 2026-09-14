@@ -105,6 +105,7 @@ fn arb_jumpserver_fields() -> impl Strategy<Value = JumpserverGatewayConfig> {
                     totp_period: mfa.period,
                     max_cached_sessions: None,
                     session_idle_timeout: std::time::Duration::from_secs(300),
+                    suppress_history: true,
                 }
             },
         )

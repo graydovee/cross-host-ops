@@ -21,6 +21,15 @@ use russh::client;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
+use crate::daemon::session::b64;
+
+/// Payload framing for the raw-mode command runner: raw passthrough, or a
+/// base64-encoded region between the begin and end markers.
+enum RawPayload {
+    Plain,
+    Base64 { decode_len: u64 },
+}
+
 pub(crate) const MENU_PROMPT_CONTAINS: &str = "Opt";
 pub(crate) const MFA_PROMPT_CONTAINS: &str = "MFA";
 pub(crate) const SHELL_PROMPT_SUFFIXES: &[&str] = &["$ ", "# "];
@@ -281,6 +290,28 @@ impl PtyShell {
         let _ = self.channel.window_change(cols, rows, 0, 0).await;
     }
 
+    /// Temporarily override the PTY read timeout. Used by cheap liveness
+    /// probes that prefer a fast failure over waiting out the full shell
+    /// timeout (which defaults to the SSH connect timeout, e.g. 30s).
+    pub(crate) fn set_read_timeout(&mut self, timeout: Duration) {
+        self.shell_timeout = timeout;
+    }
+
+    /// Cheap liveness check: run `true` through the cooked-mode machinery
+    /// and expect the exit marker + prompt back. A wedged relay produces no
+    /// output at all, so with a shortened read timeout this fails in seconds
+    /// instead of burning a full operation on a dead shell.
+    pub(crate) async fn probe_alive(&mut self) -> bool {
+        let saved = self.shell_timeout;
+        self.shell_timeout = Duration::from_secs(5);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let result = self.run_command_plain("true", &tx).await;
+        drop(tx);
+        while rx.recv().await.is_some() {}
+        self.shell_timeout = saved;
+        result.is_ok()
+    }
+
     /// Execute `command`, stream stdout to `sender` until the prompt reappears,
     /// then return the exit code captured via a unique marker. The command is
     /// wrapped as `{ command; }; status=$?; printf '{marker}:%s\n' "$status"`.
@@ -293,9 +324,7 @@ impl PtyShell {
         sender: &mpsc::UnboundedSender<Vec<u8>>,
     ) -> Result<i32> {
         let marker = make_marker();
-        let wrapped = format!(
-            "{{ {command}; }}; status=$?; printf '{marker}:%s\\n' \"$status\""
-        );
+        let wrapped = format!("{{ {command}; }}; status=$?; printf '{marker}:%s\\n' \"$status\"");
         self.clear_prompt_remainder();
         self.write_line(&wrapped).await?;
         self.drain_echo_line(3000).await?;
@@ -333,6 +362,346 @@ impl PtyShell {
                 }
             }
         }
+    }
+
+    /// Like [`Self::run_command_plain`], but designed for raw mode (`stty raw
+    /// -echo`): skips `drain_echo_line` (no echo to drain) and uses a strict
+    /// [`SentinelScanner`] instead of prompt-suffix sniffing for completion
+    /// detection. This is critical for binary data transfers where the output
+    /// stream may contain bytes that look like a prompt (`$ `/`# `) — prompt
+    /// sniffing would false-match and truncate the transfer.
+    ///
+    /// The command is wrapped with a UUID **begin** marker (`printf` before the
+    /// command) and a UUID **end** marker (`printf '{end}:%s\n' "$?"` after).
+    /// Output is only forwarded AFTER the begin marker — this discards any
+    /// shell prompt/noise that precedes the command output in raw mode.
+    /// Completion is detected SOLELY by the end sentinel.
+    /// Like [`Self::run_command_raw`], but the payload between the begin and
+    /// end markers is base64 text (see [`crate::daemon::session::b64`]): it
+    /// is decoded incrementally and forwarded to `sender` as binary, while
+    /// the raw stream is scanned for the end marker. The marker's leading `_`
+    /// is outside the base64 alphabet, giving a natural payload boundary;
+    /// `decode_len` (the expected decoded byte count) catches short/overlong
+    /// payloads instead of passing corruption silently.
+    pub(crate) async fn run_command_raw_b64(
+        &mut self,
+        command: &str,
+        decode_len: u64,
+        sender: &mpsc::UnboundedSender<Vec<u8>>,
+    ) -> Result<i32> {
+        self.run_command_raw_impl(command, sender, RawPayload::Base64 { decode_len })
+            .await
+    }
+
+    pub(crate) async fn run_command_raw(
+        &mut self,
+        command: &str,
+        sender: &mpsc::UnboundedSender<Vec<u8>>,
+    ) -> Result<i32> {
+        self.run_command_raw_impl(command, sender, RawPayload::Plain)
+            .await
+    }
+
+    /// Shared raw-mode command runner: begin marker, optionally base64
+    /// payload, then the end sentinel.
+    async fn run_command_raw_impl(
+        &mut self,
+        command: &str,
+        sender: &mpsc::UnboundedSender<Vec<u8>>,
+        payload: RawPayload,
+    ) -> Result<i32> {
+        let begin_marker = make_marker();
+        let end_marker = make_marker();
+        let begin_bytes = begin_marker.as_bytes().to_vec();
+        let end_bytes = end_marker.as_bytes().to_vec();
+        // Wrap: print begin marker, run command, print end marker + exit code.
+        let wrapped = format!(
+            "printf '{begin_marker}'; {{ {command}; }}; status=$?; printf '{end_marker}:%s\\n' \"$status\""
+        );
+        self.clear_prompt_remainder();
+        self.write_line(&wrapped).await?;
+        // No drain_echo_line — raw mode has no echo.
+
+        // Phase 1: discard everything until the begin marker appears.
+        // This removes the shell prompt + any pre-command noise.
+        let mut discard_buf = Vec::new();
+        loop {
+            let chunk = self.read_chunk().await?;
+            discard_buf.extend_from_slice(&chunk);
+            if let Some(pos) = find_subslice(&discard_buf, &begin_bytes) {
+                // Found begin marker. Keep anything after it (it's real output).
+                let after_begin = &discard_buf[pos + begin_bytes.len()..];
+                if !after_begin.is_empty() {
+                    self.pending.extend_from_slice(after_begin);
+                }
+                break;
+            }
+            // Keep only a tail to avoid unbounded growth (begin marker is ~42 bytes).
+            if discard_buf.len() > begin_bytes.len() * 2 {
+                let keep_from = discard_buf.len() - begin_bytes.len() * 2;
+                discard_buf = discard_buf[keep_from..].to_vec();
+            }
+        }
+
+        // Phase 2: emit the payload (raw passthrough or base64-decoded), then
+        // scan for the end sentinel. In base64 mode the scanner still sees
+        // the raw stream (for marker detection) but its output is discarded —
+        // the decoder is the payload source.
+        let mut decoder = match payload {
+            RawPayload::Plain => None,
+            RawPayload::Base64 { decode_len } => Some(b64::B64Decoder::new(decode_len)),
+        };
+        let mut scanner = SentinelScanner::new(end_bytes);
+        let pending = std::mem::take(&mut self.pending);
+        if !pending.is_empty() {
+            if let Some(code) = self.feed_raw_chunk(&pending, sender, &mut decoder, &mut scanner)? {
+                let leftover = scanner.take_leftover();
+                if !leftover.is_empty() {
+                    self.pending.extend_from_slice(&leftover);
+                }
+                if let Some(d) = decoder.as_ref() {
+                    d.finish()?;
+                }
+                return Ok(code);
+            }
+        }
+        loop {
+            let chunk = self.read_chunk().await?;
+            if let Some(code) = self.feed_raw_chunk(&chunk, sender, &mut decoder, &mut scanner)? {
+                let leftover = scanner.take_leftover();
+                if !leftover.is_empty() {
+                    self.pending.extend_from_slice(&leftover);
+                }
+                if let Some(d) = decoder.as_ref() {
+                    d.finish()?;
+                }
+                return Ok(code);
+            }
+        }
+    }
+
+    /// Feed one raw-mode chunk through the payload/scanner split. Returns
+    /// `Some(exit_code)` when the end sentinel matched.
+    fn feed_raw_chunk(
+        &mut self,
+        chunk: &[u8],
+        sender: &mpsc::UnboundedSender<Vec<u8>>,
+        decoder: &mut Option<b64::B64Decoder>,
+        scanner: &mut SentinelScanner,
+    ) -> Result<Option<i32>> {
+        if let Some(d) = decoder.as_mut() {
+            // Base64 payload: decode and forward; the scanner only detects
+            // the end marker, so its "forward" output is dropped.
+            let decoded = d.feed(chunk)?;
+            if !decoded.is_empty() {
+                let _ = sender.send(decoded);
+            }
+            let (_, done) = scanner.feed(chunk);
+            if done {
+                return Ok(Some(scanner.exit_code()));
+            }
+            return Ok(None);
+        }
+        // Plain payload: the scanner IS the payload source (it holds back
+        // potential marker prefixes and forwards the rest).
+        let (forward, done) = scanner.feed(chunk);
+        if !forward.is_empty() {
+            let _ = sender.send(forward);
+        }
+        if done {
+            return Ok(Some(scanner.exit_code()));
+        }
+        Ok(None)
+    }
+
+    /// Non-blocking drain of immediately-available output, fed through the
+    /// scanner. Returns `Some(exit_code)` when the end sentinel already
+    /// matched (used during the upload write phase to fast-fail a dead
+    /// receiver). Buffered leftover bytes are stashed in `pending`.
+    async fn drain_and_scan_early(&mut self, scanner: &mut SentinelScanner) -> Result<Option<i32>> {
+        loop {
+            let message =
+                match tokio::time::timeout(Duration::from_millis(0), self.channel.wait()).await {
+                    Ok(message) => message,
+                    Err(_) => return Ok(None), // nothing immediately available
+                };
+            let Some(message) = message else {
+                bail!("shell closed unexpectedly");
+            };
+            match message {
+                ChannelMsg::Data { data } => {
+                    let (_, done) = scanner.feed(&data);
+                    if done {
+                        let leftover = scanner.take_leftover();
+                        if !leftover.is_empty() {
+                            self.pending.extend_from_slice(&leftover);
+                        }
+                        return Ok(Some(scanner.exit_code()));
+                    }
+                }
+                ChannelMsg::Close | ChannelMsg::Eof => bail!("shell closed unexpectedly"),
+                _ => {}
+            }
+        }
+    }
+
+    /// Upload binary data via a three-phase protocol designed for raw PTY mode:
+    ///
+    /// 1. Send `command` (e.g. `head -c <size> > tmp`), which starts reading
+    ///    from stdin. Wait until `ready_marker` appears in the output — this
+    ///    confirms the receiver process is running and ready to consume data.
+    /// 2. Write binary data chunks from `data_rx` to the PTY (the receiver
+    ///    reads them from its stdin). This is serial — one chunk at a time.
+    /// 3. After `data_rx` closes (all data sent), wait for the `end_marker`
+    ///    sentinel to confirm the command completed with its exit code.
+    ///
+    /// The ready-signal synchronization eliminates the race where data is
+    /// written to the PTY before the receiver process has started reading.
+    pub(crate) async fn upload_binary(
+        &mut self,
+        command: &str,
+        ready_marker: &[u8],
+        end_marker: &[u8],
+        mut data_rx: mpsc::Receiver<Vec<u8>>,
+    ) -> Result<i32> {
+        self.clear_prompt_remainder();
+        self.write_line(command).await?;
+
+        // Phase 1: discard output until the ready marker appears.
+        let mut buf = Vec::new();
+        loop {
+            let chunk = self.read_chunk().await?;
+            buf.extend_from_slice(&chunk);
+            if let Some(pos) = find_subslice(&buf, ready_marker) {
+                let after = &buf[pos + ready_marker.len()..];
+                self.pending.extend_from_slice(after);
+                break;
+            }
+            if buf.len() > ready_marker.len() * 4 {
+                let keep = buf.len() - ready_marker.len() * 2;
+                buf = buf[keep..].to_vec();
+            }
+        }
+
+        // Phase 2: feed data chunks to the PTY (receiver reads them) while
+        // opportunistically draining output. Two hazards this guards against:
+        //   - A wedged relay stops draining the SSH window: the write blocks
+        //     forever unless bounded. The timeout surfaces it as an error so
+        //     the transfer fails fast (the remote partial stays for --resume)
+        //     instead of hanging at a frozen progress bar.
+        //   - The receiver pipeline dies mid-stream (e.g. `base64 -d` rejects
+        //     the wire): the end marker arrives EARLY, while data is still
+        //     being written. Detecting it stops the pointless remaining
+        //     writes and reports the exit code immediately.
+        let mut scanner = SentinelScanner::new(end_marker.to_vec());
+        while let Some(chunk) = data_rx.recv().await {
+            tokio::time::timeout(Duration::from_secs(60), self.write_raw(&chunk))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("upload stalled: bastion stopped accepting data for 60s")
+                })??;
+            if let Some(code) = self.drain_and_scan_early(&mut scanner).await? {
+                bail!(
+                    "remote receiver exited early with code {code} (wire rejected or receiver died)"
+                );
+            }
+        }
+
+        // Phase 3: wait for the end sentinel (UUID-based, strict match).
+        let pending = std::mem::take(&mut self.pending);
+        if !pending.is_empty() {
+            let (_, done) = scanner.feed(&pending);
+            if done {
+                let leftover = scanner.take_leftover();
+                if !leftover.is_empty() {
+                    self.pending.extend_from_slice(&leftover);
+                }
+                return Ok(scanner.exit_code());
+            }
+        }
+        loop {
+            let chunk = self.read_chunk().await?;
+            let (_, done) = scanner.feed(&chunk);
+            if done {
+                let leftover = scanner.take_leftover();
+                if !leftover.is_empty() {
+                    self.pending.extend_from_slice(&leftover);
+                }
+                return Ok(scanner.exit_code());
+            }
+        }
+    }
+    /// from `stdin_rx` into the PTY while the command runs. Designed for raw-mode
+    /// binary upload: the command (e.g. `head -c N > file`) reads stdin, and we
+    /// feed it chunk-by-chunk without buffering the whole file.
+    ///
+    /// The command is wrapped in the same UUID-sentinel as `run_command_plain`,
+    /// so completion is detected by the strict marker match — no prompt sniffing.
+    /// Output (if any) is forwarded to `sender`. Returns the exit code.
+    pub(crate) async fn run_command_with_stdin(
+        &mut self,
+        command: &str,
+        sender: &mpsc::UnboundedSender<Vec<u8>>,
+        mut stdin_rx: mpsc::Receiver<Vec<u8>>,
+    ) -> Result<i32> {
+        let marker = make_marker();
+        let wrapped = format!("{{ {command}; }}; status=$?; printf '{marker}:%s\\n' \"$status\"");
+        self.clear_prompt_remainder();
+        self.write_line(&wrapped).await?;
+        // No drain_echo_line — this runs in raw mode where echo is disabled.
+        // Use SentinelScanner (not prompt sniffing) for completion detection,
+        // since this path transfers binary data that could false-match prompts.
+        let mut scanner = SentinelScanner::new(marker.as_bytes().to_vec());
+        let mut first_output = true;
+        loop {
+            tokio::select! {
+                // Drain stdin data → write to PTY (feed the running command).
+                data = stdin_rx.recv() => match data {
+                    Some(chunk) => {
+                        self.write_raw(&chunk).await?;
+                    }
+                    None => {
+                        // stdin closed — continue waiting for command output.
+                    }
+                },
+                // Read PTY output → detect completion via strict sentinel scan.
+                chunk_result = self.read_chunk() => {
+                    let chunk = chunk_result?;
+                    let (forward, done) = scanner.feed(&chunk);
+                    if !forward.is_empty() {
+                        let out = if first_output {
+                            first_output = false;
+                            strip_leading_shell_noise(&forward).to_vec()
+                        } else {
+                            forward
+                        };
+                        if !out.is_empty() {
+                            let _ = sender.send(out);
+                        }
+                    }
+                    if done {
+                        let leftover = scanner.take_leftover();
+                        if !leftover.is_empty() {
+                            self.pending.extend_from_slice(&leftover);
+                        }
+                        return Ok(scanner.exit_code());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Force-close the underlying channel with a timeout. Used for cleanup when
+    /// the shell is in an unrecoverable state (e.g. raw mode + failed transfer).
+    /// After this, the shell must be discarded — never returned to the cache.
+    pub(crate) async fn force_close(&mut self) {
+        let _ = tokio::time::timeout(Duration::from_secs(3), self.channel.close()).await;
+    }
+
+    /// Send a Ctrl-C to the PTY (interrupt a potentially stuck command).
+    /// Best-effort, no await on output.
+    pub(crate) async fn send_interrupt(&mut self) {
+        let _ = self.channel.data(Cursor::new(b"\x03")).await;
     }
 
     /// Byte-for-byte bidirectional passthrough: forward `stdin_rx` to the PTY and
@@ -535,7 +904,10 @@ fn partial_suffix_match(buf: &[u8], pattern: &[u8]) -> usize {
         return 0;
     }
     let max = buf.len().min(pattern.len() - 1);
-    (1..=max).rev().find(|&len| &buf[buf.len() - len..] == &pattern[..len]).unwrap_or(0)
+    (1..=max)
+        .rev()
+        .find(|&len| buf[buf.len() - len..] == pattern[..len])
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -703,7 +1075,10 @@ fn lookahead_sentinel(after: &[u8]) -> Lookahead {
         .and_then(|s| s.parse::<i32>().ok())
         .unwrap_or(0);
     // consumed = ':' + digits + terminator ('\n' or '\r\n')
-    Lookahead::Confirmed { code, consumed: i + term_len }
+    Lookahead::Confirmed {
+        code,
+        consumed: i + term_len,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -878,13 +1253,8 @@ Opt>";
     #[test]
     fn scanner_matches_marker_split_across_chunks() {
         let marker = b"__XHO_E_test__";
-        let (out, code, _leftover) = scan(
-            marker,
-            &[
-                b"file1\n__XHO_E_t",
-                b"est__:42\ndevops@host:~$ ",
-            ],
-        );
+        let (out, code, _leftover) =
+            scan(marker, &[b"file1\n__XHO_E_t", b"est__:42\ndevops@host:~$ "]);
         assert_eq!(out, b"file1\n");
         assert_eq!(code, 42);
     }
@@ -893,10 +1263,7 @@ Opt>";
     fn scanner_lookahead_split_across_chunks() {
         // Marker complete in chunk 1, but the `:7\n` lookahead arrives later.
         let marker = b"__XHO_E_test__";
-        let (out, code, _leftover) = scan(
-            marker,
-            &[b"out__XHO_E_test__", b":7\nprompt$ "],
-        );
+        let (out, code, _leftover) = scan(marker, &[b"out__XHO_E_test__", b":7\nprompt$ "]);
         assert_eq!(out, b"out");
         assert_eq!(code, 7);
     }
@@ -968,10 +1335,7 @@ Opt>";
     fn scanner_holds_partial_marker_suffix() {
         // Chunk ends with a prefix of the marker; it must be held, not flushed.
         let marker = b"__XHO_E_test__";
-        let (out, code, _leftover) = scan(
-            marker,
-            &[b"data __XHO_E", b"_test__:0\n"],
-        );
+        let (out, code, _leftover) = scan(marker, &[b"data __XHO_E", b"_test__:0\n"]);
         assert_eq!(out, b"data ");
         assert_eq!(code, 0);
     }

@@ -15,8 +15,6 @@ pub mod reverse_client;
 #[allow(dead_code)]
 pub mod reverse_proxy;
 #[allow(dead_code)]
-pub mod review;
-#[allow(dead_code)]
 pub mod rpc;
 #[allow(dead_code)]
 pub mod session;
@@ -55,12 +53,17 @@ use uuid::Uuid;
 
 use self::ssh_server::{IncomingConn, LocalConn, RemoteSshServer, load_host_keys};
 use crate::config::{
-    AppConfig, GatewayConfig, ReviewAction, default_config_path, load_server_config,
+    AppConfig, GatewayConfig, ReviewAction, RiskLevel, default_config_path, load_server_config,
     validate_gateways,
 };
 use crate::logging::init_logging;
 #[cfg(unix)]
 use crate::logging::reopen_log_output;
+use crate::oversight::audit;
+use crate::oversight::{
+    AuditEvent, Caller, Operation, OperationDetail, OperationKind, Oversight, ReviewDecision,
+    ReviewOutcome, SessionKind, extract_caller,
+};
 use crate::protocol::{self, ExecRequest, ServerEvent, rpc as proto_rpc};
 use crate::types::{CopyDirection, CopyFrame, CopySpec};
 
@@ -68,7 +71,6 @@ use self::gateway::Gateway;
 use self::gateway::Route;
 use self::gateway::auth::AuthPrompter;
 use self::resolver::{ResolveResult, Resolver};
-use self::review::CommandReviewer;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -111,7 +113,7 @@ pub struct DaemonState {
     pub config: Arc<RwLock<AppConfig>>,
     /// All gateways, ordered by config declaration. "local" is always first.
     pub gateways: Vec<(String, Arc<dyn Gateway>)>,
-    pub reviewer: CommandReviewer,
+    pub oversight: Oversight,
     pub shutdown_tx: mpsc::Sender<()>,
     pub origin: DaemonOrigin,
     pub cli_start_options: CliStartOptions,
@@ -157,6 +159,8 @@ impl DaemonState {
 
         let mut config = self.config.write().await;
         config.gateways = new_config.gateways;
+        config.audit = new_config.audit;
+        self.oversight.apply_config(&config);
         info!(
             config_path = %self.config_path.display(),
             "gateways reloaded successfully"
@@ -273,7 +277,17 @@ pub async fn run_with_overrides(
     if let Some(level) = log_level_override {
         loaded.server.log_level = level;
     }
-    let _log_guard = init_logging(loaded.server.log_path.clone(), &loaded.server.log_level)?;
+    // TOKIO_CONSOLE=1 swaps file logging for the tokio-console task inspector
+    // (both want the global tracing subscriber; diagnostics only).
+    let console_mode = std::env::var("TOKIO_CONSOLE").as_deref() == Ok("1");
+    let _log_guard = if console_mode {
+        console_subscriber::init();
+        eprintln!("tokio-console: task inspector active on 127.0.0.1:6669");
+        None
+    } else {
+        init_logging(loaded.server.log_path.clone(), &loaded.server.log_level)?
+    };
+
     info!(config_path = %config_path.display(), "starting xhod");
 
     let config = Arc::new(RwLock::new(loaded.clone()));
@@ -294,22 +308,42 @@ pub async fn run_with_overrides(
     if (loaded.reverse_proxy.enable && loaded.reverse_proxy.allow_host_access)
         || loaded.server.proxy.enable
     {
+        // Sessions on this node start in the configured workdir, falling back
+        // to the user's home directory (sshd parity) rather than inheriting
+        // the daemon's cwd.
+        let workdir = loaded
+            .reverse_proxy
+            .workdir
+            .clone()
+            .map(PathBuf::from)
+            .or_else(|| home::home_dir());
+        if let Some(dir) = &workdir {
+            if !dir.is_dir() {
+                warn!(
+                    workdir = %dir.display(),
+                    "reverse_proxy.workdir does not exist; local sessions will fail to start"
+                );
+            }
+        }
         gateways.push((
             gateway::localhost::SELF_GATEWAY_NAME.to_string(),
             Arc::new(gateway::localhost::LocalhostGateway::new(
                 loaded.reverse_proxy.shell.clone(),
                 loaded.reverse_proxy.user.clone(),
                 loaded.server.proxy.sftp_server_path.clone(),
+                workdir,
             )),
         ));
         info!("_self (localhost) gateway registered");
     }
 
+    let oversight = Oversight::new()?;
+    oversight.init_audit(&loaded)?;
     let state = DaemonState {
         config_path,
         config: config.clone(),
         gateways,
-        reviewer: CommandReviewer::new()?,
+        oversight,
         shutdown_tx,
         origin,
         cli_start_options,
@@ -465,6 +499,9 @@ pub async fn run_with_overrides(
             auth_rejection_time_initial: Some(Duration::from_secs(0)),
             keys: host_keys,
             inactivity_timeout: server_cfg.inactivity_timeout,
+            // Probe clients so half-open connections are reaped (and reverse
+            // node registrations freed) instead of lingering forever.
+            keepalive_interval: Some(state.config.read().await.ssh.keepalive_interval),
             ..Default::default()
         });
         info!(listen_addr = %remote_config.listen_addr, "listening on remote SSH");
@@ -495,6 +532,7 @@ pub async fn run_with_overrides(
                         auth_rejection_time_initial: Some(Duration::from_secs(0)),
                         keys: host_keys,
                         inactivity_timeout: server_cfg.inactivity_timeout,
+                        keepalive_interval: Some(state.config.read().await.ssh.keepalive_interval),
                         ..Default::default()
                     });
                     info!(
@@ -565,6 +603,12 @@ pub async fn run_with_overrides(
                         warn!(error = %format!("{error:#}"), "failed to reopen log output after SIGHUP")
                     }
                 }
+                match audit::reopen_audit_output() {
+                    Ok(()) => info!("reopened audit output after SIGHUP"),
+                    Err(error) => {
+                        warn!(error = %format!("{error:#}"), "failed to reopen audit output after SIGHUP")
+                    }
+                }
                 sighup_state.reload_config().await;
             }
         });
@@ -607,6 +651,7 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
         request: Request<Streaming<proto_rpc::ExecuteRequest>>,
     ) -> Result<Response<Self::ExecuteStream>, Status> {
         info!("accepted execute stream");
+        let caller = extract_caller(&request);
         let mut inbound = request.into_inner();
         let state = self.state.clone();
         let (sender, receiver) = mpsc::channel(64);
@@ -637,7 +682,7 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                     shell: start.shell,
                     no_shell: start.no_shell,
                 };
-                process_execute(exec, &state, &mut inbound, &sender).await
+                process_execute(exec, &state, &mut inbound, &sender, caller).await
             }
             .await;
 
@@ -656,6 +701,7 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
         &self,
         request: Request<Streaming<proto_rpc::CopyRequest>>,
     ) -> Result<Response<Self::CopyStream>, Status> {
+        let caller = extract_caller(&request);
         let mut inbound = request.into_inner();
         let state = self.state.clone();
         let (sender, receiver) = mpsc::channel(16);
@@ -673,14 +719,21 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                 let resolved = resolve_target_with_merged_view(&state, &target_input).await?;
                 let route = resolved.routes
                     .first()
-                    .ok_or_else(|| anyhow!("no resolved target candidates"))?;
+                    .ok_or_else(|| anyhow!("no resolved target candidates"))?
+                    .clone();
                 if let Some(warning) = resolved.warning {
                     sender
                         .send(Ok(protocol::copy_info_response(warning)))
                         .await
                         .map_err(|_| anyhow!("copy client stream closed"))?;
                 }
+                let gateway_kind = state
+                    .find_gateway_any(&route.gateway_name)
+                    .await
+                    .map(|g| g.kind());
+                let execution_id = Uuid::new_v4();
                 info!(
+                    execution_id = %execution_id,
                     target = %route.end_target,
                     gateway = %route.gateway_name,
                     direction = ?spec.direction,
@@ -690,6 +743,90 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                     timeout_ms,
                     "copy request"
                 );
+
+                // Audit: copy started.
+                audit_started(
+                    OperationKind::Copy,
+                    &caller,
+                    &route,
+                    gateway_kind,
+                    &execution_id.to_string(),
+                    Some(&target_input),
+                    Some(timeout_ms),
+                    &OperationDetail::Copy {
+                        direction: spec.direction,
+                        remote_path: &spec.remote_path,
+                        recursive: spec.recursive,
+                        source_name: &spec.source_name,
+                    },
+                );
+
+                // Oversight: AI review (copy of sensitive dirs).
+                let config = state.config.read().await.clone();
+                match run_review(
+                    &state,
+                    &config,
+                    OperationKind::Copy,
+                    &caller,
+                    &route,
+                    gateway_kind,
+                    Some(&execution_id.to_string()),
+                    Some(timeout_ms),
+                    &OperationDetail::Copy {
+                        direction: spec.direction,
+                        remote_path: &spec.remote_path,
+                        recursive: spec.recursive,
+                        source_name: &spec.source_name,
+                    },
+                )
+                .await
+                {
+                    Enforced::Proceed => {}
+                    Enforced::Confirm(reason) => {
+                        wait_for_copy_confirmation(
+                            execution_id, &mut inbound, &sender, &reason,
+                        )
+                        .await?;
+                    }
+                    Enforced::Denied(reason) => {
+                        audit::record(&audit_event_result(
+                            OperationKind::Copy, &caller, &route, gateway_kind,
+                            &execution_id.to_string(), Some(&target_input), Some(timeout_ms),
+                            "denied", None, Some(&reason),
+                        ));
+                        sender
+                            .send(Ok(protocol::copy_error_response(format!("copy denied: {}", reason))))
+                            .await
+                            .map_err(|_| anyhow!("copy client stream closed"))?;
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                }
+
+                // Upload resume: validate the CLI's hints against remote
+                // partial state and tell it the effective offsets BEFORE it
+                // streams frames (the CLI waits for this ack).
+                if spec.direction == CopyDirection::Upload && !spec.resume.is_empty() {
+                    let effective = match session::probe_upload_resume(&state, &route, &mut spec).await
+                    {
+                        Ok(entries) => entries,
+                        Err(e) => {
+                            warn!(error = %format!("{e:#}"),
+                                "upload resume probe failed; transferring fresh");
+                            spec.resume
+                                .iter()
+                                .map(|e| crate::types::ResumeEntry {
+                                    offset: 0,
+                                    ..e.clone()
+                                })
+                                .collect()
+                        }
+                    };
+                    spec.resume = effective.clone();
+                    sender
+                        .send(Ok(protocol::copy_resume_ack_response(effective)))
+                        .await
+                        .map_err(|_| anyhow!("copy client stream closed"))?;
+                }
 
                 let mut download_relay_task: Option<tokio::task::JoinHandle<()>> = None;
                 match spec.direction {
@@ -713,6 +850,7 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                                         }
                                     }
                                     Some(proto_rpc::copy_request::Request::AuthInput(_)) => {}
+                                    Some(proto_rpc::copy_request::Request::Confirm(_)) => {}
                                     Some(proto_rpc::copy_request::Request::Start(_)) | None => {}
                                 }
                             }
@@ -749,8 +887,8 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
 
                 let copy_task: tokio::task::JoinHandle<Result<(), anyhow::Error>> = {
                     let state = state.clone();
-                    let route = route.clone();
-                    tokio::spawn(async move { session::copy_via_session(&state, &route, spec).await })
+                    let route_clone = route.clone();
+                    tokio::spawn(async move { session::copy_via_session(&state, &route_clone, spec).await })
                 };
                 tokio::pin!(copy_task);
 
@@ -765,6 +903,11 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                         } => {
                             warn!(timeout_ms, "copy timed out");
                             copy_task.abort();
+                            audit::record(&audit_event_result(
+                                OperationKind::Copy, &caller, &route, gateway_kind,
+                                &execution_id.to_string(), Some(&target_input), Some(timeout_ms),
+                                "timeout", None, Some("copy timed out"),
+                            ));
                             sender
                                 .send(Ok(protocol::copy_error_response("copy timed out (exit code 124)")))
                                 .await
@@ -773,6 +916,11 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                         }
                         result = &mut copy_task => {
                             if let Err(e) = result? {
+                                audit::record(&audit_event_result(
+                                    OperationKind::Copy, &caller, &route, gateway_kind,
+                                    &execution_id.to_string(), Some(&target_input), Some(timeout_ms),
+                                    "failed", None, Some(&e.to_string()),
+                                ));
                                 sender
                                     .send(Ok(protocol::copy_error_response(e.to_string())))
                                     .await
@@ -782,6 +930,11 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                             if let Some(relay_task) = download_relay_task.take() {
                                 let _ = relay_task.await;
                             }
+                            audit::record(&audit_event_result(
+                                OperationKind::Copy, &caller, &route, gateway_kind,
+                                &execution_id.to_string(), Some(&target_input), Some(timeout_ms),
+                                "completed", Some(0), None,
+                            ));
                             sender
                                 .send(Ok(protocol::copy_complete_response(String::new())))
                                 .await
@@ -973,6 +1126,7 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
         &self,
         request: Request<Streaming<proto_rpc::SessionRequest>>,
     ) -> Result<Response<Self::OpenSessionStream>, Status> {
+        let caller = extract_caller(&request);
         let mut inbound = request.into_inner();
         let state = self.state.clone();
         let (sender, receiver) = mpsc::channel(64);
@@ -995,80 +1149,204 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                     .into_iter()
                     .next()
                     .ok_or_else(|| anyhow!("no route for target '{target}'"))?;
-                let mut sess = session::open_target_session(&state, &route).await?;
+                let gateway_kind = state
+                    .find_gateway_any(&route.gateway_name)
+                    .await
+                    .map(|g| g.kind());
+                let sess = session::open_target_session(&state, &route).await?;
+                let (writer, mut events) = sess.split();
 
                 // Acknowledge the open. Exec/shell/subsystem arrive as later
                 // requests and drive the session start.
-                sender
-                    .send(Ok(proto_rpc::SessionResponse {
-                        msg: Some(proto_rpc::session_response::Msg::Started(
-                            proto_rpc::SessionStarted {},
-                        )),
-                    }))
-                    .await
-                    .map_err(|_| anyhow!("open_session: client stream closed"))?;
+                if send_session_msg(
+                    &sender,
+                    proto_rpc::session_response::Msg::Started(proto_rpc::SessionStarted {}),
+                )
+                .await
+                {
+                    bail!("open_session: client stream closed")
+                }
 
+                // Downlink: session events → response stream. Runs as its own
+                // task so a stalled gRPC consumer only pauses this direction —
+                // the uplink task below keeps reading client requests, which
+                // is what prevents the historical bidirectional deadlock.
+                let downlink_sender = sender.clone();
+                let downlink = {
+                    let caller = caller.clone();
+                    let route = route.clone();
+                    let target = target.clone();
+                    tokio::spawn(async move {
+                        while let Some(ev) = events.next().await {
+                            match ev {
+                                session::SessionEvent::Stdout(d) => {
+                                    if send_session_msg(
+                                        &downlink_sender,
+                                        proto_rpc::session_response::Msg::Data(
+                                            proto_rpc::SessionData { data: d },
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        break;
+                                    }
+                                }
+                                session::SessionEvent::Stderr(d) => {
+                                    if send_session_msg(
+                                        &downlink_sender,
+                                        proto_rpc::session_response::Msg::Stderr(
+                                            proto_rpc::SessionExtendedData { data: d },
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        break;
+                                    }
+                                }
+                                session::SessionEvent::ExitStatus(c) => {
+                                    audit::record(&audit_event_result(
+                                        OperationKind::Session,
+                                        &caller,
+                                        &route,
+                                        gateway_kind,
+                                        &Uuid::new_v4().to_string(),
+                                        Some(&target),
+                                        None,
+                                        "completed",
+                                        Some(c),
+                                        None,
+                                    ));
+                                    let _ = send_session_msg(
+                                        &downlink_sender,
+                                        proto_rpc::session_response::Msg::ExitStatus(
+                                            proto_rpc::SessionExitStatus { code: c },
+                                        ),
+                                    )
+                                    .await;
+                                    let _ = send_session_msg(
+                                        &downlink_sender,
+                                        proto_rpc::session_response::Msg::Eof(
+                                            proto_rpc::SessionEofIndication {},
+                                        ),
+                                    )
+                                    .await;
+                                    break;
+                                }
+                                session::SessionEvent::ExitSignal(s) => {
+                                    let _ = send_session_msg(
+                                        &downlink_sender,
+                                        proto_rpc::session_response::Msg::ExitSignal(
+                                            proto_rpc::SessionExitSignal { signal: s },
+                                        ),
+                                    )
+                                    .await;
+                                    break;
+                                }
+                                session::SessionEvent::Eof => {
+                                    let _ = send_session_msg(
+                                        &downlink_sender,
+                                        proto_rpc::session_response::Msg::Eof(
+                                            proto_rpc::SessionEofIndication {},
+                                        ),
+                                    )
+                                    .await;
+                                    break;
+                                }
+                            }
+                        }
+                    })
+                };
+
+                // Uplink: client requests → session writer. Start-op failures
+                // are reported best-effort with a non-blocking send (the
+                // downlink task owns orderly delivery).
                 loop {
-                    tokio::select! {
-                        req = inbound.message() => match req {
-                            Ok(Some(r)) => match r.msg {
-                                Some(proto_rpc::session_request::Msg::Pty(p)) => { let _ = sess.request_pty(&p.term, p.cols, p.rows, &[]).await; }
-                                Some(proto_rpc::session_request::Msg::Env(e)) => { let _ = sess.set_env(&e.key, &e.value).await; }
-                                Some(proto_rpc::session_request::Msg::Exec(e)) => { if let Err(er) = sess.exec(&e.command).await {
-                                    let _ = sender.send(Ok(proto_rpc::SessionResponse { msg: Some(proto_rpc::session_response::Msg::Error(proto_rpc::SessionError { message: er.to_string() })) })).await;
-                                }}
-                                Some(proto_rpc::session_request::Msg::Shell(_)) => { if let Err(er) = sess.shell().await {
-                                    let _ = sender.send(Ok(proto_rpc::SessionResponse { msg: Some(proto_rpc::session_response::Msg::Error(proto_rpc::SessionError { message: er.to_string() })) })).await;
-                                }}
-                                Some(proto_rpc::session_request::Msg::Subsystem(s)) => { if let Err(er) = sess.subsystem(&s.name).await {
-                                    let _ = sender.send(Ok(proto_rpc::SessionResponse { msg: Some(proto_rpc::session_response::Msg::Error(proto_rpc::SessionError { message: er.to_string() })) })).await;
-                                }}
-                                Some(proto_rpc::session_request::Msg::Resize(r)) => { let _ = sess.window_change(r.cols, r.rows).await; }
-                                Some(proto_rpc::session_request::Msg::Signal(s)) => { let _ = sess.signal(&s.signal).await; }
-                                Some(proto_rpc::session_request::Msg::Data(d)) => { let _ = sess.write_stdin(&d.data).await; }
-                                Some(proto_rpc::session_request::Msg::Eof(_)) => { let _ = sess.eof().await; }
-                                Some(proto_rpc::session_request::Msg::Open(_)) | None => break,
-                            },
-                            Ok(None) => break,
-                            Err(_) => break,
-                        },
-                        ev = sess.next_event() => match ev {
-                            Some(session::SessionEvent::Stdout(d)) => {
-                                if send_session_msg(&sender, proto_rpc::session_response::Msg::Data(proto_rpc::SessionData { data: d })).await { break; }
+                    let req = match inbound.message().await {
+                        Ok(Some(r)) => r,
+                        Ok(None) => break,
+                        Err(_) => break,
+                    };
+                    match req.msg {
+                        Some(proto_rpc::session_request::Msg::Pty(p)) => {
+                            let _ = writer.request_pty(&p.term, p.cols, p.rows, &[]).await;
+                        }
+                        Some(proto_rpc::session_request::Msg::Env(e)) => {
+                            let _ = writer.set_env(&e.key, &e.value).await;
+                        }
+                        Some(proto_rpc::session_request::Msg::Exec(e)) => {
+                            audit_session_op(
+                                &caller,
+                                &route,
+                                gateway_kind,
+                                &target,
+                                SessionKind::Exec,
+                                &e.command,
+                                "started",
+                            );
+                            if let Err(er) = writer.exec(&e.command).await {
+                                try_send_session_error(&sender, &er.to_string());
                             }
-                            Some(session::SessionEvent::Stderr(d)) => {
-                                if send_session_msg(&sender, proto_rpc::session_response::Msg::Stderr(proto_rpc::SessionExtendedData { data: d })).await { break; }
+                        }
+                        Some(proto_rpc::session_request::Msg::Shell(_)) => {
+                            audit_session_op(
+                                &caller,
+                                &route,
+                                gateway_kind,
+                                &target,
+                                SessionKind::Shell,
+                                "(interactive)",
+                                "started",
+                            );
+                            if let Err(er) = writer.shell().await {
+                                try_send_session_error(&sender, &er.to_string());
                             }
-                            Some(session::SessionEvent::ExitStatus(c)) => {
-                                let _ = send_session_msg(&sender, proto_rpc::session_response::Msg::ExitStatus(proto_rpc::SessionExitStatus { code: c })).await;
-                                let _ = send_session_msg(&sender, proto_rpc::session_response::Msg::Eof(proto_rpc::SessionEofIndication {})).await;
-                                break;
+                        }
+                        Some(proto_rpc::session_request::Msg::Subsystem(s)) => {
+                            audit_session_op(
+                                &caller,
+                                &route,
+                                gateway_kind,
+                                &target,
+                                SessionKind::Subsystem,
+                                &s.name,
+                                "started",
+                            );
+                            if let Err(er) = writer.subsystem(&s.name).await {
+                                try_send_session_error(&sender, &er.to_string());
                             }
-                            Some(session::SessionEvent::ExitSignal(s)) => {
-                                let _ = send_session_msg(&sender, proto_rpc::session_response::Msg::ExitSignal(proto_rpc::SessionExitSignal { signal: s })).await;
-                                break;
-                            }
-                            Some(session::SessionEvent::Eof) | None => {
-                                let _ = send_session_msg(&sender, proto_rpc::session_response::Msg::Eof(proto_rpc::SessionEofIndication {})).await;
-                                break;
-                            }
-                        },
+                        }
+                        Some(proto_rpc::session_request::Msg::Resize(r)) => {
+                            let _ = writer.window_change(r.cols, r.rows).await;
+                        }
+                        Some(proto_rpc::session_request::Msg::Signal(s)) => {
+                            let _ = writer.signal(&s.signal).await;
+                        }
+                        Some(proto_rpc::session_request::Msg::Data(d)) => {
+                            let _ = writer.write_stdin(&d.data).await;
+                        }
+                        Some(proto_rpc::session_request::Msg::Eof(_)) => {
+                            let _ = writer.eof().await;
+                        }
+                        Some(proto_rpc::session_request::Msg::Open(_)) | None => break,
                     }
                 }
+                // Dropping the writer closes the session's stdin side; the
+                // downlink task drains trailing events (including the exit
+                // status) before the response stream ends.
+                drop(writer);
+                let _ = downlink.await;
                 Ok::<(), anyhow::Error>(())
             }
             .await;
             if let Err(error) = result {
                 error!(error = %format!("{error:#}"), "open_session stream failed");
-                let _ = sender
-                    .send(Ok(proto_rpc::SessionResponse {
-                        msg: Some(proto_rpc::session_response::Msg::Error(
-                            proto_rpc::SessionError {
-                                message: error.to_string(),
-                            },
-                        )),
-                    }))
-                    .await;
+                let _ = send_session_msg(
+                    &sender,
+                    proto_rpc::session_response::Msg::Error(proto_rpc::SessionError {
+                        message: error.to_string(),
+                    }),
+                )
+                .await;
             }
         });
 
@@ -1367,6 +1645,7 @@ async fn process_execute(
     state: &DaemonState,
     inbound: &mut Streaming<proto_rpc::ExecuteRequest>,
     sender: &mpsc::Sender<Result<proto_rpc::ExecuteResponse, Status>>,
+    caller: Caller,
 ) -> Result<()> {
     if request.argv.is_empty() {
         bail!("argv must not be empty");
@@ -1395,7 +1674,7 @@ async fn process_execute(
             .await?;
             return Ok(());
         }
-        return process_interactive_execute(request, state, inbound, sender).await;
+        return process_interactive_execute(request, state, inbound, sender, caller).await;
     }
 
     let execution_id = Uuid::new_v4();
@@ -1410,6 +1689,10 @@ async fn process_execute(
     }
 
     let review_command = request.argv.join(" ");
+    let gateway_kind = state
+        .find_gateway_any(&route.gateway_name)
+        .await
+        .map(|g| g.kind());
 
     info!(
         execution_id = %execution_id,
@@ -1419,95 +1702,59 @@ async fn process_execute(
         "resolved target"
     );
 
-    // Review logic
-    let decision = match state
-        .reviewer
-        .review(
-            &config.review,
-            &config.secret_resolver(None),
-            &route.end_target,
-            &request.argv,
-            &review_command,
-        )
-        .await
+    // Audit: operation started.
+    audit_started(
+        OperationKind::Exec,
+        &caller,
+        route,
+        gateway_kind,
+        &execution_id.to_string(),
+        Some(&request.target),
+        Some(request.timeout_ms),
+        &OperationDetail::Exec {
+            argv: &request.argv,
+            command: &review_command,
+            interactive: false,
+            tty: request.tty,
+            shell: !request.shell.is_empty(),
+            no_shell: request.no_shell,
+        },
+    );
+
+    // Oversight: AI review (exec).
+    match run_review(
+        state,
+        &config,
+        OperationKind::Exec,
+        &caller,
+        route,
+        gateway_kind,
+        Some(&execution_id.to_string()),
+        Some(request.timeout_ms),
+        &OperationDetail::Exec {
+            argv: &request.argv,
+            command: &review_command,
+            interactive: false,
+            tty: request.tty,
+            shell: !request.shell.is_empty(),
+            no_shell: request.no_shell,
+        },
+    )
+    .await
     {
-        Ok(result) => result,
-        Err(error) => {
-            warn!(
-                execution_id = %execution_id,
-                error = %format!("{error:#}"),
-                "review failed"
-            );
-            let action = config.review.failure_action;
-            let risk_level = crate::config::RiskLevel::Dangerous;
+        Enforced::Proceed => {}
+        Enforced::Confirm(reason) => {
+            wait_for_confirmation(execution_id, inbound, sender, &reason).await?;
+        }
+        Enforced::Denied(reason) => {
             send_execute_event(
                 sender,
-                ServerEvent::ReviewResult {
-                    execution_id,
-                    risk_level,
-                    action,
-                    reason: format!("review failed: {error:#}"),
-                    matched_whitelist_reason: None,
+                ServerEvent::Error {
+                    message: format!("command denied: {}", reason),
                 },
             )
             .await?;
-            match action {
-                ReviewAction::Allow | ReviewAction::Warn => None,
-                ReviewAction::Confirm => {
-                    wait_for_confirmation(execution_id, inbound, sender, "review service failed")
-                        .await?;
-                    None
-                }
-                ReviewAction::Deny => {
-                    send_execute_event(
-                        sender,
-                        ServerEvent::Error {
-                            message: format!("review failed and policy is deny: {error:#}"),
-                        },
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            }
-        }
-    };
-
-    if let Some(decision) = decision {
-        info!(
-            execution_id = %execution_id,
-            risk_level = %decision.risk_level,
-            action = %decision.action,
-            matched_whitelist_reason = decision.matched_whitelist_reason.as_deref().unwrap_or(""),
-            "review completed"
-        );
-        send_execute_event(
-            sender,
-            ServerEvent::ReviewResult {
-                execution_id,
-                risk_level: decision.risk_level,
-                action: decision.action,
-                reason: decision.reason.clone(),
-                matched_whitelist_reason: decision.matched_whitelist_reason.clone(),
-            },
-        )
-        .await?;
-        match decision.action {
-            ReviewAction::Allow | ReviewAction::Warn => {}
-            ReviewAction::Confirm => {
-                debug!(execution_id = %execution_id, "waiting for confirmation");
-                wait_for_confirmation(execution_id, inbound, sender, &decision.reason).await?;
-            }
-            ReviewAction::Deny => {
-                warn!(execution_id = %execution_id, "execution denied by review");
-                send_execute_event(
-                    sender,
-                    ServerEvent::Error {
-                        message: format!("command denied: {}", decision.reason),
-                    },
-                )
-                .await?;
-                return Ok(());
-            }
+            return Ok(());
         }
     }
 
@@ -1644,6 +1891,18 @@ async fn process_execute(
                         return Ok(());
                     }
                 }
+                audit::record(&audit_event_result(
+                    OperationKind::Exec,
+                    &caller,
+                    route,
+                    gateway_kind,
+                    &execution_id.to_string(),
+                    Some(&request.target),
+                    Some(timeout_ms),
+                    "timeout",
+                    Some(124),
+                    None,
+                ));
                 let _ = send_execute_event(sender, ServerEvent::ExitStatus { code: 124 }).await;
                 break;
             }
@@ -1651,6 +1910,18 @@ async fn process_execute(
                 let code = match result? {
                     Ok(c) => c,
                     Err(e) => {
+                        audit::record(&audit_event_result(
+                            OperationKind::Exec,
+                            &caller,
+                            route,
+                            gateway_kind,
+                            &execution_id.to_string(),
+                            Some(&request.target),
+                            Some(timeout_ms),
+                            "failed",
+                            None,
+                            Some(&e.to_string()),
+                        ));
                         let _ = send_execute_event(sender, ServerEvent::Error { message: e.to_string() }).await;
                         return Ok(());
                     }
@@ -1661,6 +1932,18 @@ async fn process_execute(
                     }
                 }
                 info!(execution_id = %execution_id, code, "execution finished");
+                audit::record(&audit_event_result(
+                    OperationKind::Exec,
+                    &caller,
+                    route,
+                    gateway_kind,
+                    &execution_id.to_string(),
+                    Some(&request.target),
+                    Some(timeout_ms),
+                    "completed",
+                    Some(code),
+                    None,
+                ));
                 let _ = send_execute_event(sender, ServerEvent::ExitStatus { code }).await;
                 break;
             }
@@ -1676,6 +1959,7 @@ async fn process_interactive_execute(
     state: &DaemonState,
     inbound: &mut Streaming<proto_rpc::ExecuteRequest>,
     sender: &mpsc::Sender<Result<proto_rpc::ExecuteResponse, Status>>,
+    caller: Caller,
 ) -> Result<()> {
     let execution_id = Uuid::new_v4();
     let config = state.config.read().await.clone();
@@ -1689,6 +1973,10 @@ async fn process_interactive_execute(
     }
 
     let review_command = request.argv.join(" ");
+    let gateway_kind = state
+        .find_gateway_any(&route.gateway_name)
+        .await
+        .map(|g| g.kind());
 
     info!(
         execution_id = %execution_id,
@@ -1699,95 +1987,61 @@ async fn process_interactive_execute(
         "resolved target (interactive)"
     );
 
-    // Run review
-    let decision = match state
-        .reviewer
-        .review(
-            &config.review,
-            &config.secret_resolver(None),
-            &route.end_target,
-            &request.argv,
-            &review_command,
-        )
-        .await
+    // Audit: operation started.
+    audit_started(
+        OperationKind::ExecInteractive,
+        &caller,
+        route,
+        gateway_kind,
+        &execution_id.to_string(),
+        Some(&request.target),
+        Some(request.timeout_ms),
+        &OperationDetail::Exec {
+            argv: &request.argv,
+            command: &review_command,
+            interactive: true,
+            tty: request.tty,
+            shell: !request.shell.is_empty(),
+            no_shell: request.no_shell,
+        },
+    );
+
+    // Oversight: AI review (exec).
+    match run_review(
+        state,
+        &config,
+        OperationKind::ExecInteractive,
+        &caller,
+        route,
+        gateway_kind,
+        Some(&execution_id.to_string()),
+        Some(request.timeout_ms),
+        &OperationDetail::Exec {
+            argv: &request.argv,
+            command: &review_command,
+            interactive: true,
+            tty: request.tty,
+            shell: !request.shell.is_empty(),
+            no_shell: request.no_shell,
+        },
+    )
+    .await
     {
-        Ok(result) => result,
-        Err(error) => {
-            warn!(
-                execution_id = %execution_id,
-                error = %format!("{error:#}"),
-                "review failed"
-            );
-            let action = config.review.failure_action;
-            let risk_level = crate::config::RiskLevel::Dangerous;
+        Enforced::Proceed => {}
+        Enforced::Confirm(reason) => {
+            debug!(execution_id = %execution_id, "waiting for confirmation (interactive)");
+            wait_for_confirmation(execution_id, inbound, sender, &reason).await?;
+        }
+        Enforced::Denied(reason) => {
+            warn!(execution_id = %execution_id, "execution denied by review (interactive)");
             send_execute_event(
                 sender,
-                ServerEvent::ReviewResult {
-                    execution_id,
-                    risk_level,
-                    action,
-                    reason: format!("review failed: {error:#}"),
-                    matched_whitelist_reason: None,
+                ServerEvent::Error {
+                    message: format!("command denied: {}", reason),
                 },
             )
             .await?;
-            match action {
-                ReviewAction::Allow | ReviewAction::Warn => None,
-                ReviewAction::Confirm => {
-                    wait_for_confirmation(execution_id, inbound, sender, "review service failed")
-                        .await?;
-                    None
-                }
-                ReviewAction::Deny => {
-                    send_execute_event(
-                        sender,
-                        ServerEvent::Error {
-                            message: format!("review failed and policy is deny: {error:#}"),
-                        },
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            }
-        }
-    };
-
-    if let Some(decision) = decision {
-        info!(
-            execution_id = %execution_id,
-            risk_level = %decision.risk_level,
-            action = %decision.action,
-            matched_whitelist_reason = decision.matched_whitelist_reason.as_deref().unwrap_or(""),
-            "review completed (interactive)"
-        );
-        send_execute_event(
-            sender,
-            ServerEvent::ReviewResult {
-                execution_id,
-                risk_level: decision.risk_level,
-                action: decision.action,
-                reason: decision.reason.clone(),
-                matched_whitelist_reason: decision.matched_whitelist_reason.clone(),
-            },
-        )
-        .await?;
-        match decision.action {
-            ReviewAction::Allow | ReviewAction::Warn => {}
-            ReviewAction::Confirm => {
-                debug!(execution_id = %execution_id, "waiting for confirmation (interactive)");
-                wait_for_confirmation(execution_id, inbound, sender, &decision.reason).await?;
-            }
-            ReviewAction::Deny => {
-                warn!(execution_id = %execution_id, "execution denied by review (interactive)");
-                send_execute_event(
-                    sender,
-                    ServerEvent::Error {
-                        message: format!("command denied: {}", decision.reason),
-                    },
-                )
-                .await?;
-                return Ok(());
-            }
+            return Ok(());
         }
     }
 
@@ -1839,6 +2093,18 @@ async fn process_interactive_execute(
                                 return Ok(());
                             }
                         }
+                        audit::record(&audit_event_result(
+                            OperationKind::ExecInteractive,
+                            &caller,
+                            route,
+                            gateway_kind,
+                            &execution_id.to_string(),
+                            Some(&request.target),
+                            Some(request.timeout_ms),
+                            "completed",
+                            Some(code),
+                            None,
+                        ));
                         let _ = send_execute_event(sender, ServerEvent::ExitStatus { code }).await;
                         break;
                     }
@@ -1887,6 +2153,18 @@ async fn process_interactive_execute(
                         return Ok(());
                     }
                 }
+                audit::record(&audit_event_result(
+                    OperationKind::ExecInteractive,
+                    &caller,
+                    route,
+                    gateway_kind,
+                    &execution_id.to_string(),
+                    Some(&request.target),
+                    Some(request.timeout_ms),
+                    "completed",
+                    Some(code),
+                    None,
+                ));
                 let _ = send_execute_event(sender, ServerEvent::ExitStatus { code }).await;
                 break;
             }
@@ -1899,6 +2177,270 @@ async fn process_interactive_execute(
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
+
+/// Result of enforcing a review decision.
+enum Enforced {
+    /// Proceed with the operation.
+    Proceed,
+    /// The review requires interactive confirmation; the caller must await it
+    /// (the `reason` has already been surfaced to the user as a review result).
+    Confirm(String),
+    /// The operation was denied; the `reason` has been surfaced to the user.
+    Denied(String),
+}
+
+/// Run oversight review for an operation and enforce the resulting action.
+/// Emits the appropriate `ReviewResult` event to the client and records the
+/// review outcome in the audit log. Returns the enforcement result the caller
+/// must obey.
+#[allow(clippy::too_many_arguments)]
+async fn run_review(
+    state: &DaemonState,
+    config: &AppConfig,
+    kind: OperationKind,
+    caller: &Caller,
+    route: &Route,
+    gateway_kind: Option<crate::daemon::gateway::GatewayKind>,
+    execution_id: Option<&str>,
+    timeout_ms: Option<u64>,
+    detail: &OperationDetail<'_>,
+) -> Enforced {
+    let op_kind_str = kind.as_str();
+    let outcome = state
+        .oversight
+        .review(
+            config,
+            &Operation {
+                kind,
+                route,
+                gateway_kind,
+                caller,
+                detail: *detail,
+                execution_id,
+                timeout_ms,
+            },
+        )
+        .await;
+
+    match outcome {
+        ReviewOutcome::Skipped => Enforced::Proceed,
+        ReviewOutcome::Failed(error) => {
+            warn!(op = op_kind_str, error = %format!("{error:#}"), "review failed");
+            let action = config.review.failure_action;
+            audit::record(&audit_event_review(
+                kind,
+                caller,
+                route,
+                gateway_kind,
+                execution_id,
+                Some(RiskLevel::Dangerous),
+                Some(action),
+                Some(&format!("review failed: {error:#}")),
+            ));
+            match action {
+                ReviewAction::Allow | ReviewAction::Warn => Enforced::Proceed,
+                ReviewAction::Confirm => {
+                    Enforced::Confirm(format!("review service failed: {error:#}"))
+                }
+                ReviewAction::Deny => {
+                    Enforced::Denied(format!("review failed and policy is deny: {error:#}"))
+                }
+            }
+        }
+        ReviewOutcome::Decision(decision) => {
+            run_decision(kind, caller, route, gateway_kind, execution_id, decision)
+        }
+    }
+}
+
+/// Enforce a concrete [`ReviewDecision`]. Shared by exec and copy.
+fn run_decision(
+    kind: OperationKind,
+    caller: &Caller,
+    route: &Route,
+    gateway_kind: Option<crate::daemon::gateway::GatewayKind>,
+    execution_id: Option<&str>,
+    decision: ReviewDecision,
+) -> Enforced {
+    info!(
+        op = kind.as_str(),
+        risk_level = %decision.risk_level,
+        action = %decision.action,
+        matched_whitelist_reason = decision.matched_whitelist_reason.as_deref().unwrap_or(""),
+        "review completed"
+    );
+    audit::record(&audit_event_review(
+        kind,
+        caller,
+        route,
+        gateway_kind,
+        execution_id,
+        Some(decision.risk_level),
+        Some(decision.action),
+        Some(&decision.reason),
+    ));
+    match decision.action {
+        ReviewAction::Allow | ReviewAction::Warn => Enforced::Proceed,
+        ReviewAction::Confirm => Enforced::Confirm(decision.reason.clone()),
+        ReviewAction::Deny => Enforced::Denied(decision.reason.clone()),
+    }
+}
+
+/// Record an audit "started" event for an operation.
+#[allow(clippy::too_many_arguments)]
+fn audit_started(
+    kind: OperationKind,
+    caller: &Caller,
+    route: &Route,
+    gateway_kind: Option<crate::daemon::gateway::GatewayKind>,
+    execution_id: &str,
+    target_input: Option<&str>,
+    timeout_ms: Option<u64>,
+    detail: &OperationDetail<'_>,
+) {
+    let mut event = AuditEvent::new(caller.source, kind.as_str(), "started");
+    event.execution_id = Some(execution_id.to_string());
+    event.target_input = target_input.map(str::to_string);
+    event.gateway = Some(route.gateway_name.clone());
+    event.end_target = Some(route.end_target.clone());
+    event.gateway_kind = gateway_kind.map(|k| k.to_string());
+    event.timeout_ms = timeout_ms;
+    fill_caller(&mut event, caller);
+    fill_detail(&mut event, detail);
+    audit::record(&event);
+}
+
+/// Build an audit event for a result (completed/failed/timeout).
+#[allow(clippy::too_many_arguments)]
+fn audit_event_result(
+    kind: OperationKind,
+    caller: &Caller,
+    route: &Route,
+    gateway_kind: Option<crate::daemon::gateway::GatewayKind>,
+    execution_id: &str,
+    target_input: Option<&str>,
+    timeout_ms: Option<u64>,
+    status: &'static str,
+    exit_code: Option<i32>,
+    error: Option<&str>,
+) -> AuditEvent {
+    let mut event = AuditEvent::new(caller.source, kind.as_str(), status);
+    event.execution_id = Some(execution_id.to_string());
+    event.target_input = target_input.map(str::to_string);
+    event.gateway = Some(route.gateway_name.clone());
+    event.end_target = Some(route.end_target.clone());
+    event.gateway_kind = gateway_kind.map(|k| k.to_string());
+    event.timeout_ms = timeout_ms;
+    event.exit_code = exit_code;
+    event.error = error.map(str::to_string);
+    fill_caller(&mut event, caller);
+    event
+}
+
+/// Build an audit event recording a review decision.
+#[allow(clippy::too_many_arguments)]
+fn audit_event_review(
+    kind: OperationKind,
+    caller: &Caller,
+    route: &Route,
+    gateway_kind: Option<crate::daemon::gateway::GatewayKind>,
+    execution_id: Option<&str>,
+    risk: Option<RiskLevel>,
+    action: Option<ReviewAction>,
+    reason: Option<&str>,
+) -> AuditEvent {
+    let mut event = AuditEvent::new(caller.source, kind.as_str(), "reviewed");
+    event.execution_id = execution_id.map(str::to_string);
+    event.gateway = Some(route.gateway_name.clone());
+    event.end_target = Some(route.end_target.clone());
+    event.gateway_kind = gateway_kind.map(|k| k.to_string());
+    event.review_risk = risk.map(|r| r.to_string());
+    event.review_action = action.map(|a| a.to_string());
+    event.review_reason = reason.map(str::to_string);
+    fill_caller(&mut event, caller);
+    event
+}
+
+/// Fill caller-identity fields of an audit event (when enabled).
+fn fill_caller(event: &mut AuditEvent, caller: &Caller) {
+    if !audit::include_identity() {
+        return;
+    }
+    event.caller_source = Some(caller.source.to_string());
+    event.caller_peer = caller.peer_addr.clone();
+    event.caller_ssh_user = caller.ssh_user.clone();
+    event.caller_key_fingerprint = caller.key_fingerprint.clone();
+    event.caller_via_token = Some(caller.via_token);
+}
+
+/// Fill operation-detail fields of an audit event.
+fn fill_detail(event: &mut AuditEvent, detail: &OperationDetail<'_>) {
+    match detail {
+        OperationDetail::Exec {
+            argv,
+            command,
+            interactive,
+            tty,
+            shell,
+            no_shell,
+        } => {
+            event.argv = Some(argv.to_vec());
+            event.command = Some(command.to_string());
+            event.interactive = Some(*interactive);
+            event.tty = Some(*tty);
+            event.shell = Some(*shell);
+            event.no_shell = Some(*no_shell);
+        }
+        OperationDetail::Copy {
+            direction,
+            remote_path,
+            recursive,
+            source_name,
+        } => {
+            event.direction = Some(direction_label(*direction).to_string());
+            event.remote_path = Some(remote_path.to_string());
+            event.recursive = Some(*recursive);
+            event.source_name = Some(source_name.to_string());
+        }
+        OperationDetail::SessionOp {
+            session_kind,
+            command_or_name,
+        } => {
+            event.session_kind = Some(session_kind.as_str().to_string());
+            event.command = Some(command_or_name.to_string());
+        }
+    }
+}
+
+fn direction_label(direction: CopyDirection) -> &'static str {
+    match direction {
+        CopyDirection::Upload => "upload",
+        CopyDirection::Download => "download",
+    }
+}
+
+/// Record an audit event for an inner session/proxy operation (exec/shell/
+/// subsystem). Used by the open_session tunnel (audit-only, no review).
+fn audit_session_op(
+    caller: &Caller,
+    route: &Route,
+    gateway_kind: Option<crate::daemon::gateway::GatewayKind>,
+    target_input: &str,
+    session_kind: SessionKind,
+    command_or_name: &str,
+    status: &'static str,
+) {
+    let mut event = AuditEvent::new(caller.source, OperationKind::Session.as_str(), status);
+    event.execution_id = Some(Uuid::new_v4().to_string());
+    event.target_input = Some(target_input.to_string());
+    event.gateway = Some(route.gateway_name.clone());
+    event.end_target = Some(route.end_target.clone());
+    event.gateway_kind = gateway_kind.map(|k| k.to_string());
+    event.session_kind = Some(session_kind.as_str().to_string());
+    event.command = Some(command_or_name.to_string());
+    fill_caller(&mut event, caller);
+    audit::record(&event);
+}
 
 fn abort_interactive_handles(handles: &[tokio::task::AbortHandle]) {
     for handle in handles {
@@ -1938,6 +2480,38 @@ async fn wait_for_confirmation(
     }
 }
 
+/// Await a copy confirmation from the client stream (mirrors
+/// [`wait_for_confirmation`] but for the copy protocol).
+async fn wait_for_copy_confirmation(
+    execution_id: Uuid,
+    inbound: &mut Streaming<proto_rpc::CopyRequest>,
+    sender: &mpsc::Sender<Result<proto_rpc::CopyResponse, Status>>,
+    reason: &str,
+) -> Result<()> {
+    sender
+        .send(Ok(protocol::copy_confirm_required_response(
+            execution_id,
+            reason,
+        )))
+        .await
+        .map_err(|_| anyhow!("copy client stream closed"))?;
+
+    let Some(message) = inbound.message().await? else {
+        bail!("client disconnected before copy confirmation");
+    };
+    match message.request {
+        Some(proto_rpc::copy_request::Request::Confirm(confirm)) => {
+            let response_id = protocol::parse_execution_id(&confirm.execution_id)?;
+            if response_id == execution_id && confirm.allow {
+                Ok(())
+            } else {
+                bail!("copy not confirmed");
+            }
+        }
+        _ => bail!("unexpected request while awaiting copy confirmation"),
+    }
+}
+
 async fn send_execute_event(
     sender: &mpsc::Sender<Result<proto_rpc::ExecuteResponse, Status>>,
     event: ServerEvent,
@@ -1955,10 +2529,29 @@ async fn send_session_msg(
     sender: &mpsc::Sender<Result<proto_rpc::SessionResponse, Status>>,
     msg: proto_rpc::session_response::Msg,
 ) -> bool {
+    // Only the downlink task calls this. Parking here (gRPC flow control
+    // while the peer pauses reading) pauses event delivery only — the uplink
+    // task keeps consuming client requests, so this can never deadlock.
     sender
         .send(Ok(proto_rpc::SessionResponse { msg: Some(msg) }))
         .await
         .is_err()
+}
+
+/// Best-effort, non-blocking error delivery from the uplink task: the
+/// downlink task owns orderly sends; a full channel must never park the read
+/// loop (that is the deadlock this design eliminates).
+fn try_send_session_error(
+    sender: &mpsc::Sender<Result<proto_rpc::SessionResponse, Status>>,
+    message: &str,
+) {
+    let _ = sender.try_send(Ok(proto_rpc::SessionResponse {
+        msg: Some(proto_rpc::session_response::Msg::Error(
+            proto_rpc::SessionError {
+                message: message.to_string(),
+            },
+        )),
+    }));
 }
 
 #[allow(dead_code)] // reused by the TCP control channel in stage 2 (lock-file parent dir).
@@ -2097,18 +2690,30 @@ pub mod test_support {
         // Build gateways from config for test.
         let auth_prompter: Arc<AuthPrompter> =
             Arc::new(|_req| Box::pin(async { Ok(String::new()) }));
-        let gateways = gateway::build_gateways(
+        let mut gateways = gateway::build_gateways(
             config.clone(),
             &config_clone.ssh.server_config_path,
             &config_clone.gateways,
             auth_prompter,
         );
+        // Register the localhost gateway so e2e tests can drive copy against
+        // the daemon's own host through the real LocalSession/sftp path.
+        gateways.push((
+            gateway::localhost::SELF_GATEWAY_NAME.to_string(),
+            std::sync::Arc::new(gateway::localhost::LocalhostGateway::new(
+                config_clone.reverse_proxy.shell.clone(),
+                config_clone.reverse_proxy.user.clone(),
+                config_clone.server.proxy.sftp_server_path.clone(),
+                // Keep tests hermetic: children inherit the test process cwd.
+                None,
+            )),
+        ));
 
         let state = DaemonState {
             config_path,
             config,
             gateways,
-            reviewer: CommandReviewer::new().expect("failed to create reviewer"),
+            oversight: Oversight::disabled(),
             shutdown_tx,
             origin: DaemonOrigin::External,
             cli_start_options: CliStartOptions::default(),

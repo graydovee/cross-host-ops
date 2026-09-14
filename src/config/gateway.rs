@@ -147,6 +147,10 @@ fn default_session_idle_timeout() -> Duration {
     Duration::from_secs(300)
 }
 
+fn default_suppress_history() -> bool {
+    true
+}
+
 // ---------------------------------------------------------------------------
 // New gateway configuration types (task 2.1)
 // ---------------------------------------------------------------------------
@@ -220,6 +224,14 @@ pub struct JumpserverGatewayConfig {
     /// while cached. Default: 5 minutes.
     #[serde(default = "default_session_idle_timeout")]
     pub session_idle_timeout: Duration,
+    /// Suppress shell history on the target after navigation. When true
+    /// (default), xho sends `HISTFILE=/dev/null; HISTSIZE=0; ...` once per
+    /// navigated shell so its own exec/copy commands don't pollute the
+    /// target's `~/.bash_history`. Only affects the jumpserver path (the
+    /// PTY-driven shell); direct/localhost use the SSH exec channel, which
+    /// doesn't write history without a TTY.
+    #[serde(default = "default_suppress_history")]
+    pub suppress_history: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

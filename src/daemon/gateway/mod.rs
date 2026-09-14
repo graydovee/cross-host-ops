@@ -107,15 +107,59 @@ pub trait Gateway: Send + Sync {
     async fn copy(
         &self,
         target: &str,
-        spec: crate::types::CopySpec,
+        mut spec: crate::types::CopySpec,
     ) -> Result<(), GatewayError> {
+        for attempt in 0..=2u8 {
+            let result = async {
+                let sess = self.open_session(target).await?;
+                let sftp = crate::daemon::session::sftp_copy::open_sftp(sess)
+                    .await
+                    .map_err(|e| GatewayError::execution(anyhow!("{}", e)))?;
+                crate::daemon::session::sftp_copy::run(&sftp, &mut spec)
+                    .await
+                    .map_err(|e| GatewayError::execution(anyhow!("{}", e)))
+            }
+            .await;
+            match result {
+                Ok(()) => return Ok(()),
+                // Transport-class failures are worth a fresh session — for
+                // DOWNLOADS only: the frame sender is restored on failure and
+                // resume hints stay in the spec. Upload frame streams are
+                // push-based and partially consumed; a retry would desync.
+                Err(e)
+                    if attempt < 2
+                        && spec.direction == crate::types::CopyDirection::Download
+                        && matches!(e.kind, ErrorKind::Transport) =>
+                {
+                    tracing::debug!(gateway = %self.name(), attempt,
+                        "transport error during sftp copy, retrying: {}", e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!("sftp copy retry loop is bounded")
+    }
+
+    /// Validate CLI resume hints (`xho cp --resume`) against remote
+    /// partial-upload state and return entries with effective offsets filled
+    /// in (0 = transfer fresh). Called for uploads before the client streams
+    /// frames; the daemon relays the result back as a `resume_ack`.
+    ///
+    /// Default: probe `<dest>.xho_tmp` over the sftp subsystem; jumpserver
+    /// overrides with a shell-based probe. Requires [`Capabilities::COPY`].
+    async fn probe_upload_resume(
+        &self,
+        target: &str,
+        spec: &mut crate::types::CopySpec,
+    ) -> Result<Vec<crate::types::ResumeEntry>, GatewayError> {
+        if spec.resume.is_empty() || spec.recursive {
+            return Ok(fresh_resume_entries(&spec.resume));
+        }
         let sess = self.open_session(target).await?;
         let sftp = crate::daemon::session::sftp_copy::open_sftp(sess)
             .await
             .map_err(|e| GatewayError::execution(anyhow!("{}", e)))?;
-        crate::daemon::session::sftp_copy::run(&sftp, spec)
-            .await
-            .map_err(|e| GatewayError::execution(anyhow!("{}", e)))
+        Ok(crate::daemon::session::sftp_copy::probe_upload_resume(&sftp, spec).await)
     }
 
     /// List servers reachable through this gateway. Default: `Unsupported`.
@@ -263,6 +307,19 @@ impl GatewayError {
     }
 }
 
+/// Zero out the offsets of resume entries (a fresh transfer decision).
+pub(crate) fn fresh_resume_entries(
+    entries: &[crate::types::ResumeEntry],
+) -> Vec<crate::types::ResumeEntry> {
+    entries
+        .iter()
+        .map(|e| crate::types::ResumeEntry {
+            offset: 0,
+            ..e.clone()
+        })
+        .collect()
+}
+
 /// Classify an anyhow::Error as transport or not, by inspecting the error chain.
 pub fn is_transport_error(error: &anyhow::Error) -> bool {
     if let Some(status) = error.downcast_ref::<tonic::Status>() {
@@ -327,8 +384,7 @@ pub fn build_gateways(
 ) -> Vec<(String, Arc<dyn Gateway>)> {
     let mut gateways: Vec<(String, Arc<dyn Gateway>)> = Vec::new();
 
-    let (max_connections_per_address, max_idle_time, keepalive_interval) = match config.try_read()
-    {
+    let (max_connections_per_address, max_idle_time, keepalive_interval) = match config.try_read() {
         Ok(cfg) => (
             cfg.ssh.max_connections_per_ip,
             cfg.ssh.max_idle_time,

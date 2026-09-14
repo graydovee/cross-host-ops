@@ -14,13 +14,11 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 
 use anyhow::Result;
-use async_trait::async_trait;
-use russh::Pty;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
-use super::{SessionEvent, TargetSession};
+use super::{SessionCommand, SessionEvent, SessionStream, SessionWriter, TargetSession};
 
 // -----------------------------------------------------------------------
 // PTY helpers (platform-specific)
@@ -240,7 +238,7 @@ fn sftp_server_exe_name() -> &'static str {
 /// `cmd.exe`/`powershell` use `/c`; POSIX shells (`sh`/`bash`/`zsh`) use `-c`.
 /// The flag must match the *actual* shell, not the platform — on Windows a
 /// Git-Bash environment may set `SHELL` to bash.exe, in which case `-c` still
-/// applies. `Control::Exec` wraps a command as `[shell, flag, command]`.
+/// applies. `SessionCommand::Exec` wraps a command as `[shell, flag, command]`.
 fn shell_exec_flag(shell: &str) -> &'static str {
     // Lowercase the basename for matching (via the unified filepath helper).
     let lower = shell.to_ascii_lowercase();
@@ -254,41 +252,8 @@ fn shell_exec_flag(shell: &str) -> &'static str {
 }
 
 // -----------------------------------------------------------------------
-// Control protocol
+// Session command handling
 // -----------------------------------------------------------------------
-
-enum Control {
-    Pty {
-        term: String,
-        cols: u32,
-        rows: u32,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    Env {
-        key: String,
-        value: String,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    Exec {
-        command: String,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    Shell {
-        reply: oneshot::Sender<Result<()>>,
-    },
-    Subsystem {
-        name: String,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    WindowChange {
-        cols: u32,
-        rows: u32,
-    },
-    Signal {
-        signal: String,
-    },
-    Eof,
-}
 
 /// What the driver needs to drive a running backend.
 struct Backend {
@@ -301,6 +266,11 @@ struct Backend {
 }
 
 enum WriteSide {
+    /// Unix PTY master: readiness-driven AsyncFd writes (see write()).
+    #[cfg(unix)]
+    Pty(std::sync::Arc<tokio::io::unix::AsyncFd<std::fs::File>>),
+    /// Plain file/handle-backed PTY write (Windows ConPTY pipe).
+    #[cfg(windows)]
     Pty(tokio::fs::File),
     Pipe(Option<ChildStdin>),
 }
@@ -308,6 +278,30 @@ enum WriteSide {
 impl WriteSide {
     async fn write(&mut self, data: &[u8]) {
         match self {
+            #[cfg(unix)]
+            WriteSide::Pty(fd) => {
+                // True readiness-driven async write. A PTY master MUST NOT use
+                // tokio::fs::File: every write there runs as a blocking-pool
+                // task, and when the terminal buffer fills (vim redraws while
+                // the consumer is momentarily slow) those tasks park forever,
+                // eating blocking-pool threads one per keystroke until the
+                // daemon wedges.
+                loop {
+                    let mut guard = match fd.writable().await {
+                        Ok(g) => g,
+                        Err(_) => return,
+                    };
+                    match guard.try_io(|inner| {
+                        <&std::fs::File as std::io::Write>::write(&mut { &inner.get_ref() }, data)
+                    }) {
+                        Ok(Ok(n)) if n == data.len() => break,
+                        Ok(_) => break, // partial write on pty is not expected; drop remainder like old behavior
+                        Err(_would_block) => continue,
+                        Ok(Err(_)) => return,
+                    }
+                }
+            }
+            #[cfg(windows)]
             WriteSide::Pty(f) => {
                 let _ = f.write_all(data).await;
                 let _ = f.flush().await;
@@ -323,6 +317,18 @@ impl WriteSide {
 
     async fn eof(&mut self) {
         match self {
+            #[cfg(unix)]
+            WriteSide::Pty(fd) => {
+                if let Ok(mut guard) = fd.writable().await {
+                    let _ = guard.try_io(|inner| {
+                        <&std::fs::File as std::io::Write>::write(
+                            &mut { &inner.get_ref() },
+                            b"\x04",
+                        )
+                    });
+                }
+            }
+            #[cfg(windows)]
             WriteSide::Pty(f) => {
                 let _ = f.write_all(b"\x04").await;
             }
@@ -333,93 +339,92 @@ impl WriteSide {
     }
 }
 
-pub(crate) struct LocalSession {
-    control_tx: mpsc::Sender<Control>,
-    stdin_tx: mpsc::Sender<Vec<u8>>,
-    events_rx: mpsc::UnboundedReceiver<SessionEvent>,
+pub struct LocalSession {
+    writer: Option<SessionWriter>,
+    stream: Option<SessionStream>,
 }
 
 impl LocalSession {
-    pub(crate) fn new(shell: String, sftp_server_path: Option<String>) -> Self {
-        let (control_tx, control_rx) = mpsc::channel::<Control>(32);
-        let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(64);
+    pub fn new(shell: String, sftp_server_path: Option<String>, workdir: Option<PathBuf>) -> Self {
+        // Control and stdin share ONE ordered channel so eof/data cannot
+        // overtake the exec/subsystem start (see DirectSshSession for the
+        // rationale); pre-start stdin is buffered by the driver.
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(64);
         let (events_tx, events_rx) = mpsc::unbounded_channel::<SessionEvent>();
-        tokio::spawn(driver(
-            shell,
-            sftp_server_path,
-            control_rx,
-            stdin_rx,
-            events_tx,
-        ));
+        tokio::spawn(driver(shell, sftp_server_path, workdir, cmd_rx, events_tx));
         Self {
-            control_tx,
-            stdin_tx,
-            events_rx,
+            writer: Some(SessionWriter { tx: cmd_tx }),
+            stream: Some(SessionStream { rx: events_rx }),
         }
+    }
+}
+
+impl TargetSession for LocalSession {
+    fn split(mut self: Box<Self>) -> (SessionWriter, SessionStream) {
+        (
+            self.writer.take().expect("local session split twice"),
+            self.stream.take().expect("local session split twice"),
+        )
     }
 }
 
 async fn driver(
     shell: String,
     sftp_server_path: Option<String>,
-    mut control_rx: mpsc::Receiver<Control>,
-    mut stdin_rx: mpsc::Receiver<Vec<u8>>,
+    workdir: Option<PathBuf>,
+    mut cmd_rx: mpsc::Receiver<SessionCommand>,
     events_tx: mpsc::UnboundedSender<SessionEvent>,
 ) {
     let mut pty: Option<(String, u32, u32)> = None;
     let mut env: Vec<(String, String)> = Vec::new();
     let mut backend: Option<Backend> = None;
+    // Stdin that arrived before a backend was started (kept for parity with
+    // the old backend-gated stdin channel; callers normally start first).
+    let mut pending_stdin: std::collections::VecDeque<Vec<u8>> = Default::default();
+    let mut pending_eof = false;
 
     loop {
         tokio::select! {
-            // Only poll stdin when a backend exists.
-            stdin = async {
-                match &backend {
-                    Some(_) => stdin_rx.recv().await,
-                    None => std::future::pending::<Option<Vec<u8>>>().await,
-                }
-            } => match stdin {
-                Some(bytes) => {
-                    if let Some(b) = backend.as_mut() {
-                        b.write.write(&bytes).await;
-                    }
-                }
-                None => {
-                    if let Some(b) = backend.as_mut() { b.write.eof().await; }
-                }
-            },
-            ctrl = control_rx.recv() => match ctrl {
-                Some(Control::Pty { term, cols, rows, reply }) => {
+            cmd = cmd_rx.recv() => match cmd {
+                Some(SessionCommand::Pty { term, cols, rows, reply, .. }) => {
                     pty = Some((term, cols, rows));
                     let _ = reply.send(Ok(()));
                 }
-                Some(Control::Env { key, value, reply }) => {
+                Some(SessionCommand::Env { key, value, reply }) => {
                     env.push((key, value));
                     let _ = reply.send(Ok(()));
                 }
-                Some(Control::Exec { command, reply }) => {
+                Some(SessionCommand::Exec { command, reply }) => {
                     if backend.is_some() {
                         let _ = reply.send(Err(anyhow::anyhow!("session already running")));
                         continue;
                     }
                     let argv = vec![shell.clone(), shell_exec_flag(&shell).to_string(), command];
-                    match spawn(&pty, &env, &argv, &events_tx).await {
-                        Ok(b) => { backend = Some(b); let _ = reply.send(Ok(())); }
+                    match spawn(&pty, &env, &argv, &workdir, &events_tx).await {
+                        Ok(b) => {
+                            backend = Some(b);
+                            flush_pending_stdin(&mut backend, &mut pending_stdin, &mut pending_eof).await;
+                            let _ = reply.send(Ok(()));
+                        }
                         Err(e) => { let _ = reply.send(Err(e)); }
                     }
                 }
-                Some(Control::Shell { reply }) => {
+                Some(SessionCommand::Shell { reply }) => {
                     if backend.is_some() {
                         let _ = reply.send(Err(anyhow::anyhow!("session already running")));
                         continue;
                     }
                     let argv = vec![shell.clone()];
-                    match spawn(&pty, &env, &argv, &events_tx).await {
-                        Ok(b) => { backend = Some(b); let _ = reply.send(Ok(())); }
+                    match spawn(&pty, &env, &argv, &workdir, &events_tx).await {
+                        Ok(b) => {
+                            backend = Some(b);
+                            flush_pending_stdin(&mut backend, &mut pending_stdin, &mut pending_eof).await;
+                            let _ = reply.send(Ok(()));
+                        }
                         Err(e) => { let _ = reply.send(Err(e)); }
                     }
                 }
-                Some(Control::Subsystem { name, reply }) => {
+                Some(SessionCommand::Subsystem { name, reply }) => {
                     if name != "sftp" {
                         let _ = reply.send(Err(super::unsupported(&format!("subsystem {name}"))));
                         continue;
@@ -429,26 +434,41 @@ async fn driver(
                         continue;
                     };
                     match spawn_sftp(&sftp, &events_tx).await {
-                        Ok(b) => { backend = Some(b); let _ = reply.send(Ok(())); }
+                        Ok(b) => {
+                            backend = Some(b);
+                            flush_pending_stdin(&mut backend, &mut pending_stdin, &mut pending_eof).await;
+                            let _ = reply.send(Ok(()));
+                        }
                         Err(e) => { let _ = reply.send(Err(e)); }
                     }
                 }
-                Some(Control::WindowChange { cols, rows }) => {
+                Some(SessionCommand::Resize { cols, rows }) => {
                     if let Some(b) = backend.as_ref() {
                         if let Some(pty) = b.pty.as_ref() {
                             pty.resize(cols, rows);
                         }
                     }
                 }
-                Some(Control::Signal { signal }) => {
+                Some(SessionCommand::Signal { signal }) => {
                     if let Some(b) = backend.as_ref() {
                         if let Some(pty) = b.pty.as_ref() {
                             pty.signal(&signal);
                         }
                     }
                 }
-                Some(Control::Eof) => {
-                    if let Some(b) = backend.as_mut() { b.write.eof().await; }
+                Some(SessionCommand::Eof) => {
+                    if let Some(b) = backend.as_mut() {
+                        b.write.eof().await;
+                    } else {
+                        pending_eof = true;
+                    }
+                }
+                Some(SessionCommand::Data { bytes }) => {
+                    if let Some(b) = backend.as_mut() {
+                        b.write.write(&bytes).await;
+                    } else {
+                        pending_stdin.push_back(bytes);
+                    }
                 }
                 None => break,
             },
@@ -456,11 +476,28 @@ async fn driver(
     }
 }
 
+/// Deliver stdin that was buffered while no backend was running.
+async fn flush_pending_stdin(
+    backend: &mut Option<Backend>,
+    pending: &mut std::collections::VecDeque<Vec<u8>>,
+    pending_eof: &mut bool,
+) {
+    let Some(b) = backend.as_mut() else { return };
+    while let Some(bytes) = pending.pop_front() {
+        b.write.write(&bytes).await;
+    }
+    if *pending_eof {
+        b.write.eof().await;
+        *pending_eof = false;
+    }
+}
+
 /// Spawn `argv` on a pseudo-terminal.
 ///
-/// Unix uses openpty + setsid + TIOCSCTTY; Windows ConPTY support is tracked
-/// separately and currently returns an error (local Windows sessions fall back
-/// to pipe mode).
+/// Unix uses openpty + setsid + TIOCSCTTY. The write side is an `AsyncFd`
+/// (readiness-driven; a plain tokio::fs::File parks blocking-pool threads once
+/// the pty buffer fills). A duplicated master fd feeds the `PtyBackend` used
+/// for resize/signal. Windows uses the ConPTY `spawn_pty` below.
 #[cfg(unix)]
 async fn spawn_pty(
     term: &str,
@@ -469,6 +506,7 @@ async fn spawn_pty(
     program: String,
     args: &[String],
     env: &[(String, String)],
+    workdir: Option<&std::path::PathBuf>,
     events_tx: &mpsc::UnboundedSender<SessionEvent>,
 ) -> Result<Backend> {
     let (master, slave) = openpty_pair()?;
@@ -480,7 +518,9 @@ async fn spawn_pty(
     let resize_fd = dup_fd(&master)?;
     let read_fd = dup_fd(&master)?;
     let master_read = tokio::fs::File::from_std(std::fs::File::from(read_fd));
-    let master_write = tokio::fs::File::from_std(std::fs::File::from(master));
+    // AsyncFd gives real readiness-driven writes (see WriteSide::write).
+    let master_write =
+        std::sync::Arc::new(tokio::io::unix::AsyncFd::new(std::fs::File::from(master))?);
 
     let slave_file = std::fs::File::from(slave);
     let stdin = std::process::Stdio::from(slave_file.try_clone()?);
@@ -488,6 +528,9 @@ async fn spawn_pty(
     let stderr = std::process::Stdio::from(slave_file);
     let mut cmd = Command::new(&program);
     cmd.args(args).stdin(stdin).stdout(stdout).stderr(stderr);
+    if let Some(dir) = workdir {
+        cmd.current_dir(dir);
+    }
     cmd.env(
         "TERM",
         if term.is_empty() {
@@ -516,7 +559,6 @@ async fn spawn_pty(
         pid,
     })
 }
-
 /// Spawn `argv` on a Windows ConPTY pseudoconsole.
 ///
 /// Pipeline: CreatePipe ×2 → CreatePseudoConsole →
@@ -530,18 +572,19 @@ async fn spawn_pty(
     program: String,
     args: &[String],
     env: &[(String, String)],
+    workdir: Option<&std::path::PathBuf>,
     events_tx: &mpsc::UnboundedSender<SessionEvent>,
 ) -> Result<Backend> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Console::{
-        CreatePseudoConsole, COORD, HPCON, PSEUDOCONSOLE_INHERIT_CURSOR,
+        COORD, CreatePseudoConsole, HPCON, PSEUDOCONSOLE_INHERIT_CURSOR,
     };
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::Threading::{
         CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
         DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
         InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-        PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTUPINFOEXW,
+        PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTUPINFOEXW,
         UpdateProcThreadAttribute,
     };
 
@@ -574,9 +617,15 @@ async fn spawn_pty(
     envblock.push(0); // terminating double-null
     // Also set TERM so terminal-aware programs (the common case for _self PTY
     // use) behave as if attached to a Unix-style terminal.
-    let term_value = if term.is_empty() { "xterm-256color" } else { term };
+    let term_value = if term.is_empty() {
+        "xterm-256color"
+    } else {
+        term
+    };
     {
-        let mut tmp = format!("TERM={term_value}").encode_utf16().collect::<Vec<_>>();
+        let mut tmp = format!("TERM={term_value}")
+            .encode_utf16()
+            .collect::<Vec<_>>();
         tmp.push(0);
         envblock.splice(0..0, tmp); // prepend (order is irrelevant to Windows)
     }
@@ -594,10 +643,18 @@ async fn spawn_pty(
     if !ok {
         let err = std::io::Error::last_os_error();
         unsafe {
-            if !input_read.is_null() { CloseHandle(input_read); }
-            if !input_write.is_null() { CloseHandle(input_write); }
-            if !output_read.is_null() { CloseHandle(output_read); }
-            if !output_write.is_null() { CloseHandle(output_write); }
+            if !input_read.is_null() {
+                CloseHandle(input_read);
+            }
+            if !input_write.is_null() {
+                CloseHandle(input_write);
+            }
+            if !output_read.is_null() {
+                CloseHandle(output_read);
+            }
+            if !output_write.is_null() {
+                CloseHandle(output_write);
+            }
         }
         return Err(anyhow::anyhow!("ConPTY CreatePipe failed: {err}"));
     }
@@ -608,7 +665,13 @@ async fn spawn_pty(
     let size = COORD { X: c, Y: r };
     let mut hpc: HPCON = 0;
     let pc_result = unsafe {
-        CreatePseudoConsole(size, input_read, output_write, PSEUDOCONSOLE_INHERIT_CURSOR, &mut hpc)
+        CreatePseudoConsole(
+            size,
+            input_read,
+            output_write,
+            PSEUDOCONSOLE_INHERIT_CURSOR,
+            &mut hpc,
+        )
     };
     // input_read and output_write now belong to the pseudoconsole; close our
     // copies to avoid handle leaks (the PTY owns them internally).
@@ -646,13 +709,14 @@ async fn spawn_pty(
             CloseHandle(input_write);
             CloseHandle(output_read);
         }
-        return Err(anyhow::anyhow!("InitializeProcThreadAttributeList (size) failed: {err}"));
+        return Err(anyhow::anyhow!(
+            "InitializeProcThreadAttributeList (size) failed: {err}"
+        ));
     }
     let mut attr_buf: Vec<u8> = vec![0u8; needed];
     let attr_list = attr_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
-    let init_ok = unsafe {
-        InitializeProcThreadAttributeList(attr_list, attr_count, 0, &mut needed) != 0
-    };
+    let init_ok =
+        unsafe { InitializeProcThreadAttributeList(attr_list, attr_count, 0, &mut needed) != 0 };
     if !init_ok {
         let err = std::io::Error::last_os_error();
         unsafe {
@@ -660,7 +724,9 @@ async fn spawn_pty(
             CloseHandle(input_write);
             CloseHandle(output_read);
         }
-        return Err(anyhow::anyhow!("InitializeProcThreadAttributeList failed: {err}"));
+        return Err(anyhow::anyhow!(
+            "InitializeProcThreadAttributeList failed: {err}"
+        ));
     }
 
     // ---- 6. Bind the pseudoconsole handle to the attribute list.
@@ -694,6 +760,13 @@ async fn spawn_pty(
     let creation_flags =
         EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_PROCESS_GROUP;
     let program_w: Vec<u16> = program.encode_utf16().chain(std::iter::once(0)).collect();
+    let cwd_w: Option<Vec<u16>> = workdir.map(|dir| {
+        dir.as_os_str()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect()
+    });
     let cp_ok = unsafe {
         CreateProcessW(
             program_w.as_ptr(),
@@ -703,7 +776,10 @@ async fn spawn_pty(
             0, // bInheritHandles = FALSE: ConPTY owns the pipes
             creation_flags as u32,
             envblock.as_mut_ptr() as *const std::ffi::c_void,
-            std::ptr::null(),
+            cwd_w
+                .as_ref()
+                .map(|w| w.as_ptr())
+                .unwrap_or(std::ptr::null()),
             &si.StartupInfo as *const _ as *const _,
             &mut pi,
         ) != 0
@@ -735,7 +811,9 @@ async fn spawn_pty(
             CloseHandle(input_write);
             CloseHandle(output_read);
         }
-        return Err(anyhow::anyhow!("CreateProcessW returned invalid process handle"));
+        return Err(anyhow::anyhow!(
+            "CreateProcessW returned invalid process handle"
+        ));
     }
 
     // ---- 8. Wrap the I/O pipe ends for async + spawn reader/waiter tasks.
@@ -755,11 +833,7 @@ async fn spawn_pty(
 
     Ok(Backend {
         write: WriteSide::Pty(master_write),
-        pty: Some(Box::new(ConPtyBackend {
-            hpc,
-            hprocess,
-            pid,
-        })),
+        pty: Some(Box::new(ConPtyBackend { hpc, hprocess, pid })),
         pid,
     })
 }
@@ -774,7 +848,9 @@ fn spawn_waiter_conpty(
     events_tx: mpsc::UnboundedSender<SessionEvent>,
 ) {
     use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, INFINITE, WaitForSingleObject,
+    };
     // Carry the handle as a usize across the spawn_blocking boundary (raw
     // pointers are not `Send`).
     let handle_usize = hprocess as usize;
@@ -798,6 +874,7 @@ async fn spawn(
     pty: &Option<(String, u32, u32)>,
     env: &[(String, String)],
     argv: &[String],
+    workdir: &Option<PathBuf>,
     events_tx: &mpsc::UnboundedSender<SessionEvent>,
 ) -> Result<Backend> {
     let program = argv
@@ -807,13 +884,26 @@ async fn spawn(
     let args = &argv[1..];
 
     if let Some((term, cols, rows)) = pty {
-        return spawn_pty(term, *cols, *rows, program, args, env, events_tx).await;
+        return spawn_pty(
+            term,
+            *cols,
+            *rows,
+            program,
+            args,
+            env,
+            workdir.as_ref(),
+            events_tx,
+        )
+        .await;
     } else {
         let mut cmd = Command::new(&program);
         cmd.args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        if let Some(dir) = workdir {
+            cmd.current_dir(dir);
+        }
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -911,109 +1001,158 @@ fn spawn_waiter(mut child: Child, events_tx: mpsc::UnboundedSender<SessionEvent>
     });
 }
 
-// -----------------------------------------------------------------------
-// TargetSession impl
-// -----------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-async fn request(
-    control_tx: &mpsc::Sender<Control>,
-    build: impl FnOnce(oneshot::Sender<Result<()>>) -> Control,
-) -> Result<()> {
-    let (rtx, rrx) = oneshot::channel();
-    control_tx
-        .send(build(rtx))
-        .await
-        .map_err(|_| anyhow::anyhow!("session closed"))?;
-    rrx.await
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("session closed")))
-}
-
-#[async_trait]
-impl TargetSession for LocalSession {
-    async fn request_pty(
-        &mut self,
-        term: &str,
-        cols: u32,
-        rows: u32,
-        _modes: &[(Pty, u32)],
-    ) -> Result<()> {
-        request(&self.control_tx, |reply| Control::Pty {
-            term: term.to_string(),
-            cols,
-            rows,
-            reply,
-        })
-        .await
-    }
-
-    async fn set_env(&mut self, key: &str, value: &str) -> Result<()> {
-        request(&self.control_tx, |reply| Control::Env {
-            key: key.to_string(),
-            value: value.to_string(),
-            reply,
-        })
-        .await
-    }
-
-    async fn exec(&mut self, command: &str) -> Result<()> {
-        request(&self.control_tx, |reply| Control::Exec {
-            command: command.to_string(),
-            reply,
-        })
-        .await
-    }
-
-    async fn shell(&mut self) -> Result<()> {
-        request(&self.control_tx, |reply| Control::Shell { reply }).await
-    }
-
-    async fn subsystem(&mut self, name: &str) -> Result<()> {
-        request(&self.control_tx, |reply| Control::Subsystem {
-            name: name.to_string(),
-            reply,
-        })
-        .await
-    }
-
-    async fn window_change(&mut self, cols: u32, rows: u32) -> Result<()> {
-        let _ = self
-            .control_tx
-            .send(Control::WindowChange { cols, rows })
-            .await;
-        Ok(())
-    }
-
-    async fn signal(&mut self, signal: &str) -> Result<()> {
-        let _ = self
-            .control_tx
-            .send(Control::Signal {
-                signal: signal.to_string(),
-            })
-            .await;
-        Ok(())
-    }
-
-    async fn write_stdin(&mut self, data: &[u8]) -> Result<()> {
-        self.stdin_tx
-            .send(data.to_vec())
+    // Spawns /bin/sh via the unix PTY path; unix-only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn split_exec_streams_output_and_exit_code() {
+        let sess: Box<dyn TargetSession> =
+            Box::new(LocalSession::new("/bin/sh".to_string(), None, None));
+        let (writer, mut stream) = sess.split();
+        writer
+            .exec("printf hello; echo err 1>&2; exit 7")
             .await
-            .map_err(|_| anyhow::anyhow!("session closed"))?;
-        Ok(())
+            .unwrap();
+
+        let mut stdout = Vec::new();
+        let mut code = None;
+        while let Some(ev) = stream.next().await {
+            match ev {
+                SessionEvent::Stdout(d) => stdout.extend_from_slice(&d),
+                SessionEvent::Stderr(_) => {}
+                SessionEvent::ExitStatus(c) => {
+                    code = Some(c);
+                    break;
+                }
+                SessionEvent::ExitSignal(_) | SessionEvent::Eof => break,
+            }
+        }
+        assert_eq!(stdout, b"hello");
+        assert_eq!(code, Some(7));
     }
 
-    async fn eof(&mut self) -> Result<()> {
-        let _ = self.control_tx.send(Control::Eof).await;
-        Ok(())
+    // Spawns /bin/sh via the unix PTY path; unix-only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn split_carries_stdin_through_writer() {
+        let sess: Box<dyn TargetSession> =
+            Box::new(LocalSession::new("/bin/sh".to_string(), None, None));
+        let (writer, mut stream) = sess.split();
+        writer.exec("cat").await.unwrap();
+        writer.write_stdin(b"ping").await.unwrap();
+        writer.eof().await.unwrap();
+
+        let mut stdout = Vec::new();
+        while let Some(ev) = stream.next().await {
+            match ev {
+                SessionEvent::Stdout(d) => stdout.extend_from_slice(&d),
+                SessionEvent::ExitStatus(_) | SessionEvent::Eof => break,
+                _ => {}
+            }
+        }
+        assert_eq!(stdout, b"ping");
     }
 
-    async fn next_event(&mut self) -> Option<SessionEvent> {
-        self.events_rx.recv().await
+    // Spawns /bin/sh via the unix PTY path; unix-only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_runs_in_configured_workdir() {
+        let dir = std::env::temp_dir().join(format!("xho-local-workdir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sess: Box<dyn TargetSession> = Box::new(LocalSession::new(
+            "/bin/sh".to_string(),
+            None,
+            Some(dir.clone()),
+        ));
+        let (writer, mut stream) = sess.split();
+        writer.exec("pwd -P").await.unwrap();
+
+        let mut stdout = Vec::new();
+        while let Some(ev) = stream.next().await {
+            match ev {
+                SessionEvent::Stdout(d) => stdout.extend_from_slice(&d),
+                SessionEvent::ExitStatus(_) | SessionEvent::Eof => break,
+                _ => {}
+            }
+        }
+        // Compare against the canonicalized path: temp dirs are symlinked
+        // (/var → /private/var on macOS) and `pwd -P` prints the physical one.
+        let expected = std::fs::canonicalize(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            String::from_utf8_lossy(&stdout).trim(),
+            expected.to_str().unwrap()
+        );
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::shell_exec_flag;
+mod deadlock_tests {
+    use super::*;
+    use std::time::Duration;
+
+    // Regression: a remote process that never reads stdin while its stdout is
+    // consumed must not freeze the session. The stdin flood parks the write
+    // direction (pipe + channel buffers fill); the event stream must still
+    // deliver output and the exit status.
+    // Spawns /bin/sh via the unix PTY path; unix-only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdin_backpressure_does_not_stall_output() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+
+        // Flood stdin far beyond every buffer in the path. Run in the
+        // background so the assertion path below always executes.
+        let flood = tokio::spawn(async move {
+            let stdin_tx = stdin_tx;
+            for _ in 0..64 {
+                if stdin_tx.send(vec![b'x'; 65536]).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let sess: Box<dyn TargetSession> =
+            Box::new(LocalSession::new("/bin/sh".to_string(), None, None));
+        let handle = tokio::spawn(super::super::drive_exec(
+            sess,
+            "echo alive-during-flood; exit 9".to_string(),
+            false,
+            0,
+            0,
+            event_tx,
+            Some(stdin_rx),
+        ));
+
+        let mut saw_alive = false;
+        let deadline = tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(ev) = event_rx.recv().await {
+                match ev {
+                    crate::protocol::ServerEvent::Stdout { data } => {
+                        if String::from_utf8_lossy(&data).contains("alive-during-flood") {
+                            saw_alive = true;
+                        }
+                    }
+                    crate::protocol::ServerEvent::ExitStatus { .. } => break,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        assert!(deadline.is_ok(), "session froze under stdin backpressure");
+        assert!(saw_alive, "output never arrived while stdin was saturated");
+        let code = tokio::time::timeout(Duration::from_secs(20), handle)
+            .await
+            .expect("drive_exec never finished")
+            .unwrap()
+            .unwrap();
+        assert_eq!(code, 9);
+        let _ = flood.await;
+    }
 
     #[test]
     fn shell_exec_flag_matches_shell_name() {

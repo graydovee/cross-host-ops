@@ -40,7 +40,7 @@ async fn spawn_service_with_authorized_keys(
     let mut config = AppConfig::default();
     config.server.local.enable = false;
     config.server.remote.enable = false;
-    config.review.enable = false;
+    config.review.exec.enable = false;
     config.server.remote.authorized_keys_path = authorized_keys_path.display().to_string();
     // Keep the tempdir alive for the test's lifetime by leaking it (tests are short).
     std::mem::forget(tempdir);

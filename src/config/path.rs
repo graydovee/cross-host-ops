@@ -37,3 +37,15 @@ pub fn default_local_transport() -> LocalTransport {
         LocalTransport::Tcp
     }
 }
+
+/// Default audit-log path. Root daemons write to `/var/log/xho/audit.jsonl`
+/// (standard syslog area); non-root daemons write to `~/.xho/audit.jsonl`.
+pub fn default_audit_log_path() -> String {
+    #[cfg(unix)]
+    {
+        if unsafe { libc::geteuid() } == 0 {
+            return "/var/log/xho/audit.jsonl".to_string();
+        }
+    }
+    "~/.xho/audit.jsonl".to_string()
+}

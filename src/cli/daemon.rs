@@ -38,8 +38,22 @@ async fn daemon_stop() -> Result<i32> {
     let endpoint = local_endpoint()?;
     let mut client = match connect(&endpoint).await {
         Ok(client) => client,
-        Err(_) => {
-            eprintln!("xhod is not running");
+        Err(e) => {
+            // Distinguish "endpoint file doesn't exist" (daemon really not
+            // running) from "exists but connection failed" (crashed/stale).
+            if endpoint.path().exists() {
+                eprintln!(
+                    "error: failed to connect to daemon {}: {e}",
+                    endpoint.describe_internal()
+                );
+                eprintln!(
+                    "hint: the endpoint file exists but the daemon may have crashed; \
+                     try removing it: rm {}",
+                    endpoint.path().display()
+                );
+            } else {
+                eprintln!("xhod is not running");
+            }
             return Ok(1);
         }
     };

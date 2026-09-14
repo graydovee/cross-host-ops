@@ -123,7 +123,9 @@ impl NormalizedPath {
                     if let Some(s) = prefix.as_os_str().to_str() {
                         let s = s.trim_end_matches(':');
                         if s.len() == 1 && s.chars().next().unwrap().is_ascii_alphabetic() {
-                            kind = PathKind::WindowsDrive(s.chars().next().unwrap().to_ascii_uppercase());
+                            kind = PathKind::WindowsDrive(
+                                s.chars().next().unwrap().to_ascii_uppercase(),
+                            );
                         }
                     }
                 }
@@ -302,7 +304,10 @@ pub async fn validate_upload_source(path: &Path, recursive: bool) -> Result<()> 
         .await
         .with_context(|| format!("failed to inspect upload source {}", path.display()))?;
     if metadata.is_dir() && !recursive {
-        bail!("{} is a directory; use -r to copy directories", path.display());
+        bail!(
+            "{} is a directory; use -r to copy directories",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -466,7 +471,9 @@ pub mod local {
     }
 
     pub fn default_xho_root() -> PathBuf {
-        home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".xho")
+        home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".xho")
     }
 
     /// Alias retained for callers expecting the historical name.
@@ -574,12 +581,18 @@ mod tests {
 
     #[test]
     fn from_str_backslash_only_splits_on_backslash() {
-        assert_eq!(NormalizedPath::from_str(r"foo\bar"), segs(&["foo", "bar"], Relative));
+        assert_eq!(
+            NormalizedPath::from_str(r"foo\bar"),
+            segs(&["foo", "bar"], Relative)
+        );
     }
 
     #[test]
     fn from_str_forward_only_splits_on_forward() {
-        assert_eq!(NormalizedPath::from_str("foo/bar"), segs(&["foo", "bar"], Relative));
+        assert_eq!(
+            NormalizedPath::from_str("foo/bar"),
+            segs(&["foo", "bar"], Relative)
+        );
     }
 
     #[test]
@@ -593,19 +606,34 @@ mod tests {
 
     #[test]
     fn from_strips_dot_slash_prefix() {
-        assert_eq!(NormalizedPath::from_str("./x/y"), segs(&["x", "y"], Relative));
-        assert_eq!(NormalizedPath::from_str(r".\x\y"), segs(&["x", "y"], Relative));
+        assert_eq!(
+            NormalizedPath::from_str("./x/y"),
+            segs(&["x", "y"], Relative)
+        );
+        assert_eq!(
+            NormalizedPath::from_str(r".\x\y"),
+            segs(&["x", "y"], Relative)
+        );
     }
 
     #[test]
     fn from_str_windows_drive_absolute() {
-        assert_eq!(NormalizedPath::from_str(r"C:\foo"), segs(&["foo"], WindowsDrive('C')));
-        assert_eq!(NormalizedPath::from_str("D:/bar/baz"), segs(&["bar", "baz"], WindowsDrive('D')));
+        assert_eq!(
+            NormalizedPath::from_str(r"C:\foo"),
+            segs(&["foo"], WindowsDrive('C'))
+        );
+        assert_eq!(
+            NormalizedPath::from_str("D:/bar/baz"),
+            segs(&["bar", "baz"], WindowsDrive('D'))
+        );
     }
 
     #[test]
     fn from_str_posix_absolute() {
-        assert_eq!(NormalizedPath::from_str("/tmp/x"), segs(&["tmp", "x"], Absolute));
+        assert_eq!(
+            NormalizedPath::from_str("/tmp/x"),
+            segs(&["tmp", "x"], Absolute)
+        );
     }
 
     #[test]
@@ -633,17 +661,34 @@ mod tests {
 
     #[test]
     fn to_string_normalized_always_forward() {
-        assert_eq!(NormalizedPath::from_str(r"a\b").to_string_normalized(), "a/b");
-        assert_eq!(NormalizedPath::from_str(r"C:\foo").to_string_normalized(), "C:/foo");
-        assert_eq!(NormalizedPath::from_str("/a/b").to_string_normalized(), "/a/b");
+        assert_eq!(
+            NormalizedPath::from_str(r"a\b").to_string_normalized(),
+            "a/b"
+        );
+        assert_eq!(
+            NormalizedPath::from_str(r"C:\foo").to_string_normalized(),
+            "C:/foo"
+        );
+        assert_eq!(
+            NormalizedPath::from_str("/a/b").to_string_normalized(),
+            "/a/b"
+        );
     }
 
     #[test]
     fn validate_relative_rejects_absolute_and_parent() {
         assert!(NormalizedPath::from_str("a/b").validate_relative().is_ok());
-        assert!(NormalizedPath::from_str("../a").validate_relative().is_err());
+        assert!(
+            NormalizedPath::from_str("../a")
+                .validate_relative()
+                .is_err()
+        );
         assert!(NormalizedPath::from_str("/a").validate_relative().is_err());
-        assert!(NormalizedPath::from_str(r"C:\a").validate_relative().is_err());
+        assert!(
+            NormalizedPath::from_str(r"C:\a")
+                .validate_relative()
+                .is_err()
+        );
     }
 
     // --- spec::parse_remote ---

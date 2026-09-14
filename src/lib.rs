@@ -25,6 +25,7 @@ pub(crate) mod filepath;
 pub(crate) mod fs_meta;
 pub mod logging;
 pub mod output;
+pub mod oversight;
 pub mod protocol;
 pub mod secret;
 pub mod types;

@@ -20,12 +20,19 @@ Where `<target>` is a reachable server alias or `jump:server` pattern (e.g., `pr
 
 | Category | Test Cases |
 |----------|-----------|
-| **exec** | basic command, exit code propagation, -t flag, --no-tty, --timeout, multi-arg with --, shell wrapping |
-| **cp** | upload file, download file, recursive directory copy |
+| **exec** | basic command, exit code propagation, -t flag, --no-tty, --timeout (fires), --shell wrapping, stdin forwarding (-i) |
+| **cp** | upload file, download file (+ content diff), recursive directory copy — once via the direct target and once through an `xhod` jump host when the target is `jump:server` |
 | **ls** | server list returns output |
 | **status** | daemon status returns successfully |
-| **daemon** | stop + start cycle |
+| **daemon** | stop + start cycle (skippable) |
 | **host** | list configured jump hosts |
+
+Every command runs under a short hang guard (~5s); a command that produces no
+output for that long is killed and reported as `[FAIL] … [HUNG]`.
+
+Not covered here (exercised by `cargo test` instead): `xho cp --resume`
+(in-process e2e suite `tests/in_process_copy_test.rs`) and interactive review
+prompts.
 
 ## Script Parameters
 

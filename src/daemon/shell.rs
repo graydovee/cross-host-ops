@@ -162,7 +162,10 @@ mod tests {
             wrap_in_shell("echo hi", r"C:\Program Files\Git\bin\bash.exe"),
             "bash.exe -ic 'echo hi'"
         );
-        assert_eq!(wrap_in_shell("echo hi", "/usr/bin/bash"), "bash -ic 'echo hi'");
+        assert_eq!(
+            wrap_in_shell("echo hi", "/usr/bin/bash"),
+            "bash -ic 'echo hi'"
+        );
         assert_eq!(wrap_in_shell("echo hi", "sh"), "sh -c 'echo hi'");
     }
 

@@ -73,7 +73,7 @@ impl InProcessRpcHarness {
         config.server.local.enable = false;
         config.server.remote.enable = false;
         // Disable review for tests
-        config.review.enable = false;
+        config.review.exec.enable = false;
 
         // Create the gRPC service
         let service = make_test_rpc_service(config.clone(), config_path);
@@ -98,7 +98,7 @@ impl InProcessRpcHarness {
             c.ssh.server_config_path = tempdir.join("server.toml").display().to_string();
             c.server.local.enable = false;
             c.server.remote.enable = false;
-            c.review.enable = false;
+            c.review.exec.enable = false;
             c
         };
 
@@ -206,6 +206,65 @@ impl InProcessRpcHarness {
         events
     }
 
+    /// Call `Copy` for a DOWNLOAD with a fully-specified start request
+    /// (including resume hints) and collect all response events.
+    pub async fn copy_download(&mut self, start: rpc::CopyStartRequest) -> Vec<rpc::CopyResponse> {
+        let request = rpc::CopyRequest {
+            request: Some(rpc::copy_request::Request::Start(start)),
+        };
+        let response = self
+            .client
+            .copy(tokio_stream::once(request))
+            .await
+            .expect("Copy RPC failed");
+        let mut stream = response.into_inner();
+        let mut events = Vec::new();
+        while let Some(msg) = stream
+            .message()
+            .await
+            .expect("failed to read Copy response stream")
+        {
+            events.push(msg);
+        }
+        events
+    }
+
+    /// Call `Copy` for an UPLOAD: send the start request, then the given
+    /// frames (as the CLI's feeder would), and collect all response events.
+    pub async fn copy_upload(
+        &mut self,
+        start: rpc::CopyStartRequest,
+        frames: Vec<rpc::CopyFrame>,
+    ) -> Vec<rpc::CopyResponse> {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let request = rpc::CopyRequest {
+            request: Some(rpc::copy_request::Request::Start(start)),
+        };
+        tx.send(request).await.expect("send start");
+        for frame in frames {
+            let request = rpc::CopyRequest {
+                request: Some(rpc::copy_request::Request::Frame(frame)),
+            };
+            tx.send(request).await.expect("send frame");
+        }
+        drop(tx);
+        let response = self
+            .client
+            .copy(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await
+            .expect("Copy RPC failed");
+        let mut stream = response.into_inner();
+        let mut events = Vec::new();
+        while let Some(msg) = stream
+            .message()
+            .await
+            .expect("failed to read Copy response stream")
+        {
+            events.push(msg);
+        }
+        events
+    }
+
     /// Call `Status` on the remote daemon.
     pub async fn status(&mut self) -> rpc::StatusResponse {
         let response = self
@@ -264,7 +323,7 @@ impl PairedRpcHarness {
         remote_config.ssh.server_config_path = remote_server_config_path.display().to_string();
         remote_config.server.local.enable = false;
         remote_config.server.remote.enable = false;
-        remote_config.review.enable = false;
+        remote_config.review.exec.enable = false;
 
         let remote_service = make_test_rpc_service(remote_config, remote_config_path);
 
@@ -281,7 +340,7 @@ impl PairedRpcHarness {
         local_config.ssh.server_config_path = local_server_config_path.display().to_string();
         local_config.server.local.enable = false;
         local_config.server.remote.enable = false;
-        local_config.review.enable = false;
+        local_config.review.exec.enable = false;
 
         let local_service = make_test_rpc_service(local_config, local_config_path);
 

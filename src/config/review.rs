@@ -7,30 +7,14 @@ use serde::{Deserialize, Serialize};
 
 use super::duration::{deserialize_duration, serialize_duration};
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default)]
-pub struct MfaConfig {
-    pub totp_secret_base32: String,
-    pub digits: u32,
-    pub period: u64,
-    pub digest: String,
-}
-
-impl Default for MfaConfig {
-    fn default() -> Self {
-        Self {
-            totp_secret_base32: String::new(),
-            digits: 6,
-            period: 30,
-            digest: "sha1".to_string(),
-        }
-    }
-}
-
+/// AI review configuration. The LLM connection fields (endpoint/model/api_key/
+/// timeout/headers/failure_action) are shared between all reviewed operation
+/// kinds; each operation kind has its own sub-config for enable flag, prompts,
+/// policy and allow/blocklists.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ReviewConfig {
-    pub enable: bool,
+    // --- shared LLM connection ---
     pub endpoint: String,
     pub model: String,
     pub api_key: Option<String>,
@@ -39,30 +23,111 @@ pub struct ReviewConfig {
         serialize_with = "serialize_duration"
     )]
     pub timeout: Duration,
-    pub failure_action: ReviewAction,
     pub headers: HashMap<String, String>,
+    /// Fallback action when the LLM service itself errors (network failure,
+    /// bad response, parse error). Applied by the oversight layer.
+    pub failure_action: ReviewAction,
+
+    // --- per-operation review config ---
+    pub exec: ReviewExecConfig,
+    pub copy: ReviewCopyConfig,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: default_review_endpoint(),
+            model: default_review_model(),
+            api_key: default_review_api_key(),
+            timeout: Duration::from_secs(10),
+            headers: HashMap::new(),
+            failure_action: ReviewAction::Deny,
+            exec: ReviewExecConfig::default(),
+            copy: ReviewCopyConfig::default(),
+        }
+    }
+}
+
+/// AI review settings for `exec` operations.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ReviewExecConfig {
+    pub enable: bool,
     pub prompts: ReviewPrompts,
     pub policy: ReviewPolicy,
     pub fast_allowlist: FastAllowlistConfig,
     pub semantic_whitelist: Vec<SemanticWhitelistEntry>,
 }
 
-impl Default for ReviewConfig {
+impl Default for ReviewExecConfig {
     fn default() -> Self {
         Self {
             enable: false,
-            endpoint: default_review_endpoint(),
-            model: default_review_model(),
-            api_key: default_review_api_key(),
-            timeout: Duration::from_secs(10),
-            failure_action: ReviewAction::Deny,
-            headers: HashMap::new(),
             prompts: ReviewPrompts::default(),
             policy: ReviewPolicy::default(),
             fast_allowlist: FastAllowlistConfig::default(),
             semantic_whitelist: default_semantic_whitelist(),
         }
     }
+}
+
+/// AI review settings for `cp` (file copy) operations. Copies matching the
+/// blocklist are denied immediately; copies matching the allowlist are allowed
+/// immediately; everything else is classified by the LLM.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ReviewCopyConfig {
+    pub enable: bool,
+    pub prompts: ReviewCopyPrompts,
+    pub policy: ReviewPolicy,
+    /// Glob patterns matched against `remote_path` and `source_name`.
+    /// A match short-circuits to an allow decision (e.g. `/var/log/*`).
+    pub allowlist: Vec<String>,
+    /// Glob patterns matched against `remote_path` and `source_name`.
+    /// A match short-circuits to a deny decision (e.g. `~/.ssh/*`).
+    pub blocklist: Vec<String>,
+}
+
+impl Default for ReviewCopyConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            prompts: ReviewCopyPrompts::default(),
+            policy: ReviewPolicy::default(),
+            allowlist: Vec::new(),
+            blocklist: default_copy_blocklist(),
+        }
+    }
+}
+
+/// System + user template for copy-review LLM prompts.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ReviewCopyPrompts {
+    pub system: String,
+    pub template: String,
+}
+
+impl Default for ReviewCopyPrompts {
+    fn default() -> Self {
+        Self {
+            system: default_copy_review_system_prompt(),
+            template: default_copy_review_template(),
+        }
+    }
+}
+
+/// Default copy blocklist: credential and config directories that should not be
+/// silently copied. Operators can override via `[review.copy] blocklist`.
+pub fn default_copy_blocklist() -> Vec<String> {
+    vec![
+        ".ssh".to_string(),
+        ".aws".to_string(),
+        ".gnupg".to_string(),
+        ".kube".to_string(),
+        "/etc/shadow".to_string(),
+        "/etc/ssh".to_string(),
+    ]
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -160,6 +225,29 @@ pub fn default_review_template() -> String {
         "If a command mixes a benign subcommand with any mutating or unclear behavior, do not whitelist it.",
         "Return compact JSON with keys: risk_level, reason, matched_whitelist_reason.",
         "matched_whitelist_reason must be null when no whitelist intent applies.",
+    ]
+    .join("\n")
+}
+
+pub fn default_copy_review_system_prompt() -> String {
+    [
+        "You are a file-transfer safety reviewer for a remote operations tool.",
+        "Your job is to classify whether copying a file or directory to/from a target host is safe.",
+        "Be conservative: credential files, secrets, private keys, and broad system directories are sensitive.",
+        "Return JSON only, with no markdown and no extra text.",
+    ]
+    .join(" ")
+}
+
+pub fn default_copy_review_template() -> String {
+    [
+        "Classify the copy operation into exactly one risk level: safe, risky, or dangerous.",
+        "safe: ordinary application data, logs, build artifacts, or public files with no secret material.",
+        "risky: sensitive but non-secret paths where exfiltration or overwrite could cause harm.",
+        "dangerous: credentials, private keys, shadow files, or any path likely to contain secrets.",
+        "Consider the direction: downloading secrets from a host is exfiltration; overwriting system files is destructive.",
+        "Return compact JSON with keys: risk_level, reason, matched_whitelist_reason.",
+        "matched_whitelist_reason must be null when no special reason applies.",
     ]
     .join("\n")
 }

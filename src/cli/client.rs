@@ -19,8 +19,8 @@ pub(crate) async fn connect_data_client(
     connect_local_data_client(&client_config, access).await
 }
 
-pub(crate) async fn connect_local_copy_client() -> Result<rpc::xho_rpc_client::XhoRpcClient<tonic::transport::Channel>>
-{
+pub(crate) async fn connect_local_copy_client()
+-> Result<rpc::xho_rpc_client::XhoRpcClient<tonic::transport::Channel>> {
     let client_config = ClientConfig::load()?;
     connect_local_data_client(&client_config, ClientAccess::AutoStart).await
 }
