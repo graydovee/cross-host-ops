@@ -103,6 +103,12 @@ xho exec --no-shell <target> -- /bin/ls
 xho exec remote-xhod:web1 -- hostname
 ```
 
+#### Command modes
+
+- **`--` argument mode** — everything after `--` is passed as literal argument words: no glob expansion, no shell metacharacter interpretation. A word containing spaces is one argument (e.g. one program name), never shell code. On direct and localhost targets the words may still be wrapped in an interactive shell (`--shell`/`--no-shell` control) for rc/alias loading, but each word stays one literal word.
+- **Quoted single-string mode** — `xho exec <target> '<shell code>'` (a single argument without `--`) runs the string as shell code under `sh`; write your escaping for exactly one shell parse.
+- `--shell` / `--no-shell` are honored on direct and localhost targets only. xhod-tunnel (`remote-xhod:web1`), reverse-proxy, and jumpserver targets ignore them: those transports execute the argv words without an extra shell wrapper.
+
 ### Interactive Mode
 
 Automatically activated when the following conditions are met:

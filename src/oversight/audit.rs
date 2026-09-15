@@ -263,15 +263,20 @@ pub fn include_identity() -> bool {
 // Internals
 // ---------------------------------------------------------------------------
 
-fn build_appender(config: &AuditConfig) -> Result<(PathBuf, NonBlocking, WorkerGuard)> {
+fn resolve_audit_path(config: &AuditConfig) -> Result<PathBuf> {
     let raw = config
         .path
         .clone()
         .filter(|p| !p.trim().is_empty())
         .unwrap_or_else(crate::config::default_audit_log_path);
-    // The fallback path still contains a literal `~` (expand_paths only
-    // expands explicitly configured values).
-    let path = PathBuf::from(crate::config::expand_tilde(&raw)?);
+    // Config-loaded paths are already tilde-expanded in `AppConfig::expand_paths`;
+    // the zero-config default ("~/.xho/audit.jsonl") is not, so expand here too —
+    // otherwise a literal "~" directory appears in the daemon's working directory.
+    Ok(PathBuf::from(crate::config::expand_tilde(&raw)?))
+}
+
+fn build_appender(config: &AuditConfig) -> Result<(PathBuf, NonBlocking, WorkerGuard)> {
+    let path = resolve_audit_path(config)?;
     build_appender_at(&path, config.enabled, config.include_identity)
 }
 
@@ -301,6 +306,43 @@ fn build_appender_at(
 mod tests {
     use super::*;
     use crate::config::AuditConfig;
+
+    #[test]
+    fn zero_config_audit_path_expands_tilde() {
+        // The zero-config default is the literal string "~/.xho/audit.jsonl";
+        // it must resolve against the home directory, not create a literal
+        // "~" directory relative to the daemon's working directory.
+        let path = resolve_audit_path(&AuditConfig::default()).unwrap();
+        assert!(!path.starts_with("~"));
+        assert!(path.ends_with(".xho/audit.jsonl"));
+
+        // A user-configured tilde path resolves too, and absolute paths and
+        // whitespace-only overrides fall back to the default.
+        let configured = AuditConfig {
+            path: Some("~/logs/audit.jsonl".to_string()),
+            ..AuditConfig::default()
+        };
+        assert!(
+            resolve_audit_path(&configured)
+                .unwrap()
+                .ends_with("logs/audit.jsonl")
+        );
+
+        let absolute = AuditConfig {
+            path: Some("/var/log/xho/audit.jsonl".to_string()),
+            ..AuditConfig::default()
+        };
+        assert_eq!(
+            resolve_audit_path(&absolute).unwrap(),
+            PathBuf::from("/var/log/xho/audit.jsonl")
+        );
+
+        let blank = AuditConfig {
+            path: Some("   ".to_string()),
+            ..AuditConfig::default()
+        };
+        assert!(!resolve_audit_path(&blank).unwrap().starts_with("~"));
+    }
 
     #[test]
     fn event_serializes_to_json_and_skips_none() {

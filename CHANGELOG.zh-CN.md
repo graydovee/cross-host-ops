@@ -7,13 +7,13 @@
      条目按发布版本分组（## v0.x.y 对应 git tag），已发布小节冻结；下一版未定稿时写入 ## v0.5.7。
      完整规则见 AGENTS.md 与 CHANGELOG.md 头部注释。 -->
 
-## latest
-
-- 2026-09-15 [refactor] release CI 弃用 QEMU 模拟：docker 镜像改在 linux/amd64 + linux/arm64 原生 runner 上构建（合并为单一 manifest），aarch64-musl 二进制也改在 arm64 原生 runner 编译（去掉 `cross`）——发布流水线提速数倍
-
 ## v0.5.10
 
+- 2026-09-15 [refactor] release CI 弃用 QEMU 模拟：docker 镜像改在 linux/amd64 + linux/arm64 原生 runner 上构建（合并为单一 manifest），aarch64-musl 二进制也改在 arm64 原生 runner 编译（去掉 `cross`）——发布流水线提速数倍
 - 2026-09-14 [feat] Windows ARM64 构建：release 新增 `aarch64-pc-windows-msvc` zip 包（与 x64 并列），Git Bash 下 `deploy.sh` 自动识别 ARM64 Windows
+- 2026-09-07 [bug] exec `--` 模式下含空格或元字符的命令名不再被包裹 shell 重新解释为代码，而是作为单个字面量词执行；纯命令名的 alias 展开保持不变
+- 2026-09-07 [bug] 零配置时的默认审计日志路径（`~/.xho/audit.jsonl`）现在会正确展开 tilde，不再在 daemon 工作目录下创建字面量的 `~` 目录
+- 2026-09-07 [docs] 补充文档说明 exec 的两种命令模式（引号包裹的 shell 代码串 vs `--` 后的字面量参数）以及哪些网关类型支持 --shell/--no-shell
 
 ## v0.5.9
 

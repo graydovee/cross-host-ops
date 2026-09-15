@@ -85,31 +85,14 @@ pub fn build_final_command(argv: &[String], shell: &str) -> String {
     if shell.is_empty() {
         inner
     } else {
-        // When wrapping in a shell, we join argv with spaces but leave the
-        // first word (command name) unquoted so that shell aliases can expand.
-        // Subsequent arguments are still shell-quoted to preserve semantics.
-        let shell_inner = build_shell_inner_command(argv);
+        // When wrapping in a shell, leave the first word (command name)
+        // unquoted only when it is a safe command word, so that shell aliases
+        // can expand. Any other argv[0] is quoted to preserve argv word
+        // boundaries: quoting it raw would let the shell re-interpret spaces
+        // and metacharacters as code.
+        let shell_inner = build_interactive_shell_command(argv);
         wrap_in_shell(&shell_inner, shell)
     }
-}
-
-/// Build a command string for use inside a shell wrapper.
-/// The first argument (command name) is left unquoted so aliases expand.
-/// Remaining arguments are shell-quoted to preserve word boundaries.
-fn build_shell_inner_command(argv: &[String]) -> String {
-    let mut result = String::new();
-    for (index, arg) in argv.iter().enumerate() {
-        if index > 0 {
-            result.push(' ');
-        }
-        if index == 0 {
-            // Leave command name unquoted for alias expansion
-            result.push_str(arg);
-        } else {
-            result.push_str(&shell_quote(arg));
-        }
-    }
-    result
 }
 
 /// Resolve the effective shell-wrapping decision.
@@ -150,8 +133,8 @@ pub fn resolve_shell(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_final_command, build_remote_command, resolve_shell, shell_flags, shell_quote,
-        wrap_in_shell,
+        build_final_command, build_interactive_shell_command, build_remote_command, resolve_shell,
+        shell_flags, shell_quote, wrap_in_shell,
     };
 
     #[test]
@@ -227,6 +210,36 @@ mod tests {
         let argv2 = vec!["ls".to_string()];
         let result2 = build_final_command(&argv2, "bash");
         assert_eq!(result2, "bash -ic 'ls'");
+    }
+
+    #[test]
+    fn build_final_command_quotes_unsafe_argv0() {
+        // argv[0] containing spaces or metacharacters must be quoted so the
+        // wrapping shell cannot re-interpret it as code. The inner opening
+        // quote of shell_quote appears escaped as '\'' right after the
+        // wrapper's own opening quote.
+        let argv = vec!["my cmd".to_string(), "-la".to_string()];
+        let result = build_final_command(&argv, "bash");
+        assert_eq!(result, r#"bash -ic ''\''my cmd'\'' '\''-la'\'''"#);
+
+        let argv2 = vec!["foo;bar".to_string()];
+        let result2 = build_final_command(&argv2, "bash");
+        assert_eq!(result2, r#"bash -ic ''\''foo;bar'\'''"#);
+    }
+
+    #[test]
+    fn interactive_shell_command_quotes_unsafe_words() {
+        let argv = vec!["ls".to_string(), "hello world".to_string()];
+        assert_eq!(build_interactive_shell_command(&argv), "ls 'hello world'");
+
+        let argv2 = vec!["my cmd".to_string()];
+        assert_eq!(build_interactive_shell_command(&argv2), "'my cmd'");
+
+        let argv3 = vec!["/usr/bin/ls".to_string(), "-l".to_string()];
+        assert_eq!(build_interactive_shell_command(&argv3), "/usr/bin/ls '-l'");
+
+        let argv4 = vec!["$HOME".to_string()];
+        assert_eq!(build_interactive_shell_command(&argv4), "'$HOME'");
     }
 
     #[test]

@@ -156,6 +156,16 @@ Combined `-it` = allocate PTY + forward stdin (interactive mode when both are TT
 
 A global `-y/--yes` auto-confirms review prompts (exec/cp) instead of asking.
 
+### Command modes
+
+- `xho exec <target> '<shell code>'` — a single quoted string (no `--`) runs as shell
+  code under the target's shell; your escaping is parsed exactly once.
+- `xho exec <target> -- <words>` — everything after `--` is literal argv: no glob or
+  metacharacter interpretation; a space-containing word is one argument, never shell code.
+- `--shell`/`--no-shell` only affect direct and localhost targets; xhod-tunnel,
+  reverse-proxy, and jumpserver targets ignore them (argv words run without an extra
+  shell wrapper).
+
 ## cp Flags
 
 Destinations follow scp semantics: a directory destination (e.g. `host:/tmp`)
