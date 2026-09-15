@@ -84,17 +84,29 @@ jobs:
   docker-ghcr:
     name: docker ghcr (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
+    needs: build-release-binaries
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: linux/amd64
             runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      - name: Download prebuilt binaries
+        uses: actions/download-artifact@v5
+        with:
+          name: release-${{ matrix.target }}
+
+      - name: Extract build context
+        shell: bash
+        run: tar -xzf "cross-host-ops-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -112,10 +124,11 @@ jobs:
         env:
           DOCKER_BUILD_RECORD_UPLOAD: "false"
         with:
-          context: .
+          context: cross-host-ops-${{ github.ref_name }}-${{ matrix.target }}
+          file: packaging/docker/Dockerfile.runtime
           platforms: ${{ matrix.platform }}
           push: true
-          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/cross-host-ops,push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/cross-host-ops,push-by-digest=true,name-canonical=true
 
       - name: Export digest
         shell: bash

@@ -19,6 +19,7 @@
 
 ## v0.5.10
 
+- 2026-09-15 [refactor] release docker images are assembled from the prebuilt musl binaries instead of compiling inside the container, cutting the docker stage from over an hour to about a minute
 - 2026-09-15 [refactor] release CI drops QEMU emulation: docker images build natively on linux/amd64 + linux/arm64 runners (merged into one manifest), and the aarch64-musl binaries compile natively on an arm64 runner instead of via `cross` — the release pipeline gets several times faster
 - 2026-09-14 [feat] Windows ARM64 builds: releases now ship an `aarch64-pc-windows-msvc` zip alongside x64, and `deploy.sh` auto-detects ARM64 Windows under Git Bash
 - 2026-09-07 [bug] shell-wrapped exec no longer re-interprets a `--` command name containing spaces or metacharacters as shell code; it now runs as one literal word, and plain command names keep their alias expansion

@@ -1,0 +1,17 @@
+# Runtime-only image assembled from prebuilt static binaries.
+# CI (.github/workflows/release.yml) feeds the musl release artifacts into the
+# build context; for a from-source build use the top-level Dockerfile instead.
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates openssh-client tar \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY xho xhod /usr/local/bin/
+COPY config.example.toml /etc/xho/config.toml
+
+EXPOSE 2222
+
+CMD ["/usr/local/bin/xdhod", "--config", "/etc/xho/config.toml", "--origin", "external"]

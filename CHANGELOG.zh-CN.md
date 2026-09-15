@@ -9,6 +9,7 @@
 
 ## v0.5.10
 
+- 2026-09-15 [refactor] 发布 docker 镜像改为直接组装预编译的 musl 二进制，不再在容器内编译，docker 阶段从一个多小时缩短到约一分钟
 - 2026-09-15 [refactor] release CI 弃用 QEMU 模拟：docker 镜像改在 linux/amd64 + linux/arm64 原生 runner 上构建（合并为单一 manifest），aarch64-musl 二进制也改在 arm64 原生 runner 编译（去掉 `cross`）——发布流水线提速数倍
 - 2026-09-14 [feat] Windows ARM64 构建：release 新增 `aarch64-pc-windows-msvc` zip 包（与 x64 并列），Git Bash 下 `deploy.sh` 自动识别 ARM64 Windows
 - 2026-09-07 [bug] exec `--` 模式下含空格或元字符的命令名不再被包裹 shell 重新解释为代码，而是作为单个字面量词执行；纯命令名的 alias 展开保持不变
