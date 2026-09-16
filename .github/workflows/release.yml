@@ -140,7 +140,9 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@v5
         with:
-          name: digests-${{ matrix.platform }}
+          # matrix.target is slash-free (matrix.platform's linux/amd64 is not
+          # a legal artifact name).
+          name: digests-${{ matrix.target }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
