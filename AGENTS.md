@@ -89,6 +89,7 @@ The changelog exists in **two languages**, both at the repo root: `CHANGELOG.md`
   | `[docs]`    | Documentation changes |
 
 - Tests, formatting, and minor cleanup bundled with a `fix`/`feat` are **not logged separately** — fold them into that entry; Merge/Revert commits get no entry.
+- **One version, one change, one entry**: multiple commits iterating on the same change within a single version are logged as a **single entry** that states that version's final state — never one entry per intermediate step. When a follow-up commit amends work already listed in the open section, merge the entries instead of adding a new one.
 - **Keep the changelog lines in the same commit as the code change** — never a standalone changelog commit.
 
 ## Interaction & documentation conventions
