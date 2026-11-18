@@ -767,9 +767,12 @@ async fn download_recursive(
 /// Used for mkdir/chmod/touch/mv/ln during raw-mode upload sessions.
 async fn run_shell_command_raw(shell: &mut PtyShell, command: &str) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    shell.run_command_raw(command, &tx).await?;
+    let code = shell.run_command_raw(command, &tx).await?;
     drop(tx);
     while rx.recv().await.is_some() {}
+    if code != 0 {
+        bail!("remote shell command failed with exit code {code}");
+    }
     Ok(())
 }
 

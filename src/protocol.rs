@@ -211,24 +211,34 @@ mod tests {
 pub fn copy_frame_from_rpc(frame: rpc::CopyFrame) -> Result<CopyFrame> {
     use rpc::copy_frame::Frame;
     match frame.frame.ok_or_else(|| anyhow!("empty copy frame"))? {
-        Frame::BeginFile(frame) => Ok(CopyFrame::BeginFile {
-            relative_path: frame.relative_path,
-            mode: frame.mode,
-            size: frame.size,
-            mtime: frame.mtime,
-            start_offset: frame.start_offset,
-        }),
+        Frame::BeginFile(frame) => {
+            crate::filepath::validate_wire_relative_path(&frame.relative_path)?;
+            Ok(CopyFrame::BeginFile {
+                relative_path: frame.relative_path,
+                mode: frame.mode,
+                size: frame.size,
+                mtime: frame.mtime,
+                start_offset: frame.start_offset,
+            })
+        }
         Frame::FileData(frame) => Ok(CopyFrame::FileData { data: frame.data }),
         Frame::EndFile(_) => Ok(CopyFrame::EndFile),
-        Frame::BeginDirectory(frame) => Ok(CopyFrame::BeginDirectory {
-            relative_path: frame.relative_path,
-            mode: frame.mode,
-            mtime: frame.mtime,
-        }),
-        Frame::Symlink(frame) => Ok(CopyFrame::Symlink {
-            relative_path: frame.relative_path,
-            target: frame.target,
-        }),
+        Frame::BeginDirectory(frame) => {
+            crate::filepath::validate_wire_relative_path(&frame.relative_path)?;
+            Ok(CopyFrame::BeginDirectory {
+                relative_path: frame.relative_path,
+                mode: frame.mode,
+                mtime: frame.mtime,
+            })
+        }
+        Frame::Symlink(frame) => {
+            crate::filepath::validate_wire_relative_path(&frame.relative_path)?;
+            crate::filepath::validate_wire_symlink_target(&frame.target)?;
+            Ok(CopyFrame::Symlink {
+                relative_path: frame.relative_path,
+                target: frame.target,
+            })
+        }
         Frame::EndOfStream(_) => Ok(CopyFrame::EndOfStream),
     }
 }

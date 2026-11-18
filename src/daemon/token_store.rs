@@ -71,7 +71,9 @@ impl TokenStore {
         let entry = TokenEntry {
             prefix,
             hash: hash.clone(),
-            expires_at: now + ttl,
+            // Client supplied TTLs can exceed the representable SystemTime
+            // range; expire such a token immediately instead of panicking.
+            expires_at: now.checked_add(ttl).unwrap_or(UNIX_EPOCH),
             once,
             consumed: false,
             created_at: now,

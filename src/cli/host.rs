@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use russh::keys::ssh_key::HashAlg;
 
 use crate::config::{
     AppConfig, GatewayConfig, RESERVED_NAMES, XhodGatewayConfig, default_config_path,
@@ -73,8 +74,8 @@ async fn remote_connect(
     address: String,
     identity_file_override: Option<String>,
     known_hosts_override: Option<String>,
-    _accept_new_host_key: bool,
-    _fingerprint: Option<String>,
+    accept_new_host_key: bool,
+    expected_fingerprint: Option<String>,
     token_arg: Option<String>,
 ) -> Result<i32> {
     // --- Step 1: Validate <name> against RESERVED_NAMES ---
@@ -89,7 +90,8 @@ async fn remote_connect(
     // --- Step 2: Validate <name> against existing gateway names ---
     // Load the daemon config to check for name collisions.
     let config_path = default_config_path();
-    let config = AppConfig::load(Some(&config_path)).unwrap_or_default();
+    let config = AppConfig::load(Some(&config_path))
+        .with_context(|| format!("failed to load config {}", config_path.display()))?;
     if let Some(entry) = config.gateways.iter().find(|g| g.name() == name) {
         eprintln!(
             "error: name '{}' is already used by a {:?} gateway",
@@ -102,7 +104,7 @@ async fn remote_connect(
     // --- Step 3: Parse <address> via RemoteAddress::parse ---
     let defaults = AddressDefaults {
         user: "xho".to_string(),
-        port: 2222,
+        port: 12222,
     };
     let remote_addr = match RemoteAddress::parse(&address, &defaults) {
         Ok(addr) => addr,
@@ -126,18 +128,31 @@ async fn remote_connect(
         &public_key,
         &std::path::PathBuf::from(&known_hosts_path),
     );
+    if let Some(expected) = expected_fingerprint.as_deref() {
+        let actual = public_key.fingerprint(HashAlg::Sha256).to_string();
+        if expected != actual {
+            bail!(
+                "host key fingerprint mismatch: expected {}, got {}",
+                expected,
+                actual
+            );
+        }
+    }
     match state {
         KnownHostState::Known => {}
         KnownHostState::Unknown {
             algorithm,
-            fingerprint,
+            fingerprint: actual_fingerprint,
         } => {
             eprintln!(
                 "The authenticity of host '{}' can't be established.",
                 target.address()
             );
-            eprintln!("{} key fingerprint is {}.", algorithm, fingerprint);
-            if !prompt_for_confirmation("trust this host key and continue", false)? {
+            eprintln!("{} key fingerprint is {}.", algorithm, actual_fingerprint);
+            if expected_fingerprint.is_none()
+                && !accept_new_host_key
+                && !prompt_for_confirmation("trust this host key and continue", false)?
+            {
                 bail!("host key not trusted");
             }
             trust_known_host(
@@ -149,13 +164,13 @@ async fn remote_connect(
         }
         KnownHostState::Changed {
             algorithm,
-            fingerprint,
+            fingerprint: actual_fingerprint,
         } => {
             bail!(
                 "host key for {} changed; refusing to connect ({} {})",
                 target.address(),
                 algorithm,
-                fingerprint
+                actual_fingerprint
             );
         }
     }
@@ -183,7 +198,8 @@ async fn remote_connect(
     });
 
     // Re-load config to persist (avoid stale state)
-    let mut config = AppConfig::load(Some(&config_path)).unwrap_or_default();
+    let mut config = AppConfig::load(Some(&config_path))
+        .with_context(|| format!("failed to reload config {}", config_path.display()))?;
     config.gateways.push(new_entry);
 
     // Write the updated config atomically

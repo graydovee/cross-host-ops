@@ -19,6 +19,7 @@
 
 ## latest
 
+- 2026-11-18 [bug] Restricted control-plane RPCs by caller authentication, rejected unsafe copy paths and shell names, and enforced SSH host-key verification for outbound connections.
 - 2026-11-18 [bug] SSH proxy setup failures now report an error and close the channel, with a connection deadline and Ctrl+C cancellation instead of hanging indefinitely.
 - 2026-10-09 [bug] jumpserver targets missing from the bastion inventory now fail fast with a "no matching assets" resolution error (exit 127) instead of hanging for the connect timeout and reporting a shell-output timeout
 

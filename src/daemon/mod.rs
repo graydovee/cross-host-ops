@@ -17,6 +17,8 @@ pub mod reverse_proxy;
 #[allow(dead_code)]
 pub mod rpc;
 #[allow(dead_code)]
+mod rpc_auth;
+#[allow(dead_code)]
 pub mod session;
 #[allow(dead_code)]
 pub mod shell;
@@ -71,6 +73,7 @@ use self::gateway::Gateway;
 use self::gateway::Route;
 use self::gateway::auth::AuthPrompter;
 use self::resolver::{ResolveResult, Resolver};
+use self::shell::build_final_command;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -614,9 +617,15 @@ pub async fn run_with_overrides(
         });
     }
 
+    let reserved_gateway_names = state
+        .gateways
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
     let incoming = ReceiverStream::new(receiver_map_incoming(
         incoming_rx,
         state.reverse_proxy_registry.clone(),
+        reserved_gateway_names,
     ));
     Server::builder()
         .add_service(proto_rpc::xho_rpc_server::XhoRpcServer::new(
@@ -650,6 +659,7 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
         &self,
         request: Request<Streaming<proto_rpc::ExecuteRequest>>,
     ) -> Result<Response<Self::ExecuteStream>, Status> {
+        rpc_auth::authorize(&request, rpc_auth::RpcClass::Business)?;
         info!("accepted execute stream");
         let caller = extract_caller(&request);
         let mut inbound = request.into_inner();
@@ -701,6 +711,7 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
         &self,
         request: Request<Streaming<proto_rpc::CopyRequest>>,
     ) -> Result<Response<Self::CopyStream>, Status> {
+        rpc_auth::authorize(&request, rpc_auth::RpcClass::Business)?;
         let caller = extract_caller(&request);
         let mut inbound = request.into_inner();
         let state = self.state.clone();
@@ -960,8 +971,9 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
 
     async fn status(
         &self,
-        _request: Request<proto_rpc::StatusRequest>,
+        request: Request<proto_rpc::StatusRequest>,
     ) -> Result<Response<proto_rpc::StatusResponse>, Status> {
+        rpc_auth::authorize(&request, rpc_auth::RpcClass::Admin)?;
         info!("status request");
         let config = self.state.config.read().await.clone();
         let socket_path = config.server.local.socket_path.clone();
@@ -1078,6 +1090,7 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
         &self,
         request: Request<proto_rpc::ServerListRequest>,
     ) -> Result<Response<proto_rpc::ServerListResponse>, Status> {
+        rpc_auth::authorize(&request, rpc_auth::RpcClass::Business)?;
         let config = self.state.config.read().await.clone();
         let path = PathBuf::from(&config.ssh.server_config_path);
 
@@ -1126,6 +1139,7 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
         &self,
         request: Request<Streaming<proto_rpc::SessionRequest>>,
     ) -> Result<Response<Self::OpenSessionStream>, Status> {
+        rpc_auth::authorize(&request, rpc_auth::RpcClass::Business)?;
         let caller = extract_caller(&request);
         let mut inbound = request.into_inner();
         let state = self.state.clone();
@@ -1355,8 +1369,9 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
 
     async fn shutdown(
         &self,
-        _request: Request<proto_rpc::ShutdownRequest>,
+        request: Request<proto_rpc::ShutdownRequest>,
     ) -> Result<Response<proto_rpc::InfoResponse>, Status> {
+        rpc_auth::authorize(&request, rpc_auth::RpcClass::Admin)?;
         shutdown_daemon(&self.state)
             .await
             .map_err(|error| Status::internal(error.to_string()))?;
@@ -1369,6 +1384,7 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
         &self,
         request: Request<proto_rpc::UpdateConfigRequest>,
     ) -> Result<Response<proto_rpc::UpdateConfigResponse>, Status> {
+        rpc_auth::authorize(&request, rpc_auth::RpcClass::Admin)?;
         let req = request.into_inner();
         match req.mutation_type.as_str() {
             "add_gateway" => {
@@ -1497,8 +1513,9 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
 
     async fn list_gateways(
         &self,
-        _request: Request<proto_rpc::ListGatewaysRequest>,
+        request: Request<proto_rpc::ListGatewaysRequest>,
     ) -> Result<Response<proto_rpc::ListGatewaysResponse>, Status> {
+        rpc_auth::authorize(&request, rpc_auth::RpcClass::Admin)?;
         let config = self.state.config.read().await.clone();
         let gateways: Vec<proto_rpc::GatewayStatus> = config
             .gateways
@@ -1534,6 +1551,7 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
         &self,
         request: Request<proto_rpc::TokenGenRequest>,
     ) -> Result<Response<proto_rpc::TokenGenResponse>, Status> {
+        rpc_auth::authorize(&request, rpc_auth::RpcClass::Admin)?;
         let req = request.into_inner();
         let ttl = if req.ttl_secs == 0 {
             Duration::from_secs(300)
@@ -1545,7 +1563,9 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
             .filter(|s| !s.trim().is_empty())
             .map(|s| s.trim().to_string());
         let token = self.state.token_store.generate(ttl, req.once, label).await;
-        let expires_at = std::time::SystemTime::now() + ttl;
+        let expires_at = std::time::SystemTime::now()
+            .checked_add(ttl)
+            .unwrap_or(std::time::UNIX_EPOCH);
         let expires_at_str = token_store::format_rfc3339_utc(expires_at);
         info!(
             once = req.once,
@@ -1561,8 +1581,9 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
 
     async fn token_list(
         &self,
-        _request: Request<proto_rpc::TokenListRequest>,
+        request: Request<proto_rpc::TokenListRequest>,
     ) -> Result<Response<proto_rpc::TokenListResponse>, Status> {
+        rpc_auth::authorize(&request, rpc_auth::RpcClass::Admin)?;
         let entries = self.state.token_store.list().await;
         let tokens = entries
             .into_iter()
@@ -1586,6 +1607,7 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
         &self,
         request: Request<proto_rpc::TokenInvalidateRequest>,
     ) -> Result<Response<proto_rpc::TokenInvalidateResponse>, Status> {
+        rpc_auth::authorize(&request, rpc_auth::RpcClass::Admin)?;
         let req = request.into_inner();
         let invalidated = self
             .state
@@ -1604,6 +1626,7 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
         &self,
         request: Request<proto_rpc::BootstrapAuthorizeRequest>,
     ) -> Result<Response<proto_rpc::BootstrapAuthorizeResponse>, Status> {
+        rpc_auth::authorize(&request, rpc_auth::RpcClass::Bootstrap)?;
         let req = request.into_inner();
         let key = russh::keys::ssh_key::PublicKey::from_openssh(req.public_key.trim())
             .map_err(|e| Status::invalid_argument(format!("invalid public key: {e}")))?;
@@ -1688,7 +1711,7 @@ async fn process_execute(
         send_execute_event(sender, ServerEvent::Info { message: warning }).await?;
     }
 
-    let review_command = request.argv.join(" ");
+    let review_command = build_final_command(&request.argv, &request.shell);
     let gateway_kind = state
         .find_gateway_any(&route.gateway_name)
         .await
@@ -1972,7 +1995,7 @@ async fn process_interactive_execute(
         send_execute_event(sender, ServerEvent::Info { message: warning }).await?;
     }
 
-    let review_command = request.argv.join(" ");
+    let review_command = build_final_command(&request.argv, &request.shell);
     let gateway_kind = state
         .find_gateway_any(&route.gateway_name)
         .await
@@ -2086,7 +2109,7 @@ async fn process_interactive_execute(
                         // races between stdout-close and exit-delivery drop the
                         // exit code (e.g. `xho exec -it -- ls` would lose it).
                         debug!(execution_id = %execution_id, "stdout channel closed; awaiting exit code");
-                        let code = (&mut handle.exit_rx).await.unwrap_or(0);
+                        let code = (&mut handle.exit_rx).await.unwrap_or(255);
                         info!(execution_id = %execution_id, code, "interactive session exited (after stdout close)");
                         while let Ok(bytes) = handle.stdout_rx.try_recv() {
                             if send_execute_event(sender, ServerEvent::Stdout { data: bytes }).await.is_err() {
@@ -2145,7 +2168,7 @@ async fn process_interactive_execute(
             }
             // Process exit
             exit_result = &mut handle.exit_rx => {
-                let code = exit_result.unwrap_or(0);
+                let code = exit_result.unwrap_or(255);
                 info!(execution_id = %execution_id, code, "interactive session exited");
                 // Drain any remaining stdout
                 while let Ok(bytes) = handle.stdout_rx.try_recv() {
@@ -2574,6 +2597,7 @@ async fn shutdown_daemon(state: &DaemonState) -> Result<()> {
 fn receiver_map_incoming(
     receiver: mpsc::Receiver<IncomingConn>,
     reverse_proxy_registry: Arc<reverse_proxy::ReverseProxyRegistry>,
+    reserved_gateway_names: Vec<String>,
 ) -> mpsc::Receiver<Result<IncomingConn, io::Error>> {
     let (tx, rx) = mpsc::channel(32);
     tokio::spawn(async move {
@@ -2582,9 +2606,14 @@ fn receiver_map_incoming(
             match conn {
                 IncomingConn::ReverseProxy(handshake) => {
                     let registry = reverse_proxy_registry.clone();
+                    let reserved_gateway_names = reserved_gateway_names.clone();
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            reverse_proxy::process_reverse_handshake(&registry, handshake).await
+                        if let Err(e) = reverse_proxy::process_reverse_handshake(
+                            &registry,
+                            &reserved_gateway_names,
+                            handshake,
+                        )
+                        .await
                         {
                             warn!(error = %format!("{e:#}"), "reverse proxy handshake failed");
                         }

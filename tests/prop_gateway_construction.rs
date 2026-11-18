@@ -118,6 +118,7 @@ fn arb_direct_gateway(name: String) -> impl Strategy<Value = GatewayConfig> {
                 user,
                 identity_file,
                 password: None,
+                known_hosts_path: String::new(),
             })
         },
     )

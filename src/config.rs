@@ -146,6 +146,7 @@ impl AppConfig {
                 }
                 GatewayConfig::Direct(c) => {
                     c.identity_file = expand_tilde(&c.identity_file)?;
+                    c.known_hosts_path = expand_tilde(&c.known_hosts_path)?;
                 }
             }
         }

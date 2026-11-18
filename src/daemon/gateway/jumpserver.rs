@@ -117,6 +117,11 @@ impl SessionCache {
     /// is cleaned up lazily on checkout or during prune.
     fn insert(&mut self, ip: String, shell: PtyShell, lease: SingletonLease<JumpserverTransport>) {
         if let Some(max) = self.max_cached_sessions {
+            if max == 0 {
+                drop(shell);
+                drop(lease);
+                return;
+            }
             while self.shells.len() >= max {
                 self.shells.pop_first();
             }

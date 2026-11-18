@@ -255,6 +255,35 @@ impl NormalizedPath {
     }
 }
 
+/// Validate a path received from the copy wire protocol.
+///
+/// Wire paths are slash-separated. Backslashes and drive-relative forms are
+/// rejected as well so a path cannot become traversable when it is materialized
+/// on a Windows host.
+pub fn validate_wire_relative_path(path: &str) -> Result<()> {
+    if path.starts_with('/') || path.starts_with('\\') {
+        bail!("copy frame relative path must not be rooted: {path}");
+    }
+    if path.len() >= 2 && path.as_bytes()[0].is_ascii_alphabetic() && path.as_bytes()[1] == b':' {
+        bail!("copy frame relative path must not contain a drive prefix: {path}");
+    }
+    if path.split(['/', '\\']).any(|segment| segment == "..") {
+        bail!("copy frame relative path must not contain `..`: {path}");
+    }
+    if path.contains('\0') {
+        bail!("copy frame relative path must not contain NUL");
+    }
+    NormalizedPath::from_str(path).validate_relative()
+}
+
+/// Validate a symlink target received from the copy wire protocol.
+pub fn validate_wire_symlink_target(target: &str) -> Result<()> {
+    if target.is_empty() {
+        bail!("copy frame symlink target must not be empty");
+    }
+    validate_wire_relative_path(target)
+}
+
 // ---------------------------------------------------------------------------
 // Copy-protocol helpers (migrated from copy_frames.rs)
 // ---------------------------------------------------------------------------
@@ -689,6 +718,17 @@ mod tests {
                 .validate_relative()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn wire_copy_paths_reject_cross_platform_traversal() {
+        assert!(validate_wire_relative_path("safe/file").is_ok());
+        assert!(validate_wire_relative_path("../outside").is_err());
+        assert!(validate_wire_relative_path("safe/../../outside").is_err());
+        assert!(validate_wire_relative_path(r"..\outside").is_err());
+        assert!(validate_wire_relative_path("C:/outside").is_err());
+        assert!(validate_wire_symlink_target("/outside").is_err());
+        assert!(validate_wire_symlink_target("safe/../outside").is_err());
     }
 
     // --- spec::parse_remote ---

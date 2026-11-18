@@ -210,7 +210,7 @@ impl XhodGateway {
         let mut handle = client::connect(
             Arc::new(client_config),
             (target.host.as_str(), target.port),
-            ClientHandler,
+            ClientHandler::with_known_hosts(&target.host, target.port, &_known_hosts_path),
         )
         .await
         .map_err(|e| {

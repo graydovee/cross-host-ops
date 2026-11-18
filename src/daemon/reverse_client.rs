@@ -6,14 +6,77 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow, bail};
 use russh::client;
 use russh::keys::{PrivateKeyWithHashAlg, load_secret_key};
+use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::time::sleep;
+use tonic::transport::server::Connected;
 use tracing::{info, warn};
 
 use crate::config::ReverseProxyClientConfig;
 use crate::daemon::gateway::auth::{ClientHandler, normalize_paths, parse_remote_target};
 use crate::protocol::rpc as proto_rpc;
 
+use super::ssh_server::RemoteConnectInfo;
 use super::{DaemonState, XhoRpcService};
+
+/// Duplex transport used by a reverse node to serve RPCs from its hub.
+///
+/// The SSH authentication happened on the hub side before this stream was
+/// created. Marking the stream as a remote key connection prevents the node's
+/// RPC service from treating hub requests as local administrator calls.
+pub(super) struct ReverseHubConn(DuplexStream);
+
+impl ReverseHubConn {
+    fn new(stream: DuplexStream) -> Self {
+        Self(stream)
+    }
+}
+
+impl Connected for ReverseHubConn {
+    type ConnectInfo = Option<RemoteConnectInfo>;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        Some(RemoteConnectInfo {
+            peer_addr: None,
+            ssh_user: "reverse-hub".to_string(),
+            public_key_fingerprint: "reverse-hub".to_string(),
+            via_token: false,
+        })
+    }
+}
+
+impl AsyncRead for ReverseHubConn {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ReverseHubConn {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
 
 /// Run the reverse proxy client loop: connect → serve → reconnect.
 pub async fn run_reverse_proxy_client(
@@ -74,7 +137,7 @@ async fn connect_and_serve(config: &ReverseProxyClientConfig, state: &DaemonStat
     let mut handle = client::connect(
         ssh_config,
         (target.host.as_str(), target.port),
-        ClientHandler,
+        ClientHandler::with_known_hosts(&target.host, target.port, &_known_hosts_path),
     )
     .await
     .map_err(|e| anyhow!("SSH connection failed: {}", e))?;
@@ -131,7 +194,7 @@ async fn connect_and_serve(config: &ReverseProxyClientConfig, state: &DaemonStat
     // client connects lazily on first RPC (15s health check), so the
     // preface arrives late. With `once`, tonic returns before that.
     let (stream_tx, stream_rx) = tokio::sync::mpsc::channel::<std::io::Result<_>>(1);
-    let _ = stream_tx.send(Ok(server_io)).await;
+    let _ = stream_tx.send(Ok(ReverseHubConn::new(server_io))).await;
     let incoming = tokio_stream::wrappers::ReceiverStream::new(stream_rx);
 
     let svc = proto_rpc::xho_rpc_server::XhoRpcServer::new(XhoRpcService {

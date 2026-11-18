@@ -55,6 +55,7 @@ proptest! {
             user: "testuser".to_string(),
             identity_file: "/tmp/test_key".to_string(),
             password: None,
+            known_hosts_path: String::new(),
         })];
 
         let resolver = Resolver::new(&config, &server_config, &gateways);

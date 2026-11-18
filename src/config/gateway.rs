@@ -245,4 +245,6 @@ pub struct DirectGatewayConfig {
     pub identity_file: String,
     #[serde(default)]
     pub password: Option<Secret>,
+    #[serde(default)]
+    pub known_hosts_path: String,
 }

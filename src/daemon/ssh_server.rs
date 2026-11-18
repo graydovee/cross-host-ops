@@ -157,8 +157,7 @@ pub(super) struct RemoteSshHandler {
     accepted_user: Option<String>,
     accepted_fingerprint: Option<String>,
     /// True when auth succeeded via a bootstrap token (password auth) rather
-    /// than an authorized public key. Used only for audit logging — token-
-    /// authed sessions have the same RPC permissions as pubkey-authed ones.
+    /// than an authorized public key.
     authed_via_token: bool,
     channels: HashMap<ChannelId, Channel<Msg>>,
 }
@@ -398,6 +397,16 @@ impl server::Handler for RemoteSshHandler {
         };
 
         if name != remote_subsystem_name() && !(is_reverse && reverse_enabled) {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
+
+        if is_reverse && self.authed_via_token {
+            warn!(
+                peer = ?self.peer_addr,
+                user = ?self.accepted_user,
+                "rejecting reverse proxy registration authenticated by token"
+            );
             session.channel_failure(channel)?;
             return Ok(());
         }

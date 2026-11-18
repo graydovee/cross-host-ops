@@ -6,7 +6,7 @@
 // implementations.
 
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,7 +19,7 @@ use russh::client::{self, AuthResult, Handle, KeyboardInteractiveAuthResponse};
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, known_hosts, load_secret_key, ssh_key};
 use sha1::Sha1;
 use tokio::time::timeout;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::{AppConfig, MfaConfig, default_known_hosts_path, expand_tilde};
 
@@ -29,7 +29,7 @@ type HmacSha1 = Hmac<Sha1>;
 // Remote target parsing
 // ---------------------------------------------------------------------------
 
-const DEFAULT_REMOTE_PORT: u16 = 2222;
+const DEFAULT_REMOTE_PORT: u16 = 12222;
 const DEFAULT_REMOTE_USER: &str = "xho";
 
 /// A parsed remote target (user@host:port).
@@ -47,7 +47,7 @@ impl RemoteTarget {
 }
 
 /// Parse a remote target string of the form `[user@]host[:port]`.
-/// Defaults to user "xho" and port 2222 when not specified.
+/// Defaults to user "xho" and port 12222 when not specified.
 pub fn parse_remote_target(input: &str) -> Result<RemoteTarget> {
     if input.trim().is_empty() {
         bail!("remote target must not be empty");
@@ -228,21 +228,67 @@ pub fn normalize_paths(
 }
 
 // ---------------------------------------------------------------------------
-// SSH client handler (accepts all host keys — verification done externally)
+// SSH client handler (strict known_hosts verification)
 // ---------------------------------------------------------------------------
 
-/// Minimal SSH client handler that accepts all host keys.
-/// Known-hosts verification is done separately before or after the handshake.
-pub(crate) struct ClientHandler;
+/// SSH client handler with strict known-hosts verification.
+pub(crate) struct ClientHandler {
+    host: String,
+    port: u16,
+    known_hosts_path: PathBuf,
+}
+
+impl ClientHandler {
+    pub(crate) fn with_known_hosts(host: &str, port: u16, known_hosts_path: &str) -> Self {
+        Self {
+            host: host.to_string(),
+            port,
+            known_hosts_path: PathBuf::from(known_hosts_path),
+        }
+    }
+}
 
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &ssh_key::PublicKey,
+        server_public_key: &ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        match inspect_known_host(
+            &self.host,
+            self.port,
+            server_public_key,
+            &self.known_hosts_path,
+        ) {
+            KnownHostState::Known => Ok(true),
+            KnownHostState::Unknown {
+                algorithm,
+                fingerprint,
+            } => {
+                warn!(
+                    host = %self.host,
+                    port = self.port,
+                    algorithm = %algorithm,
+                    fingerprint = %fingerprint,
+                    "rejecting unknown SSH host key; trust it with xho host add"
+                );
+                Ok(false)
+            }
+            KnownHostState::Changed {
+                algorithm,
+                fingerprint,
+            } => {
+                warn!(
+                    host = %self.host,
+                    port = self.port,
+                    algorithm = %algorithm,
+                    fingerprint = %fingerprint,
+                    "rejecting changed SSH host key"
+                );
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -266,7 +312,15 @@ pub(crate) async fn connect_handle(
     };
     let handle = timeout(
         config.ssh.connect_timeout,
-        client::connect(Arc::new(client_config), (host, port), ClientHandler),
+        client::connect(
+            Arc::new(client_config),
+            (host, port),
+            ClientHandler::with_known_hosts(
+                host,
+                port,
+                &default_known_hosts_path().display().to_string(),
+            ),
+        ),
     )
     .await
     .context("timed out opening SSH connection")??;

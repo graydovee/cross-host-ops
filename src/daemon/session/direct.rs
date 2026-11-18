@@ -11,6 +11,7 @@
 // control message and await the result.
 
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -23,8 +24,10 @@ use russh::client::{self};
 use russh::keys::{PrivateKeyWithHashAlg, load_secret_key};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
+use tracing::warn;
 
 use crate::config::{AppConfig, DirectAuth};
+use crate::daemon::gateway::auth::{KnownHostState, inspect_known_host};
 
 use super::{SessionCommand, SessionEvent, SessionStream, SessionWriter, TargetSession};
 
@@ -42,10 +45,14 @@ pub(crate) async fn connect_authenticated(
     user: &str,
     auth: &DirectAuth,
     config: &AppConfig,
+    known_hosts_path: &std::path::Path,
 ) -> Result<(client::Handle<ClientHandler>, Arc<AtomicU32>)> {
     let exit_code = Arc::new(AtomicU32::new(NO_EXIT));
     let handler = ClientHandler {
         exit_code: exit_code.clone(),
+        host: host.to_string(),
+        port,
+        known_hosts_path: known_hosts_path.to_path_buf(),
     };
     let mut handle = connect_handle(host, port, config, handler).await?;
     match auth {
@@ -66,6 +73,9 @@ pub(crate) async fn connect_authenticated(
 /// process's exit status in a shared atomic (reliable fallback).
 pub(crate) struct ClientHandler {
     exit_code: Arc<AtomicU32>,
+    host: String,
+    port: u16,
+    known_hosts_path: PathBuf,
 }
 
 impl client::Handler for ClientHandler {
@@ -73,9 +83,37 @@ impl client::Handler for ClientHandler {
 
     async fn check_server_key(
         &mut self,
-        _key: &russh::keys::ssh_key::PublicKey,
+        key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        match inspect_known_host(&self.host, self.port, key, &self.known_hosts_path) {
+            KnownHostState::Known => Ok(true),
+            KnownHostState::Unknown {
+                algorithm,
+                fingerprint,
+            } => {
+                warn!(
+                    host = %self.host,
+                    port = self.port,
+                    algorithm = %algorithm,
+                    fingerprint = %fingerprint,
+                    "rejecting unknown SSH host key; trust it with xho host add"
+                );
+                Ok(false)
+            }
+            KnownHostState::Changed {
+                algorithm,
+                fingerprint,
+            } => {
+                warn!(
+                    host = %self.host,
+                    port = self.port,
+                    algorithm = %algorithm,
+                    fingerprint = %fingerprint,
+                    "rejecting changed SSH host key"
+                );
+                Ok(false)
+            }
+        }
     }
 
     async fn exit_status(

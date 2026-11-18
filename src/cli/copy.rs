@@ -244,6 +244,8 @@ pub(crate) async fn run_copy(
     } else {
         None
     };
+    let mut completed = false;
+    let mut confirmation_denied = false;
     let outcome = async {
         while let Some(message) = stream.message().await? {
             match message
@@ -263,6 +265,7 @@ pub(crate) async fn run_copy(
                     return Err(super::classify_daemon_error(&error.message).into());
                 }
                 rpc::copy_response::Event::Complete(done) => {
+                    completed = true;
                     if !quiet && !done.message.is_empty() {
                         println!("{}", done.message);
                     }
@@ -341,6 +344,7 @@ pub(crate) async fn run_copy(
                     .await
                     .map_err(|_| anyhow!("failed to send copy confirmation request"))?;
                     if !allow {
+                        confirmation_denied = true;
                         break;
                     }
                 }
@@ -356,9 +360,12 @@ pub(crate) async fn run_copy(
             // resume the truncated in-progress file is removed.
             writer.handle_failure().await;
         }
-        (Ok(()), Some(writer)) => {
+        (Ok(()), Some(writer)) if completed && !confirmation_denied => {
             // Publish the completed `.part` over the destination.
             writer.publish().await?;
+        }
+        (Ok(()), Some(writer)) => {
+            writer.handle_failure().await;
         }
         _ => {}
     }
@@ -368,6 +375,12 @@ pub(crate) async fn run_copy(
         }
     }
     outcome?;
+    if confirmation_denied {
+        return Ok(126);
+    }
+    if !completed {
+        bail!("copy stream ended before completion");
+    }
     Ok(0)
 }
 
@@ -769,6 +782,7 @@ impl CopyDownloadWriter {
                         .with_context(|| format!("failed to create {}", path.display()))?;
                     (path, file, 0)
                 };
+                let mode = mode & 0o0777;
                 if mode != 0 && self.resume.is_none() {
                     if let Err(error) = crate::fs_meta::apply_mode(&path, mode) {
                         // Non-fatal: copy fidelity on Windows targets is best-effort.
@@ -816,6 +830,7 @@ impl CopyDownloadWriter {
                 tokio::fs::create_dir_all(&path)
                     .await
                     .with_context(|| format!("failed to create directory {}", path.display()))?;
+                let mode = mode & 0o0777;
                 if mode != 0 {
                     if let Err(error) = crate::fs_meta::apply_mode(&path, mode) {
                         tracing::debug!(error = %error, "failed to set permissions on {}", path.display());

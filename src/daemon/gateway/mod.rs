@@ -430,13 +430,14 @@ pub fn build_gateways(
                 auth_prompter.clone(),
                 max_idle_time,
             )),
-            GatewayConfig::Direct(c) => Arc::new(DirectGateway::new(
+            GatewayConfig::Direct(c) => Arc::new(DirectGateway::new_with_known_hosts(
                 c.name.clone(),
                 config.clone(),
                 server_config_path.to_string(),
                 auth_prompter.clone(),
                 max_connections_per_address,
                 max_idle_time,
+                c.known_hosts_path.clone(),
             )),
         };
         gateways.push((gc.name().to_string(), gateway));

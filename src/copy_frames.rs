@@ -35,6 +35,7 @@ pub fn join_relative_path(
     root: &std::path::Path,
     relative_path: &str,
 ) -> anyhow::Result<std::path::PathBuf> {
+    crate::filepath::validate_wire_relative_path(relative_path)?;
     let np = crate::filepath::NormalizedPath::from_local(root).join(relative_path);
     Ok(np.to_local())
 }

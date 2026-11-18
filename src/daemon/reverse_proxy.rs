@@ -195,6 +195,7 @@ impl Default for ReverseProxyRegistry {
 /// caller should `unregister` the node.
 pub(super) async fn process_reverse_handshake(
     registry: &Arc<ReverseProxyRegistry>,
+    reserved_names: &[String],
     handshake: ReverseProxyHandshake,
 ) -> Result<()> {
     let ReverseProxyHandshake {
@@ -204,9 +205,7 @@ pub(super) async fn process_reverse_handshake(
     } = handshake;
 
     // Node name was parsed from the subsystem name: "xho-reverse:<name>".
-    if node_name.is_empty() {
-        bail!("reverse proxy node name is empty (subsystem must be xho-reverse:<name>)");
-    }
+    validate_node_name(&node_name, reserved_names)?;
 
     // Check for name conflict before proceeding.
     if registry.contains(&node_name).await {
@@ -292,6 +291,32 @@ pub(super) async fn process_reverse_handshake(
         }
     }
 
+    Ok(())
+}
+
+fn validate_node_name(name: &str, reserved_names: &[String]) -> Result<()> {
+    if name.is_empty() {
+        bail!("reverse proxy node name is empty (subsystem must be xho-reverse:<name>)");
+    }
+    if name.len() > 128
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        bail!(
+            "reverse proxy node name '{}' contains unsupported characters",
+            name
+        );
+    }
+    if crate::config::RESERVED_NAMES.contains(&name) || name == "_self" {
+        bail!("reverse proxy node name '{}' is reserved", name);
+    }
+    if reserved_names.iter().any(|reserved| reserved == name) {
+        bail!(
+            "reverse proxy node name '{}' conflicts with a gateway",
+            name
+        );
+    }
     Ok(())
 }
 
@@ -437,5 +462,21 @@ impl Gateway for ReverseProxyGateway {
     async fn prune_idle(&self) {
         // No-op: the reverse proxy connection lifetime is managed by the
         // SSH channel, not by idle pruning.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_node_name;
+
+    #[test]
+    fn reverse_node_names_are_restricted() {
+        let reserved = vec!["prod".to_string()];
+        assert!(validate_node_name("node-1", &reserved).is_ok());
+        assert!(validate_node_name("", &reserved).is_err());
+        assert!(validate_node_name("node:target", &reserved).is_err());
+        assert!(validate_node_name("node@target", &reserved).is_err());
+        assert!(validate_node_name("_self", &reserved).is_err());
+        assert!(validate_node_name("prod", &reserved).is_err());
     }
 }

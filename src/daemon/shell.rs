@@ -65,8 +65,8 @@ fn shell_flags(shell_name: &str) -> &'static str {
 /// PATH and the embedded path can't break on backslashes/spaces.
 pub fn wrap_in_shell(inner_cmd: &str, shell_name: &str) -> String {
     let escaped = inner_cmd.replace('\'', "'\\''");
-    let flags = shell_flags(shell_name);
-    let basename = shell_basename(shell_name);
+    let basename = safe_shell_name(shell_name).unwrap_or_else(|| "sh".to_string());
+    let flags = shell_flags(&basename);
     format!("{basename} {flags} '{escaped}'")
 }
 
@@ -76,6 +76,27 @@ pub fn wrap_in_shell(inner_cmd: &str, shell_name: &str) -> String {
 /// Forwards to [`crate::filepath::quote::shell_basename`].
 fn shell_basename(shell_name: &str) -> &str {
     crate::filepath::quote::shell_basename(shell_name)
+}
+
+fn is_safe_shell_basename(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-' | '+'))
+}
+
+/// Return a safe shell basename, or `None` if it contains shell syntax.
+pub fn safe_shell_name(shell_name: &str) -> Option<String> {
+    if shell_name.chars().any(|ch| {
+        matches!(
+            ch,
+            ';' | '|' | '&' | '$' | '`' | '\n' | '\r' | '\'' | '"' | '<' | '>'
+        )
+    }) {
+        return None;
+    }
+    let basename = shell_basename(shell_name);
+    is_safe_shell_basename(basename).then(|| basename.to_string())
 }
 
 /// Build the final remote command, optionally wrapping in a shell.
@@ -115,18 +136,18 @@ pub fn resolve_shell(
         if name == "false" {
             return None;
         }
-        return Some(name.to_string());
+        return safe_shell_name(name);
     }
     if let Some(shell) = server_shell {
         if shell.is_empty() {
             return None;
         }
-        return Some(shell.to_string());
+        return safe_shell_name(shell);
     }
     if defaults_shell.is_empty() {
         None
     } else {
-        Some(defaults_shell.to_string())
+        safe_shell_name(defaults_shell)
     }
 }
 
@@ -291,5 +312,14 @@ mod tests {
     #[test]
     fn resolve_shell_defaults_empty_returns_none() {
         assert_eq!(resolve_shell(None, false, None, ""), None);
+    }
+
+    #[test]
+    fn unsafe_shell_name_is_disabled() {
+        assert_eq!(
+            resolve_shell(Some("sh;touch /tmp/pwned"), false, None, "bash"),
+            None
+        );
+        assert_eq!(wrap_in_shell("id", "sh;echo injected"), "sh -c 'id'");
     }
 }

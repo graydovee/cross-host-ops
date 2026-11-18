@@ -497,10 +497,12 @@ pub async fn drive_exec(
                 });
                 return Ok(255);
             }
-            SessionEvent::Eof => return Ok(0),
+            // EOF only closes the output side. SSH may deliver exit-status
+            // after EOF, so keep consuming events until the session closes.
+            SessionEvent::Eof => continue,
         }
     }
-    Ok(0)
+    Ok(255)
 }
 
 /// Drive a `TargetSession` for an interactive (`xho exec -it`) session: request
@@ -566,13 +568,10 @@ pub async fn drive_interactive(
                     let _ = exit_tx.send(255);
                     return;
                 }
-                SessionEvent::Eof => {
-                    let _ = exit_tx.send(0);
-                    return;
-                }
+                SessionEvent::Eof => continue,
             }
         }
-        let _ = exit_tx.send(0);
+        let _ = exit_tx.send(255);
     });
     let _ = input_task;
 

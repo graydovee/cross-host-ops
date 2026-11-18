@@ -18,7 +18,8 @@ use tokio::sync::RwLock;
 use tracing::debug;
 
 use crate::config::{
-    AppConfig, DirectAuth, list_server_entries, load_server_config, resolve_server_entry,
+    AppConfig, DirectAuth, default_known_hosts_path, list_server_entries, load_server_config,
+    resolve_server_entry,
 };
 use crate::daemon::connection_manager::{ConnectionStatusSnapshot, ManagedPool, PoolLease};
 use crate::daemon::session::TargetSession;
@@ -104,6 +105,7 @@ pub struct DirectGateway {
     gateway_name: String,
     config: Arc<RwLock<AppConfig>>,
     server_config_path: String,
+    known_hosts_path: String,
     #[allow(dead_code)]
     auth_prompter: Arc<AuthPrompter>,
     /// Pool of authenticated SSH handles, keyed by endpoint + user + auth.
@@ -121,10 +123,37 @@ impl DirectGateway {
         max_connections_per_address: usize,
         max_idle_time: Duration,
     ) -> Self {
+        Self::new_with_known_hosts(
+            gateway_name,
+            config,
+            server_config_path,
+            auth_prompter,
+            max_connections_per_address,
+            max_idle_time,
+            default_known_hosts_path().display().to_string(),
+        )
+    }
+
+    /// Construct a direct gateway with an explicit known_hosts file.
+    pub fn new_with_known_hosts(
+        gateway_name: String,
+        config: Arc<RwLock<AppConfig>>,
+        server_config_path: String,
+        auth_prompter: Arc<AuthPrompter>,
+        max_connections_per_address: usize,
+        max_idle_time: Duration,
+        known_hosts_path: String,
+    ) -> Self {
+        let known_hosts_path = if known_hosts_path.trim().is_empty() {
+            default_known_hosts_path().display().to_string()
+        } else {
+            known_hosts_path
+        };
         Self {
             gateway_name,
             config,
             server_config_path,
+            known_hosts_path,
             auth_prompter,
             pool: Arc::new(ManagedPool::new(max_connections_per_address, max_idle_time)),
             max_connections_per_address,
@@ -199,6 +228,7 @@ impl DirectGateway {
                         &resolved.user,
                         &resolved.auth,
                         &self.config.read().await.clone(),
+                        Path::new(&self.known_hosts_path),
                     )
                     .await
                     .map_err(|e| {

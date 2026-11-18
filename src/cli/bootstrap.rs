@@ -13,13 +13,14 @@ use russh::keys::ssh_key;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
+use crate::config::default_known_hosts_path;
 use crate::daemon::gateway::auth::{
     ClientHandler, authenticate_with_password, parse_remote_target,
 };
 use crate::daemon::ssh_server::remote_subsystem_name;
 use crate::protocol::rpc;
 
-/// Connect to `addr` (`user@host[:port]`, port defaults to 22), authenticate
+/// Connect to `addr` (`user@host[:port]`, port defaults to 12222), authenticate
 /// with `token` as the SSH password, open the `xho-rpc` subsystem, and call
 /// `BootstrapAuthorize` with the OpenSSH public key sidecar of `identity_file`.
 ///
@@ -98,9 +99,14 @@ async fn open_rpc_stream(
     token: &str,
 ) -> Result<russh::ChannelStream<client::Msg>> {
     let client_config = client::Config::default();
-    let mut handle = client::connect(Arc::new(client_config), (host, port), ClientHandler)
-        .await
-        .map_err(|e| anyhow!("SSH connection to {host}:{port} failed: {e}"))?;
+    let known_hosts_path = default_known_hosts_path();
+    let mut handle = client::connect(
+        Arc::new(client_config),
+        (host, port),
+        ClientHandler::with_known_hosts(host, port, &known_hosts_path.display().to_string()),
+    )
+    .await
+    .map_err(|e| anyhow!("SSH connection to {host}:{port} failed: {e}"))?;
 
     authenticate_with_password(&mut handle, user, token)
         .await
