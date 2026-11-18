@@ -7,6 +7,11 @@
      条目按发布版本分组（## v0.x.y 对应 git tag），已发布小节冻结；下一版未定稿时写入 ## v0.5.7。
      完整规则见 AGENTS.md 与 CHANGELOG.md 头部注释。 -->
 
+## latest
+
+- 2026-11-18 [bug] SSH 代理建立会话失败时会报错并关闭通道，支持连接超时和 Ctrl+C 取消，不再无限挂起。
+- 2026-10-09 [bug] jumpserver 目标不在堡垒机资产列表时立即以 "no matching assets" resolution 错误失败（退出码 127），不再空等连接超时后误报 shell 输出超时
+
 ## v0.5.10
 
 - 2026-09-15 [refactor] release CI 去掉 QEMU/cross 与容器内编译，docker 镜像改为在原生 amd64/arm64 runner 上直接组装预编译 musl 二进制——docker 阶段从一个多小时缩短到一分钟以内

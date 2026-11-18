@@ -25,9 +25,9 @@ use crate::daemon::connection_manager::{
     ConnectionStatusSnapshot, ManagedSingleton, SingletonLease,
 };
 use crate::daemon::jumpserver_engine::{
-    MFA_PROMPT_CONTAINS, PtyShell, SHELL_PROMPT_SUFFIXES, contains_menu_prompt,
-    contains_page_prompt, parse_asset_rows, parse_page_status, request_default_pty,
-    select_exact_asset_id, strip_ansi,
+    MFA_PROMPT_CONTAINS, PtyShell, SHELL_PROMPT_SUFFIXES, asset_search_found_nothing,
+    contains_menu_prompt, contains_page_prompt, parse_asset_rows, parse_page_status,
+    request_default_pty, select_exact_asset_id, strip_ansi,
 };
 use crate::daemon::resolver::derive_target_ip;
 use crate::daemon::session::TargetSession;
@@ -36,7 +36,10 @@ use crate::daemon::session::shell_copy;
 use crate::daemon::shell::{build_remote_command, resolve_shell};
 
 use super::auth::{AuthPrompt, AuthPrompter, ClientHandler, authenticate_with_key, connect_handle};
-use super::{Capabilities, ErrorKind, Gateway, GatewayError, GatewayKind, is_transport_error};
+use super::{
+    Capabilities, ErrorKind, Gateway, GatewayError, GatewayKind, is_resolution_error,
+    is_transport_error,
+};
 
 type JumpserverTransport = AsyncMutex<JumpserverTransportState>;
 
@@ -333,13 +336,7 @@ impl JumpserverGateway {
 
         self.navigate_to_asset(&mut shell, target)
             .await
-            .map_err(|e| {
-                if is_transport_error(&e) {
-                    GatewayError::transport(e)
-                } else {
-                    GatewayError::execution(e)
-                }
-            })?;
+            .map_err(Self::classify_navigation_error)?;
 
         // Suppress shell history once per navigated shell. The shell is cached
         // and reused for subsequent exec/copy operations, so the env vars set
@@ -469,6 +466,20 @@ impl JumpserverGateway {
         Ok(())
     }
 
+    /// Map a menu-navigation failure to its GatewayError kind: transport
+    /// failures keep the retry hint, "no match" bails mean the target is
+    /// absent from the bastion inventory (Resolution → exit 127), and
+    /// anything else is an execution failure.
+    fn classify_navigation_error(e: anyhow::Error) -> GatewayError {
+        if is_transport_error(&e) {
+            GatewayError::transport(e)
+        } else if is_resolution_error(&e) {
+            GatewayError::resolution(e)
+        } else {
+            GatewayError::execution(e)
+        }
+    }
+
     /// Drive the bastion menu state machine to the asset shell prompt:
     /// MFA → search by IP → exact asset selection (with pagination) → prompt.
     async fn navigate_to_asset(&self, shell: &mut PtyShell, target: &str) -> Result<()> {
@@ -538,7 +549,7 @@ impl JumpserverGateway {
                             continue;
                         }
                         Some(status) => bail!(
-                            "jumpserver asset search for {} did not find an exact IP match after {} page(s)",
+                            "jumpserver asset search for {} found no matching asset after {} page(s)",
                             ip,
                             status.total
                         ),
@@ -551,7 +562,18 @@ impl JumpserverGateway {
 
                 if contains_menu_prompt(&text) && !parse_asset_rows(&text).is_empty() {
                     bail!(
-                        "jumpserver asset search for {} returned candidates but no exact IP match",
+                        "jumpserver asset search for {} returned candidates but no matching asset",
+                        ip
+                    );
+                }
+
+                // The search render finished back at the menu prompt with zero
+                // table rows: the bastion inventory has no asset matching the
+                // target. Fail fast instead of waiting out the read timeout on
+                // a silent menu.
+                if asset_search_found_nothing(&text, &ip) {
+                    bail!(
+                        "jumpserver asset search for {} returned no matching assets",
                         ip
                     );
                 }
@@ -687,6 +709,7 @@ impl Gateway for JumpserverGateway {
 mod tests {
     use super::*;
     use crate::daemon::jumpserver_engine::PageStatus;
+    use proptest::prelude::*;
 
     fn test_gateway() -> JumpserverGateway {
         JumpserverGateway::new(
@@ -748,6 +771,65 @@ Opt>";
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind, ErrorKind::Unsupported);
         assert_eq!(gateway.transport.current_generation().await, None);
+    }
+
+    #[test]
+    fn navigation_no_match_bails_are_resolution_classified() {
+        // Wording guard: every "search completed, target absent" bail must
+        // carry a signal that `is_resolution_error` recognizes, so the CLI
+        // reports target-not-found (exit 127) instead of a generic failure.
+        for message in [
+            "jumpserver asset search for 10.0.0.9 returned no matching assets",
+            "jumpserver asset search for 10.0.0.9 found no matching asset after 3 page(s)",
+            "jumpserver asset search for 10.0.0.9 returned candidates but no matching asset",
+        ] {
+            let error = JumpserverGateway::classify_navigation_error(anyhow!(message));
+            assert_eq!(error.kind, ErrorKind::Resolution, "{message}");
+        }
+    }
+
+    #[test]
+    fn navigation_timeout_and_parse_failures_are_execution() {
+        for message in [
+            "timed out waiting for shell output",
+            "jumpserver asset search for 10.0.0.9 showed a paginated table but page status could not be parsed",
+        ] {
+            let error = JumpserverGateway::classify_navigation_error(anyhow!(message));
+            assert_eq!(error.kind, ErrorKind::Execution, "{message}");
+        }
+    }
+
+    #[test]
+    fn navigation_transport_errors_stay_transport() {
+        let error = JumpserverGateway::classify_navigation_error(anyhow!("channel closed"));
+        assert_eq!(error.kind, ErrorKind::Transport);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 128,
+            ..ProptestConfig::default()
+        })]
+
+        /// For any search term and any render that contains at least one
+        /// asset row after the echoed term, `asset_search_found_nothing`
+        /// must be false — a populated result is never misdetected as an
+        /// empty one (that would wrongly fail navigation).
+        #[test]
+        fn prop_populated_search_render_is_never_no_match(
+            search in "[a-zA-Z0-9-]{1,12}",
+            id in 1u32..1000,
+            a in proptest::num::u8::ANY,
+            b in proptest::num::u8::ANY,
+            c in proptest::num::u8::ANY,
+            d in proptest::num::u8::ANY,
+        ) {
+            let ip = format!("{a}.{b}.{c}.{d}");
+            let text = format!(
+                "{search}\r\n  {id} | host | {ip} | \n页码：1，每页行数：9，总页数：1，总数量：1\nOpt>"
+            );
+            proptest::prop_assert!(!asset_search_found_nothing(&text, &search));
+        }
     }
 
     #[test]

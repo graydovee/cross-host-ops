@@ -1166,6 +1166,21 @@ pub(crate) fn contains_page_prompt(text: &str) -> bool {
     clean.contains(PAGE_PROMPT_CONTAINS) && clean.trim_end().ends_with(':')
 }
 
+/// True when the pending buffer shows a *completed* asset-search render that
+/// produced zero candidate rows: the bastion is back at its menu prompt
+/// (waiting for input) and no asset table row follows the echoed search term.
+/// The echoed input is excluded from the menu-prompt scan so a search term
+/// that itself contains the prompt marker (e.g. a host named "Optimus")
+/// cannot trigger a false positive while the table is still streaming.
+pub(crate) fn asset_search_found_nothing(text: &str, typed_search: &str) -> bool {
+    let clean = strip_ansi(text);
+    let after_echo = match clean.find(typed_search) {
+        Some(pos) => &clean[pos + typed_search.len()..],
+        None => clean.as_str(),
+    };
+    contains_menu_prompt(after_echo) && parse_asset_rows(after_echo).is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1217,6 +1232,53 @@ Opt>
 Opt>";
         let error = select_exact_asset_id(text, "10.0.0.1").unwrap_err();
         assert!(error.to_string().contains("returned 2 exact matches"));
+    }
+
+    #[test]
+    fn no_match_render_back_at_menu_is_detected() {
+        // Echoed search term, then an empty result table ending at the menu
+        // prompt — the state a bastion reaches when nothing matches.
+        let text = "\
+xxx\r\n\
+  ID    | 主机名 | IP | 备注\n\
++-------+--------+----+----+\n\
+页码：1，每页行数：9，总页数：0，总数量：0\n\
+Opt>";
+        assert!(asset_search_found_nothing(text, "xxx"));
+    }
+
+    #[test]
+    fn echo_only_mid_render_is_not_no_match() {
+        // Only the echoed search term has arrived; the table is still
+        // streaming. The menu prompt (if any) must not be "found" in the
+        // echo itself.
+        assert!(!asset_search_found_nothing("xxx\r\n", "xxx"));
+    }
+
+    #[test]
+    fn search_term_containing_prompt_marker_is_not_false_positive() {
+        // A search term that itself contains the menu-prompt marker must not
+        // trip detection while the real table is still rendering.
+        let echo_only = "Optimus\r\n";
+        assert!(!asset_search_found_nothing(echo_only, "Optimus"));
+
+        let populated = "\
+Optimus\r\n\
+  1 | host-a | 10.0.0.1 | \n\
+  2 | host-b | 10.0.0.2 | \n\
+页码：1，每页行数：9，总页数：1，总数量：2\n\
+Opt>";
+        assert!(!asset_search_found_nothing(populated, "Optimus"));
+    }
+
+    #[test]
+    fn populated_search_is_not_no_match() {
+        let text = "\
+xxx\r\n\
+  1 | host-a | 10.0.0.1 | \n\
+页码：1，每页行数：9，总页数：1，总数量：1\n\
+Opt>";
+        assert!(!asset_search_found_nothing(text, "xxx"));
     }
 
     // ---- SentinelScanner ----

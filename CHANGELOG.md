@@ -17,6 +17,11 @@
      Entries are grouped per released version (## v0.x.y matching a git tag); released sections are frozen.
      While the next tag is undecided, write new entries under ## v0.5.7 and rename it when the tag is cut. -->
 
+## latest
+
+- 2026-11-18 [bug] SSH proxy setup failures now report an error and close the channel, with a connection deadline and Ctrl+C cancellation instead of hanging indefinitely.
+- 2026-10-09 [bug] jumpserver targets missing from the bastion inventory now fail fast with a "no matching assets" resolution error (exit 127) instead of hanging for the connect timeout and reporting a shell-output timeout
+
 ## v0.5.10
 
 - 2026-09-15 [refactor] release CI builds natively without QEMU/cross and assembles docker images from the prebuilt musl binaries instead of compiling in-container — the docker stage drops from over an hour to under a minute
