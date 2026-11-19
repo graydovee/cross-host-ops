@@ -37,7 +37,12 @@ message SessionRequest {
   }
 }
 
-message SessionOpen { string target = 1; }
+message SessionOpen {
+  string target = 1;
+  repeated string argv = 2;
+  string shell = 3;
+  bool no_shell = 4;
+}
 message SessionPty { string term = 1; uint32 cols = 2; uint32 rows = 3; }
 message SessionEnv { string key = 1; string value = 2; }
 message SessionExec { string command = 1; }
@@ -281,6 +286,18 @@ message CopyComplete {
 
 message ErrorResponse {
   string message = 1;
+  ErrorKind kind = 2;
+}
+
+enum ErrorKind {
+  ERROR_KIND_UNSPECIFIED = 0;
+  RESOLUTION = 1;
+  TRANSPORT = 2;
+  EXECUTION = 3;
+  UNSUPPORTED = 4;
+  AUTHORIZATION = 5;
+  TIMEOUT = 6;
+  INTERNAL = 7;
 }
 
 message InfoResponse {

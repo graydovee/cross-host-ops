@@ -291,7 +291,11 @@ pub(crate) async fn run_command(
                 eprintln!("{}", info.message);
             }
             rpc::execute_response::Event::Error(error) => {
-                return Err(super::classify_daemon_error(&error.message).into());
+                return Err(super::classify_daemon_error_kind(
+                    rpc::ErrorKind::try_from(error.kind).unwrap_or(rpc::ErrorKind::Unspecified),
+                    &error.message,
+                )
+                .into());
             }
         }
     }
@@ -430,7 +434,11 @@ pub(crate) async fn run_interactive(
                 // cleanly. This avoids double-printing.
                 stdin_task.abort();
                 sigwinch_task.abort();
-                return Err(super::classify_daemon_error(&error.message).into());
+                return Err(super::classify_daemon_error_kind(
+                    rpc::ErrorKind::try_from(error.kind).unwrap_or(rpc::ErrorKind::Unspecified),
+                    &error.message,
+                )
+                .into());
             }
             rpc::execute_response::Event::Info(info) => {
                 write_raw_mode_diagnostic(&info.message)?;

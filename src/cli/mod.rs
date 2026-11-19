@@ -37,7 +37,7 @@ use self::copy::run_copy;
 use self::daemon::run_daemon_command;
 use self::exec::{detect_double_dash_separator, run_command};
 use self::host::run_host_command;
-use self::output::{list_servers, status};
+use self::output::{list_servers, list_servers_json, status, status_json};
 use self::secret::run_secret_command;
 use self::token::run_token_command;
 
@@ -71,8 +71,26 @@ pub(crate) fn classify_daemon_error(message: &str) -> XhoError {
     }
 }
 
+pub(crate) fn classify_daemon_error_kind(
+    kind: crate::protocol::rpc::ErrorKind,
+    message: &str,
+) -> XhoError {
+    use crate::protocol::rpc::ErrorKind;
+    match kind {
+        ErrorKind::Resolution | ErrorKind::Unsupported => {
+            XhoError::TargetNotFound(message.to_string())
+        }
+        ErrorKind::Authorization => XhoError::CannotExecute(message.to_string()),
+        ErrorKind::Timeout => XhoError::Timeout(message.to_string()),
+        ErrorKind::Transport | ErrorKind::Internal => XhoError::Internal(message.to_string()),
+        ErrorKind::Execution => XhoError::General(message.to_string()),
+        ErrorKind::Unspecified => classify_daemon_error(message),
+    }
+}
+
 pub async fn run_cli(cli: ArunCli) -> Result<i32> {
     let yes = cli.yes;
+    let output_format = cli.output_format;
     match cli.command {
         ArunCommand::Exec {
             target,
@@ -173,8 +191,20 @@ pub async fn run_cli(cli: ArunCli) -> Result<i32> {
             };
             run_copy(recursive, resume, quiet, yes, source, dest, timeout_ms).await
         }
-        ArunCommand::Status => status().await,
-        ArunCommand::Ls { refresh } => list_servers(refresh).await,
+        ArunCommand::Status => {
+            if matches!(output_format, OutputFormat::Json) {
+                status_json().await
+            } else {
+                status().await
+            }
+        }
+        ArunCommand::Ls { refresh } => {
+            if matches!(output_format, OutputFormat::Json) {
+                list_servers_json(refresh).await
+            } else {
+                list_servers(refresh).await
+            }
+        }
         ArunCommand::Host { command } => run_host_command(command).await,
         ArunCommand::Daemon { command } => run_daemon_command(command).await,
         ArunCommand::Token { command } => run_token_command(command).await,

@@ -617,11 +617,16 @@ pub async fn run_with_overrides(
         });
     }
 
-    let reserved_gateway_names = state
+    let mut reserved_gateway_names: Vec<String> = state
         .gateways
         .iter()
         .map(|(name, _)| name.clone())
         .collect();
+    if let Ok(server_config) =
+        load_server_config(Path::new(&state.config.read().await.ssh.server_config_path))
+    {
+        reserved_gateway_names.extend(server_config.servers.keys().cloned());
+    }
     let incoming = ReceiverStream::new(receiver_map_incoming(
         incoming_rx,
         state.reverse_proxy_registry.clone(),
@@ -1152,10 +1157,11 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                     .message()
                     .await?
                     .ok_or_else(|| anyhow!("open_session: missing open request"))?;
-                let target = match first.msg {
-                    Some(proto_rpc::session_request::Msg::Open(open)) => open.target,
+                let open = match first.msg {
+                    Some(proto_rpc::session_request::Msg::Open(open)) => open,
                     _ => bail!("open_session: first message must be SessionOpen"),
                 };
+                let target = open.target.clone();
 
                 let resolved = resolve_target_with_merged_view(&state, &target).await?;
                 let route = resolved
@@ -1167,7 +1173,19 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                     .find_gateway_any(&route.gateway_name)
                     .await
                     .map(|g| g.kind());
-                let sess = session::open_target_session(&state, &route).await?;
+                let (sess, mut pending_exec) = if open.argv.is_empty() {
+                    (session::open_target_session(&state, &route).await?, None)
+                } else {
+                    let (sess, command) = session::open_exec_session(
+                        &state,
+                        &route,
+                        &open.argv,
+                        &open.shell,
+                        open.no_shell,
+                    )
+                    .await?;
+                    (sess, Some(command))
+                };
                 let (writer, mut events) = sess.split();
 
                 // Acknowledge the open. Exec/shell/subsystem arrive as later
@@ -1288,6 +1306,19 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                             let _ = writer.set_env(&e.key, &e.value).await;
                         }
                         Some(proto_rpc::session_request::Msg::Exec(e)) => {
+                            if let Err(reason) = review_session_request(
+                                &state,
+                                &caller,
+                                &route,
+                                gateway_kind,
+                                SessionKind::Exec,
+                                &e.command,
+                            )
+                            .await
+                            {
+                                try_send_session_error(&sender, &reason);
+                                continue;
+                            }
                             audit_session_op(
                                 &caller,
                                 &route,
@@ -1297,11 +1328,25 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                                 &e.command,
                                 "started",
                             );
-                            if let Err(er) = writer.exec(&e.command).await {
+                            let command = pending_exec.take().unwrap_or(e.command);
+                            if let Err(er) = writer.exec(&command).await {
                                 try_send_session_error(&sender, &er.to_string());
                             }
                         }
                         Some(proto_rpc::session_request::Msg::Shell(_)) => {
+                            if let Err(reason) = review_session_request(
+                                &state,
+                                &caller,
+                                &route,
+                                gateway_kind,
+                                SessionKind::Shell,
+                                "(interactive)",
+                            )
+                            .await
+                            {
+                                try_send_session_error(&sender, &reason);
+                                continue;
+                            }
                             audit_session_op(
                                 &caller,
                                 &route,
@@ -1316,6 +1361,19 @@ impl proto_rpc::xho_rpc_server::XhoRpc for XhoRpcService {
                             }
                         }
                         Some(proto_rpc::session_request::Msg::Subsystem(s)) => {
+                            if let Err(reason) = review_session_request(
+                                &state,
+                                &caller,
+                                &route,
+                                gateway_kind,
+                                SessionKind::Subsystem,
+                                &s.name,
+                            )
+                            .await
+                            {
+                                try_send_session_error(&sender, &reason);
+                                continue;
+                            }
                             audit_session_op(
                                 &caller,
                                 &route,
@@ -2210,6 +2268,40 @@ enum Enforced {
     Confirm(String),
     /// The operation was denied; the `reason` has been surfaced to the user.
     Denied(String),
+}
+
+async fn review_session_request(
+    state: &DaemonState,
+    caller: &Caller,
+    route: &Route,
+    gateway_kind: Option<crate::daemon::gateway::GatewayKind>,
+    session_kind: SessionKind,
+    command_or_name: &str,
+) -> Result<(), String> {
+    let config = state.config.read().await.clone();
+    let detail = OperationDetail::SessionOp {
+        session_kind,
+        command_or_name,
+    };
+    match run_review(
+        state,
+        &config,
+        OperationKind::Session,
+        caller,
+        route,
+        gateway_kind,
+        None,
+        None,
+        &detail,
+    )
+    .await
+    {
+        Enforced::Proceed => Ok(()),
+        Enforced::Confirm(reason) => Err(format!(
+            "session operation requires confirmation, which this transport cannot provide: {reason}"
+        )),
+        Enforced::Denied(reason) => Err(format!("session operation denied: {reason}")),
+    }
 }
 
 /// Run oversight review for an operation and enforce the resulting action.

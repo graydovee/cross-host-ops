@@ -18,8 +18,8 @@ use tokio::sync::RwLock;
 use tracing::debug;
 
 use crate::config::{
-    AppConfig, DirectAuth, default_known_hosts_path, list_server_entries, load_server_config,
-    resolve_server_entry,
+    AppConfig, DirectAuth, DirectGatewayConfig, default_known_hosts_path, list_server_entries,
+    load_server_config, resolve_server_entry,
 };
 use crate::daemon::connection_manager::{ConnectionStatusSnapshot, ManagedPool, PoolLease};
 use crate::daemon::session::TargetSession;
@@ -63,13 +63,25 @@ impl PooledHandle {
 /// The auth fingerprint is part of equality/hash so different users or
 /// credentials never share a transport by accident, but it is never surfaced
 /// in labels/logs.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 struct DirectPoolKey {
     host: String,
     port: u16,
     user: String,
     auth_kind: &'static str,
     auth_fingerprint: String,
+}
+
+impl std::fmt::Debug for DirectPoolKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectPoolKey")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("auth_kind", &self.auth_kind)
+            .field("auth_fingerprint", &"<redacted>")
+            .finish()
+    }
 }
 
 impl DirectPoolKey {
@@ -106,6 +118,7 @@ pub struct DirectGateway {
     config: Arc<RwLock<AppConfig>>,
     server_config_path: String,
     known_hosts_path: String,
+    configured_endpoint: Option<DirectGatewayConfig>,
     #[allow(dead_code)]
     auth_prompter: Arc<AuthPrompter>,
     /// Pool of authenticated SSH handles, keyed by endpoint + user + auth.
@@ -154,15 +167,68 @@ impl DirectGateway {
             config,
             server_config_path,
             known_hosts_path,
+            configured_endpoint: None,
             auth_prompter,
             pool: Arc::new(ManagedPool::new(max_connections_per_address, max_idle_time)),
             max_connections_per_address,
         }
     }
 
+    pub fn new_configured(
+        gateway_name: String,
+        config: Arc<RwLock<AppConfig>>,
+        server_config_path: String,
+        auth_prompter: Arc<AuthPrompter>,
+        max_connections_per_address: usize,
+        max_idle_time: Duration,
+        fields: DirectGatewayConfig,
+    ) -> Self {
+        let known_hosts_path = fields.known_hosts_path.clone();
+        let mut gateway = Self::new_with_known_hosts(
+            gateway_name,
+            config,
+            server_config_path,
+            auth_prompter,
+            max_connections_per_address,
+            max_idle_time,
+            known_hosts_path,
+        );
+        gateway.configured_endpoint = Some(fields);
+        gateway
+    }
+
     /// Resolve a target string to host, port, user, and auth credentials by
     /// looking it up in the server.toml configuration.
     async fn resolve_target(&self, target: &str) -> Result<ResolvedTarget, GatewayError> {
+        if target == "_self" {
+            if let Some(fields) = &self.configured_endpoint {
+                let auth = if let Some(password) = &fields.password {
+                    let resolver = self.config.read().await.secret_resolver(None);
+                    let value = password.resolve(&resolver).map_err(|e| {
+                        GatewayError::execution(anyhow!(
+                            "failed to resolve direct gateway password: {e}"
+                        ))
+                    })?;
+                    DirectAuth::Password {
+                        password: value.to_string(),
+                    }
+                } else if !fields.identity_file.is_empty() {
+                    DirectAuth::Key {
+                        identity_file: fields.identity_file.clone(),
+                    }
+                } else {
+                    DirectAuth::None
+                };
+                return Ok(ResolvedTarget {
+                    host: fields.host.clone(),
+                    port: fields.port,
+                    user: fields.user.clone(),
+                    auth,
+                    shell: None,
+                    defaults_shell: String::new(),
+                });
+            }
+        }
         let path = Path::new(&self.server_config_path);
         let server_config = load_server_config(path).map_err(|e| {
             GatewayError::resolution(anyhow!("failed to load server config: {}", e))
@@ -219,9 +285,9 @@ impl DirectGateway {
         let key = DirectPoolKey::from_resolved(resolved);
         for attempt in 0..=1 {
             let key_for_error = key.clone();
-            let lease = self
-                .pool
-                .checkout_or_create_with(key.clone(), || async {
+            let lease = tokio::time::timeout(
+                self.config.read().await.ssh.connect_timeout,
+                self.pool.checkout_or_create_with(key.clone(), || async {
                     let (handle, exit_code) = connect_authenticated(
                         &resolved.host,
                         resolved.port,
@@ -239,8 +305,12 @@ impl DirectGateway {
                         ))
                     })?;
                     Ok::<PooledHandle, GatewayError>(PooledHandle { handle, exit_code })
-                })
-                .await;
+                }),
+            )
+            .await
+            .map_err(|_| {
+                GatewayError::transport(anyhow!("timed out waiting for direct connection pool"))
+            })?;
 
             let lease = match lease {
                 Ok(lease) => lease,

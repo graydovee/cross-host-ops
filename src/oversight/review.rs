@@ -53,8 +53,9 @@ impl CommandReviewer {
                 self.review_exec(config, app_config, op).await
             }
             OperationKind::Copy => self.review_copy(config, app_config, op).await,
-            // session/proxy are not reviewed — audit-only.
-            OperationKind::Session | OperationKind::Proxy => ReviewOutcome::Skipped,
+            OperationKind::Session | OperationKind::Proxy => {
+                self.review_exec(config, app_config, op).await
+            }
         }
     }
 
@@ -68,8 +69,20 @@ impl CommandReviewer {
         if !exec_cfg.enable {
             return ReviewOutcome::Skipped;
         }
-        let super::OperationDetail::Exec { argv, command, .. } = &op.detail else {
-            return ReviewOutcome::Skipped;
+        let synthetic_argv;
+        let (argv, command) = match &op.detail {
+            super::OperationDetail::Exec { argv, command, .. } => (*argv, *command),
+            super::OperationDetail::SessionOp {
+                session_kind,
+                command_or_name,
+            } => {
+                synthetic_argv = vec![
+                    session_kind.as_str().to_string(),
+                    (*command_or_name).to_string(),
+                ];
+                (&synthetic_argv[..], *command_or_name)
+            }
+            _ => return ReviewOutcome::Skipped,
         };
         // Fast local allowlist short-circuits the LLM.
         if let Some(decision) = fast_allow(exec_cfg, argv) {
@@ -100,9 +113,19 @@ impl CommandReviewer {
             return ReviewOutcome::Skipped;
         };
         let target = &op.route.end_target;
+        let normalized_remote_path =
+            crate::filepath::NormalizedPath::from_str(remote_path).to_string_normalized();
+        if normalized_remote_path.split('/').any(|part| part == "..") {
+            return ReviewOutcome::Decision(ReviewDecision {
+                risk_level: RiskLevel::Dangerous,
+                action: ReviewAction::Deny,
+                reason: "copy path contains traversal components".to_string(),
+                matched_whitelist_reason: Some("path-validation".to_string()),
+            });
+        }
 
         // blocklist → deny short-circuit.
-        if matches_any(&copy_cfg.blocklist, remote_path, source_name) {
+        if matches_any(&copy_cfg.blocklist, &normalized_remote_path, source_name) {
             return ReviewOutcome::Decision(ReviewDecision {
                 risk_level: RiskLevel::Dangerous,
                 action: ReviewAction::Deny,
@@ -111,7 +134,7 @@ impl CommandReviewer {
             });
         }
         // allowlist → allow short-circuit.
-        if matches_any(&copy_cfg.allowlist, remote_path, source_name) {
+        if matches_any(&copy_cfg.allowlist, &normalized_remote_path, source_name) {
             return ReviewOutcome::Decision(ReviewDecision {
                 risk_level: RiskLevel::Safe,
                 action: copy_cfg.policy.action_for(RiskLevel::Safe),
@@ -125,7 +148,7 @@ impl CommandReviewer {
             app_config,
             target,
             *direction,
-            remote_path,
+            &normalized_remote_path,
             source_name,
         )
         .await
@@ -144,7 +167,7 @@ impl CommandReviewer {
         if config.endpoint.is_empty() || config.model.is_empty() {
             bail!("review is enabled but endpoint/model is missing");
         }
-        let resolver = app_config.secret_resolver(None);
+        let resolver = app_config.default_secret_resolver();
         let whitelist = render_semantic_whitelist(&exec_cfg.semantic_whitelist);
         let user_prompt = format!(
             "{}\n\nTarget host: {}\nArgv JSON: {}\nShell command: {}\n\nSemantic whitelist intents:\n{}\n\nReturn JSON only.",
@@ -178,7 +201,7 @@ impl CommandReviewer {
         if config.endpoint.is_empty() || config.model.is_empty() {
             bail!("review is enabled but endpoint/model is missing");
         }
-        let resolver = app_config.secret_resolver(None);
+        let resolver = app_config.default_secret_resolver();
         let dir_str = match direction {
             crate::types::CopyDirection::Upload => "upload (local → target)",
             crate::types::CopyDirection::Download => "download (target → local)",

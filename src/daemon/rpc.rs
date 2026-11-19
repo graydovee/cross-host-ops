@@ -12,7 +12,7 @@ use crate::protocol::ServerListSourceStatus;
 use crate::types::ServerListSource;
 
 use super::DaemonState;
-use super::gateway::{Capabilities, ErrorKind, GatewayKind};
+use super::gateway::{Capabilities, ErrorKind, ListServersOptions};
 
 /// Timeout for each gateway's list_servers call.
 const LIST_SERVERS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -28,10 +28,8 @@ pub fn prefix_source(gateway_name: &str, remote_source: &str) -> ServerListSourc
 
 /// Process a list_servers request by iterating all gateways, merging results.
 ///
-/// `no_recurse`: when true (set by XhodGateway/ReverseProxyGateway outgoing
-/// calls), skip forward XhodGateway connections to prevent recursive loops.
-/// Reverse proxy gateways are always queried — they propagate the flag on
-/// their own outgoing calls, so the receiving side skips its forward gateways.
+/// `no_recurse`: when true, pass the recursion context into each gateway so
+/// forwarding backends can suppress loops inside their own implementation.
 pub async fn process_list_servers(
     state: &DaemonState,
     no_recurse: bool,
@@ -52,13 +50,6 @@ pub async fn process_list_servers(
 
     // Iterate static gateways (config declaration order).
     for (name, gateway) in &state.gateways {
-        // When no_recurse is set, skip forward XhodGateway connections.
-        // They would call back to a remote that has a reverse proxy to us,
-        // creating an infinite loop.
-        if no_recurse && gateway.kind() == GatewayKind::Xhod {
-            continue;
-        }
-
         // Skip gateways that don't declare LIST (e.g. Jumpserver bastion) —
         // calling list_servers would just return Unsupported, so we never
         // surface it to the client in the first place.
@@ -67,7 +58,12 @@ pub async fn process_list_servers(
         }
 
         let source_tag = make_source(name);
-        match tokio::time::timeout(LIST_SERVERS_TIMEOUT, gateway.list_servers()).await {
+        match tokio::time::timeout(
+            LIST_SERVERS_TIMEOUT,
+            gateway.list_servers_with_options(ListServersOptions { no_recurse }),
+        )
+        .await
+        {
             Ok(Ok(rows)) => {
                 for row in rows {
                     results.push((row.server, row.source));
@@ -113,7 +109,12 @@ pub async fn process_list_servers(
         ));
 
         if let Some(gateway) = state.reverse_proxy_registry.get(&node.name).await {
-            match tokio::time::timeout(LIST_SERVERS_TIMEOUT, gateway.list_servers()).await {
+            match tokio::time::timeout(
+                LIST_SERVERS_TIMEOUT,
+                gateway.list_servers_with_options(ListServersOptions { no_recurse }),
+            )
+            .await
+            {
                 Ok(Ok(rows)) => {
                     for row in rows {
                         results.push((row.server, row.source));

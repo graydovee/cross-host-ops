@@ -15,7 +15,7 @@ mod ssh;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 pub use self::audit::AuditConfig;
@@ -143,6 +143,7 @@ impl AppConfig {
                 }
                 GatewayConfig::Jumpserver(c) => {
                     c.identity_file = expand_tilde(&c.identity_file)?;
+                    c.known_hosts_path = expand_tilde(&c.known_hosts_path)?;
                 }
                 GatewayConfig::Direct(c) => {
                     c.identity_file = expand_tilde(&c.identity_file)?;
@@ -193,6 +194,29 @@ impl AppConfig {
             })
             .or_else(|| fallback_identity.map(str::to_string));
         SecretResolver::new(Some(vault_path), key_source)
+    }
+
+    /// Resolve the vault identity using the same precedence for CLI and daemon
+    /// callers: explicit secret key, daemon host key, then server.toml default.
+    pub fn default_secret_key_source(&self) -> Result<String> {
+        if let Some(key_source) = &self.secret.key_source {
+            return Ok(key_source.clone());
+        }
+        if self.server.remote.enable {
+            return Ok(self.server.remote.host_key_path.clone());
+        }
+        let server = load_server_config(Path::new(&self.ssh.server_config_path))?;
+        server
+            .defaults
+            .identity_file
+            .ok_or_else(|| anyhow!("no vault key source configured"))
+    }
+
+    pub fn default_secret_resolver(&self) -> SecretResolver {
+        let fallback = load_server_config(Path::new(&self.ssh.server_config_path))
+            .ok()
+            .and_then(|server| server.defaults.identity_file);
+        self.secret_resolver(fallback.as_deref())
     }
 
     /// Resolve the vault file path. Uses `[secret].vault_path` if set, else

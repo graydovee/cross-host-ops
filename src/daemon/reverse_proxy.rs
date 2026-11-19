@@ -262,7 +262,15 @@ pub(super) async fn process_reverse_handshake(
         hc_request
             .metadata_mut()
             .insert("xho-no-recurse", "true".parse().unwrap());
-        let result = health_client.clone().list_servers(hc_request).await;
+        let result = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            health_client.clone().list_servers(hc_request),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(tonic::Status::deadline_exceeded("health check failed")),
+        };
         match result {
             Ok(resp) => {
                 // Parse node info from the _self entry in the response.
@@ -396,13 +404,18 @@ impl Gateway for ReverseProxyGateway {
         &self,
         target: &str,
         argv: &[String],
-        _shell: &str,
-        _no_shell: bool,
+        shell: &str,
+        no_shell: bool,
     ) -> Result<(Box<dyn TargetSession>, String), GatewayError> {
         let client = (*self.client.lock().await).clone();
         let command = build_remote_command(argv);
-        let session =
-            Box::new(TunneledSession::new(client, target.to_string())) as Box<dyn TargetSession>;
+        let session = Box::new(TunneledSession::new_with_exec(
+            client,
+            target.to_string(),
+            argv.to_vec(),
+            shell.to_string(),
+            no_shell,
+        )) as Box<dyn TargetSession>;
         Ok((session, command))
     }
 
@@ -412,15 +425,25 @@ impl Gateway for ReverseProxyGateway {
     }
 
     async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError> {
+        self.list_servers_with_options(super::gateway::ListServersOptions { no_recurse: true })
+            .await
+    }
+
+    async fn list_servers_with_options(
+        &self,
+        options: super::gateway::ListServersOptions,
+    ) -> Result<Vec<ServerListRow>, GatewayError> {
         let mut client = {
             let guard = self.client.lock().await;
             (*guard).clone()
         };
 
         let mut request = tonic::Request::new(rpc::ServerListRequest {});
-        request
-            .metadata_mut()
-            .insert("xho-no-recurse", "true".parse().unwrap());
+        if options.no_recurse {
+            request
+                .metadata_mut()
+                .insert("xho-no-recurse", "true".parse().unwrap());
+        }
 
         let response = client
             .list_servers(request)

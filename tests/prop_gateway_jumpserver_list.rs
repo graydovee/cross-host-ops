@@ -99,6 +99,7 @@ fn arb_jumpserver_fields() -> impl Strategy<Value = JumpserverGatewayConfig> {
                     port,
                     user,
                     identity_file,
+                    known_hosts_path: String::new(),
                     pubkey_accepted_algorithms,
                     totp_secret_base32: mfa.totp_secret_base32,
                     totp_digits: mfa.digits,

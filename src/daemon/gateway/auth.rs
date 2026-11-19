@@ -303,6 +303,15 @@ pub(crate) async fn connect_handle(
     port: u16,
     config: &AppConfig,
 ) -> Result<Handle<ClientHandler>> {
+    connect_handle_with_known_hosts(host, port, config, &default_known_hosts_path()).await
+}
+
+pub(crate) async fn connect_handle_with_known_hosts(
+    host: &str,
+    port: u16,
+    config: &AppConfig,
+    known_hosts_path: &Path,
+) -> Result<Handle<ClientHandler>> {
     let client_config = client::Config {
         // Keep idle transports (including jumpserver hops) alive with active
         // keepalive pings rather than letting inactivity_timeout drop them.
@@ -315,11 +324,7 @@ pub(crate) async fn connect_handle(
         client::connect(
             Arc::new(client_config),
             (host, port),
-            ClientHandler::with_known_hosts(
-                host,
-                port,
-                &default_known_hosts_path().display().to_string(),
-            ),
+            ClientHandler::with_known_hosts(host, port, &known_hosts_path.display().to_string()),
         ),
     )
     .await

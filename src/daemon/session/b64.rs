@@ -200,12 +200,14 @@ impl B64Encoder {
         self.pending.extend_from_slice(data);
         let groups = self.pending.len() / GROUP;
         let mut out = Vec::with_capacity(groups * 77);
-        for _ in 0..groups {
-            let group: Vec<u8> = self.pending.drain(..GROUP).collect();
-            out.extend_from_slice(&encode_group(&group));
+        for index in 0..groups {
+            let start = index * GROUP;
+            let end = start + GROUP;
+            out.extend_from_slice(&encode_group(&self.pending[start..end]));
             out.push(b'\n');
             self.encoded_total += 77;
         }
+        self.pending.drain(..groups * GROUP);
         out
     }
 

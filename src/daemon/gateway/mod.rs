@@ -170,6 +170,13 @@ pub trait Gateway: Send + Sync {
         )))
     }
 
+    async fn list_servers_with_options(
+        &self,
+        _options: ListServersOptions,
+    ) -> Result<Vec<ServerListRow>, GatewayError> {
+        self.list_servers().await
+    }
+
     /// Snapshot of this gateway's connection pool, for `xho status`.
     /// Default: no pools.
     async fn pool_status(&self) -> Vec<ConnectionStatusSnapshot> {
@@ -178,6 +185,11 @@ pub trait Gateway: Send + Sync {
 
     /// Prune idle connections. Called by the daemon's reaper timer. Default: no-op.
     async fn prune_idle(&self) {}
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ListServersOptions {
+    pub no_recurse: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -430,14 +442,14 @@ pub fn build_gateways(
                 auth_prompter.clone(),
                 max_idle_time,
             )),
-            GatewayConfig::Direct(c) => Arc::new(DirectGateway::new_with_known_hosts(
+            GatewayConfig::Direct(c) => Arc::new(DirectGateway::new_configured(
                 c.name.clone(),
                 config.clone(),
                 server_config_path.to_string(),
                 auth_prompter.clone(),
                 max_connections_per_address,
                 max_idle_time,
-                c.known_hosts_path.clone(),
+                c.clone(),
             )),
         };
         gateways.push((gc.name().to_string(), gateway));

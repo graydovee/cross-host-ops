@@ -33,13 +33,24 @@ pub struct ServerHostConfig {
     pub shell: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DirectAuth {
     Key { identity_file: String },
     Password { password: String },
     None,
     ReverseProxy,
+}
+
+impl std::fmt::Debug for DirectAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Key { .. } => f.write_str("Key { identity_file: <redacted> }"),
+            Self::Password { .. } => f.write_str("Password { password: <redacted> }"),
+            Self::None => f.write_str("None"),
+            Self::ReverseProxy => f.write_str("ReverseProxy"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

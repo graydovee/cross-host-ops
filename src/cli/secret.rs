@@ -58,20 +58,13 @@ fn vault_path(config: &AppConfig) -> PathBuf {
 /// enabled) → `server.toml`'s `[defaults].identity_file`. Returns an error with
 /// guidance if none is available.
 fn key_source(config: &AppConfig, server_config: &ServerConfigFile) -> Result<String> {
-    if let Some(key_source) = &config.secret.key_source {
-        return expand_tilde(key_source);
-    }
-    if config.server.remote.enable {
-        return Ok(config.server.remote.host_key_path.clone());
-    }
-    if let Some(identity) = &server_config.defaults.identity_file {
-        // server.toml defaults are already tilde-expanded by load_server_config.
-        return Ok(identity.clone());
-    }
-    bail!(
-        "no vault key source: set [secret].key_source in config.toml, enable \
-         [server.remote] (to reuse the host key), or set [defaults].identity_file in server.toml"
-    )
+    let _ = server_config;
+    config
+        .default_secret_key_source()
+        .and_then(|source| expand_tilde(&source))
+        .map_err(|_| anyhow!(
+            "no vault key source: set [secret].key_source in config.toml, enable [server.remote], or set [defaults].identity_file in server.toml"
+        ))
 }
 
 fn set(config_path: Option<&Path>, name: &str) -> Result<i32> {

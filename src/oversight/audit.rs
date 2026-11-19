@@ -299,6 +299,16 @@ fn build_appender_at(
     let (writer, guard) = NonBlockingBuilder::default()
         .thread_name("xho-audit")
         .finish(appender);
+    #[cfg(unix)]
+    if path.exists() {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).with_context(|| {
+            format!(
+                "failed to restrict audit log permissions {}",
+                path.display()
+            )
+        })?;
+    }
     Ok((path.clone(), writer, guard))
 }
 

@@ -9,6 +9,7 @@
 
 ## latest
 
+- 2026-11-18 [bug] 补齐 jumpserver 主机密钥路径、下载 symlink 防护、有界 session 事件队列、RPC 错误类型和本地输出完整排空。
 - 2026-11-18 [bug] 按调用方认证类型限制控制面 RPC，拒绝不安全的复制路径与 shell 名称，并校验出站 SSH 主机密钥。
 - 2026-11-18 [bug] SSH 代理建立会话失败时会报错并关闭通道，支持连接超时和 Ctrl+C 取消，不再无限挂起。
 - 2026-10-09 [bug] jumpserver 目标不在堡垒机资产列表时立即以 "no matching assets" resolution 错误失败（退出码 127），不再空等连接超时后误报 shell 输出超时

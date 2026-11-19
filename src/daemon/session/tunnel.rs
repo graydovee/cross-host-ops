@@ -32,9 +32,21 @@ pub(crate) struct TunneledSession {
 
 impl TunneledSession {
     pub(crate) fn new(client: RpcClient, target: String) -> Self {
+        Self::new_with_exec(client, target, Vec::new(), String::new(), false)
+    }
+
+    pub(crate) fn new_with_exec(
+        client: RpcClient,
+        target: String,
+        argv: Vec<String>,
+        shell: String,
+        no_shell: bool,
+    ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(64);
         let (events_tx, events_rx) = mpsc::unbounded_channel::<SessionEvent>();
-        tokio::spawn(driver(client, target, cmd_rx, events_tx));
+        tokio::spawn(driver(
+            client, target, argv, shell, no_shell, cmd_rx, events_tx,
+        ));
         Self {
             writer: Some(SessionWriter { tx: cmd_tx }),
             stream: Some(SessionStream { rx: events_rx }),
@@ -54,6 +66,9 @@ impl TargetSession for TunneledSession {
 async fn driver(
     mut client: RpcClient,
     target: String,
+    argv: Vec<String>,
+    shell: String,
+    no_shell: bool,
     cmd_rx: mpsc::Receiver<SessionCommand>,
     events_tx: mpsc::UnboundedSender<SessionEvent>,
 ) {
@@ -76,7 +91,12 @@ async fn driver(
     // Kick off: open the session on the remote end_target.
     if req_tx
         .send(r::SessionRequest {
-            msg: Some(r::session_request::Msg::Open(r::SessionOpen { target })),
+            msg: Some(r::session_request::Msg::Open(r::SessionOpen {
+                target,
+                argv,
+                shell,
+                no_shell,
+            })),
         })
         .await
         .is_err()

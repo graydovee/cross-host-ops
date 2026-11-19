@@ -35,7 +35,9 @@ use crate::daemon::session::jumpserver::JumpserverSession;
 use crate::daemon::session::shell_copy;
 use crate::daemon::shell::{build_remote_command, resolve_shell};
 
-use super::auth::{AuthPrompt, AuthPrompter, ClientHandler, authenticate_with_key, connect_handle};
+use super::auth::{
+    AuthPrompt, AuthPrompter, ClientHandler, authenticate_with_key, connect_handle_with_known_hosts,
+};
 use super::{
     Capabilities, ErrorKind, Gateway, GatewayError, GatewayKind, is_resolution_error,
     is_transport_error,
@@ -226,9 +228,9 @@ impl JumpserverGateway {
 
     async fn ensure_transport(&self) -> Result<SingletonLease<JumpserverTransport>, GatewayError> {
         for attempt in 0..=1 {
-            let result = self
-                .transport
-                .checkout_or_insert_with(|| async {
+            let result = tokio::time::timeout(
+                self.config.read().await.ssh.connect_timeout,
+                self.transport.checkout_or_insert_with(|| async {
                     self.establish_transport()
                         .await
                         .map(AsyncMutex::new)
@@ -239,8 +241,12 @@ impl JumpserverGateway {
                                 e
                             ))
                         })
-                })
-                .await;
+                }),
+            )
+            .await
+            .map_err(|_| {
+                GatewayError::transport(anyhow!("timed out waiting for jumpserver connection"))
+            })?;
             match result {
                 Ok(lease) => return Ok(lease),
                 Err(e) if attempt == 0 && matches!(e.kind, ErrorKind::Transport) => {
@@ -255,7 +261,18 @@ impl JumpserverGateway {
 
     async fn establish_transport(&self) -> Result<JumpserverTransportState> {
         let app_config = self.config.read().await.clone();
-        let mut handle = connect_handle(&self.fields.host, self.fields.port, &app_config).await?;
+        let known_hosts = if self.fields.known_hosts_path.is_empty() {
+            crate::config::default_known_hosts_path()
+        } else {
+            std::path::PathBuf::from(&self.fields.known_hosts_path)
+        };
+        let mut handle = connect_handle_with_known_hosts(
+            &self.fields.host,
+            self.fields.port,
+            &app_config,
+            &known_hosts,
+        )
+        .await?;
 
         let totp_secret = self.resolve_totp_secret().await?;
         let mfa_config = MfaConfig {
@@ -726,6 +743,7 @@ mod tests {
                 port: 22,
                 user: "admin".to_string(),
                 identity_file: "~/.ssh/id_rsa".to_string(),
+                known_hosts_path: String::new(),
                 pubkey_accepted_algorithms: None,
                 totp_secret_base32: String::new(),
                 totp_digits: 6,

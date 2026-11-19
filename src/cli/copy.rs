@@ -262,7 +262,12 @@ pub(crate) async fn run_copy(
                     .map_err(|_| anyhow!("failed to send copy auth input request"))?;
                 }
                 rpc::copy_response::Event::Error(error) => {
-                    return Err(super::classify_daemon_error(&error.message).into());
+                    return Err(super::classify_daemon_error_kind(
+                        rpc::ErrorKind::try_from(error.kind)
+                            .unwrap_or(rpc::ErrorKind::Unspecified),
+                        &error.message,
+                    )
+                    .into());
                 }
                 rpc::copy_response::Event::Complete(done) => {
                     completed = true;
@@ -772,6 +777,7 @@ impl CopyDownloadWriter {
                     (path, file, start_offset)
                 } else {
                     let path = self.destination_for_file(&relative_path).await?;
+                    self.ensure_safe_download_path(&path).await?;
                     if let Some(parent) = path.parent() {
                         if !parent.as_os_str().is_empty() {
                             tokio::fs::create_dir_all(parent).await?;
@@ -827,6 +833,7 @@ impl CopyDownloadWriter {
                 }
                 let root = self.download_root().await?;
                 let path = join_relative_path(&root, &relative_path)?;
+                self.ensure_safe_download_path(&path).await?;
                 tokio::fs::create_dir_all(&path)
                     .await
                     .with_context(|| format!("failed to create directory {}", path.display()))?;
@@ -847,6 +854,7 @@ impl CopyDownloadWriter {
                 } else {
                     self.destination_for_single_entry(&relative_path).await?
                 };
+                self.ensure_safe_download_path(&path).await?;
                 if let Some(parent) = path.parent() {
                     if !parent.as_os_str().is_empty() {
                         tokio::fs::create_dir_all(parent).await?;
@@ -884,6 +892,21 @@ impl CopyDownloadWriter {
         }
     }
 
+    async fn ensure_safe_download_path(&self, path: &Path) -> Result<()> {
+        let root = if self.recursive {
+            self.root
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| self.dest.clone())
+        } else {
+            self.dest
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."))
+        };
+        ensure_no_symlink_escape(&root, path).await
+    }
+
     async fn download_root(&mut self) -> Result<PathBuf> {
         if let Some(root) = &self.root {
             return Ok(root.clone());
@@ -908,6 +931,48 @@ fn download_progress_name(path: &Path, relative_path: &str) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or("download")
         .to_string()
+}
+
+async fn ensure_no_symlink_escape(root: &Path, path: &Path) -> Result<()> {
+    let cwd = std::env::current_dir().context("failed to get current directory")?;
+    let root_abs = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        cwd.join(root)
+    };
+    let path_abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    anyhow::ensure!(
+        path_abs.starts_with(&root_abs),
+        "download path escapes destination root: {}",
+        path.display()
+    );
+
+    let mut current = root_abs.clone();
+    if let Ok(meta) = tokio::fs::symlink_metadata(&current).await {
+        anyhow::ensure!(
+            !meta.file_type().is_symlink(),
+            "download destination root must not be a symlink: {}",
+            current.display()
+        );
+    }
+    if let Ok(relative) = path_abs.strip_prefix(&root_abs) {
+        for component in relative.components() {
+            current.push(component.as_os_str());
+            match tokio::fs::symlink_metadata(&current).await {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    bail!("download path traverses symlink: {}", current.display());
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
 }
 
 struct CopyCliPlan {

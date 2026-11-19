@@ -39,6 +39,7 @@ pub struct ConnectionStatusSnapshot {
 
 pub(crate) struct ManagedSingleton<T> {
     inner: AsyncMutex<Option<SingletonEntry<T>>>,
+    creating: AsyncMutex<()>,
     next_generation: Mutex<u64>,
 }
 
@@ -68,6 +69,7 @@ impl<T> ManagedSingleton<T> {
     pub(crate) fn new() -> Self {
         Self {
             inner: AsyncMutex::new(None),
+            creating: AsyncMutex::new(()),
             next_generation: Mutex::new(1),
         }
     }
@@ -80,19 +82,35 @@ impl<T> ManagedSingleton<T> {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T, E>>,
     {
-        let mut guard = self.inner.lock().await;
-        if let Some(entry) = guard.as_mut() {
-            entry.last_used = Instant::now();
-            return Ok(SingletonLease {
-                resource: entry.resource.clone(),
-                generation: entry.generation,
-            });
+        {
+            let mut guard = self.inner.lock().await;
+            if let Some(entry) = guard.as_mut() {
+                entry.last_used = Instant::now();
+                return Ok(SingletonLease {
+                    resource: entry.resource.clone(),
+                    generation: entry.generation,
+                });
+            }
+        }
+
+        // Serialize only the creation path. The inner state lock is never held
+        // while SSH connect/auth/MFA runs, so status and pruning remain live.
+        let _creating = self.creating.lock().await;
+        {
+            let mut guard = self.inner.lock().await;
+            if let Some(entry) = guard.as_mut() {
+                entry.last_used = Instant::now();
+                return Ok(SingletonLease {
+                    resource: entry.resource.clone(),
+                    generation: entry.generation,
+                });
+            }
         }
 
         let resource = Arc::new(create().await?);
         let generation = self.allocate_generation();
         let now = Instant::now();
-        *guard = Some(SingletonEntry {
+        self.inner.lock().await.replace(SingletonEntry {
             resource: resource.clone(),
             generation,
             created_at: now,

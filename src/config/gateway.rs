@@ -205,6 +205,8 @@ pub struct JumpserverGatewayConfig {
     #[serde(default)]
     pub identity_file: String,
     #[serde(default)]
+    pub known_hosts_path: String,
+    #[serde(default)]
     pub pubkey_accepted_algorithms: Option<String>,
     // Flat MFA/TOTP fields (no nested sub-table)
     #[serde(default)]

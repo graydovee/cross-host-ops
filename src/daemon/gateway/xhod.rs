@@ -313,11 +313,14 @@ impl XhodGateway {
     async fn list_servers_with_client(
         &self,
         mut client: XhoRpcClient,
+        no_recurse: bool,
     ) -> Result<Vec<ServerListRow>, GatewayError> {
         let mut request = tonic::Request::new(rpc::ServerListRequest {});
-        request
-            .metadata_mut()
-            .insert("xho-no-recurse", "true".parse().unwrap());
+        if no_recurse {
+            request
+                .metadata_mut()
+                .insert("xho-no-recurse", "true".parse().unwrap());
+        }
 
         let response = client
             .list_servers(request)
@@ -377,16 +380,21 @@ impl Gateway for XhodGateway {
         &self,
         target: &str,
         argv: &[String],
-        _shell: &str,
-        _no_shell: bool,
+        shell: &str,
+        no_shell: bool,
     ) -> Result<(Box<dyn TargetSession>, String), GatewayError> {
         // The remote xhod builds the final command for its own end target via
         // the OpenSession tunnel, so we send raw (quoted) argv and let the next
         // hop resolve the shell.
         let client = self.client().await?;
         let command = build_remote_command(argv);
-        let session =
-            Box::new(TunneledSession::new(client, target.to_string())) as Box<dyn TargetSession>;
+        let session = Box::new(TunneledSession::new_with_exec(
+            client,
+            target.to_string(),
+            argv.to_vec(),
+            shell.to_string(),
+            no_shell,
+        )) as Box<dyn TargetSession>;
         Ok((session, command))
     }
 
@@ -396,10 +404,21 @@ impl Gateway for XhodGateway {
     }
 
     async fn list_servers(&self) -> Result<Vec<ServerListRow>, GatewayError> {
+        self.list_servers_with_options(super::ListServersOptions { no_recurse: true })
+            .await
+    }
+
+    async fn list_servers_with_options(
+        &self,
+        options: super::ListServersOptions,
+    ) -> Result<Vec<ServerListRow>, GatewayError> {
         let lease = self.ensure_client().await?;
         let client = (*lease.resource()).clone();
 
-        match self.list_servers_with_client(client).await {
+        match self
+            .list_servers_with_client(client, options.no_recurse)
+            .await
+        {
             Ok(rows) => Ok(rows),
             Err(e) if matches!(e.kind, ErrorKind::Transport) => {
                 debug!(gateway = %self.gateway_name,
@@ -408,7 +427,10 @@ impl Gateway for XhodGateway {
 
                 let new_lease = self.ensure_client().await?;
                 let new_client = (*new_lease.resource()).clone();
-                match self.list_servers_with_client(new_client).await {
+                match self
+                    .list_servers_with_client(new_client, options.no_recurse)
+                    .await
+                {
                     Ok(rows) => Ok(rows),
                     Err(e) => {
                         if matches!(e.kind, ErrorKind::Transport) {

@@ -78,6 +78,7 @@ async fn setup() -> E2E {
         port: bastion.addr.port(),
         user: "mockuser".to_string(),
         identity_file: key_path.to_string_lossy().to_string(),
+        known_hosts_path: String::new(),
         pubkey_accepted_algorithms: None,
         totp_secret_base32: String::new(),
         totp_digits: 6,

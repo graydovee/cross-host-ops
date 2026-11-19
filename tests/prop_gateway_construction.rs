@@ -95,6 +95,7 @@ fn arb_jumpserver_gateway(name: String) -> impl Strategy<Value = GatewayConfig> 
                 port,
                 user,
                 identity_file,
+                known_hosts_path: String::new(),
                 pubkey_accepted_algorithms: None,
                 totp_secret_base32: String::new(),
                 totp_digits: 6,

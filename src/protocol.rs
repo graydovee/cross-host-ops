@@ -345,16 +345,43 @@ pub fn server_event_to_rpc(event: ServerEvent) -> rpc::ExecuteResponse {
         ServerEvent::Stderr { data } => Event::Stderr(rpc::OutputChunk { data }),
         ServerEvent::ExitStatus { code } => Event::ExitStatus(rpc::ExitStatus { code }),
         ServerEvent::Info { message } => Event::Info(rpc::InfoResponse { message }),
-        ServerEvent::Error { message } => Event::Error(rpc::ErrorResponse { message }),
+        ServerEvent::Error { message } => Event::Error(error_response_value(message)),
     };
     rpc::ExecuteResponse { event: Some(event) }
 }
 
 pub fn error_response(message: impl Into<String>) -> rpc::ExecuteResponse {
+    let message = message.into();
     rpc::ExecuteResponse {
-        event: Some(rpc::execute_response::Event::Error(rpc::ErrorResponse {
-            message: message.into(),
-        })),
+        event: Some(rpc::execute_response::Event::Error(error_response_value(
+            message,
+        ))),
+    }
+}
+
+pub fn error_response_value(message: String) -> rpc::ErrorResponse {
+    rpc::ErrorResponse {
+        kind: error_kind_from_message(&message) as i32,
+        message,
+    }
+}
+
+pub fn error_kind_from_message(message: &str) -> rpc::ErrorKind {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("[resolution]") || lower.contains("not found") {
+        rpc::ErrorKind::Resolution
+    } else if lower.contains("[transport]") || lower.contains("connection") {
+        rpc::ErrorKind::Transport
+    } else if lower.contains("[unsupported]") || lower.contains("no route") {
+        rpc::ErrorKind::Unsupported
+    } else if lower.contains("permission denied") || lower.contains("authorization") {
+        rpc::ErrorKind::Authorization
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        rpc::ErrorKind::Timeout
+    } else if lower.contains("[execution]") {
+        rpc::ErrorKind::Execution
+    } else {
+        rpc::ErrorKind::Internal
     }
 }
 
@@ -421,10 +448,11 @@ pub fn copy_resume_ack_response(entries: Vec<crate::types::ResumeEntry>) -> rpc:
 }
 
 pub fn copy_error_response(message: impl Into<String>) -> rpc::CopyResponse {
+    let message = message.into();
     rpc::CopyResponse {
-        event: Some(rpc::copy_response::Event::Error(rpc::ErrorResponse {
-            message: message.into(),
-        })),
+        event: Some(rpc::copy_response::Event::Error(error_response_value(
+            message,
+        ))),
     }
 }
 

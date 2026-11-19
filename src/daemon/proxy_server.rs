@@ -39,6 +39,7 @@ pub(super) struct ProxySshServer {
     pub authorized_keys_path: String,
 }
 
+#[derive(Clone)]
 struct PtyParams {
     term: String,
     cols: u32,
@@ -118,11 +119,6 @@ async fn forward_or_buffer(
     msg: ProxyMsg,
 ) {
     if let Some(bridge) = bridges.get(&channel) {
-        // Unbounded: handler.data() runs INSIDE the russh session loop, so it
-        // must never park (a parked data() stops the loop from reading the
-        // socket and answering keepalives - the historical terminal freeze).
-        // Backpressure is enforced downstream by the pump -> writer -> PTY
-        // chain instead.
         let _ = bridge.tx.send(msg);
     } else if let Some(entry) = channels.get_mut(&channel) {
         entry.pending.push(msg);
@@ -301,6 +297,62 @@ async fn run_bridge(
         SessionStart::Shell => ("shell", "(interactive)".to_string()),
         SessionStart::Subsystem(name) => ("subsystem", name.clone()),
     };
+    let review_kind = match &start {
+        SessionStart::Exec(_) => crate::oversight::SessionKind::Exec,
+        SessionStart::Shell => crate::oversight::SessionKind::Shell,
+        SessionStart::Subsystem(_) => crate::oversight::SessionKind::Subsystem,
+    };
+    let review_detail = crate::oversight::OperationDetail::SessionOp {
+        session_kind: review_kind,
+        command_or_name: &command_or_name,
+    };
+    let review_config = state.config.read().await.clone();
+    match state
+        .oversight
+        .review(
+            &review_config,
+            &crate::oversight::Operation {
+                kind: crate::oversight::OperationKind::Proxy,
+                route: &route,
+                gateway_kind,
+                caller: &caller,
+                detail: review_detail,
+                execution_id: None,
+                timeout_ms: None,
+            },
+        )
+        .await
+    {
+        crate::oversight::ReviewOutcome::Decision(decision)
+            if matches!(
+                decision.action,
+                crate::config::ReviewAction::Deny | crate::config::ReviewAction::Confirm
+            ) =>
+        {
+            let reason = if matches!(decision.action, crate::config::ReviewAction::Confirm) {
+                format!("proxy operation requires confirmation: {}", decision.reason)
+            } else {
+                format!("proxy operation denied: {}", decision.reason)
+            };
+            let _ = channel
+                .extended_data(1, Cursor::new(format!("xhod: {reason}\r\n")))
+                .await;
+            let _ = channel.exit_status(126).await;
+            close_channel(channel).await;
+            return;
+        }
+        crate::oversight::ReviewOutcome::Failed(error)
+            if review_config.review.failure_action == crate::config::ReviewAction::Deny =>
+        {
+            let _ = channel
+                .extended_data(1, Cursor::new(format!("xhod: review failed: {error}\r\n")))
+                .await;
+            let _ = channel.exit_status(126).await;
+            close_channel(channel).await;
+            return;
+        }
+        _ => {}
+    }
     let mut started_event = crate::oversight::AuditEvent::new(
         caller.source,
         crate::oversight::OperationKind::Proxy.as_str(),
@@ -381,6 +433,7 @@ async fn forward_to_session(writer: &SessionWriter, msg: ProxyMsg) -> Result<()>
     }
 }
 
+#[derive(Clone)]
 enum SessionStart {
     Exec(String),
     Shell,

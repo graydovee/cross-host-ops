@@ -58,8 +58,14 @@ pub enum SecretSource {
 }
 
 /// A credential stored in configuration as an indirection reference.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Secret(SecretSource);
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Secret").field(&"<redacted>").finish()
+    }
+}
 
 impl Secret {
     /// Build a secret from a raw config string, classifying it by prefix.

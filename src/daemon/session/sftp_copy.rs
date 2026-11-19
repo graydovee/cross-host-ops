@@ -50,10 +50,13 @@ pub(crate) async fn open_sftp(sess: Box<dyn TargetSession>) -> Result<SftpSessio
         });
         while let Some(ev) = stream.next().await {
             match ev {
-                super::SessionEvent::Stdout(d) | super::SessionEvent::Stderr(d) => {
+                super::SessionEvent::Stdout(d) => {
                     if wr.write_all(&d).await.is_err() {
                         break;
                     }
+                }
+                super::SessionEvent::Stderr(d) => {
+                    tracing::debug!(bytes = d.len(), "discarding stderr from SFTP transport");
                 }
                 super::SessionEvent::ExitStatus(_)
                 | super::SessionEvent::ExitSignal(_)

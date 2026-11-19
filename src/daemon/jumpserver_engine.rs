@@ -731,6 +731,7 @@ impl PtyShell {
     ) -> (i32, Option<PtyShell>) {
         let mut exit_code = 0;
         let mut stdin_open = true;
+        let mut resize_open = true;
         let mut scanner = sentinel.clone().map(SentinelScanner::new);
         // Only sentinel mode can leave the channel reusable (the asset shell is
         // still at its prompt after the wrapped command completes). `shell()` /
@@ -771,11 +772,12 @@ impl PtyShell {
                         stdin_open = false;
                     }
                 },
-                resize = resize_rx.recv() => {
-                    if let Some((cols, rows)) = resize {
+                resize = resize_rx.recv(), if resize_open => match resize {
+                    Some((cols, rows)) => {
                         let _ = self.channel.window_change(cols, rows, 0, 0).await;
                     }
-                }
+                    None => resize_open = false,
+                },
                 msg = self.channel.wait() => match msg {
                     Some(ChannelMsg::Data { data }) => {
                         let chunk = data.to_vec();

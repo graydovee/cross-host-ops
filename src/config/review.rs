@@ -11,7 +11,7 @@ use super::duration::{deserialize_duration, serialize_duration};
 /// timeout/headers/failure_action) are shared between all reviewed operation
 /// kinds; each operation kind has its own sub-config for enable flag, prompts,
 /// policy and allow/blocklists.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ReviewConfig {
     // --- shared LLM connection ---
@@ -31,6 +31,21 @@ pub struct ReviewConfig {
     // --- per-operation review config ---
     pub exec: ReviewExecConfig,
     pub copy: ReviewCopyConfig,
+}
+
+impl fmt::Debug for ReviewConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReviewConfig")
+            .field("endpoint", &self.endpoint)
+            .field("model", &self.model)
+            .field("api_key", &"<redacted>")
+            .field("timeout", &self.timeout)
+            .field("headers", &self.headers.keys().collect::<Vec<_>>())
+            .field("failure_action", &self.failure_action)
+            .field("exec", &self.exec)
+            .field("copy", &self.copy)
+            .finish()
+    }
 }
 
 impl Default for ReviewConfig {

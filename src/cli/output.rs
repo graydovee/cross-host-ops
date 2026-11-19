@@ -135,6 +135,27 @@ pub(crate) async fn status() -> Result<i32> {
     Ok(0)
 }
 
+pub(crate) async fn status_json() -> Result<i32> {
+    let mut client = connect_data_client(ClientAccess::NoAutoStart).await?;
+    let response = client.status(rpc::StatusRequest {}).await?.into_inner();
+    let value = serde_json::json!({
+        "daemon_running": response.daemon_running,
+        "origin": response.daemon_origin,
+        "cli_controllable": response.cli_controllable,
+        "active_executions": response.active_executions,
+        "remote": { "listening": response.remote_listening, "address": response.remote_addr },
+        "proxy": { "listening": response.proxy_listening, "address": response.proxy_addr },
+        "gateways": response.gateways.iter().map(|g| serde_json::json!({
+            "name": g.name, "kind": g.kind, "address": g.address
+        })).collect::<Vec<_>>(),
+        "pools": response.pools.iter().map(|p| serde_json::json!({
+            "key": p.key, "total": p.total, "busy": p.busy, "idle": p.idle, "queued": p.queued
+        })).collect::<Vec<_>>(),
+    });
+    println!("{}", serde_json::to_string(&value)?);
+    Ok(0)
+}
+
 /// Print headers + rows with aligned columns.
 fn print_aligned_rows(headers: &[&str], rows: &[Vec<String>], indent: &str) {
     let col_count = headers.len();
@@ -192,6 +213,29 @@ pub(crate) async fn list_servers(refresh: bool) -> Result<i32> {
         print_flat_server_list(&response.servers);
     }
     let _ = refresh; // TODO: wire refresh flag to ServerListRequest when proto field is added
+    Ok(0)
+}
+
+pub(crate) async fn list_servers_json(refresh: bool) -> Result<i32> {
+    let mut client = connect_data_client(ClientAccess::AutoStart).await?;
+    let response = client
+        .list_servers(rpc::ServerListRequest {})
+        .await?
+        .into_inner();
+    let value = serde_json::json!({
+        "server_config_path": response.server_config_path,
+        "servers": response.servers.iter().map(|s| serde_json::json!({
+            "alias": s.alias, "host": s.host, "port": s.port, "user": s.user, "auth_kind": s.auth_kind
+        })).collect::<Vec<_>>(),
+        "merged": response.merged.as_ref().map(|merged| merged.rows.iter().map(|row| serde_json::json!({
+            "source": row.source,
+            "server": row.server.as_ref().map(|s| serde_json::json!({
+                "alias": s.alias, "host": s.host, "port": s.port, "user": s.user, "auth_kind": s.auth_kind
+            }))
+        })).collect::<Vec<_>>())
+    });
+    println!("{}", serde_json::to_string(&value)?);
+    let _ = refresh;
     Ok(0)
 }
 
