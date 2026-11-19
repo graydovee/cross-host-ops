@@ -19,6 +19,7 @@
 
 ## latest
 
+- 2026-11-19 [refactor] CI now publishes a short-lived Linux release binary artifact for direct server upgrades without local cross-compilation.
 - 2026-11-18 [bug] Added strict jumpserver host-key paths, symlink-safe downloads, bounded session event queues, typed RPC error categories, and complete local output draining.
 - 2026-11-18 [bug] Restricted control-plane RPCs by caller authentication, rejected unsafe copy paths and shell names, and enforced SSH host-key verification for outbound connections.
 - 2026-11-18 [bug] SSH proxy setup failures now report an error and close the channel, with a connection deadline and Ctrl+C cancellation instead of hanging indefinitely.

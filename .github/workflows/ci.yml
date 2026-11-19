@@ -39,3 +39,17 @@ jobs:
       - name: cargo build binaries (windows)
         if: runner.os == 'Windows'
         run: cargo build --target ${{ matrix.target }} --bin xho --bin xhod
+
+      - name: cargo build release binaries (linux)
+        if: runner.os == 'Linux'
+        run: cargo build --release --target ${{ matrix.target }} --bin xho --bin xhod
+
+      - name: Upload Linux release binaries
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v5
+        with:
+          name: xho-linux-${{ github.sha }}
+          path: |
+            target/${{ matrix.target }}/release/xho
+            target/${{ matrix.target }}/release/xhod
+          retention-days: 7
